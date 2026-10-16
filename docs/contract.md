@@ -50,8 +50,21 @@ module tt_um_fesens_r32v (
 - No negative-edge flip-flops, no internal tristates, no combinational loops.
 - The design must not rely on power-up values. Registers, the register file included, may start
   unknown. Checkers randomize them (cosim) or leave them as X (gate-level test).
-- Plain synthesizable Verilog only. No instantiated cells in v1; synthesis maps to
+- Plain synthesizable Verilog-2005 only. No instantiated cells in v1; synthesis maps to
   `sky130_fd_sc_hd`.
+- **Restricted preprocessor**, so every tool (Verilator, yosys, Icarus, LibreLane) sees the same
+  design:
+  - The only compiler directives allowed in `src/*.v` are `` `ifdef RISCV_FORMAL ``,
+    `` `ifndef RISCV_FORMAL ``, `` `else ``, `` `endif ``, `` `default_nettype `` and
+    `` `timescale ``. That means no `` `define ``, macro uses, `` `include ``, `` `undef ``,
+    `` `elsif `` or anything else. Use `parameter`/`localparam` instead.
+  - No `initial` blocks, and no initializers on `reg` or `integer` declarations (parameters are
+    fine).
+  - No attribute instances (`(* ... *)`) other than the `@(*)` sensitivity list.
+  - No tool metacomments (`verilator`, `synopsys`, `synthesis`, `pragma`, `yosys` or
+    `translate_` directives in comments).
+  - Every `src/*.v` file is part of the design. The gates read them in sorted order, and the lead
+    keeps `info.yaml` `source_files` equal to that list.
 
 ## 2. SPI memory protocol (23LC512-compatible, mode 0)
 
