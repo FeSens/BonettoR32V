@@ -94,9 +94,9 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
     Writes to other IO bytes are ignored.
   - Misaligned IO accesses (`addr[1:0] != 0` with `n > 1`) are unspecified; no test uses them.
   - An IO access never appears on the SPI pins.
-- **`ui_in` timing.** An IO load samples `ui_in` after the previous instruction retires and before
-  its own retirement. The cosim changes `ui_in` only directly after retirements, and formal holds
-  it constant.
+- **`ui_in` timing.** An IO load samples `ui_in` after its own fetch transaction has completed
+  (CS_n has risen after the fetch) and before its own retirement. The cosim changes `ui_in` only
+  shortly after retirements (within 2 cycles), and formal holds it constant.
 - **`uo_out` timing.** `uo_out` changes only as the result of an IO store that writes byte 0. It
   holds the new value no later than one cycle after that store retires.
 
@@ -161,7 +161,14 @@ Conventions:
   `k` is the byte at `mem_addr + k`. IO accesses use the same fields.
 - **Transaction order.** Every SPI transaction belongs to the instruction that retires next. A
   fetch may only read that instruction's bytes, and a load or store may only move that
-  instruction's data. All of an instruction's SPI traffic finishes before its `rvfi_valid` cycle.
+  instruction's data. All of an instruction's SPI traffic finishes before its `rvfi_valid` cycle,
+  with CS_n high at that cycle.
+- **Fetch and load completeness.** Every retired instruction is fetched by its own SPI READ
+  covering all 4 of its bytes: no caching or reuse of earlier fetches. Every RAM load reads all of
+  its bytes over SPI.
+- **On a trapping retirement**, the checkers compare only `rvfi_trap`, `rvfi_halt`, `rvfi_insn`
+  and `rvfi_pc_rdata`, plus the absence of side effects (`rd_addr = 0`, no memory write). The
+  register-read fields aren't compared.
 
 ## 7. What a hypothesis may change
 
