@@ -22,3 +22,4 @@ __pycache__/
 *.elf
 verif/formal/work/
 .venv/
+.claude/worktrees/

@@ -19,3 +19,27 @@ it the floor with standard cells, at about 10.1k µm² for the register file alo
   slow (about 256 steps per word read) and needs contract v1.1 with careful latch timing.
 - Check whether LibreLane's sky130 flow keeps dfxtp_1 (20.02 µm²) or upsizes it. NanoV's netlist
   shows dfxtp_2 (21.27 µm²), which adds 600 µm² over 480 bits.
+
+## Update: what the real flow allows (2026-10-16)
+
+`~/.ciel/sky130A/libs.tech/openlane/sky130_fd_sc_hd/no_synth.cells` (the PDK version LibreLane
+3.0.14 uses) excludes `sky130_fd_sc_hd__dfxtp_1` and `edfxtp_1` from synthesis. Every inferred
+flip-flop therefore becomes `dfxtp_2` at 21.27 µm², which H001's LibreLane-engine area confirms.
+`dlxtp_1` (15.01 µm²) is not excluded.
+
+Re-pricing the two register files at the real flip-flop cost:
+
+| Variant | Storage | Logic | Total |
+|---|---|---|---|
+| Rotating flip-flops (dfxtp_2) | 480 x 21.27 = 10,210 µm² | ~520 µm² | ~10,730 µm² |
+| Latch array, serial read | 480 x 15.01 = 7,207 µm² | ~4,235 µm² + staging ~700 | ~12,140 µm² |
+
+Rotating flip-flops still win, by about 1.4k µm².
+
+Two levers follow:
+- **(a) Instantiate `dfxtp_1` explicitly.** It would save 1.25 µm² per flip-flop (~730 µm² on
+  H001's 582). It needs contract v1.1: an allowed-cell list with contract-owned behavioral models
+  for formal, cosim and equiv, plus the PDK model for the gate-level test. First, find out why
+  the PDK excludes it (drive and slew? hold?).
+- **(b) The latch bubble ring (backlog X1).** It gains more now that latches are 6.26 µm² per bit
+  cheaper than flip-flops.
