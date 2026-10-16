@@ -1,0 +1,52 @@
+# Tiny Tapeout project information
+project:
+  title:        "BonettoR32V"
+  author:       "Felipe Sens Bonetto"
+  discord:      ""
+  description:  "Smallest-area RV32E RISC-V core with SPI RAM and GPIO"
+  language:     "Verilog"
+  clock_hz:     20000000
+
+  # How many tiles your design occupies? A single tile is about 167x108 uM.
+  # Contract: the lead sets this to the smallest tile config the champion hardens in.
+  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+
+  top_module:  "tt_um_fesens_r32v"
+
+  # Source files must be in ./src; the lead regenerates this list from the champion's src/.
+  source_files:
+    - "tt_um_fesens_r32v.v"
+
+pinout:
+  # Inputs
+  ui[0]: "GPIO_IN0"
+  ui[1]: "GPIO_IN1"
+  ui[2]: "GPIO_IN2"
+  ui[3]: "GPIO_IN3"
+  ui[4]: "GPIO_IN4"
+  ui[5]: "GPIO_IN5"
+  ui[6]: "GPIO_IN6"
+  ui[7]: "GPIO_IN7"
+
+  # Outputs
+  uo[0]: "GPIO_OUT0"
+  uo[1]: "GPIO_OUT1"
+  uo[2]: "GPIO_OUT2"
+  uo[3]: "GPIO_OUT3"
+  uo[4]: "GPIO_OUT4"
+  uo[5]: "GPIO_OUT5"
+  uo[6]: "GPIO_OUT6"
+  uo[7]: "GPIO_OUT7"
+
+  # Bidirectional pins
+  uio[0]: "SPI_CS_N"
+  uio[1]: "SPI_MOSI"
+  uio[2]: "SPI_MISO"
+  uio[3]: "SPI_SCK"
+  uio[4]: ""
+  uio[5]: ""
+  uio[6]: ""
+  uio[7]: ""
+
+# Do not change!
+yaml_version: 6

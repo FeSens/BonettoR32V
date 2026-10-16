@@ -1,0 +1,19 @@
+name: docs
+
+on:
+  # main only: hypothesis branches must not burn the private repo's Actions minutes
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build docs
+        uses: TinyTapeout/tt-gds-action/docs@ttsky26d
