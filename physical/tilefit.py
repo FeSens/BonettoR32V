@@ -219,7 +219,9 @@ def main():
     ap.add_argument("--keep-info-sources", action="store_true",
                     help="use info.yaml's source list (default: src/ glob, like area.py)")
     ap.add_argument("--no-precheck", action="store_true", help="skip TT's precheck per trial")
-    ap.add_argument("--keep-runs", action="store_true", help="keep failing runs' LibreLane dirs")
+    ap.add_argument("--keep-runs", action="store_true",
+                    help="keep every run's LibreLane directory (default: only the min-fraction "
+                         "run's; each is about 200 MB)")
     a = ap.parse_args()
 
     t0 = time.time()
