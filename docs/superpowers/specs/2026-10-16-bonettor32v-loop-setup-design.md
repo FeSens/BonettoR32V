@@ -298,3 +298,12 @@ loop.
   The set is about 4-5.5k µm². Fitting core plus MCU in 1x1 needs the core around 9-10k µm², which
   likely needs latch storage (contract v1.1) or a better idea. Peripherals and interrupts are
   contract changes (pins, memory map, ISA) and go to the user before they're adopted.
+- **ADC (asked by the user).** An all-digital delta-sigma ADC is a candidate optional peripheral.
+  The comparator is an input pin's switching threshold, the 1-bit DAC is an output pin, and the
+  integrator is an external RC. On the die it's about 15-20 flip-flops (modulator plus decimation
+  counter), my estimate 300-500 µm², for roughly 8-10 bits at sub-kHz to kHz rates (unverified).
+  A single-slope RC-timing ADC on the timer is the cheaper fallback. A real analog ADC needs
+  custom layout and TT's analog option (2 tiles high), so it's out for now.
+- **Measured storage floor** (`docs/storage.md`): the always-rotating flip-flop register file is
+  10,133 µm². A latch array with serial read costs about 12,100 µm² once its read muxes are
+  counted.
