@@ -20,7 +20,7 @@ module tt_um_fesens_r32v (
     input  wire       clk,
     input  wire       rst_n
 `ifdef RISCV_FORMAL
-    , `RVFI_OUTPUTS             // see section 6
+    , output wire rvfi_valid, ...   // the RVFI ports of section 6, written out (no macros)
 `endif
 );
 ```
@@ -50,8 +50,25 @@ module tt_um_fesens_r32v (
 - No negative-edge flip-flops, no internal tristates, no combinational loops.
 - The design must not rely on power-up values. Registers, the register file included, may start
   unknown. Checkers randomize them (cosim) or leave them as X (gate-level test).
-- Plain synthesizable Verilog only. No instantiated cells in v1; synthesis maps to
+- Plain synthesizable Verilog-2005 only. No instantiated cells in v1; synthesis maps to
   `sky130_fd_sc_hd`.
+- **Restricted preprocessor**, so every tool (Verilator, yosys, Icarus, LibreLane) sees the same
+  design:
+  - The only compiler directives allowed in `src/*.v` are `` `ifdef RISCV_FORMAL ``,
+    `` `ifndef RISCV_FORMAL ``, `` `else ``, `` `endif ``, `` `default_nettype `` and
+    `` `timescale ``. That means no `` `define ``, macro uses, `` `include ``, `` `undef ``,
+    `` `elsif `` or anything else. Use `parameter`/`localparam` instead.
+  - No `initial` blocks, and no initializers on `reg` or `integer` declarations (parameters are
+    fine).
+  - No attribute instances (`(* ... *)`) other than the `@(*)` sensitivity list.
+  - No tool metacomments (`verilator`, `synopsys`, `synthesis`, `pragma`, `yosys` or
+    `translate_` directives in comments).
+  - Module names: `tt_um_fesens_r32v`, or anything starting with `r32v_`. Nothing else, so no
+    design module can shadow a checker's module.
+  - Continuous-assignment net declarations (`wire w = expr;`) are fine; they aren't power-up
+    values.
+  - Every `src/*.v` file is part of the design. The gates read them in sorted order, and the lead
+    keeps `info.yaml` `source_files` equal to that list.
 
 ## 2. SPI memory protocol (23LC512-compatible, mode 0)
 
@@ -139,7 +156,8 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
 
 ## 6. RVFI (formal and cosim builds only)
 
-Ports exist only under `` `ifdef RISCV_FORMAL ``. Logic under that define may only compute RVFI
+Ports exist only under `` `ifdef RISCV_FORMAL ``, written out explicitly (macros aren't allowed in
+`src/`). Every checker compiles `src/` with exactly one define for the RVFI build: `RISCV_FORMAL`. Logic under that define may only compute RVFI
 outputs; nothing that drives a pin may depend on it. The equivalence gate enforces this: the RVFI
 build with its RVFI ports stripped must be equivalent to the plain build. The pin-level cosim and
 the gate-level test also run the plain build.
