@@ -38,7 +38,10 @@ module tt_um_fesens_r32v (
 - `uio_oe` is constant `8'b0000_1011` at all times. `uio_out[7:4]` and `uio_out[2]` are constant 0.
 - Reset: `rst_n` is low for at least one rising edge. Every requirement below holds from the first
   rising edge at which `rst_n` is low. While `rst_n` is low, CS_n = 1, SCK = 0 and `uo_out` = 0.
-  After the release, execution starts at `pc = 0`.
+  After the release, execution starts at `pc = 0`. Checkers assert reset only at the start of a run
+  and check the rules below from the first rising edge after `rst_n` is first sampled low. A
+  mid-run reset is out of scope for v1. The design should still deassert CS_n, but no checker
+  tests it.
 - Single clock domain: every flip-flop is clocked on the rising edge of `clk`.
 - No latches in v1. sky130 latches only time safely (STA sees them) when enabled through a
   clock-gating cell from `clk`, and the formal and cosim tools can't read the PDK's UDP cell
@@ -107,7 +110,8 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   - the all-zeros word `0x00000000` and the all-ones word `0xFFFFFFFF`.
   A trapping instruction retires with `rvfi_trap = 1` and `rvfi_halt = 1`. It has no
   architectural effect: no register write and no memory write, on the pins or in RVFI. Then the
-  core never retires again and never starts another SPI WRITE.
+  core never retires again and never starts another SPI WRITE. Its `rvfi_pc_wdata` is
+  unspecified.
 - **Reserved encodings are UNSPECIFIED.** That covers every other encoding that isn't one of the
   instructions above, including RV32E encodings whose register fields name x16-x31. The core may
   give them any effect, but two rules hold:
@@ -117,7 +121,10 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   Cosim programs never contain reserved encodings.
 - **Latency cap.** The first instruction retires within 1,024 cycles of reset release, and every
   later one within 1,024 cycles of the previous retirement. A halted core is exempt.
-- **FENCE** (every FENCE encoding, FENCE.TSO and PAUSE included) is a no-op that retires normally.
+- **FENCE** is a no-op that retires normally. That covers every MISC-MEM encoding with
+  `funct3 = 000`, whatever its fm, pred, succ, rs1 and rd fields hold (x16-x31 included):
+  FENCE.TSO, PAUSE and the rest. The spec requires base implementations to ignore those fields.
+  FENCE.I (`funct3 = 001`, Zifencei) isn't part of RV32E, so it's reserved.
 - **Misaligned loads and stores never trap** (section 3).
 - **Program termination.** Test programs end with EBREAK. The checkers detect the halt and read
   results from RAM and GPIO.
