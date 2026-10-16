@@ -67,6 +67,20 @@ module tt_um_fesens_r32v (
     design module can shadow a checker's module.
   - Continuous-assignment net declarations (`wire w = expr;`) are fine; they aren't power-up
     values.
+  - **Synthesizable subset**, enforced by `tools/src_check.py`. `docs/eval.md` has the full list.
+    The main rules:
+    - no delay controls (`#` only for `module name #(` parameter ports and `name #(`
+      instantiations);
+    - every `always` takes an edge list or `@(*)` / `@*`, never a level-sensitive list like
+      `@(a or b)`;
+    - no `$` system tasks or functions except `$signed` and `$unsigned` (so no `$clog2`: write
+      literal localparams);
+    - no tasks, no strings, no real numbers, no escaped identifiers;
+    - no SystemVerilog constructs;
+    - no hierarchical references (`.` only in named port connections);
+    - no gate primitives;
+    - no special net types (only `wire`, `reg`, `integer`, `genvar`, `parameter`, `localparam`);
+    - functions must assign every local before reading it, on every path.
   - Every `src/*.v` file is part of the design. The gates read them in sorted order, and the lead
     keeps `info.yaml` `source_files` equal to that list.
 
