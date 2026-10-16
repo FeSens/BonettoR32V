@@ -463,10 +463,12 @@ def engine_line(spec, depth, reach=False):
 
 
 def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, reset_free=False,
-              role="proof"):
+              role="proof", reach=None):
     """One SBY task. role "proof": the check's assertions (reach statements removed).
-    role "reach": only the reach_* statements, each as assert(!trigger), so a failed
-    one is a reached trigger (the check's own design and assumptions)."""
+    role "reach": only the required reach_* statements (`reach`), each as
+    assert(!trigger), so a failed one is a reached trigger (the check's own design and
+    assumptions). Keeping only the required ones lets the run stop as soon as all of
+    them are reached (an unreachable extra one would be proven unreachable to the end)."""
     tdir = os.path.join(work, "tasks")
     os.makedirs(tdir, exist_ok=True)
     files = [os.path.join(HERE, f) for f in CHECKER_FILES]
@@ -497,7 +499,8 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
         defines.append("`define BONETTO_RESET_FREE")
     if role == "reach":
         defines.append("`define BONETTO_REACH_AS_ASSERT")
-        script_extra = "chformal -assert -remove c:* c:*reach_* %d\n"
+        keep = " ".join(f"c:*.{lbl}" for lbl in reach)
+        script_extra = f"select -set keep {keep}\nchformal -assert -remove c:* @keep %d\n"
     else:
         script_extra = "chformal -cover -remove\n"
     defines.append('`include "rvfi_macros.vh"')
@@ -782,7 +785,7 @@ def main():
             rf = (cname == "reset")
             p = write_sby(work, cname, checker, tdepth, eng, timeout, model=model, reset_free=rf)
             r = write_sby(work, cname + "_reach", checker, tdepth, reach_eng, timeout,
-                          model=model, reset_free=rf, role="reach")
+                          model=model, reset_free=rf, role="reach", reach=req)
             jobs_todo += [(cname, p, timeout), (cname + "_reach", r, timeout)]
             checks_todo.append((cname, req))
             task_depths[cname] = tdepth

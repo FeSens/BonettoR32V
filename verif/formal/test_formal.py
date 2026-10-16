@@ -108,11 +108,14 @@ def test_reach_and_proof_tasks_are_separate(tmp_path):
     p = run_formal.write_sby(str(tmp_path), "x", "bonetto_spi_check", 100,
                              "smtbmc yices step=all", 60)
     r = run_formal.write_sby(str(tmp_path), "x_reach", "bonetto_spi_check", 100,
-                             "smtbmc yices step=29", 60, role="reach")
+                             "smtbmc yices step=29", 60, role="reach",
+                             reach=["reach_spi_end_read", "reach_spi_end_write"])
     pt, rt = open(p).read(), open(r).read()
     assert "chformal -cover -remove" in pt and "BONETTO_REACH_AS_ASSERT" not in pt
     assert "--keep-going" not in pt and "-t 0:100:100" in pt
-    assert "BONETTO_REACH_AS_ASSERT" in rt and "chformal -assert -remove c:* c:*reach_* %d" in rt
+    assert "BONETTO_REACH_AS_ASSERT" in rt
+    assert "select -set keep c:*.reach_spi_end_read c:*.reach_spi_end_write" in rt
+    assert "chformal -assert -remove c:* @keep %d" in rt
     assert "smtbmc --keep-going --nopresat yices -- -t 0:29:100" in rt
 
 
