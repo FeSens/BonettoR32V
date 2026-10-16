@@ -38,7 +38,10 @@ module tt_um_fesens_r32v (
 - `uio_oe` is constant `8'b0000_1011` at all times. `uio_out[7:4]` and `uio_out[2]` are constant 0.
 - Reset: `rst_n` is low for at least one rising edge. Every requirement below holds from the first
   rising edge at which `rst_n` is low. While `rst_n` is low, CS_n = 1, SCK = 0 and `uo_out` = 0.
-  After the release, execution starts at `pc = 0`.
+  After the release, execution starts at `pc = 0`. Checkers assert reset only at the start of a run
+  and check the rules below from the first rising edge after `rst_n` is first sampled low. A
+  mid-run reset is out of scope for v1. The design should still deassert CS_n, but no checker
+  tests it.
 - Single clock domain: every flip-flop is clocked on the rising edge of `clk`.
 - No latches in v1. sky130 latches only time safely (STA sees them) when enabled through a
   clock-gating cell from `clk`, and the formal and cosim tools can't read the PDK's UDP cell
@@ -47,8 +50,21 @@ module tt_um_fesens_r32v (
 - No negative-edge flip-flops, no internal tristates, no combinational loops.
 - The design must not rely on power-up values. Registers, the register file included, may start
   unknown. Checkers randomize them (cosim) or leave them as X (gate-level test).
-- Plain synthesizable Verilog only. No instantiated cells in v1; synthesis maps to
+- Plain synthesizable Verilog-2005 only. No instantiated cells in v1; synthesis maps to
   `sky130_fd_sc_hd`.
+- **Restricted preprocessor**, so every tool (Verilator, yosys, Icarus, LibreLane) sees the same
+  design:
+  - The only compiler directives allowed in `src/*.v` are `` `ifdef RISCV_FORMAL ``,
+    `` `ifndef RISCV_FORMAL ``, `` `else ``, `` `endif ``, `` `default_nettype `` and
+    `` `timescale ``. That means no `` `define ``, macro uses, `` `include ``, `` `undef ``,
+    `` `elsif `` or anything else. Use `parameter`/`localparam` instead.
+  - No `initial` blocks, and no initializers on `reg` or `integer` declarations (parameters are
+    fine).
+  - No attribute instances (`(* ... *)`) other than the `@(*)` sensitivity list.
+  - No tool metacomments (`verilator`, `synopsys`, `synthesis`, `pragma`, `yosys` or
+    `translate_` directives in comments).
+  - Every `src/*.v` file is part of the design. The gates read them in sorted order, and the lead
+    keeps `info.yaml` `source_files` equal to that list.
 
 ## 2. SPI memory protocol (23LC512-compatible, mode 0)
 
@@ -91,9 +107,9 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
     Writes to other IO bytes are ignored.
   - Misaligned IO accesses (`addr[1:0] != 0` with `n > 1`) are unspecified; no test uses them.
   - An IO access never appears on the SPI pins.
-- **`ui_in` timing.** An IO load samples `ui_in` after the previous instruction retires and before
-  its own retirement. The cosim changes `ui_in` only directly after retirements, and formal holds
-  it constant.
+- **`ui_in` timing.** An IO load samples `ui_in` after its own fetch transaction has completed
+  (CS_n has risen after the fetch) and before its own retirement. The cosim changes `ui_in` only
+  shortly after retirements (within 2 cycles), and formal holds it constant.
 - **`uo_out` timing.** `uo_out` changes only as the result of an IO store that writes byte 0. It
   holds the new value no later than one cycle after that store retires.
 
@@ -107,7 +123,8 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   - the all-zeros word `0x00000000` and the all-ones word `0xFFFFFFFF`.
   A trapping instruction retires with `rvfi_trap = 1` and `rvfi_halt = 1`. It has no
   architectural effect: no register write and no memory write, on the pins or in RVFI. Then the
-  core never retires again and never starts another SPI WRITE.
+  core never retires again and never starts another SPI WRITE. Its `rvfi_pc_wdata` is
+  unspecified.
 - **Reserved encodings are UNSPECIFIED.** That covers every other encoding that isn't one of the
   instructions above, including RV32E encodings whose register fields name x16-x31. The core may
   give them any effect, but two rules hold:
@@ -117,7 +134,10 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   Cosim programs never contain reserved encodings.
 - **Latency cap.** The first instruction retires within 1,024 cycles of reset release, and every
   later one within 1,024 cycles of the previous retirement. A halted core is exempt.
-- **FENCE** (every FENCE encoding, FENCE.TSO and PAUSE included) is a no-op that retires normally.
+- **FENCE** is a no-op that retires normally. That covers every MISC-MEM encoding with
+  `funct3 = 000`, whatever its fm, pred, succ, rs1 and rd fields hold (x16-x31 included):
+  FENCE.TSO, PAUSE and the rest. The spec requires base implementations to ignore those fields.
+  FENCE.I (`funct3 = 001`, Zifencei) isn't part of RV32E, so it's reserved.
 - **Misaligned loads and stores never trap** (section 3).
 - **Program termination.** Test programs end with EBREAK. The checkers detect the halt and read
   results from RAM and GPIO.
@@ -154,7 +174,14 @@ Conventions:
   `k` is the byte at `mem_addr + k`. IO accesses use the same fields.
 - **Transaction order.** Every SPI transaction belongs to the instruction that retires next. A
   fetch may only read that instruction's bytes, and a load or store may only move that
-  instruction's data. All of an instruction's SPI traffic finishes before its `rvfi_valid` cycle.
+  instruction's data. All of an instruction's SPI traffic finishes before its `rvfi_valid` cycle,
+  with CS_n high at that cycle.
+- **Fetch and load completeness.** Every retired instruction is fetched by its own SPI READ
+  covering all 4 of its bytes: no caching or reuse of earlier fetches. Every RAM load reads all of
+  its bytes over SPI.
+- **On a trapping retirement**, the checkers compare only `rvfi_trap`, `rvfi_halt`, `rvfi_insn`
+  and `rvfi_pc_rdata`, plus the absence of side effects (`rd_addr = 0`, no memory write). The
+  register-read fields aren't compared.
 
 ## 7. What a hypothesis may change
 
