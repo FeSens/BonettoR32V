@@ -172,18 +172,28 @@ def mutant_ids():
 
 @pytest.mark.parametrize("name", mutant_ids())
 def test_mutant_fails(programs, name):
-    """Each mutant fails in the stated mode(s) with its specific error, and passes where stated
-    (the RVFI-hidden mutant passes rvfi mode: only the plain build differs)."""
+    """Each mutant fails in every mode listed under "fail" with that mode's error text ("" means
+    any error), for every listed seed, and passes the modes listed under "pass" (an RVFI-only bug
+    passes pins mode; a bug hidden under RISCV_FORMAL passes rvfi mode)."""
     m = manifest()
     assert name in m, "mutants/MANIFEST.json is missing (mutants are built from the seed)"
     spec = m[name]
     src = COSIM / "mutants" / name
+    assert (src / "tt_um_fesens_r32v.v").exists()
     prog = PROGS / f"{spec.get('prog', 'selftest')}.hex"
-    for mode in spec.get("pass_modes", []):
+    for mode in spec.get("pass", []):
         s, _ = run_cosim.run_one(mode, prog, 1, src=src)
         assert s["pass"], f"{name} should pass {mode} mode: {s['error']}"
-    for mode in spec["fail_modes"]:
+    for mode, err in spec["fail"].items():
         for seed in spec.get("seeds", [1]):
             s, _ = run_cosim.run_one(mode, prog, seed, src=src)
             assert not s["pass"], f"{name} passed {mode} mode (seed {seed})"
-            assert spec["error"] in (s["error"] or ""), f"{name} {mode}: {s['error']}"
+            assert s["error"] and err in s["error"], f"{name} {mode} seed {seed}: {s['error']}"
+
+
+def test_every_required_mutant_class_is_present():
+    m = manifest()
+    required = {"miso_sck_low", "mosi_on_rise", "cs_sck_high", "write_midbyte", "rvfi_rd_wrong",
+                "rvfi_hidden", "zero_init", "latency"}
+    assert required <= set(m), required - set(m)
+    assert m["rvfi_hidden"]["pass"] == ["rvfi"] and "pins" in m["rvfi_hidden"]["fail"]

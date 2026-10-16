@@ -1,0 +1,115 @@
+{
+ "miso_sck_low": {
+  "desc": "MISO is sampled while SCK is low (into a flop at the rising SCK edge), so it reads noise.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "rvfi_insn",
+   "pins": ""
+  },
+  "seeds": [
+   1,
+   2,
+   3
+  ]
+ },
+ "mosi_on_rise": {
+  "desc": "MOSI presents the next bit while SCK is high, so it changes on the rising SCK edge.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "MOSI changed on a rising SCK edge",
+   "pins": "MOSI changed on a rising SCK edge"
+  }
+ },
+ "cs_sck_high": {
+  "desc": "CS_n rises on the same edge SCK falls (SCK was high), after the last bit.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "CS_n changed while SCK was high",
+   "pins": "CS_n changed while SCK was high"
+  }
+ },
+ "write_midbyte": {
+  "desc": "A WRITE transaction stops 4 bits early, in the middle of its last data byte.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "WRITE ended mid-byte",
+   "pins": "WRITE ended mid-byte"
+  }
+ },
+ "rvfi_rd_wrong": {
+  "desc": "RVFI reports a wrong rd value for SUB and SRA (the register file itself is right).",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "rvfi_rd_wdata"
+  },
+  "pass": [
+   "pins"
+  ]
+ },
+ "rvfi_hidden": {
+  "desc": "SLTU/SLTIU are right only in the RISCV_FORMAL build: the plain build computes <=.",
+  "prog": "selftest",
+  "fail": {
+   "pins": "doesn't match the reference store"
+  },
+  "pass": [
+   "rvfi"
+  ]
+ },
+ "zero_init": {
+  "desc": "pc has no reset: the core relies on it powering up as 0.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "is not part of retirement #0",
+   "pins": ""
+  },
+  "seeds": [
+   1,
+   2,
+   3
+  ]
+ },
+ "latency": {
+  "desc": "Every load and store waits 1,000 extra cycles before retiring (latency cap 1,024).",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "latency cap"
+  }
+ },
+ "no_halt": {
+  "desc": "EBREAK retires as a trap but the core keeps running.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "retirement after the halt",
+   "pins": "uo_out changed to 0x5e"
+  }
+ },
+ "trap_writes_rd": {
+  "desc": "A JAL whose target has bit 1 set traps but still writes rd.",
+  "prog": "trap_jal",
+  "fail": {
+   "rvfi": "rvfi_rd_addr"
+  }
+ },
+ "uo_late": {
+  "desc": "uo_out takes the IO store's value two cycles after the store retires.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "one cycle after the IO store retired"
+  }
+ },
+ "fetch_extra_byte": {
+  "desc": "The fetch READ clocks 8 more bits: a fifth byte that isn't the instruction's.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "SPI READ of byte 0x0004"
+  }
+ },
+ "cs_open_at_retire": {
+  "desc": "After a data access CS_n stays low until the retirement edge (open during rvfi_valid).",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "SPI transaction still open"
+  }
+ }
+}
