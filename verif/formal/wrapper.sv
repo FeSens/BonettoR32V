@@ -48,7 +48,30 @@ module rvfi_wrapper (
 		.ena     (1'b1),
 		.clk     (clock),
 		.rst_n   (!reset),
-		`RVFI_CONN
+		// The contract's RVFI port set (section 6), connected by name. No riscv-formal
+		// feature define (CSRs, MEM_FAULT, ...) is enabled, so the testbench's RVFI
+		// wires carry exactly these signals.
+		.rvfi_valid     (rvfi_valid),
+		.rvfi_order     (rvfi_order),
+		.rvfi_insn      (rvfi_insn),
+		.rvfi_trap      (rvfi_trap),
+		.rvfi_halt      (rvfi_halt),
+		.rvfi_intr      (rvfi_intr),
+		.rvfi_mode      (rvfi_mode),
+		.rvfi_ixl       (rvfi_ixl),
+		.rvfi_rs1_addr  (rvfi_rs1_addr),
+		.rvfi_rs2_addr  (rvfi_rs2_addr),
+		.rvfi_rs1_rdata (rvfi_rs1_rdata),
+		.rvfi_rs2_rdata (rvfi_rs2_rdata),
+		.rvfi_rd_addr   (rvfi_rd_addr),
+		.rvfi_rd_wdata  (rvfi_rd_wdata),
+		.rvfi_pc_rdata  (rvfi_pc_rdata),
+		.rvfi_pc_wdata  (rvfi_pc_wdata),
+		.rvfi_mem_addr  (rvfi_mem_addr),
+		.rvfi_mem_rmask (rvfi_mem_rmask),
+		.rvfi_mem_wmask (rvfi_mem_wmask),
+		.rvfi_mem_rdata (rvfi_mem_rdata),
+		.rvfi_mem_wdata (rvfi_mem_wdata)
 	);
 
 	reg reset_q_r = 1'b0;

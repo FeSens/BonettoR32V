@@ -1,0 +1,7 @@
+{
+  "class": "GPIO store ignores the byte address",
+  "checks": [
+    "gpio"
+  ],
+  "description": "Any IO store sets uo_out, even when it writes no byte with X[1:0] = 0."
+}

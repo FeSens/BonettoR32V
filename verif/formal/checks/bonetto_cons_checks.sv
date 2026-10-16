@@ -9,7 +9,8 @@
 `include "bonetto_macros.vh"
 
 // reg: a register read returns the last value written to it (writes of trapping
-// instructions excluded, as in stock). Fork: a register that has not been written
+// instructions excluded, as in stock; reads of trapping retirements are not compared,
+// contract section 6). Fork: a register that has not been written
 // yet must read the same value every time (the value seen on its first read): the
 // register file may start unknown but does not change by itself. Stock only checks
 // reads after a write.
@@ -21,8 +22,8 @@ module bonetto_reg_check (
 	reg known;
 
 	wire valid = !reset && rvfi_valid;
-	wire rd1 = rvfi_rs1_addr == register_index;
-	wire rd2 = rvfi_rs2_addr == register_index;
+	wire rd1 = !rvfi_trap && rvfi_rs1_addr == register_index;
+	wire rd2 = !rvfi_trap && rvfi_rs2_addr == register_index;
 	wire wr = !rvfi_trap && rvfi_rd_addr == register_index;
 
 	always @(posedge clock) begin
@@ -116,7 +117,8 @@ module bonetto_pc_bwd_check (
 endmodule
 
 // causal (stock semantics): a register written by the retirement with order N is
-// not read by any retirement with a larger order that retired before it.
+// not read by any retirement with a larger order that retired before it. Trapping
+// retirements neither write nor have their reads compared (contract section 6).
 module bonetto_causal_check (
 	`BONETTO_CHECKER_PORTS
 );
@@ -128,13 +130,13 @@ module bonetto_causal_check (
 	always @(posedge clock) begin
 		if (reset) begin
 			found_non_causal <= 1'b0;
-		end else if (valid && rvfi_order > insn_order &&
+		end else if (valid && !rvfi_trap && rvfi_order > insn_order &&
 				(rvfi_rs1_addr == register_index || rvfi_rs2_addr == register_index)) begin
 			found_non_causal <= 1'b1;
 		end
 	end
 
-	wire trigger = valid && register_index != 0 && rvfi_rd_addr == register_index &&
+	wire trigger = valid && !rvfi_trap && register_index != 0 && rvfi_rd_addr == register_index &&
 			rvfi_order == insn_order;
 	always @* begin
 		if (check && trigger) causal: assert (!found_non_causal);
@@ -202,7 +204,8 @@ module bonetto_liveness_check (
 endmodule
 
 // ill (fork): stock covers only 0x00000000. Contract section 4: the all-zeros and
-// all-ones words trap and halt, with no register write and no memory access.
+// all-ones words trap and halt, with no register write and no memory write (the
+// fields compared on a trapping retirement, contract section 6).
 module bonetto_ill_check (
 	`BONETTO_CHECKER_PORTS
 );
@@ -214,8 +217,6 @@ module bonetto_ill_check (
 			ill_trap: assert (rvfi_trap);
 			ill_halt: assert (rvfi_halt);
 			ill_rd_addr: assert (rvfi_rd_addr == 0);
-			ill_rd_wdata: assert (rvfi_rd_wdata == 0);
-			ill_rmask: assert (rvfi_mem_rmask == 0);
 			ill_wmask: assert (rvfi_mem_wmask == 0);
 		end
 		if (!reset) begin
@@ -277,18 +278,21 @@ module bonetto_rvfi_check (
 			conv_intr: assert (rvfi_intr == 1'b0);
 			conv_mode: assert (rvfi_mode == 2'd3);
 			conv_ixl: assert (rvfi_ixl == 2'd1);
-			if (rvfi_rs1_addr == 0) conv_rs1_x0: assert (rvfi_rs1_rdata == 0);
-			if (rvfi_rs2_addr == 0) conv_rs2_x0: assert (rvfi_rs2_rdata == 0);
-			if (rvfi_rd_addr == 0) conv_rd_x0: assert (rvfi_rd_wdata == 0);
+			// Register and read-mask fields of a trapping retirement are not
+			// compared (contract section 6).
+			if (!rvfi_trap) begin
+				if (rvfi_rs1_addr == 0) conv_rs1_x0: assert (rvfi_rs1_rdata == 0);
+				if (rvfi_rs2_addr == 0) conv_rs2_x0: assert (rvfi_rs2_rdata == 0);
+				if (rvfi_rd_addr == 0) conv_rd_x0: assert (rvfi_rd_wdata == 0);
+				conv_rmask: assert (mask_ok(rvfi_mem_rmask));
+			end
 			// Fatal traps retire with trap = halt = 1; reserved encodings either
 			// retire or trap and halt; nothing halts without trapping.
 			conv_trap_halt: assert (rvfi_trap == rvfi_halt);
 			if (rvfi_trap) begin
 				conv_trap_rd_addr: assert (rvfi_rd_addr == 0);
-				conv_trap_rd_wdata: assert (rvfi_rd_wdata == 0);
 				conv_trap_wmask: assert (rvfi_mem_wmask == 0);
 			end
-			conv_rmask: assert (mask_ok(rvfi_mem_rmask));
 			conv_wmask: assert (mask_ok(rvfi_mem_wmask));
 			// rvfi_order counts retirements from 0; execution starts at pc = 0.
 			if (!seen) begin
@@ -305,7 +309,7 @@ module bonetto_rvfi_check (
 endmodule
 
 // cover (riscv-formal's cover check): sanity covers that the core does anything
-// at all within the depth. Only used by the reach task.
+// at all within the depth. A pure reach task (no assertions of its own).
 module bonetto_cover_check (
 	`BONETTO_CHECKER_PORTS
 );

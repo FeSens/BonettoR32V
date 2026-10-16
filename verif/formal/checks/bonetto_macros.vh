@@ -25,11 +25,14 @@
 `ifndef BONETTO_MACROS_VH
 `define BONETTO_MACROS_VH
 
-// Reach statements (each check's trigger). Normally a cover. The reach task
-// defines BONETTO_REACH_AS_ASSERT, removes every other assertion and runs BMC with
-// --keep-going over the whole depth in one solver window: each failing reach_*
-// assertion is a reached trigger. This is much faster than SBY's cover mode, which
-// must solve step by step.
+// Reach statements (each check's trigger). run_formal.py defines
+// BONETTO_REACH_AS_ASSERT in every task, so each one is assert(!trigger) inside the
+// check's own design, and runs BMC with --keep-going over the whole depth in one
+// solver window. A failing reach_* assertion is a reached trigger; any other
+// failing assertion is a counterexample. Each reach costs one extra satisfiable
+// solver call in the same unrolling, much cheaper than SBY's cover mode (which
+// must solve step by step) or a separate task. Without the define (manual use)
+// they are covers.
 `ifdef BONETTO_REACH_AS_ASSERT
 `define BONETTO_REACH(_lbl, _expr) _lbl: assert (!(_expr));
 `else

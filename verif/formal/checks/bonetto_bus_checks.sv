@@ -210,7 +210,9 @@ module bonetto_bus_dmem_check (
 	wire valid = !reset && rvfi_valid;
 	always @* begin
 		if (valid && check) begin
-			if (load_hit) begin
+			// A trapping retirement's rmask and rdata are not compared (contract
+			// section 6): a read it claims is allowed but not checked.
+			if (load_hit && !rvfi_trap) begin
 				bus_dmem_load_read: assert (rd_full);
 				bus_dmem_load_value: assert (load_byte == mstart);
 			end
@@ -222,7 +224,7 @@ module bonetto_bus_dmem_check (
 			if (rd_any) bus_dmem_read_claimed: assert (fetch_hit || load_hit);
 		end
 		if (!reset) begin
-			`BONETTO_REACH(reach_bus_dmem_load, valid && load_hit)
+			`BONETTO_REACH(reach_bus_dmem_load, valid && load_hit && !rvfi_trap)
 			`BONETTO_REACH(reach_bus_dmem_store, valid && store_hit)
 		end
 	end

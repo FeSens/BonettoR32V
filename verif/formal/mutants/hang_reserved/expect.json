@@ -1,0 +1,7 @@
+{
+  "class": "hangs on a reserved encoding",
+  "checks": [
+    "liveness"
+  ],
+  "description": "The custom-0 opcode (0001011) stays in EXEC forever instead of trapping."
+}

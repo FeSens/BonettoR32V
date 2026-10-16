@@ -1,0 +1,7 @@
+{
+  "class": "a behavior difference only without RVFI",
+  "checks": [
+    "equiv"
+  ],
+  "description": "uo_out is inverted in the plain build only."
+}

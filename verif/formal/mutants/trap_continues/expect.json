@@ -1,0 +1,7 @@
+{
+  "class": "keeps executing after a fatal trap",
+  "checks": [
+    "silent"
+  ],
+  "description": "A misaligned jump or branch target retires with trap = halt = 1, then the core fetches again."
+}

@@ -19,9 +19,6 @@ memory and control instructions) and writes:
     rvfi_isa_rv32e
         All 40 E-filtered models muxed into one spec, in riscv-formal's
         rvfi_isa_<isa> layout.
-    bonetto_isa_cover
-        One labelled cover per instruction (the instruction check's trigger:
-        a retirement of that instruction with spec_valid), used by the reach task.
 
 Usage: python3 verif/formal/gen_isa_rv32e.py [--check]
   --check  regenerate in memory and exit 1 if the committed files differ.
@@ -34,10 +31,6 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 RVI_TXT = os.path.join(ROOT, "third_party", "riscv-formal", "insns", "isa_rv32i.txt")
 
 NEW_INSNS = ["fence", "ecall", "ebreak"]
-
-# Instructions whose spec can trap (a taken/jump target with target[1] = 1, or
-# ECALL/EBREAK). The reach task covers their trapping retirement too (info only).
-TRAPPING = {"jal", "jalr", "beq", "bne", "blt", "bge", "bltu", "bgeu", "ecall", "ebreak"}
 
 PORTS = """\
   input                                 rvfi_valid,
@@ -153,7 +146,7 @@ def conn(prefix):
 
 
 def gen_v():
-    out = [HEADER, '`include "bonetto_macros.vh"\n']
+    out = [HEADER]
     # New models.
     for insn in NEW_INSNS:
         out.append(f"\nmodule rvfi_insn_{insn} (\n{PORTS}\n);\n{NEW_MODELS[insn]}endmodule\n")
@@ -186,37 +179,6 @@ def gen_v():
     for s in SPEC_SIGS:
         terms = [f"spec_insn_{i}_valid ? spec_insn_{i}_{s}" for i in all_insns()]
         out.append(f"  assign spec_{s} =\n\t\t" + " :\n\t\t".join(terms) + " : 0;")
-    out.append("endmodule\n")
-    # Cover module for the reach task.
-    out.append("""
-// Reach covers for the instruction checks. bonetto_insn_check's assertions are
-// active exactly when a retirement of the checked instruction has spec_valid
-// (its free check input can only select such a retirement), so covering
-// rvfi_valid && spec_valid per instruction proves each insn check non-vacuous.
-module bonetto_isa_cover (
-  input clock, reset,
-  input                                 rvfi_valid,
-  input                                 rvfi_trap,
-  input  [`RISCV_FORMAL_ILEN   - 1 : 0] rvfi_insn,
-  input  [`RISCV_FORMAL_XLEN   - 1 : 0] rvfi_pc_rdata,
-  input  [`RISCV_FORMAL_XLEN   - 1 : 0] rvfi_rs1_rdata,
-  input  [`RISCV_FORMAL_XLEN   - 1 : 0] rvfi_rs2_rdata,
-  input  [`RISCV_FORMAL_XLEN   - 1 : 0] rvfi_mem_rdata
-);""")
-    for insn in all_insns():
-        for s in SPEC_SIGS:
-            out.append(f"  wire {SPEC_DECL[s]}c_{insn}_{s};")
-        out.append(f"  rvfi_insn_e_{insn} insn_{insn} (")
-        out.append(conn(f"c_{insn}_").replace(".rvfi_valid(rvfi_valid)", ".rvfi_valid(rvfi_valid && !reset)"))
-        out.append("  );")
-    out.append("  always @* begin")
-    out.append("    if (!reset) begin")
-    for insn in all_insns():
-        out.append(f"      `BONETTO_REACH(reach_insn_{insn}, c_{insn}_valid)")
-        if insn in TRAPPING:
-            out.append(f"      `BONETTO_REACH(info_trap_{insn}, c_{insn}_valid && c_{insn}_trap)")
-    out.append("    end")
-    out.append("  end")
     out.append("endmodule\n")
     return "\n".join(out)
 

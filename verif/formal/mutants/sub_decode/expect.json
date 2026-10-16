@@ -1,0 +1,7 @@
+{
+  "class": "a decoder bug in SUB",
+  "checks": [
+    "insn_sub"
+  ],
+  "description": "SUB (funct3 000) is decoded as ADD."
+}

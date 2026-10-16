@@ -11,7 +11,6 @@
 `define RISCV_FORMAL_NRET 1
 `define RISCV_FORMAL_XLEN 32
 `define RISCV_FORMAL_ILEN 32
-`include "rvfi_macros.vh"
 
 module timing_tb;
 	reg clk = 0;
@@ -21,12 +20,16 @@ module timing_tb;
 	reg miso;
 	wire [7:0] uio_in = {4'b0, uio_out[3], miso, uio_out[1:0]};
 
-	`RVFI_WIRES
+	// The RVFI ports this testbench reads, connected by name (contract section 6);
+	// the others are left open.
+	wire rvfi_valid, rvfi_trap, rvfi_halt;
+	wire [31:0] rvfi_insn;
 
 	tt_um_fesens_r32v uut (
 		.ui_in(ui_in), .uo_out(uo_out), .uio_in(uio_in), .uio_out(uio_out), .uio_oe(uio_oe),
 		.ena(1'b1), .clk(clk), .rst_n(rst_n),
-		`RVFI_CONN
+		.rvfi_valid(rvfi_valid), .rvfi_insn(rvfi_insn), .rvfi_trap(rvfi_trap),
+		.rvfi_halt(rvfi_halt)
 	);
 
 	reg [7:0] mem [0:65535];

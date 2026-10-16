@@ -1,0 +1,7 @@
+{
+  "class": "writes the wrong register",
+  "checks": [
+    "reg"
+  ],
+  "description": "Even destination registers are written one register up (x2 writes x3); RVFI reports x2."
+}

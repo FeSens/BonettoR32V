@@ -1,0 +1,7 @@
+{
+  "class": "CS_n toggles while SCK is high",
+  "checks": [
+    "spi"
+  ],
+  "description": "CS_n rises on the edge where SCK falls after the last bit."
+}

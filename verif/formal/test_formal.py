@@ -238,12 +238,18 @@ def test_mutant_fails(mutant, tmp_path, seed_timing):
     out = tmp_path / "formal.json"
     regex = "^(" + "|".join(expect["checks"]) + ")$"
     rc, text = formal(["--src", str(src), "--timing", seed_timing, "--only", regex,
-                       "--no-reach", "--out", str(out)])
+                       "--out", str(out)])
     res = json.load(open(out))
-    failed = [c for c, v in res["checks"].items() if v == "FAIL"]
+    # A FAIL must be a counterexample (a failed assertion), not a timeout or an error;
+    # equiv fails in the pre-pass and has no SBY task.
+    failed = [c for c, v in res["checks"].items() if v == "FAIL" and
+              (c == "equiv" or res["failures"].get(c, {}).get("assertions"))]
     assert rc != 0, f"{mutant} passed formal:\n{text[-3000:]}"
     assert set(expect["checks"]) & set(failed), \
-        f"{mutant}: expected a FAIL in {expect['checks']}, got {res['checks']}\n{text[-2000:]}"
+        f"{mutant}: expected a counterexample in {expect['checks']}, got {res['checks']}\n" \
+        f"{res.get('failures')}\n{text[-2000:]}"
+    print(f"{mutant}: FAIL in {sorted(set(expect['checks']) & set(failed))}: "
+          f"{ {c: res['failures'].get(c, {}).get('assertions') for c in failed} }")
 
 
 @pytest.mark.skipif(os.environ.get("BONETTO_SKIP_SEED") == "1", reason="BONETTO_SKIP_SEED=1")
