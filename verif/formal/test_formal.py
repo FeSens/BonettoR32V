@@ -64,22 +64,38 @@ def test_depth_policy():
     assert t["per_class"]["load"]["max_cycles"] == 230
 
 
-def test_inline_reach_verdicts():
-    """sby FAIL with only reach_* labels failed is a PASS; any other label is a FAIL;
-    a missing required trigger is UNREACHED; an unfinished run is a FAIL."""
+def test_check_verdicts():
+    """A check PASSes only if its proof task passed and its reach task reached every
+    required trigger; a counterexample is a FAIL; a missing trigger is UNREACHED; a task
+    that did not finish (timeout, error, unknown) is a FAIL."""
     c = run_formal.classify
     req = ["reach_insn", "reach_insn_trap"]
     det = lambda *l: {"failed": list(l)}
-    assert c("FAIL", det("reach_insn", "reach_insn_trap"), req)[0] == "PASS"
-    assert c("FAIL", det("reach_insn"), req)[0] == "UNREACHED"
-    assert c("PASS", det(), req)[0] == "UNREACHED"
-    v, info = c("FAIL", det("reach_insn", "insn_rd_wdata", "reach_insn_trap"), req)
+    both = det("reach_insn", "reach_insn_trap")
+    assert c("PASS", det(), "FAIL", both, req)[0] == "PASS"
+    assert c("PASS", det(), "FAIL", det("reach_insn"), req)[0] == "UNREACHED"
+    assert c("PASS", det(), "PASS", det(), req)[0] == "UNREACHED"
+    v, info = c("FAIL", det("insn_rd_wdata"), "FAIL", both, req)
     assert v == "FAIL" and info["assertions"] == ["insn_rd_wdata"]
-    assert c("FAIL", det("wrapper.sv:315.7-315.50"), ["reach_gpio_load"])[0] == "FAIL"
+    assert c("FAIL", det(), "FAIL", both, req)[0] == "FAIL"
     for st in ("TIMEOUT", "UNKNOWN", "ERROR"):
-        assert c(st, det("reach_insn", "reach_insn_trap"), req)[0] == "FAIL"
-    assert c("FAIL", det(), req)[0] == "FAIL"
+        assert c(st, det(), "FAIL", both, req)[0] == "FAIL"
+        assert c("PASS", det(), st, both, req)[0] == "FAIL"
     assert run_formal.insn_reach("jal") == req and run_formal.insn_reach("add") == ["reach_insn"]
+
+
+def test_reach_and_proof_tasks_are_separate(tmp_path):
+    """The proof task has no reach statements; the reach task keeps only them."""
+    run_formal.setup_path()
+    p = run_formal.write_sby(str(tmp_path), "x", "bonetto_spi_check", 100,
+                             "smtbmc yices step=all", 60)
+    r = run_formal.write_sby(str(tmp_path), "x_reach", "bonetto_spi_check", 100,
+                             "smtbmc yices step=29", 60, role="reach")
+    pt, rt = open(p).read(), open(r).read()
+    assert "chformal -cover -remove" in pt and "BONETTO_REACH_AS_ASSERT" not in pt
+    assert "--keep-going" not in pt and "-t 0:100:100" in pt
+    assert "BONETTO_REACH_AS_ASSERT" in rt and "chformal -assert -remove c:* c:*reach_* %d" in rt
+    assert "smtbmc --keep-going --nopresat yices -- -t 0:29:100" in rt
 
 
 # ---------------------------------------------------------------------------

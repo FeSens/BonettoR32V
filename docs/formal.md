@@ -76,23 +76,27 @@ when a register field the instruction uses names x16-x31 (the E filter). Those e
 reserved (UNSPECIFIED), so the instruction checks demand nothing of them. The consistency checks
 (reg, pc, causal, unique, rvfi, bus, gpio, silent, liveness) still apply to every retirement.
 
-### Non-vacuity: inline reach
+### Non-vacuity: a reach task per check
 
 Every check has one or more `reach_*` statements: its triggers. For an instruction check that is
 a retirement of that instruction with `spec_valid`, and for JAL, JALR, the branches, ECALL and
-EBREAK also a trapping one. The runner defines `BONETTO_REACH_AS_ASSERT` in every task, so each
-`reach_*` is `assert(!trigger)` in the check's own design, and smtbmc runs with `--keep-going` in
-one solver window over the whole depth. smtbmc then drops each failed assertion (it is never
-assumed afterwards) and re-checks the rest in the same unrolling, so:
+EBREAK also a trapping one. Each check runs as two SBY tasks on the same design (same checker,
+same assumptions, same depth):
 
-- a failed `reach_*` assertion is a trigger reached within the depth;
-- any other failed assertion is a counterexample: the check is `FAIL`;
-- the last solver call, with every reached trigger dropped, is the proof of the check's
-  assertions: the check is `PASS` only if every required trigger was reached and nothing else
-  failed, `UNREACHED` if a required trigger was not reached.
+- the **proof task**: the check's assertions, with the reach statements removed;
+- the **reach task**: `BONETTO_REACH_AS_ASSERT` turns each `reach_*` into `assert(!trigger)` and
+  every other assertion is removed. smtbmc runs with `--keep-going` in small windows, so a failed
+  `reach_*` assertion is a trigger reached within the depth, it is dropped (never assumed), and
+  the run stops as soon as every trigger has been reached.
 
-A reach costs one extra satisfiable call in an unrolling the proof needs anyway. SBY's cover mode
-would solve step by step, and a separate reach task would unroll the design again.
+A check is `PASS` only if its proof task passed and every required trigger was reached,
+`UNREACHED` if the proof passed but a required trigger was not reached, and `FAIL` otherwise
+(a counterexample, or a task that timed out or errored).
+
+The two queries are kept apart on purpose. One solver call that mixes easy satisfiable goals (the
+triggers) with a hard unsatisfiable one (the proof) can stall: on the seed, `bus_imem` at D = 232
+took 19.6 s as a proof alone and 61.1 s as a reach alone (one window each), but more than 10
+minutes with both in one run (stopped). SBY's cover mode would solve step by step.
 
 ## Properties and the contract clauses they encode
 

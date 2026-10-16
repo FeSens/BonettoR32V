@@ -18,11 +18,12 @@ Steps:
      max_cycles_per_insn + margin, from the cosim's --timing-json when available,
      else from verif/formal/timing_tb.v run on the candidate (Icarus). D above
      depth_cap is a FAIL (too slow for the formal policy).
-  4. One SBY task per check in the config (checks.cfg, or checks-deep.cfg with
-     --deep). Each task also proves its own triggers reachable within its depth
-     (inline reach: every reach_* statement is assert(!trigger), BMC runs with
-     --keep-going, and a failing reach_* is a reached trigger; any other failing
-     assertion is a counterexample). Tasks run in parallel (jobs <= 8).
+  4. Two SBY tasks per check in the config (checks.cfg, or checks-deep.cfg with
+     --deep), on the same design and depth: the proof task (the check's assertions)
+     and the reach task (only the reach_* statements, each as assert(!trigger), BMC
+     with --keep-going: a failed one is a reached trigger). A check PASSes iff its
+     proof passes and every required trigger is reached. Tasks run in parallel
+     (jobs <= 8).
   5. build/formal.json: {"pass", "checks": {name: PASS|FAIL|UNREACHED}, "depth",
      "runtime_s", ...}. Exit 0 iff every check is PASS.
 """
@@ -433,9 +434,9 @@ def pick_depth(cfg, timing):
 # SBY task generation
 # ---------------------------------------------------------------------------
 
-def engine_line(spec, depth):
-    """Config engine spec -> (sby [engines] line, sby mode). Every engine must support
-    --keep-going: the inline reach needs the run to continue past reached triggers."""
+def engine_line(spec, depth, reach=False):
+    """Config engine spec -> (sby [engines] line, sby mode). Reach tasks need smtbmc
+    (--keep-going: the run continues past each reached trigger)."""
     toks = spec.split()
     if toks[0] == "smtbmc":
         solver = toks[1]
@@ -443,19 +444,29 @@ def engine_line(spec, depth):
         for t in toks[2:]:
             if t.startswith("step="):
                 v = t.split("=", 1)[1]
-                step = depth if v == "all" else int(v)
+                step = depth if v == "all" else min(depth, int(v))
         # The trailing "-- -t 0:step:depth" sets smtbmc's step size: all assertions in
-        # a window of `step` steps are checked in one solver call (every step is still
-        # checked; see yosys-smtbmc -t). With --keep-going a failed assertion is dropped
-        # (never assumed) and the rest are re-checked in the same window.
-        return f"smtbmc --keep-going --nopresat {solver} -- -t 0:{step}:{depth}", "bmc"
+        # a window of `step` steps are checked in one solver call, and the assertions of
+        # a finished window are assumed in the later ones (every step is still checked;
+        # see yosys-smtbmc -t). With --keep-going a failed assertion is dropped (never
+        # assumed) and the rest are re-checked in the same window; the run stops once
+        # every assertion has failed.
+        kg = " --keep-going" if reach else ""
+        return f"smtbmc{kg} --nopresat {solver} -- -t 0:{step}:{depth}", "bmc"
+    if reach:
+        raise ValueError(f"reach engine '{spec}' is not supported: reach tasks need smtbmc")
     if toks[:2] == ["abc", "pdr"]:
-        return "abc --keep-going pdr", "prove"
-    raise ValueError(f"engine '{spec}' is not supported: the inline reach needs smtbmc or "
-                     f"abc pdr (both run with --keep-going)")
+        return "abc pdr", "prove"
+    if toks[:2] == ["abc", "bmc3"]:
+        return "abc bmc3", "bmc"
+    raise ValueError(f"engine '{spec}' is not supported")
 
 
-def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, reset_free=False):
+def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, reset_free=False,
+              role="proof"):
+    """One SBY task. role "proof": the check's assertions (reach statements removed).
+    role "reach": only the reach_* statements, each as assert(!trigger), so a failed
+    one is a reached trigger (the check's own design and assumptions)."""
     tdir = os.path.join(work, "tasks")
     os.makedirs(tdir, exist_ok=True)
     files = [os.path.join(HERE, f) for f in CHECKER_FILES]
@@ -470,7 +481,7 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
     for i in insns:
         files.append(os.path.join(RVF, "insns", f"insn_{i}.v"))
         read.append(f"insn_{i}.v")
-    eng, sby_mode = engine_line(engine_spec, depth)
+    eng, sby_mode = engine_line(engine_spec, depth, reach=(role == "reach"))
     defines = [
         "`define RISCV_FORMAL",
         "`define RISCV_FORMAL_NRET 1",
@@ -484,8 +495,11 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
         defines.append(f"`define RISCV_FORMAL_INSN_MODEL rvfi_insn_e_{model}")
     if reset_free:
         defines.append("`define BONETTO_RESET_FREE")
-    # Inline reach: each reach_* statement becomes assert(!trigger).
-    defines.append("`define BONETTO_REACH_AS_ASSERT")
+    if role == "reach":
+        defines.append("`define BONETTO_REACH_AS_ASSERT")
+        script_extra = "chformal -assert -remove c:* c:*reach_* %d\n"
+    else:
+        script_extra = "chformal -cover -remove\n"
     defines.append('`include "rvfi_macros.vh"')
     core_il = os.path.join(work, "core.il")
     text = f"""[options]
@@ -501,7 +515,7 @@ expect pass,fail
 read_rtlil core.il
 read -formal defines.sv {' '.join(read)}
 prep -flatten -nordff -top rvfi_testbench
-
+{script_extra}
 [files]
 core.il {core_il}
 {chr(10).join(files)}
@@ -545,25 +559,24 @@ def parse_task(tdir, name):
     return status, {"failed": failed, "traces": traces, "errors": errors}
 
 
-def classify(status, detail, required):
-    """Inline-reach verdict for one task: (PASS | FAIL | UNREACHED, info).
-    sby reports FAIL whenever a reach_* assertion fails (a reached trigger), so the
-    verdict comes from the failed labels: any other failed label is a counterexample;
-    every required reach label must have failed. A run that did not finish (timeout,
-    error, unknown) is a FAIL."""
-    proof_fail = [l for l in detail["failed"] if not is_reach_label(l)]
-    reached = [l for l in detail["failed"] if is_reach_label(l)]
-    info = {"status": status, "reached": reached}
-    if status not in ("PASS", "FAIL"):
-        info["why"] = f"sby status {status}"
+def classify(proof_status, proof_detail, reach_status, reach_detail, required):
+    """Verdict for one check from its proof task and its reach task:
+    (PASS | FAIL | UNREACHED, info).
+    proof: PASS = no assertion failed within the depth; FAIL = counterexample; any other
+    status (timeout, error, unknown) is a FAIL. reach: every failed reach_* assertion is a
+    reached trigger (sby reports FAIL); a reach task that did not finish is a FAIL."""
+    info = {"proof": proof_status, "reach": reach_status,
+            "reached": [l for l in reach_detail["failed"] if is_reach_label(l)]}
+    if proof_status == "FAIL":
+        info["assertions"] = proof_detail["failed"] or ["(not parsed)"]
         return "FAIL", info
-    if status == "FAIL" and not detail["failed"]:
-        info["why"] = "sby FAIL without a parsed assertion"
+    if proof_status != "PASS":
+        info["why"] = f"proof task {proof_status}"
         return "FAIL", info
-    if proof_fail:
-        info["assertions"] = proof_fail
+    if reach_status not in ("PASS", "FAIL"):
+        info["why"] = f"reach task {reach_status}"
         return "FAIL", info
-    missing = [l for l in required if l not in reached]
+    missing = [l for l in required if l not in info["reached"]]
     if missing:
         info["unreached"] = missing
         return "UNREACHED", info
@@ -629,7 +642,7 @@ def vcd_retirements(vcd_path, limit=8):
     return rows[:limit]
 
 
-def run_task(work, name, path, timeout, required):
+def run_task(name, path, timeout):
     tdir = os.path.dirname(path)
     t0 = time.time()
     try:
@@ -640,15 +653,25 @@ def run_task(work, name, path, timeout, required):
         pass
     dt = time.time() - t0
     status, detail = parse_task(tdir, name)
-    verdict, info = classify(status, detail, required)
+    return name, status, dt, detail
+
+
+def combine(proof, reach, required):
+    """(verdict, info) from the proof and reach run_task results of one check."""
+    _, pst, pdt, pdet = proof
+    _, rst, rdt, rdet = reach
+    verdict, info = classify(pst, pdet, rst, rdet, required)
+    info["proof_s"] = round(pdt, 1)
+    info["reach_s"] = round(rdt, 1)
     if verdict == "FAIL" and info.get("assertions"):
-        trace = detail["traces"].get(info["assertions"][0])
+        trace = pdet["traces"].get(info["assertions"][0])
         info["trace"] = trace
         if trace:
             info["cex_retirements"] = vcd_retirements(trace)
-    if detail["errors"] and verdict == "FAIL":
-        info["errors"] = detail["errors"]
-    return name, verdict, dt, info
+    errs = pdet["errors"] + rdet["errors"]
+    if errs and verdict == "FAIL":
+        info["errors"] = errs[:5]
+    return verdict, info
 
 
 # ---------------------------------------------------------------------------
@@ -738,58 +761,57 @@ def main():
         log(result["error"])
         finish(1)
 
-    # Tasks: one per check; each proves its own triggers reachable (inline reach).
+    # Tasks: per check, a proof task and a reach task (its triggers, same design).
     only = re.compile(args.only) if args.only else None
-    tasks = []      # (check name, sby path, timeout, required reach labels)
+    checks_todo = []   # (check name, required reach labels)
+    jobs_todo = []     # (task name, sby path, timeout)
     task_depths = {}
+    reach_eng = cfg["engines"]["reach"]
     for name, kind, opts in cfg["checks"]:
         timeout = int(opts.get("timeout", cfg["timeout_s"]))
         ekey = opts.get("engine", kind if kind in cfg["engines"] else "bmc")
         eng = cfg["engines"][ekey]
         tdepth = depth + int(opts.get("depth_add", 0))
         if kind == "insn":
-            for ins in isa_insns():
-                cname = f"insn_{ins}"
-                if only and not only.search(cname):
-                    continue
-                p = write_sby(work, cname, "bonetto_insn_check", tdepth, eng, timeout, model=ins)
-                tasks.append((cname, p, timeout, insn_reach(ins)))
-                task_depths[cname] = tdepth
-            continue
-        if only and not only.search(name):
-            continue
-        p = write_sby(work, name, CHECKERS[name], tdepth, eng, timeout, reset_free=(name == "reset"))
-        tasks.append((name, p, timeout, REACH[name]))
-        task_depths[name] = tdepth
+            items = [(f"insn_{i}", "bonetto_insn_check", i, insn_reach(i)) for i in isa_insns()]
+        else:
+            items = [(name, CHECKERS[name], None, REACH[name])]
+        for cname, checker, model, req in items:
+            if only and not only.search(cname):
+                continue
+            rf = (cname == "reset")
+            p = write_sby(work, cname, checker, tdepth, eng, timeout, model=model, reset_free=rf)
+            r = write_sby(work, cname + "_reach", checker, tdepth, reach_eng, timeout,
+                          model=model, reset_free=rf, role="reach")
+            jobs_todo += [(cname, p, timeout), (cname + "_reach", r, timeout)]
+            checks_todo.append((cname, req))
+            task_depths[cname] = tdepth
 
     # Longest first (measured on the seed: liveness, then the bus checks).
     order = {"liveness": 0, "bus_dmem": 1, "bus_imem": 2}
-    tasks.sort(key=lambda t: order.get(t[0], 9))
-    log(f"running {len(tasks)} SBY task(s), jobs={jobs}, D={depth}")
+    jobs_todo.sort(key=lambda t: order.get(t[0], 9))
+    log(f"running {len(jobs_todo)} SBY task(s) for {len(checks_todo)} check(s), jobs={jobs}, D={depth}")
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(run_task, work, n, p, to, req) for n, p, to, req in tasks]
+        futs = [ex.submit(run_task, n, p, to) for n, p, to in jobs_todo]
         for fu in concurrent.futures.as_completed(futs):
-            tname, verdict, dt, info = fu.result()
-            results[tname] = (verdict, dt, info)
-            extra = ""
-            if info.get("assertions"):
-                extra = " failed: " + ", ".join(info["assertions"][:6])
-            elif info.get("unreached"):
-                extra = " unreached: " + ", ".join(info["unreached"])
-            elif info.get("why"):
-                extra = " (" + info["why"] + ")"
-            log(f"  {tname:<16} {verdict:<9} {dt:7.1f}s{extra}")
+            res = fu.result()
+            results[res[0]] = res
+            failed = [l for l in res[3]["failed"]]
+            extra = f" failed: {', '.join(failed[:6])}" if failed else ""
+            log(f"  {res[0]:<22} {res[1]:<8} {res[2]:7.1f}s{extra}")
 
     checks = dict(result["checks"])  # structure, equiv
     runtimes, failures, reached = {}, {}, {}
-    for tname, _, _, _ in tasks:
-        verdict, dt, info = results.get(tname, ("FAIL", 0.0, {"why": "no result"}))
-        checks[tname] = verdict
-        runtimes[tname] = round(dt, 1)
-        reached[tname] = info.get("reached", [])
+    missing_res = (None, "ERROR", 0.0, {"failed": [], "traces": {}, "errors": ["no result"]})
+    for cname, req in checks_todo:
+        verdict, info = combine(results.get(cname, missing_res),
+                                results.get(cname + "_reach", missing_res), req)
+        checks[cname] = verdict
+        runtimes[cname] = {"proof": info["proof_s"], "reach": info["reach_s"]}
+        reached[cname] = info["reached"]
         if verdict != "PASS":
-            failures[tname] = info
+            failures[cname] = info
     result["checks"] = checks
     result["per_check_runtime_s"] = runtimes
     result["per_check_depth"] = task_depths
