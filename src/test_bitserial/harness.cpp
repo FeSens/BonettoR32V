@@ -210,8 +210,8 @@ int main(int argc, char** argv) {
   bool halted = false;
   uint64_t halt_cycle = 0;
   uint64_t fetches = 0, last_fetch = 0;
-  std::vector<uint64_t> cls_cycles(32, 0), cls_count(32, 0), cls_max(32, 0);
-  const char* cls_names[32] = {nullptr};
+  std::vector<uint64_t> cls_cycles(48, 0), cls_count(48, 0), cls_max(48, 0), cls_min(48, ~0ull);
+  std::vector<std::string> cls_names(48);
   int ncls = 0;
 
   auto ui_now = [&]() -> uint8_t {
@@ -358,14 +358,26 @@ int main(int argc, char** argv) {
       // timing by class
       uint64_t gap = cycle - last_ret;
       if (gap > max_gap) max_gap = gap;
-      const char* cn = iss_class(r);
+      // class name, with the access width for memory classes and the direction for shifts
+      std::string cn = iss_class(r);
+      unsigned msk = r.rmask | r.wmask;
+      if (msk) cn += msk == 1 ? "_b" : msk == 3 ? "_h" : "_w";
+      if (cn == "shift") {
+        unsigned s = ((r.insn & 0x7F) == 0x13) ? (r.insn >> 20) & 31 : r.rs2v & 31;
+        cn += ((r.insn >> 14) & 1) ? "_right" : "_left";
+        cn += s == 0 ? "_0" : s <= 8 ? "_1-8" : s <= 16 ? "_9-16" : s <= 24 ? "_17-24" : "_25-31";
+      }
       int ci = 0;
       for (; ci < ncls; ci++)
-        if (!strcmp(cls_names[ci], cn)) break;
-      if (ci == ncls && ncls < 32) cls_names[ncls++] = cn;
+        if (cls_names[ci] == cn) break;
+      if (ci == ncls) {
+        if (ncls < 47) cls_names[ncls++] = cn;
+        else ci = 47;
+      }
       cls_cycles[ci] += gap;
       cls_count[ci]++;
       if (gap > cls_max[ci]) cls_max[ci] = gap;
+      if (gap < cls_min[ci]) cls_min[ci] = gap;
       last_ret = cycle;
       retired++;
       top.ui_in = ui_now();
@@ -434,9 +446,9 @@ int main(int argc, char** argv) {
          retired ? (double)cycle / retired : 0.0, (unsigned long long)max_gap, fail.c_str());
   if (rvfi && !o.quiet) {
     for (int i = 0; i < ncls; i++)
-      fprintf(stderr, "  %-18s n=%-7llu avg=%-7.1f max=%llu\n", cls_names[i],
-              (unsigned long long)cls_count[i], (double)cls_cycles[i] / cls_count[i],
-              (unsigned long long)cls_max[i]);
+      fprintf(stderr, "  %-20s n=%-7llu min=%-5llu avg=%-7.1f max=%llu\n", cls_names[i].c_str(),
+              (unsigned long long)cls_count[i], (unsigned long long)cls_min[i],
+              (double)cls_cycles[i] / cls_count[i], (unsigned long long)cls_max[i]);
   }
   return fail.empty() ? 0 : 1;
 }

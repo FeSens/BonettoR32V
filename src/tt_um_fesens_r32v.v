@@ -536,6 +536,7 @@ module tt_um_fesens_r32v (
 
     reg [63:0] r_order;
     reg [31:0] r_rs1, r_rs2, r_pc, r_mrd;
+    integer    mi;
     wire [31:0] v_rs1 = xr[rs1_f];
     wire [31:0] v_rs2 = xr[rs2_f];
     always @(posedge clk) begin
@@ -549,8 +550,9 @@ module tt_um_fesens_r32v (
             r_rs2 <= {v_rs2[0], v_rs2[31:1]};
             r_pc  <= {pcr[0], pcr[31:1]};
         end
-        if (st == S_LWR && lwin)
-            r_mrd[{kb, ph[2:0]}] <= bufr[2];
+        for (mi = 0; mi < 32; mi = mi + 1)
+            if (st == S_LWR && lwin && {kb, ph[2:0]} == mi[4:0])
+                r_mrd[mi] <= bufr[2];
     end
 
     wire [31:0] imm_i = {{20{insn[31]}}, insn[31:20]};
