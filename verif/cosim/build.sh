@@ -4,9 +4,11 @@
 #   verif/cosim/build.sh MODE [SRC_DIR] [OUT_DIR]
 #
 # MODE is rvfi (design built with RISCV_FORMAL, RVFI compared every retirement) or pins (the plain
-# design). SRC_DIR defaults to src/ and is globbed (*.v, *.sv, minus test_* files), since a design
-# may add, rename or split files. OUT_DIR defaults to build/cosim/MODE. TRACE=1 adds FST tracing
-# (harness --trace PATH).
+# design). SRC_DIR defaults to src/. Every SRC_DIR/*.v file is part of the design (contract
+# section 1) and they are read in sorted (C locale) order, like the gates. The RVFI build gets
+# exactly one define, RISCV_FORMAL, and nothing is read in front of the design: no prelude, no
+# include path. OUT_DIR defaults to build/cosim/MODE. TRACE=1 adds FST tracing (harness --trace
+# PATH). VFLAGS adds Verilator arguments; only the harness self-tests use it, on mutant copies.
 #
 # Verilator runs with --x-initial unique and --x-assign unique; the harness randomizes every
 # power-up value at run time from its --seed, so a design that relies on zero-initialized state
@@ -21,11 +23,10 @@ OUT="${3:-$ROOT/build/cosim/$MODE}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
+export LC_ALL=C  # glob order = byte order
 FILES=()
-for f in "$SRC"/*.v "$SRC"/*.sv; do
-  [ -e "$f" ] || continue
-  case "$(basename "$f")" in test_*) continue ;; esac
-  FILES+=("$f")
+for f in "$SRC"/*.v; do
+  [ -f "$f" ] && FILES+=("$f")
 done
 if [ ${#FILES[@]} -eq 0 ]; then
   echo "build.sh: no Verilog sources in $SRC" >&2
@@ -36,9 +37,7 @@ DEFS=()
 CDEFS=""
 case "$MODE" in
   rvfi)
-    DEFS=(+define+RISCV_FORMAL +define+RISCV_FORMAL_NRET=1 +define+RISCV_FORMAL_XLEN=32
-          +define+RISCV_FORMAL_ILEN=32 "+incdir+$ROOT/third_party/riscv-formal/checks"
-          "$ROOT/third_party/riscv-formal/checks/rvfi_macros.vh")
+    DEFS=(+define+RISCV_FORMAL)
     CDEFS="-DRVFI_MODE"
     ;;
   pins) ;;
@@ -55,18 +54,20 @@ if [ "${TRACE:-0}" = "1" ]; then
   CDEFS="$CDEFS -DHARNESS_TRACE"
 fi
 
-verilator --cc --exe --build -j 0 -O3 \
-  --x-assign unique --x-initial unique \
-  -Wno-fatal -Wno-lint -Wno-style -Wno-DEFOVERRIDE \
-  --top-module tt_um_fesens_r32v \
-  "+incdir+$SRC" \
-  ${DEFS[@]+"${DEFS[@]}"} \
-  ${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"} \
-  "${FILES[@]}" \
-  "$COSIM/harness.cpp" \
-  -CFLAGS "-O2 -std=c++17 -I$COSIM $CDEFS" \
-  -Mdir "$OUT/obj" -o "$OUT/harness" >"$OUT/build.log" 2>&1 || {
-    tail -40 "$OUT/build.log" >&2
-    exit 1
-  }
+ARGS=(--cc --exe --build -j 0 -O3
+  --x-assign unique --x-initial unique
+  -Wno-fatal -Wno-lint -Wno-style
+  --top-module tt_um_fesens_r32v
+  ${DEFS[@]+"${DEFS[@]}"}
+  ${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"}
+  "${FILES[@]}"
+  "$COSIM/harness.cpp"
+  -CFLAGS "-O2 -std=c++17 -I$COSIM $CDEFS"
+  -Mdir "$OUT/obj" -o "$OUT/harness")
+# the exact command, one argument per line (test_cosim_harness.py checks the design inputs)
+printf '%s\n' verilator "${ARGS[@]}" >"$OUT/verilator.args"
+verilator "${ARGS[@]}" >"$OUT/build.log" 2>&1 || {
+  tail -40 "$OUT/build.log" >&2
+  exit 1
+}
 echo "built $OUT/harness ($MODE, ${#FILES[@]} source files)"

@@ -376,6 +376,19 @@ auipc1:
     SIG  x3
     lw   x3, 8(x1)
     SIG  x3
+    # Loads of the instruction's own bytes: the load still needs its own SPI READ (contract
+    # section 6, fetch and load completeness), it can't reuse the fetch.
+    ABS  x6, .Lself1
+.Lself1:
+    lw   x5, 0(x6)             # 0x00032283, its own encoding
+    EXPECT x5, 0x00032283
+    SIG  x5
+    ABS  x6, .Lself2
+.Lself2:
+    lw   x5, 2(x6)             # 0x00232283: its bytes 2..3, then bytes 0..1 of the next one
+    addi x0, x0, 0x7ff         # 0x7ff00013
+    EXPECT x5, 0x00130023
+    SIG  x5
 
 #ifndef SPIKE_XCHECK
 # ---------------------------------------------------------------------------------------------
@@ -482,6 +495,34 @@ alias_code:
     j    fail
 2:  jalr x0, 0(ra)
 alias_done:
+    # JAL and branches with offsets whose low 16 bits are small: the target aliases to code a few
+    # bytes ahead, while the 32-bit pc moves by the full offset (J immediate bits 16..20, the
+    # sign included; riscv-arch-test's jal-01 cases of this kind don't fit a 64 KB RAM)
+    auipc x6, 0                # P
+    jal  x5, 3f + 0xf0000      # P + 4 -> P + 0xf0010 (runs 3f at pc 3f + 0xf0000)
+    j    fail
+    j    fail
+3:  auipc x7, 0                # P + 0x10 + 0xf0000
+    sub  x7, x7, x6
+    EXPECT x7, 0x000f0010
+    sub  x5, x5, x6
+    EXPECT x5, 8
+    SIG  x7
+    auipc x6, 0                # Q (= its link-time address + 0xf0000)
+    jal  x5, 4f - 0x100000     # offset 0x10 - 0x100000: to Q + 0x14 - 0x100000
+    j    fail
+    j    fail
+    j    fail
+4:  auipc x7, 0
+    sub  x7, x7, x6
+    EXPECT x7, 0xfff00014
+    SIG  x7
+    jal  x0, alias_back + 0x10000  # pc is link-time - 0x10000 here: back to link-time
+    j    fail
+alias_back:
+    auipc x7, 0
+    ABS  x6, alias_back
+    EQ   x7, x6
 #endif
 
 # ---------------------------------------------------------------------------------------------

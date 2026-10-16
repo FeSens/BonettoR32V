@@ -93,7 +93,7 @@ def test_standin_zero_init_reliance_fails():
 # ------------------------------------------------------------------------------------------------
 # 2. the design in src/ passes
 def have_design():
-    return any(SRC.glob("*.v")) or any(SRC.glob("*.sv"))
+    return bool(run_cosim.src_files(SRC))
 
 
 QUICK = ["selftest", "gpio_demo", "trap_ecall", "trap_jal", "trap_jalr", "trap_branch",
@@ -128,7 +128,8 @@ def test_timing_json(programs, tmp_path):
     assert list(summary) == ["prog", "mode", "seed", "pass", "retired", "cycles", "cpi",
                              "max_cycles_per_insn", "error"]
     t = json.loads(out.read_text())
-    assert set(t) == {"first_retire_cycle", "max_cycles_per_insn", "per_class"}
+    assert set(t) == {"pass", "first_retire_cycle", "max_cycles_per_insn", "per_class"}
+    assert t["pass"] is True
     classes = {"alu", "alu_imm", "shift", "lui_auipc", "branch_taken", "branch_not_taken", "jal",
                "jalr", "load", "store", "io_load", "io_store", "fence", "trap"}
     assert set(t["per_class"]) == classes
@@ -148,6 +149,105 @@ def test_dump_ram_matches_reference(programs, tmp_path):
                         "rvfi" if mode == "rvfi" else "pins", "--seed", "2", "--dump-ram",
                         str(ref)], capture_output=True, check=True)
         assert out.read_bytes() == ref.read_bytes() and len(out.read_bytes()) == 65536
+
+
+def test_build_key_covers_every_src_file_and_the_tools(tmp_path, monkeypatch):
+    # Any file under src/ may matter (a header someone includes by mistake, a second .v file, a
+    # test_*.v file, which is part of the design); the unit tests' test_*.py files can't reach
+    # the model; a different Verilator must rebuild too.
+    d = tmp_path / "src"
+    d.mkdir()
+    (d / "top.v").write_text("module top; endmodule\n")
+    key = lambda: run_cosim.build_key("pins", d, "", False)  # noqa: E731
+    k1 = key()
+    (d / "defs.vh").write_text("`define X 1\n")
+    k2 = key()
+    assert k2 != k1
+    (d / "defs.vh").write_text("`define X 2\n")
+    k3 = key()
+    assert k3 != k2
+    (d / "sub").mkdir()
+    (d / "sub" / "more.svh").write_text("\n")
+    k4 = key()
+    assert k4 != k3
+    (d / "test_unit.py").write_text("x = 1\n")
+    assert key() == k4
+    (d / "test_part.v").write_text("module r32v_part; endmodule\n")
+    k5 = key()
+    assert k5 != k4
+    assert [p.name for p in run_cosim.src_files(d)] == ["test_part.v", "top.v"]
+    monkeypatch.setattr(run_cosim, "_verilator_version", "Verilator 0.000")
+    assert key() != k5
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_build_reads_exactly_the_design(mode):
+    # Contract sections 1 and 6: every src/*.v file in sorted order, nothing in front of them,
+    # and the RVFI build's only define is RISCV_FORMAL (none at all for the plain build).
+    assert have_design(), "no design in src/"
+    exe = run_cosim.ensure_built(mode)
+    args = (exe.parent / "verilator.args").read_text().splitlines()
+    verilog = [a for a in args if a.endswith((".v", ".sv", ".vh", ".svh"))]
+    assert verilog == [str(p) for p in run_cosim.src_files(SRC.resolve())]
+    assert [a for a in args if a.startswith("+define+")] == (
+        ["+define+RISCV_FORMAL"] if mode == "rvfi" else [])
+    assert not [a for a in args if a.startswith(("+incdir", "-I", "-D", "-y", "-v", "-f"))]
+
+
+def test_build_lock_is_cross_process(programs):
+    # While another process holds build/cosim/pins.lock, ensure_built waits, even for an
+    # up-to-date build.
+    import fcntl
+    run_cosim.ensure_built("pins")
+    lock = ROOT / "build" / "cosim" / "pins.lock"
+    code = (f"import sys; sys.path.insert(0, {str(COSIM)!r}); import run_cosim; "
+            "run_cosim.ensure_built('pins'); print('built')")
+    with open(lock, "a") as f:
+        fcntl.lockf(f, fcntl.LOCK_EX)
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                p.wait(timeout=3)
+        finally:
+            fcntl.lockf(f, fcntl.LOCK_UN)
+    assert p.wait(timeout=60) == 0 and p.stdout.read().strip() == "built"
+
+
+def test_latency_cap_boundary(programs, tmp_path):
+    """Contract section 4: a gap of exactly 1,024 cycles passes and 1,025 fails, for the first
+    retirement after reset release and for later ones, whether the late retirement arrives (the
+    check at the retirement edge) or never comes (the watchdog). mutants/stall_gap holds every
+    retirement until exactly STALL_GAP cycles after the previous one."""
+    src = COSIM / "mutants" / "stall_gap"
+    prog = PROGS / "selftest.hex"
+    t = tmp_path / "timing.json"
+
+    def run(mode, vflags="", timing=None):
+        return run_cosim.run_one(mode, prog, 1, timing_json=timing, src=src, vflags=vflags)[0]
+
+    s = run("rvfi", "+define+STALL_GAP=1024", t)
+    assert s["pass"], s["error"]
+    tj = json.loads(t.read_text())
+    assert tj["pass"] and tj["first_retire_cycle"] == 1024 and tj["max_cycles_per_insn"] == 1024
+    assert set(tj["per_class"].values()) == {1024}
+    assert run("pins", "+define+STALL_GAP=1024")["pass"]
+    # 1,025: the first retirement is late
+    s = run("rvfi", "", t)
+    assert not s["pass"]
+    assert "latency cap: retirement #0 " in s["error"], s["error"]
+    assert "came 1025 cycles after reset release" in s["error"], s["error"]
+    assert json.loads(t.read_text())["pass"] is False, "a failed run's timing report says so"
+    # 1,025 later on (the first instruction runs at full speed)
+    s = run("rvfi", "+define+STALL_SKIP_FIRST")
+    assert not s["pass"]
+    assert "latency cap: retirement #1 " in s["error"], s["error"]
+    assert "came 1025 cycles after the previous retirement" in s["error"], s["error"]
+    assert run("rvfi", "+define+STALL_SKIP_FIRST +define+STALL_GAP=1024")["pass"]
+    # 1,026: nothing retires at 1,025, so the watchdog reports it at cycle 1,025
+    s = run("rvfi", "+define+STALL_GAP=1026")
+    assert not s["pass"]
+    assert s["error"].startswith("cycle 1025: latency cap: no retirement within 1024 cycles of "
+                                 "reset release"), s["error"]
 
 
 def test_coremark_log_ring_is_checked(programs, tmp_path):
@@ -205,6 +305,7 @@ def test_trap_retirement_compares_only_the_contract_fields():
 def test_every_required_mutant_class_is_present():
     m = manifest()
     required = {"miso_sck_low", "mosi_on_rise", "cs_sck_high", "write_midbyte", "rvfi_rd_wrong",
-                "rvfi_hidden", "zero_init", "latency"}
+                "rvfi_hidden", "zero_init", "latency", "stall_gap", "ui_at_retire", "uo_glitch",
+                "load_own_fetch"}
     assert required <= set(m), required - set(m)
     assert m["rvfi_hidden"]["pass"] == ["rvfi"] and "pins" in m["rvfi_hidden"]["fail"]

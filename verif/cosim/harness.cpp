@@ -84,7 +84,7 @@ std::string describe(uint64_t n, const Retire& e) {
 struct Expect {
   Retire e;
   uint16_t fetch[4];
-  bool fetch_read[4];
+  bool fetch_done = false;  // one READ carried all 4 instruction bytes in full
   int nload = 0;
   uint16_t load[4];
   bool load_read[4];
@@ -95,10 +95,8 @@ struct Expect {
 
   void set(const Retire& r) {
     e = r;
-    for (int k = 0; k < 4; k++) {
-      fetch[k] = (uint16_t)(r.pc + k);
-      fetch_read[k] = false;
-    }
+    for (int k = 0; k < 4; k++) fetch[k] = (uint16_t)(r.pc + k);
+    fetch_done = false;
     nload = nstore = 0;
     bool io = r.maddr >> 31;
     if (r.rmask && !io) {
@@ -114,13 +112,34 @@ struct Expect {
       }
     }
   }
-  bool read_ok(uint16_t a, bool full) {
-    bool ok = false;
+  bool read_allowed(uint16_t a) const {
     for (int k = 0; k < 4; k++)
-      if (fetch[k] == a) ok = true, fetch_read[k] |= full;
+      if (fetch[k] == a) return true;
     for (int k = 0; k < nload; k++)
-      if (load[k] == a) ok = true, load_read[k] |= full;
-    return ok;
+      if (load[k] == a) return true;
+    return false;
+  }
+  // One completed READ transaction. Returns the index of its first byte that is neither a fetch
+  // nor a load byte of this instruction, or -1. Completeness is tracked per transaction
+  // (contract section 6): the first READ that carries all 4 instruction bytes in full is the
+  // fetch, and load bytes count only when another READ carries them, so a load of the
+  // instruction's own bytes still needs its own READ.
+  int read_txn(const SpiTxn& x) {
+    for (size_t k = 0; k < x.bytes.size(); k++)
+      if (!read_allowed(x.at(k))) return (int)k;
+    const size_t full = x.full_bytes();
+    bool has[4] = {false, false, false, false};
+    for (size_t k = 0; k < full; k++)
+      for (int j = 0; j < 4; j++)
+        if (x.at(k) == fetch[j]) has[j] = true;
+    if (!fetch_done && has[0] && has[1] && has[2] && has[3]) {
+      fetch_done = true;
+      return -1;
+    }
+    for (size_t k = 0; k < full; k++)
+      for (int j = 0; j < nload; j++)
+        if (x.at(k) == load[j]) load_read[j] = true;
+    return -1;
   }
   bool write_ok(uint16_t a, uint8_t v) {
     for (int k = 0; k < nstore; k++)
@@ -163,7 +182,10 @@ class Harness {
   std::string error_;
   uint64_t t_ = 0;          // rising clk edges so far
   uint64_t reset_edges_ = 1;  // edges 0 .. reset_edges_-1 have rst_n = 0
-  uint8_t ui_ = 0;
+  uint8_t ui_ = 0;          // ui_in, driven at every falling edge
+  bool ui_pend_ = false;    // rvfi mode: ui_next_ goes on ui_in at the falling edge after ui_at_
+  uint64_t ui_at_ = 0;
+  uint8_t ui_next_ = 0;
   std::vector<uint8_t> uo_seen_;
   uint8_t uo_last_ = 0;
 
@@ -197,6 +219,18 @@ class Harness {
   uint32_t outputs() const {
     return (uint32_t)top_->uo_out | (uint32_t)top_->uio_out << 8 | (uint32_t)top_->uio_oe << 16;
   }
+
+  // rvfi mode, contract section 3: the cosim changes ui_in within 2 cycles after a retirement.
+  // After retirement edge t the new value goes on ui_in at the falling edge after edge t + d,
+  // d in {0, 1} chosen per retirement from the seed, so the core's flops first see it at edge
+  // t + 1 or t + 2. An IO load that samples ui_in before its own fetch has completed can then
+  // read the previous value.
+  void schedule_ui(uint8_t v, uint64_t index) {
+    if (ui_pend_) ui_ = ui_next_;
+    ui_next_ = v;
+    ui_at_ = t_ + ((ui_value(o_.seed ^ 0xA5A5A5A5u, index) >> 4) & 1);
+    ui_pend_ = true;
+  }
 };
 
 int Harness::run(const uint8_t* img) {
@@ -222,10 +256,18 @@ int Harness::run(const uint8_t* img) {
   iss.load_image(img);
 #ifdef RVFI_MODE
   Expect pend;
-  uint8_t uo_committed = 0;  // ISS uo_out after the last retired instruction
+  // uo_out: the ISS's change sequence up to and including the pending instruction. The DUT's
+  // uo_out must make exactly these changes, in order: each one no earlier than the previous
+  // retirement and no later than one cycle after its IO store retires.
+  std::vector<uint8_t> uo_ref_seq;
+  uint8_t iss_uo_last = 0;
+  size_t uo_dut_n = 0;       // changes the DUT has made
+  auto note_iss_uo = [&]() {
+    if (iss.uo_out() != iss_uo_last) iss_uo_last = iss.uo_out(), uo_ref_seq.push_back(iss_uo_last);
+  };
   uint64_t last_ret = reset_edges_ - 1;
   uint64_t uo_deadline = 0;
-  uint8_t uo_deadline_val = 0;
+  size_t uo_deadline_n = 0;  // changes due by uo_deadline
   uint64_t budget = 0;
   if (!spi_only) {
     // Pre-run once to size the cycle budget.
@@ -243,6 +285,7 @@ int Harness::run(const uint8_t* img) {
     if (r.reserved) {
       fail("test program bug: the ISS hit an unspecified instruction at " + describe(0, r));
     }
+    note_iss_uo();
     pend.set(r);
   }
 #else
@@ -363,18 +406,21 @@ int Harness::run(const uint8_t* img) {
           if (x.write) fail("SPI WRITE after the halt");
           continue;
         }
-        for (size_t k = 0; k < x.bytes.size(); k++) {
-          uint16_t a = x.at(k);
-          if (x.write ? !pend.write_ok(a, x.bytes[k]) : !pend.read_ok(a, k < x.full_bytes())) {
-            fail(fmt("SPI %s of byte 0x%04x%s (transaction at 0x%04x, cycles %llu..%llu) is not "
-                     "part of %s; allowed: %s",
-                     x.write ? "WRITE" : "READ", a,
-                     x.write ? fmt(" = 0x%02x", x.bytes[k]).c_str() : "", x.addr,
-                     (unsigned long long)since_release(x.start),
-                     (unsigned long long)since_release(x.end), describe(retired_, pend.e).c_str(),
-                     pend.allowed().c_str()));
-            break;
-          }
+        int bad = -1;
+        if (x.write) {
+          for (size_t k = 0; k < x.bytes.size() && bad < 0; k++)
+            if (!pend.write_ok(x.at(k), x.bytes[k])) bad = (int)k;
+        } else {
+          bad = pend.read_txn(x);
+        }
+        if (bad >= 0) {
+          fail(fmt("SPI %s of byte 0x%04x%s (transaction at 0x%04x, cycles %llu..%llu) is not "
+                   "part of %s; allowed: %s",
+                   x.write ? "WRITE" : "READ", x.at(bad),
+                   x.write ? fmt(" = 0x%02x", x.bytes[bad]).c_str() : "", x.addr,
+                   (unsigned long long)since_release(x.start),
+                   (unsigned long long)since_release(x.end), describe(retired_, pend.e).c_str(),
+                   pend.allowed().c_str()));
         }
         if (!error_.empty()) break;
       }
@@ -393,6 +439,16 @@ int Harness::run(const uint8_t* img) {
         }
         const Retire& e = pend.e;
         const std::string who = describe(retired_, e);
+        // latency cap (contract section 4): at most LAT_CAP edges since the previous retirement
+        // (or since reset release, the last edge with rst_n low)
+        const uint64_t gap = t_ - last_ret;
+        if (gap > LAT_CAP) {
+          fail(fmt("latency cap: %s came %llu cycles after %s (limit %llu)", who.c_str(),
+                   (unsigned long long)gap,
+                   retired_ ? "the previous retirement" : "reset release",
+                   (unsigned long long)LAT_CAP));
+          break;
+        }
         if (!cs_n) {
           fail("SPI transaction still open at " + who +
                " (all of an instruction's SPI traffic must finish before its rvfi_valid cycle)");
@@ -451,12 +507,10 @@ int Harness::run(const uint8_t* img) {
           break;
         }
         // the instruction's own SPI traffic must be complete
-        for (int k = 0; k < 4; k++)
-          if (!pend.fetch_read[k]) {
-            fail(fmt("%s retired without reading instruction byte 0x%04x over SPI", who.c_str(),
-                     pend.fetch[k]));
-            break;
-          }
+        if (!pend.fetch_done)
+          fail(fmt("%s retired without an SPI READ carrying all 4 instruction bytes "
+                   "0x%04x..0x%04x (its own fetch)",
+                   who.c_str(), pend.fetch[0], pend.fetch[3]));
         for (int k = 0; k < pend.nload && error_.empty(); k++)
           if (!pend.load_read[k])
             fail(fmt("%s retired without reading load byte 0x%04x over SPI", who.c_str(),
@@ -466,19 +520,17 @@ int Harness::run(const uint8_t* img) {
             fail(fmt("%s retired without writing store byte 0x%04x over SPI", who.c_str(),
                      pend.store[k]));
         if (!error_.empty()) break;
-        // latency
-        uint64_t gap = t_ - last_ret;
+        // latency statistics
         if (retired_ == 0) first_gap_ = gap;
         if (gap > max_gap_) max_gap_ = gap;
         uint64_t& pc = per_class_[iss_class(e)];
         if (gap > pc) pc = gap;
         last_ret = t_;
-        // uo_out: the new value must be visible one cycle after an IO store retires
-        if (iss.uo_out() != uo_committed) {
+        // uo_out: the retired instruction's change (if any) must be visible one cycle later
+        if (uo_dut_n < uo_ref_seq.size()) {
           uo_deadline = t_ + 1;
-          uo_deadline_val = iss.uo_out();
+          uo_deadline_n = uo_ref_seq.size();
         }
-        uo_committed = iss.uo_out();
         retired_++;
         if (e.halt) {
           halted_ = true;
@@ -486,37 +538,44 @@ int Harness::run(const uint8_t* img) {
           cycles_ = since_release(t_);
           spi_.write_started = false;
         } else {
-          ui_ = ui_value(o_.seed, retired_);
-          Retire r = iss.step(ui_);
+          const uint8_t nu = ui_value(o_.seed, retired_);
+          schedule_ui(nu, retired_);
+          Retire r = iss.step(nu);
           if (r.reserved) {
             fail("test program bug: the ISS hit an unspecified instruction at " +
                  describe(retired_, r));
             break;
           }
+          note_iss_uo();
           pend.set(r);
         }
       }
-      // uo_out may only change to the value of an IO store that is executing or retired
+      // uo_out makes exactly the reference's changes, in order; nothing else changes it, not
+      // even a glitch that returns to the old value before the store retires
       if (uo != uo_last_) {
-        uint8_t next = halted_ ? uo_committed : iss.uo_out();
-        if (uo != uo_committed && uo != next) {
-          fail(fmt("uo_out changed to 0x%02x; expected 0x%02x (only an IO store writing byte 0 "
-                   "changes it; next retirement %s)",
-                   uo, uo_committed, describe(retired_, pend.e).c_str()));
+        if (uo_dut_n >= uo_ref_seq.size() || uo != uo_ref_seq[uo_dut_n]) {
+          fail(fmt("uo_out changed to 0x%02x; %s (only an IO store writing byte 0 changes it, "
+                   "once; next retirement %s)",
+                   uo,
+                   uo_dut_n < uo_ref_seq.size()
+                       ? fmt("the next change due is to 0x%02x", uo_ref_seq[uo_dut_n]).c_str()
+                       : fmt("no change is due (uo_out stays 0x%02x)", uo_last_).c_str(),
+                   halted_ ? "none (halted)" : describe(retired_, pend.e).c_str()));
           break;
         }
+        uo_dut_n++;
         uo_seen_.push_back(uo);
         uo_last_ = uo;
       }
       if (uo_deadline && t_ == uo_deadline) {
-        if (uo != uo_deadline_val) {
+        if (uo_dut_n < uo_deadline_n) {
           fail(fmt("uo_out = 0x%02x one cycle after the IO store retired; expected 0x%02x", uo,
-                   uo_deadline_val));
+                   uo_ref_seq[uo_deadline_n - 1]));
           break;
         }
         uo_deadline = 0;
       }
-      if (!halted_ && t_ - last_ret > LAT_CAP) {
+      if (!halted_ && t_ - last_ret >= LAT_CAP + 1) {
         fail(fmt("latency cap: no retirement within %llu cycles of %s (next: %s)",
                  (unsigned long long)LAT_CAP,
                  retired_ ? "the previous retirement" : "reset release",
@@ -628,6 +687,7 @@ int Harness::run(const uint8_t* img) {
     top_->clk = 0;
     const bool rst_change = (t_ + 1 == reset_edges_);
     top_->rst_n = t_ + 1 >= reset_edges_;
+    if (ui_pend_ && t_ >= ui_at_) ui_ = ui_next_, ui_pend_ = false;
     top_->ui_in = ui_;
     top_->uio_in = (uint8_t)(spi_.noise() & ~4u) | (spi_.miso() << 2);
     top_->eval();

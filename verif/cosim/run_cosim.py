@@ -14,13 +14,15 @@ builds the programs, runs every program in both modes under seeds 1, 2 and 3, wr
 build/cosim.json and exits 0 only if every run passes.
 
 --max-cycles defaults to the latency cap's bound, 1,024 * (reference retirements + 16).
---timing-json (rvfi mode) writes {"first_retire_cycle", "max_cycles_per_insn", "per_class"}.
+--timing-json (rvfi mode) writes {"pass", "first_retire_cycle", "max_cycles_per_insn",
+"per_class"} on every run; with "pass": false the numbers only cover the run up to the failure.
 --dump-ram writes the final 64 KB RAM image (raw bytes) as the design left it.
 Programs whose <name>.expect.json lists "log_contains" must leave those strings in the RAM log
 ring at 0xF000-0xF7FF (NUL-terminated), e.g. coremark's "Correct operation validated".
 """
 import argparse
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -44,16 +46,41 @@ _build_lock = threading.Lock()
 
 
 def src_files(src: Path):
-    return sorted(p for p in list(src.glob("*.v")) + list(src.glob("*.sv"))
-                  if not p.name.startswith("test_"))
+    """The design: every src/*.v file, in sorted (byte) order (contract section 1)."""
+    return sorted((p for p in src.glob("*.v") if p.is_file()), key=lambda p: p.name.encode())
+
+
+def key_files(src: Path):
+    """What the build stamp hashes: every file under src/ except __pycache__ and the unit tests'
+    non-Verilog test_* files (a test_*.v file is part of the design). Over-inclusive on purpose:
+    a spurious rebuild is cheap, a stale model is not."""
+    return sorted(p for p in src.rglob("*")
+                  if p.is_file() and (p.suffix == ".v" or not p.name.startswith("test_"))
+                  and "__pycache__" not in p.relative_to(src).parts)
+
+
+_verilator_version = None
+
+
+def verilator_version() -> str:
+    global _verilator_version
+    if _verilator_version is None:
+        try:
+            p = subprocess.run(["verilator", "--version"], capture_output=True, text=True)
+            _verilator_version = p.stdout.strip() or p.stderr.strip()
+        except OSError as e:
+            _verilator_version = f"verilator unavailable: {e}"
+    return _verilator_version
 
 
 def build_key(mode: str, src: Path, vflags: str, trace: bool) -> str:
-    h = hashlib.sha256(f"{mode}|{vflags}|{trace}".encode())
+    h = hashlib.sha256(f"{mode}|{vflags}|{trace}|{verilator_version()}".encode())
     deps = [COSIM / n for n in ("harness.cpp", "spiram.h", "iss.h", "build.sh")]
-    deps += [ROOT / "third_party/riscv-formal/checks/rvfi_macros.vh"]
-    for p in src_files(src) + deps:
-        h.update(p.name.encode())
+    for p in key_files(src):
+        h.update(str(p.relative_to(src)).encode() + b"\0")
+        h.update(p.read_bytes())
+    for p in deps:
+        h.update(p.name.encode() + b"\0")
         h.update(p.read_bytes())
     return h.hexdigest()
 
@@ -73,15 +100,24 @@ def ensure_built(mode: str, src: Path = SRC, vflags: str = "", trace: bool = Fal
     out = build_dir_for(mode, src, vflags, trace)
     exe, stamp = out / "harness", out / "stamp"
     key = build_key(mode, src, vflags, trace)
-    with _build_lock:
-        if exe.exists() and stamp.exists() and stamp.read_text() == key:
-            return exe
-        env = dict(os.environ, VFLAGS=vflags, TRACE="1" if trace else "0")
-        p = subprocess.run(["bash", str(COSIM / "build.sh"), mode, str(src), str(out)],
-                           env=env, capture_output=True, text=True)
-        if p.returncode != 0:
-            raise RuntimeError(f"cosim build failed ({mode}, {src}):\n{p.stderr[-3000:]}")
-        stamp.write_text(key)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # _build_lock serializes threads of this process; the lockf lock on build/cosim/<dir>.lock
+    # serializes processes (two pytest or eval runs building the same model).
+    with _build_lock, open(out.parent / f"{out.name}.lock", "a") as lk:
+        fcntl.lockf(lk, fcntl.LOCK_EX)
+        try:
+            if exe.exists() and stamp.exists() and stamp.read_text() == key:
+                return exe
+            if stamp.exists():
+                stamp.unlink()
+            env = dict(os.environ, VFLAGS=vflags, TRACE="1" if trace else "0")
+            p = subprocess.run(["bash", str(COSIM / "build.sh"), mode, str(src), str(out)],
+                               env=env, capture_output=True, text=True)
+            if p.returncode != 0:
+                raise RuntimeError(f"cosim build failed ({mode}, {src}):\n{p.stderr[-3000:]}")
+            stamp.write_text(key)
+        finally:
+            fcntl.lockf(lk, fcntl.LOCK_UN)
     return exe
 
 
@@ -99,6 +135,19 @@ def expect_for(hexfile: Path):
 def run_one(mode: str, hexfile: Path, seed: int = 1, max_cycles: int = 0, timing_json=None,
             dump_ram=None, src: Path = SRC, vflags: str = "", trace=None):
     """Run one cosim. Returns (summary dict with KEYS, full harness result dict)."""
+    summary, res = _run(mode, hexfile, seed, max_cycles, dump_ram, src, vflags, trace)
+    if timing_json:
+        # Written on every run, so a stale file can't survive. "pass": false means the numbers
+        # stop at the failure (partial) or are null.
+        timing = {"pass": bool(summary["pass"]),
+                  "first_retire_cycle": res.get("first_retire_cycle"),
+                  "max_cycles_per_insn": res.get("max_cycles_per_insn"),
+                  "per_class": res.get("per_class")}
+        Path(timing_json).write_text(json.dumps(timing, indent=1) + "\n")
+    return summary, res
+
+
+def _run(mode, hexfile, seed, max_cycles, dump_ram, src, vflags, trace):
     hexfile = Path(hexfile)
     prog = hexfile.name[:-len(".hex")] if hexfile.name.endswith(".hex") else hexfile.stem
     summary = {"prog": prog, "mode": mode, "seed": seed, "pass": False, "retired": None,
@@ -144,11 +193,6 @@ def run_one(mode: str, hexfile: Path, seed: int = 1, max_cycles: int = 0, timing
                     summary["pass"] = False
                     summary["error"] = f"RAM log ring lacks {want!r}; log: {text[-400:]!r}"
                     break
-    if timing_json:
-        timing = {"first_retire_cycle": res.get("first_retire_cycle"),
-                  "max_cycles_per_insn": res.get("max_cycles_per_insn"),
-                  "per_class": res.get("per_class")}
-        Path(timing_json).write_text(json.dumps(timing, indent=1) + "\n")
     return summary, res
 
 

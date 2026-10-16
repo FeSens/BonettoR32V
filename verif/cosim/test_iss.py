@@ -557,6 +557,8 @@ def mnemonic(insn: int) -> str:
 RV32E = ("lui auipc jal jalr beq bne blt bge bltu bgeu lb lh lw lbu lhu sb sh sw addi slti sltiu "
          "xori ori andi slli srli srai add sub sll slt sltu xor srl sra or and fence ebreak").split()
 BRANCHES = {"beq", "bne", "blt", "bge", "bltu", "bgeu"}
+R_ALU = "add sub sll slt sltu xor srl sra or and".split()
+I_ALU = "addi slti sltiu xori ori andi slli srli srai".split()
 
 
 def test_selftest_covers_rv32e(built):
@@ -601,6 +603,26 @@ def test_random_programs_are_valid_and_varied(built, seed):
     assert any(r["maddr"] >> 31 for r in log if r["rmask"])
     assert any(r["maddr"] >> 31 for r in log if r["wmask"])
     assert any(r["maddr"] & 3 for r in log if (r["rmask"] or r["wmask"]) and not r["maddr"] >> 31)
+    # x14 and x15 are ordinary ALU sources and destinations
+    alu = set(R_ALU) | set(I_ALU)
+    for x in (14, 15):
+        assert any(r["rd"] == x and mnemonic(r["insn"]) in alu for r in log), f"x{x} as rd"
+        assert any(x in (r["rs1"], r["rs2"]) and mnemonic(r["insn"]) in alu for r in log)
+    # RAM addresses with alias bits, the 64 KB wrap (loads and stores), any IO address
+    ram = [r for r in log if (r["rmask"] or r["wmask"]) and not r["maddr"] >> 31]
+    io = [r for r in log if (r["rmask"] or r["wmask"]) and r["maddr"] >> 31]
+    assert any(r["maddr"] >> 16 for r in ram if r["rmask"]) and any(r["maddr"] >> 16 for r in ram
+                                                                     if r["wmask"])
+    crosses = [r for r in ram
+               if (r["maddr"] & 0xFFFF) + bin(r["rmask"] | r["wmask"]).count("1") > 0x10000]
+    assert any(r["rmask"] for r in crosses) and any(r["wmask"] for r in crosses)
+    assert any(r["maddr"] & 0x7FFFFFF0 for r in io if r["rmask"])
+    assert any(r["maddr"] & 0x7FFFFFF0 for r in io if r["wmask"])
+    for m in ("rmask", "wmask"):
+        assert {r[m] for r in io if r[m]} >= {1, 15}, f"IO byte and word accesses ({m})"
+    # bounded loops: taken backward branches
+    back = [r for r in log if mnemonic(r["insn"]) in BRANCHES and r["npc"] < r["pc"]]
+    assert len(back) >= 5, len(back)
     # deterministic per seed
     again = subprocess.run(["python3", str(ROOT / "verif/programs/gen_random.py"), str(seed),
                             "3000"], capture_output=True, text=True, check=True).stdout

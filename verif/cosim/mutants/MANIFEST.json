@@ -126,5 +126,45 @@
    "pins"
   ],
   "fail": {}
+ },
+ "stall_gap": {
+  "desc": "Every retirement is held back until exactly `STALL_GAP cycles after the previous one (or after reset release): 1,025 by default, one more than the latency cap. Built with +define+STALL_GAP=1024 it is legal; +define+STALL_SKIP_FIRST exempts the first instruction.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "latency cap"
+  },
+  "pass": [
+   "pins"
+  ]
+ },
+ "ui_at_retire": {
+  "desc": "IO loads return ui_in sampled in the cycle after the previous retirement (before their own fetch completed) instead of after the fetch.",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "RVFI mismatch"
+  },
+  "seeds": [
+   1,
+   2,
+   3
+  ]
+ },
+ "uo_glitch": {
+  "desc": "An IO store shows its value on uo_out in EXEC, restores the old value for the retirement cycle, then writes it again (a glitch and return before retirement).",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "no change is due",
+   "pins": "uo_out changed to"
+  }
+ },
+ "load_own_fetch": {
+  "desc": "An LW whose address is its own pc returns the fetched instruction word without an SPI READ of its own (the value is right; contract section 6 requires the READ).",
+  "prog": "selftest",
+  "fail": {
+   "rvfi": "retired without reading load byte"
+  },
+  "pass": [
+   "pins"
+  ]
  }
 }
