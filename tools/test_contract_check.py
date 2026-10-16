@@ -232,6 +232,85 @@ def test_branch_on_older_base_fails_when_contract_moved(repo):
     assert any("tools/eval.py (modified)" in l for l in lines)
 
 
+def index_add(repo, path, content="x\n", mode="100644"):
+    """Stage a blob under any path, bypassing the filesystem (case-insensitive on macOS)."""
+    blob = subprocess.run(["git", "-C", repo, "hash-object", "-w", "--stdin"], input=content,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", repo, "update-index", "--add", "--cacheinfo",
+                    f"{mode},{blob},{path}"], check=True, capture_output=True)
+
+
+def commit_index(repo, msg="index change"):
+    g(repo, "commit", "-q", "-m", msg)
+
+
+@pytest.mark.parametrize("path", ["src/a b.v", "src/a;b.v", 'src/a"b.v', "src/a'b.v",
+                                  "src/a\\b.v", "src/café.v", "src/a\tb.v", "src/a\x01b.v",
+                                  "src/-Wno-fatal.v", "src/sub/-x.v", "src/a$b.v",
+                                  "src/z.v; log INJECTED; log x.v"])
+def test_non_portable_paths_fail(repo, path):
+    index_add(repo, path)
+    commit_index(repo)
+    ok, lines = run(repo)
+    assert not ok, lines
+    assert any("non-portable path" in l for l in lines), lines
+
+
+def test_portable_odd_but_legal_names_pass(repo):
+    index_add(repo, "src/alu_v2.v")
+    index_add(repo, "src/test_alu/vec-1.hex")
+    index_add(repo, "src/regs+mux.v")
+    commit_index(repo)
+    ok, lines = run(repo)
+    assert ok, lines
+
+
+def test_case_fold_collision_fails(repo):
+    index_add(repo, "src/ALU.v", "module ALU; endmodule\n")     # src/alu.v exists in BASE
+    commit_index(repo)
+    ok, lines = run(repo)
+    assert not ok
+    assert any("src/ALU.v (added): case-fold collision with src/alu.v" in l for l in lines), lines
+
+
+def test_case_fold_directory_collision_fails(repo):
+    index_add(repo, "src/sub/a.v")
+    index_add(repo, "src/Sub/b.v")
+    commit_index(repo)
+    ok, lines = run(repo)
+    assert not ok
+    assert any("case-fold collision" in l for l in lines), lines
+
+
+def test_case_collision_with_contract_path_fails(repo):
+    index_add(repo, "src/Config.json", "{}\n")
+    commit_index(repo)
+    ok, lines = run(repo)
+    assert not ok
+    assert any("src/Config.json (added): case-fold collision with src/config.json" in l
+               for l in lines), lines
+
+
+def test_gitlink_in_src_fails(repo):
+    g(repo, "update-index", "--add", "--cacheinfo", f"160000,{SUB_B},src/vendor_core")
+    commit_index(repo)
+    ok, lines = run(repo)
+    assert not ok
+    assert any("src/vendor_core (added): symlinks and submodules" in l for l in lines), lines
+
+
+def test_runs_from_champion_checkout_with_repo_option(repo, tmp_path):
+    # The lead runs main's copy against main's repository, from any directory.
+    write(repo, "src/alu.v", "module alu; wire q; endmodule\n")
+    hyp = commit(repo)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    p = subprocess.run([sys.executable, os.path.join(HERE, "contract_check.py"), "--repo", repo,
+                        base_sha(repo), hyp], capture_output=True, text=True, cwd=elsewhere)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "PASS: 1 changed path(s)" in p.stdout
+
+
 def test_cli_exit_codes(repo):
     script = os.path.join(HERE, "contract_check.py")
     base = base_sha(repo)

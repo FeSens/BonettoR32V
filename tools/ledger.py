@@ -2,18 +2,26 @@
 """The loop's record: loop/ledger.jsonl (one JSON object per line) and loop/LEADERBOARD.md.
 
 Commands:
-  ledger.py add --id NNN --branch B --sha SHA --idea "..." --verdict {merged,rejected,failed}
+  ledger.py add --id NNN --branch B --sha SHA --idea "..."
+                --verdict {merged,rejected,failed,rolled_back}
                 [--eval build/eval.json] [--notes "..."] [--parent-sha SHA]
+                [--tile-fraction F] [--formal-deep pass|fail]
       Appends one entry. Fields: id, ts, branch, sha, parent_sha, idea, verdict, area_um2,
-      cells, delta_um2, gates, notes. area_um2, cells and gates come from --eval.
-      parent_sha defaults to the current champion's sha; delta_um2 is area_um2 minus the
-      champion's area_um2 (negative is smaller, which is better).
+      cells, delta_um2, gates, notes, tile_fraction, formal_deep. area_um2, cells and gates come
+      from --eval. parent_sha defaults to the current champion's sha; delta_um2 is area_um2 minus
+      the champion's area_um2 (negative is smaller, which is better). tile_fraction (from
+      `make tilefit`, 0 < F <= 1) and formal_deep (pass, fail) are optional, null by default.
       A `merged` entry needs --eval with pass: true, a clean tree (dirty: false) and the same sha.
       An --eval whose sha differs from --sha is refused for every verdict.
+      A `rolled_back` entry names the current champion's sha (for example after formal-deep
+      fails); the champion becomes the previous merged entry again.
+  ledger.py annotate --id NNN [--tile-fraction F] [--formal-deep pass|fail] [--notes-append T]
+      Records champion-round results on an existing entry (rewrites that one line).
   ledger.py board     regenerates loop/LEADERBOARD.md (champion history, last 20 hypotheses)
-  ledger.py show      prints the current champion (the latest merged entry); --json for raw
+  ledger.py show      prints the current champion; --json for raw
   ledger.py next-id   prints the next sequential id
 
+Champion: the latest merged entry that no later rolled_back entry names.
 Lines that are blank or start with '#' are skipped.
 """
 import argparse
@@ -27,9 +35,10 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER = os.path.join(REPO, "loop", "ledger.jsonl")
 BOARD = os.path.join(REPO, "loop", "LEADERBOARD.md")
-VERDICTS = ("merged", "rejected", "failed")
+VERDICTS = ("merged", "rejected", "failed", "rolled_back")
+FORMAL_DEEP = ("pass", "fail")
 FIELDS = ("id", "ts", "branch", "sha", "parent_sha", "idea", "verdict", "area_um2", "cells",
-          "delta_um2", "gates", "notes")
+          "delta_um2", "gates", "notes", "tile_fraction", "formal_deep")
 RECENT = 20
 
 
@@ -53,9 +62,34 @@ def load(path):
     return entries
 
 
+def replay(entries):
+    """Apply merged and rolled_back entries in order.
+
+    Returns (standing, rolled): the merged entries still standing (oldest first) and
+    {id of a rolled-back merged entry: id of the rolled_back entry that names it}.
+    """
+    standing, rolled = [], {}
+    for e in entries:
+        if e.get("verdict") == "merged":
+            standing.append(e)
+        elif e.get("verdict") == "rolled_back":
+            for i in range(len(standing) - 1, -1, -1):
+                if same_sha(standing[i].get("sha"), e.get("sha")):
+                    rolled[standing[i]["id"]] = e["id"]
+                    del standing[i]
+                    break
+    return standing, rolled
+
+
 def champion(entries):
-    merged = [e for e in entries if e.get("verdict") == "merged"]
-    return merged[-1] if merged else None
+    standing, _ = replay(entries)
+    return standing[-1] if standing else None
+
+
+def check_tile_fraction(value):
+    if value is not None and not (0 < value <= 1):
+        raise LedgerError(f"tile_fraction {value} must be in (0, 1]")
+    return value
 
 
 def next_id(entries):
@@ -108,10 +142,19 @@ def make_entry(entries, args, ts=None):
     elif args.verdict == "merged":
         raise LedgerError("a merged entry needs --eval")
     champ = champion(entries)
-    parent = args.parent_sha if args.parent_sha else (champ["sha"] if champ else None)
     delta = None
-    if champ and isinstance(area, (int, float)) and isinstance(champ.get("area_um2"), (int, float)):
-        delta = round(area - champ["area_um2"], 3)
+    if args.verdict == "rolled_back":
+        if not champ or not same_sha(champ["sha"], sha):
+            raise LedgerError(f"rolled_back must name the current champion's sha "
+                              f"({champ['sha'] if champ else 'none'}), not {sha}")
+        parent = args.parent_sha or champ.get("parent_sha")
+        if not args.eval:
+            area, cells = champ.get("area_um2"), champ.get("cells")
+    else:
+        parent = args.parent_sha if args.parent_sha else (champ["sha"] if champ else None)
+        if (champ and isinstance(area, (int, float))
+                and isinstance(champ.get("area_um2"), (int, float))):
+            delta = round(area - champ["area_um2"], 3)
     entry = {
         "id": args.id,
         "ts": ts or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -125,8 +168,33 @@ def make_entry(entries, args, ts=None):
         "delta_um2": delta,
         "gates": gates,
         "notes": args.notes or "",
+        "tile_fraction": check_tile_fraction(args.tile_fraction),
+        "formal_deep": args.formal_deep,
     }
     return {k: entry[k] for k in FIELDS}
+
+
+def annotate(entries, args):
+    """Return the entries with champion-round results recorded on entry args.id."""
+    hits = [e for e in entries if e.get("id") == args.id]
+    if not hits:
+        raise LedgerError(f"no entry with id {args.id}")
+    if args.tile_fraction is None and args.formal_deep is None and not args.notes_append:
+        raise LedgerError("annotate needs --tile-fraction, --formal-deep or --notes-append")
+    e = hits[0]
+    if args.tile_fraction is not None:
+        e["tile_fraction"] = check_tile_fraction(args.tile_fraction)
+    if args.formal_deep is not None:
+        e["formal_deep"] = args.formal_deep
+    if args.notes_append:
+        e["notes"] = (e.get("notes") + "; " if e.get("notes") else "") + args.notes_append
+    for k in FIELDS:
+        e.setdefault(k, None)
+    return entries
+
+
+def fmt_tile(v):
+    return "-" if v is None else f"{v:.3f}"
 
 
 def fmt_num(v, nd=1):
@@ -158,12 +226,14 @@ def render_board(entries):
            "Score: `area_um2`, the sky130_fd_sc_hd cell area from `make area` (lower wins). "
            "Delta is against the champion at the time of the entry.", ""]
     champ = champion(entries)
+    _, rolled = replay(entries)
     out.append("## Current champion")
     out.append("")
     if champ:
         out.append(f"**{champ['id']}** `{champ['sha'][:12]}` ({champ['branch']}): "
-                   f"{fmt_num(champ['area_um2'])} µm², {fmt_num(champ['cells'])} cells. "
-                   f"{cell(champ['idea'], 200)}")
+                   f"{fmt_num(champ['area_um2'])} µm², {fmt_num(champ['cells'])} cells, "
+                   f"tile fraction {fmt_tile(champ.get('tile_fraction'))}, deep formal "
+                   f"{champ.get('formal_deep') or '-'}. {cell(champ['idea'], 200)}")
     else:
         out.append("No champion yet.")
     out.append("")
@@ -171,17 +241,22 @@ def render_board(entries):
     out.append("")
     merged = [e for e in entries if e.get("verdict") == "merged"]
     if merged:
-        out.append("| # | id | date | sha | area µm² | cells | delta µm² | delta % | idea |")
-        out.append("|---|---|---|---|---|---|---|---|---|")
+        out.append("| # | id | date | sha | area µm² | cells | delta µm² | delta % | tile fraction "
+                   "| deep formal | status | idea |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
         prev = None
         for i, e in enumerate(merged):
             pct = "-"
             if prev is not None and isinstance(e.get("area_um2"), (int, float)) and prev:
                 pct = f"{100.0 * (e['area_um2'] - prev) / prev:+.2f}%"
+            status = f"rolled back by {rolled[e['id']]}" if e["id"] in rolled else (
+                "champion" if champ and e["id"] == champ["id"] else "-")
             out.append(f"| {i} | {e['id']} | {e['ts'][:10]} | `{e['sha'][:10]}` | "
                        f"{fmt_num(e.get('area_um2'))} | {fmt_num(e.get('cells'))} | "
-                       f"{fmt_delta(e.get('delta_um2'))} | {pct} | {cell(e.get('idea'))} |")
-            if isinstance(e.get("area_um2"), (int, float)):
+                       f"{fmt_delta(e.get('delta_um2'))} | {pct} | "
+                       f"{fmt_tile(e.get('tile_fraction'))} | {e.get('formal_deep') or '-'} | "
+                       f"{status} | {cell(e.get('idea'))} |")
+            if isinstance(e.get("area_um2"), (int, float)) and e["id"] not in rolled:
                 prev = e["area_um2"]
     else:
         out.append("No merged entries yet.")
@@ -218,6 +293,12 @@ def main(argv=None):
     a.add_argument("--eval", help="build/eval.json of a `make eval` on exactly --sha")
     a.add_argument("--notes", default="")
     a.add_argument("--parent-sha", help="default: the current champion's sha")
+    for p in (a, sub.add_parser("annotate", help="record champion-round results on an entry")):
+        p.add_argument("--tile-fraction", type=float, help="from make tilefit, in (0, 1]")
+        p.add_argument("--formal-deep", choices=FORMAL_DEEP)
+    ann = sub.choices["annotate"]
+    ann.add_argument("--id", required=True)
+    ann.add_argument("--notes-append", default="")
     sub.add_parser("board", help="regenerate loop/LEADERBOARD.md")
     s = sub.add_parser("show", help="print the current champion")
     s.add_argument("--json", action="store_true")
@@ -234,6 +315,14 @@ def main(argv=None):
             print(f"ledger: added {entry['id']} ({entry['verdict']}), area "
                   f"{fmt_num(entry['area_um2'])} µm², delta {fmt_delta(entry['delta_um2'])}")
             print("ledger: run `python3 tools/ledger.py board` and commit loop/")
+        elif args.cmd == "annotate":
+            entries = annotate(entries, args)
+            tmp = args.ledger + ".tmp"
+            with open(tmp, "w") as f:
+                for e in entries:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            os.replace(tmp, args.ledger)
+            print(f"ledger: annotated {args.id}; run `python3 tools/ledger.py board`")
         elif args.cmd == "board":
             with open(args.board_path, "w") as f:
                 f.write(render_board(entries))
@@ -248,6 +337,8 @@ def main(argv=None):
                 print(f"champion {champ['id']}: {champ['sha']} ({champ['branch']})")
                 print(f"  area {fmt_num(champ['area_um2'])} um2, {fmt_num(champ['cells'])} cells, "
                       f"merged {champ['ts']}")
+                print(f"  tile fraction {fmt_tile(champ.get('tile_fraction'))}, deep formal "
+                      f"{champ.get('formal_deep') or '-'}")
                 print(f"  idea:  {champ['idea']}")
                 if champ.get("notes"):
                     print(f"  notes: {champ['notes']}")

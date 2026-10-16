@@ -164,6 +164,79 @@ def test_explicit_parent_sha(paths, tmp_path):
     assert entries(paths)[1]["parent_sha"] == HYP3
 
 
+def test_optional_fields_default_null_and_can_be_set(paths, tmp_path):
+    add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500)
+    rc = cli(paths, "add", "--id", "001", "--branch", "b", "--sha", HYP1, "--idea", "i",
+             "--verdict", "merged", "--eval", eval_json(tmp_path, HYP1, 19000.0, 1400),
+             "--tile-fraction", "0.42", "--formal-deep", "pass")
+    assert rc == 0
+    e = entries(paths)
+    assert e[0]["tile_fraction"] is None and e[0]["formal_deep"] is None
+    assert e[1]["tile_fraction"] == 0.42 and e[1]["formal_deep"] == "pass"
+
+
+@pytest.mark.parametrize("frac", ["0", "1.5", "-0.1"])
+def test_bad_tile_fraction_refused(paths, tmp_path, capsys, frac):
+    rc = cli(paths, "add", "--id", "000", "--branch", "b", "--sha", SEED, "--idea", "i",
+             "--verdict", "failed", "--tile-fraction", frac)
+    assert rc == 1 and "tile_fraction" in capsys.readouterr().err
+
+
+def test_rolled_back_restores_previous_champion(paths, tmp_path, capsys):
+    add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500, idea="seed")
+    add(paths, tmp_path, "001", HYP1, "merged", 15000.0, 1200, idea="bit-serial")
+    assert ledger.champion(entries(paths))["id"] == "001"
+    rc = cli(paths, "annotate", "--id", "001", "--formal-deep", "fail",
+             "--notes-append", "deep formal: reg check cex")
+    assert rc == 0
+    rc = cli(paths, "add", "--id", "002", "--branch", "hyp/001-bit-serial", "--sha", HYP1,
+             "--idea", "roll back 001", "--verdict", "rolled_back", "--formal-deep", "fail")
+    assert rc == 0
+    e = entries(paths)
+    assert e[1]["formal_deep"] == "fail" and "reg check cex" in e[1]["notes"]
+    assert e[2]["verdict"] == "rolled_back" and e[2]["parent_sha"] == SEED
+    assert e[2]["area_um2"] == 15000.0 and e[2]["delta_um2"] is None
+    capsys.readouterr()
+    assert cli(paths, "show") == 0
+    assert "champion 000" in capsys.readouterr().out
+    # The next hypothesis is measured against the restored champion.
+    add(paths, tmp_path, "003", HYP2, "rejected", 19000.0, 1450)
+    assert entries(paths)[3]["parent_sha"] == SEED and entries(paths)[3]["delta_um2"] == -1000.0
+    cli(paths, "board")
+    text = open(paths[1]).read()
+    assert "rolled back by 002" in text and "| champion |" in text and "**000**" in text
+
+
+def test_rolled_back_must_name_current_champion(paths, tmp_path, capsys):
+    add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500)
+    add(paths, tmp_path, "001", HYP1, "merged", 15000.0, 1200)
+    rc = cli(paths, "add", "--id", "002", "--branch", "b", "--sha", SEED, "--idea", "i",
+             "--verdict", "rolled_back")
+    assert rc == 1 and "current champion" in capsys.readouterr().err
+
+
+def test_annotate_tile_fraction_shows_on_board(paths, tmp_path, capsys):
+    add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500)
+    assert cli(paths, "annotate", "--id", "000", "--tile-fraction", "0.375") == 0
+    assert entries(paths)[0]["tile_fraction"] == 0.375
+    cli(paths, "board")
+    text = open(paths[1]).read()
+    assert "tile fraction 0.375" in text
+    history = text.split("## Champion history")[1].split("## Last")[0]
+    assert "| tile fraction |" in history and "| 0.375 |" in history
+    capsys.readouterr()
+    cli(paths, "show")
+    assert "tile fraction 0.375" in capsys.readouterr().out
+
+
+def test_annotate_errors(paths, tmp_path, capsys):
+    add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500)
+    assert cli(paths, "annotate", "--id", "009", "--tile-fraction", "0.5") == 1
+    assert "no entry with id 009" in capsys.readouterr().err
+    assert cli(paths, "annotate", "--id", "000") == 1
+    assert "annotate needs" in capsys.readouterr().err
+
+
 def test_repo_ledger_is_valid():
     path = os.path.join(os.path.dirname(HERE), "loop", "ledger.jsonl")
     assert os.path.exists(path)

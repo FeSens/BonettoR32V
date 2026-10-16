@@ -25,9 +25,14 @@ import shutil
 import subprocess
 import sys
 import time
+import re
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import src_check  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SAFE_PATH = re.compile(r"^/[A-Za-z0-9_./+-]+$")
 TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
 TOP = "tt_um_fesens_r32v"
 ORDER = ["lint", "cosim", "equiv", "formal", "arch", "area", "gl"]
@@ -153,13 +158,15 @@ def last_json_line(lines):
 # ---------------------------------------------------------------------------------------------
 
 def gate_lint(ctx):
-    """verilator --lint-only -Wall over src/*.v, top tt_um_fesens_r32v, plain and RISCV_FORMAL."""
+    """tools/src_check.py first, then verilator --lint-only -Wall over src/*.v (top
+    tt_um_fesens_r32v), plain and RISCV_FORMAL builds."""
+    problems = src_check.check(ctx.path("src"))
+    if problems:
+        shown = "; ".join(problems[:3]) + (f" (+{len(problems) - 3} more)"
+                                           if len(problems) > 3 else "")
+        raise GateFail(f"src hygiene (tools/src_check.py): {shown}")
     ctx.need_tool("lint", "verilator")
     srcs = ctx.src_files("lint")
-    other_hdl = sorted(glob.glob(ctx.path("src", "*.sv")) + glob.glob(ctx.path("src", "*.svh")))
-    if other_hdl:
-        raise GateFail("gate lint: SystemVerilog files in src/ (contract section 1: plain "
-                       "Verilog only): " + ", ".join(os.path.basename(p) for p in other_hdl))
     inc = ctx.path("third_party", "riscv-formal", "checks")
     if not os.path.isfile(os.path.join(inc, "rvfi_macros.vh")):
         raise GateFail("gate lint: third_party/riscv-formal not initialized "
@@ -169,6 +176,11 @@ def gate_lint(ctx):
     prelude = os.path.join(work, "rvfi_prelude.vh")
     with open(prelude, "w") as f:
         f.write('`include "rvfi_macros.vh"\n')
+    # Paths go to Verilator as separate argv entries (no shell). They are absolute (so none can
+    # read as an option) and must match SAFE_PATH, as a second line behind src_check.
+    for p in [inc, prelude] + srcs:
+        if not SAFE_PATH.match(p):
+            raise GateFail(f"gate lint: unsafe path {p!r}")
     base = ["verilator", "--lint-only", "-Wall", "--top-module", TOP]
     builds = (("plain", []),
               ("RISCV_FORMAL", ["-D" + d for d in RVFI_DEFINES] + ["-I" + inc, prelude]))
@@ -321,7 +333,7 @@ def gate_area(ctx):
     netlist = netlist if os.path.isabs(netlist) else ctx.path(netlist)
     if not os.path.isfile(netlist):
         raise GateFail(f"gate area: netlist {netlist} missing")
-    ctx.notes.update({"area_um2": area, "cells": cells, "netlist": netlist})
+    ctx.notes.update({"area_um2": area, "cells": cells, "netlist": netlist, "area_t0": t0})
     return (f"{area} um2, {cells} cells, {j.get('flops')} flops, 0 latches",
             {"area_um2": area, "cells": cells, "flops": j.get("flops")})
 
@@ -347,6 +359,9 @@ def gate_gl(ctx):
         except GateFail as e:
             raise GateFail(f"gate gl: needs the area netlist, and area failed: {e}")
     netlist = ctx.notes["netlist"]
+    if os.path.getmtime(netlist) < ctx.notes["area_t0"] - 1:
+        raise GateFail(f"gate gl: {os.path.relpath(netlist, ctx.repo)} is older than this run's "
+                       f"area step (area.py did not rewrite it)")
     shutil.copyfile(netlist, ctx.path("test", "gate_level_netlist.v"))
     env = dict(ctx.env)
     if not env.get("PDK_ROOT") and os.path.isdir(os.path.expanduser("~/.ciel/sky130A")):

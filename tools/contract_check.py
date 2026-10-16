@@ -13,14 +13,25 @@ Allowed (CLAUDE.md, docs/contract.md section 7):
 Everything else fails, including deletions and renames out of src/ (renames are listed as a
 delete plus an add, so both paths are judged). Symlinks and submodules (gitlinks) fail anywhere.
 
+Every changed path that exists in HEAD must also be portable: only [A-Za-z0-9._+-] and `/`, no
+component starting with `-` (no whitespace, control characters, `;`, quotes, backslash or
+non-ASCII), and no case-fold collision with another path in HEAD (macOS checkouts are
+case-insensitive, so two such paths would show the tools one file and git another).
+
 Independently of the path list, it fingerprints the don't-touch list: every path in it must have
 the same git object id in BASE and HEAD (the riscv-formal submodule pointer included).
+
+Run it from the CHAMPION checkout, never from the candidate's worktree, so a candidate's own tools
+can't certify themselves:  python3 <main>/tools/contract_check.py --repo <main> BASE HEAD
 
 Exit 0 on PASS, 1 on FAIL (the offending paths are listed), 2 on usage errors.
 """
 import argparse
+import re
 import subprocess
 import sys
+
+PORTABLE_COMPONENT = re.compile(r"^[A-Za-z0-9._+][A-Za-z0-9._+-]*$")
 
 DONT_TOUCH = ["verif", "tools", "test", "third_party", "info.yaml", "src/config.json",
               "docs/contract.md", "CLAUDE.md", "Makefile", ".github", "loop", ".claude"]
@@ -32,10 +43,33 @@ class GitError(Exception):
 
 
 def git(repo, *args):
-    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True)
     if p.returncode != 0:
-        raise GitError(f"git {' '.join(args)}: {p.stderr.strip()}")
-    return p.stdout
+        raise GitError(f"git {' '.join(args)}: {p.stderr.decode(errors='replace').strip()}")
+    # Paths may hold any bytes; keep them recoverable so the portability check can see them.
+    return p.stdout.decode("utf-8", errors="surrogateescape")
+
+
+def portable(path):
+    """'' when the path is portable, else the reason."""
+    if any(ord(c) > 127 for c in path):
+        return "non-ASCII or non-UTF-8 characters"
+    for comp in path.split("/"):
+        if comp in ("", ".", ".."):
+            return f"bad path component {comp!r}"
+        if not PORTABLE_COMPONENT.match(comp):
+            return (f"component {comp!r} has characters outside [A-Za-z0-9._+-] or starts "
+                    f"with '-'")
+    return ""
+
+
+def casefold_collisions(repo, commit):
+    """{casefolded path: sorted distinct paths} for every collision in the commit's tree."""
+    out = git(repo, "ls-tree", "-r", "-t", "-z", "--name-only", commit)
+    groups = {}
+    for p in filter(None, out.split("\0")):
+        groups.setdefault(p.casefold(), set()).add(p)
+    return {k: sorted(v) for k, v in groups.items() if len(v) > 1}
 
 
 def resolve(repo, rev):
@@ -90,12 +124,28 @@ def check(repo, base_rev, head_rev, physical=False):
     bad = []
     rows = changed(repo, base, head)
     kind = {"A": "added", "D": "deleted", "M": "modified", "T": "type changed"}
+    collisions = casefold_collisions(repo, head)
     for status, src_mode, dst_mode, path in rows:
+        shown = path.encode("utf-8", errors="surrogateescape").decode("ascii", "backslashreplace")
         ok, why = path_allowed(path, physical)
         if ok and ("120000" in (src_mode, dst_mode) or "160000" in (src_mode, dst_mode)):
             ok, why = False, "symlinks and submodules are not allowed in a hypothesis"
+        if ok and status != "D":
+            reason = portable(path)
+            if reason:
+                ok, why = False, f"non-portable path: {reason}"
+        if ok and status != "D":
+            parts = path.split("/")
+            for i in range(1, len(parts) + 1):
+                prefix = "/".join(parts[:i])
+                if prefix.casefold() in collisions:
+                    ok, why = False, ("case-fold collision with "
+                                      + ", ".join(p for p in collisions[prefix.casefold()]
+                                                  if p != prefix))
+                    break
         if not ok:
-            bad.append(f"  {path} ({kind.get(status, status)}): {why}")
+            label = path if not portable(path) else repr(shown)
+            bad.append(f"  {label} ({kind.get(status, status)}): {why}")
 
     fp_bad = []
     for path in DONT_TOUCH:

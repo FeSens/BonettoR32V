@@ -116,6 +116,73 @@ def test_syntax_error_fails(tmp_path):
     assert "yosys build" in j["detail"]
 
 
+def test_file_name_injection_blocked_before_yosys(tmp_path):
+    # Review repro: a file named like this used to inject yosys commands into the build script.
+    src = copy_fixture(tmp_path, "pass_observer")
+    (src / "z.v; log INJECTED_CMD_RAN; log x.v").write_text("module zz; endmodule\n")
+    rc, j, out = run_equiv(tmp_path, src)
+    assert rc == 1
+    assert "src hygiene" in j["detail"] and "name must match" in j["detail"]
+    assert not (tmp_path / "work").exists()          # nothing was built, no yosys ran
+    assert "INJECTED_CMD_RAN" not in [l.strip() for l in out.splitlines()]
+
+
+def test_macro_split_blocked(tmp_path):
+    src = copy_fixture(tmp_path, "pass_observer", [
+        ("tt_um_fesens_r32v.v", "    assign uo_out  = gpio;\n",
+         "`ifdef YOSYS\n    assign uo_out  = gpio;\n`else\n    assign uo_out  = ~gpio;\n`endif\n"),
+    ])
+    rc, j, _ = run_equiv(tmp_path, src)
+    assert rc == 1 and "`ifdef YOSYS" in j["detail"]
+
+
+def test_rvfi_only_initial_value_blocked(tmp_path):
+    src = copy_fixture(tmp_path, "pass_observer", [
+        ("fx_core.v", "    reg [1:0] ptr;\n",
+         "    reg [1:0] ptr;\n`ifdef RISCV_FORMAL\n    initial ptr = 2'd0;\n`endif\n"),
+    ])
+    rc, j, _ = run_equiv(tmp_path, src)
+    assert rc == 1 and "`initial` is not allowed" in j["detail"]
+
+
+def test_init_wires_reads_yosys_output(tmp_path):
+    # The init-attribute check is the second line behind src_check; pin its parsing to what
+    # yosys actually writes for `reg r = 1` and `initial s = 0`.
+    v = tmp_path / "m.v"
+    v.write_text("module m(input wire clk, input wire d, output wire q, output wire p);\n"
+                 "  reg r = 1'b1;\n  reg s;\n  initial s = 1'b0;\n"
+                 "  always @(posedge clk) begin r <= d; s <= ~s; end\n"
+                 "  assign q = r; assign p = s;\nendmodule\n")
+    il = tmp_path / "m.il"
+    subprocess.run(["yosys", "-q", "-p", f"read_verilog -mem2reg {v}; hierarchy -top m; proc; "
+                    f"flatten; opt_clean; write_rtlil {il}"], check=True, env=equiv.tool_env())
+    assert sorted(equiv.init_wires(str(il))) == ["r", "s"]
+    clean = tmp_path / "clean.il"
+    clean.write_text("module \\m\n  attribute \\src \"x\"\n  wire input 1 \\a\nend\n")
+    assert equiv.init_wires(str(clean)) == []
+
+
+@pytest.mark.parametrize("bad", ["/tmp/a b/x.v", "/tmp/a;b.v", '/tmp/a"b.v', "/tmp/a#b.v",
+                                 "/tmp/a\nlog x.v", "/tmp/caf\u00e9.v"])
+def test_ys_path_rejects_unsafe(bad):
+    with pytest.raises(equiv.UnsafePath):
+        equiv.ys_path(bad)
+
+
+def test_ys_path_quotes_safe():
+    assert equiv.ys_path("/tmp/ok_dir/x-1.v") == '"/tmp/ok_dir/x-1.v"'
+    assert equiv.ys_path("/tmp/ok_dir", quote=False) == "/tmp/ok_dir"
+
+
+def test_unsafe_work_dir_fails(tmp_path):
+    out = tmp_path / "equiv.json"
+    p = subprocess.run([sys.executable, os.path.join(HERE, "equiv.py"), "--src",
+                        os.path.join(FIX, "pass_observer"), "--work", str(tmp_path / "w x"),
+                        "--out", str(out)], capture_output=True, text=True)
+    assert p.returncode == 1
+    assert "unsafe in a yosys script" in json.loads(out.read_text())["detail"]
+
+
 def test_sigbits():
     assert equiv.sigbits("\\uo_out") == [("uo_out", i) for i in range(8)]
     assert equiv.sigbits("\\uo_out [3]") == [("uo_out", 3)]

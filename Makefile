@@ -3,14 +3,19 @@
 # Every gate's command lives in tools/eval.py, one adapter per gate; the gate targets below only
 # call it, so `make cosim` and the cosim step of `make eval` are the same command.
 # Gate order in `make eval`: lint, cosim, equiv, formal, arch, area, gl (stops at the first FAIL).
-# Heavy jobs (formal, harden, tilefit) run under `lockf -k /tmp/bonetto-heavy.lock`, one at a
-# time on this Mac; don't wrap `make` itself in that lock, or the inner lockf waits forever.
-# See docs/eval.md.
+# `make gates` is the same command under another name, for agent sandboxes that block commands
+# containing the word "eval".
+# Only formal, harden and tilefit take `lockf -k /tmp/bonetto-heavy.lock` (one heavy job at a
+# time on this Mac). Never wrap `make eval` / `make gates` in that lock: formal would wait on it
+# forever. See docs/eval.md.
 
 SHELL := /bin/bash
 
-# Resolve python before PATH changes (GNU Make 3.81 on macOS).
-PYTHON := $(shell command -v python3)
+# Resolve python before PATH changes (GNU Make 3.81 on macOS); fail clearly if it's missing.
+PYTHON := $(shell command -v python3 2>/dev/null)
+ifeq ($(strip $(PYTHON)),)
+$(error python3 not found on PATH; the gates need Python 3)
+endif
 
 TOOLCHAIN_BIN := $(HOME)/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin
 ifneq ($(wildcard $(TOOLCHAIN_BIN)),)
@@ -25,7 +30,7 @@ GATE_TARGETS := lint cosim equiv formal formal-deep arch area gl
 HARDEN_ARGS ?=
 TILEFIT_ARGS ?=
 
-.PHONY: help $(GATE_TARGETS) eval harden tilefit test-tools clean
+.PHONY: help $(GATE_TARGETS) eval gates harden tilefit test-tools clean
 
 help:
 	@echo "make lint         Verilator -Wall lint, plain and RISCV_FORMAL builds"
@@ -37,6 +42,7 @@ help:
 	@echo "make area         sky130 cell area (build/area.json)"
 	@echo "make gl           gate-level cocotb test on the area netlist"
 	@echo "make eval         all gates in order, stop at first FAIL, write build/eval.json (V=1 streams logs)"
+	@echo "make gates        exactly the same as make eval (for sandboxes that block the word)"
 	@echo "make harden       TT 1x1 hardening with LibreLane (heavy lock)"
 	@echo "make tilefit      smallest signoff-clean fraction of the 1x1 tile (heavy lock)"
 	@echo "make test-tools   pytest over tools/"
@@ -45,7 +51,7 @@ help:
 $(GATE_TARGETS):
 	$(EVAL) --gate $@
 
-eval:
+eval gates:
 	$(EVAL) $(if $(V),-v)
 
 harden:

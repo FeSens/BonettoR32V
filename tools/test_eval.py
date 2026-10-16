@@ -129,8 +129,52 @@ def test_stale_eval_json_is_replaced(repo, monkeypatch):
     assert json.loads((repo / "build" / "eval.json").read_text())["pass"] is False
 
 
-def test_real_repo_sha_and_dirty_flag():
+def test_sha_and_dirty_flag(repo, monkeypatch):
+    import subprocess
+    for k, v in {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}.items():
+        monkeypatch.setenv(k, v)
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    g("init", "-q")
+    put(repo, ".gitignore", "build/\n")
+    put(repo, "src/top.v", "module top; endmodule\n")
+    g("add", "-A")
+    g("commit", "-q", "-m", "c")
+    sha = g("rev-parse", "HEAD")
+    fake_gates(monkeypatch)
+
+    def run():
+        assert ev.main(["--repo", str(repo)]) == 0
+        return json.loads((repo / "build" / "eval.json").read_text())
+
+    doc = run()                     # build/ (gitignored) now exists: still clean
+    assert doc["sha"] == sha and doc["dirty"] is False
+    put(repo, "src/top.v", "module top; wire x; endmodule\n")
+    assert run()["dirty"] is True   # modified tracked file
+    g("checkout", "--", "src/top.v")
+    put(repo, "src/extra.v", "module extra; endmodule\n")
+    assert run()["dirty"] is True   # untracked file in src/
+
+
+def test_real_repo_sha():
     assert len(ev.git(REPO, "rev-parse", "HEAD")) == 40
+
+
+def test_make_gates_alias_runs_the_same_command():
+    import subprocess
+
+    def dry(target):
+        return subprocess.run(["make", "-n", "-C", REPO, target], capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    assert dry("gates") == dry("eval")
+    assert dry("gates").endswith("tools/eval.py")
+    assert "lockf" not in dry("gates")              # the full run never takes the heavy lock
 
 
 # --- missing runners fail loudly ---------------------------------------------------------------
@@ -181,9 +225,25 @@ def test_lint_warning_fails(repo, where, label):
 def test_lint_rejects_systemverilog(repo):
     put(repo, "src/top.v", "module top; endmodule\n")
     put(repo, "src/alu.sv", "module alu; endmodule\n")
-    if not HAVE_VERILATOR:
-        pytest.skip("verilator not on PATH")
-    assert "SystemVerilog files in src/" in run_gate(repo, "lint")["detail"]
+    assert "SystemVerilog is not allowed" in run_gate(repo, "lint")["detail"]
+
+
+def test_lint_runs_src_hygiene_before_verilator(repo):
+    with_src(repo)
+    put(repo, "src/z.v; log INJECTED; log x.v", "module zz; endmodule\n")
+    doc = run_gate(repo, "lint")
+    assert doc["pass"] is False
+    assert doc["detail"].startswith("src hygiene (tools/src_check.py)")
+    assert not (repo / "build" / "logs" / "lint_plain.log").exists()   # verilator never ran
+
+
+def test_lint_rejects_macro_split(repo):
+    with_src(repo)
+    top = repo / "src" / "tt_um_fesens_r32v.v"
+    top.write_text(top.read_text().replace("    assign uo_out  = gpio;\n",
+                                           "`ifndef SYNTHESIS\n    assign uo_out  = gpio;\n"
+                                           "`else\n    assign uo_out  = ~gpio;\n`endif\n"))
+    assert "`ifndef SYNTHESIS" in run_gate(repo, "lint")["detail"]
 
 
 # --- equiv adapter (real tools/equiv.py) -------------------------------------------------------
@@ -270,6 +330,10 @@ def test_area_adapter(repo, change, ok, msg):
 
 # --- gl adapter --------------------------------------------------------------------------------
 
+WRITE_NETLIST = ("os.makedirs('build/synth', exist_ok=True); "
+                 "open('build/synth/netlist.v', 'w').write('module tt_um_fesens_r32v(); endmodule')")
+
+
 def gl_makefile(xml):
     return ("all:\n\t@test \"$(GATES)\" = yes\n\t@test -f gate_level_netlist.v\n"
             f"\t@printf '%s' '{xml}' > results.xml\n")
@@ -283,12 +347,20 @@ def gl_makefile(xml):
      False),
 ])
 def test_gl_adapter(repo, xml, ok):
-    put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
-    fake_runner(repo, "tools/area.py", "build/area.json", good_area(), 0)
+    fake_runner(repo, "tools/area.py", "build/area.json", good_area(), 0, extra=WRITE_NETLIST)
     put(repo, "test/Makefile", gl_makefile(xml))
     res = run_gate(repo, "gl")
     assert res["pass"] is ok, res["detail"]
     assert (repo / "test" / "gate_level_netlist.v").exists()
+
+
+def test_gl_rejects_netlist_older_than_area_step(repo):
+    netlist = put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
+    os.utime(netlist, (1_000_000_000, 1_000_000_000))      # area.py below does not rewrite it
+    fake_runner(repo, "tools/area.py", "build/area.json", good_area(), 0)
+    put(repo, "test/Makefile", gl_makefile("<testsuites/>"))
+    res = run_gate(repo, "gl")
+    assert res["pass"] is False and "older than this run's area step" in res["detail"]
 
 
 def test_gl_fails_when_area_fails(repo):

@@ -26,6 +26,11 @@ How the proof can fail and pass:
   still removed (they drive nothing once the rvfi ports are gone).
 - `-mem2reg` turns arrays into registers with source-derived names (`rf[3]`), which match across
   builds; `equiv_make` rejects designs that still contain memories.
+- Initial values: neither build may carry an `init` attribute (from `initial` or `reg r = 0;`).
+  The proof ignores init values, so formal could otherwise assume a power-up value the chip lacks.
+- Before anything is built, tools/src_check.py must pass (file names, macros, includes,
+  initial). Every path written into a yosys script must match a strict safe-character pattern and
+  is double-quoted where yosys strips quotes (read_verilog, -I, write_rtlil, read_rtlil).
 
 Usage: equiv.py [--src DIR] [--top NAME] [--out JSON] [--work DIR] [--seq N]
 Exit 0 on PASS, 1 on FAIL. Writes a JSON summary (default build/equiv.json).
@@ -40,7 +45,28 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import src_check  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SAFE_PATH = re.compile(r"^/[A-Za-z0-9_./+-]+$")
+
+
+class UnsafePath(Exception):
+    pass
+
+
+def ys_path(path, quote=True):
+    """An absolute path for a yosys script: validated against SAFE_PATH, then double-quoted.
+
+    Yosys strips the quotes for file arguments (read_verilog, write_rtlil, read_rtlil) but keeps
+    them in `-I <dir>`, so include dirs go unquoted; SAFE_PATH already excludes whitespace,
+    quotes, `;` and `#`, the characters yosys's script tokenizer treats specially.
+    """
+    p = os.path.abspath(path)
+    if not SAFE_PATH.match(p):
+        raise UnsafePath(f"path {p!r} has characters that are unsafe in a yosys script")
+    return f'"{p}"' if quote else p
 TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
 RVFI_INCLUDE = os.path.join(REPO, "third_party", "riscv-formal", "checks")
 RVFI_DEFINES = ["RISCV_FORMAL", "RISCV_FORMAL_NRET=1", "RISCV_FORMAL_XLEN=32",
@@ -185,20 +211,43 @@ def run_yosys(script, log, env):
     return p.returncode
 
 
-def build_script(srcs, top, rvfi, out_il, rename_to, ports_txt, prelude):
-    defs = " ".join("-D" + d for d in RVFI_DEFINES) + f" -I{RVFI_INCLUDE} {prelude}" if rvfi else ""
+def build_script(srcs, top, rvfi, out_il, rename_to, prestrip_il, prelude):
+    """Yosys script for one build. Paths are validated and quoted by ys_path; `top` and
+    `rename_to` are checked identifiers."""
+    files = [ys_path(s) for s in srcs]
+    if rvfi:
+        defs = " ".join("-D" + d for d in RVFI_DEFINES)
+        head = f"read_verilog -mem2reg {defs} -I {ys_path(RVFI_INCLUDE, quote=False)} {ys_path(prelude)}"
+    else:
+        head = "read_verilog -mem2reg"
     lines = [
-        f"read_verilog -mem2reg {defs} {' '.join(srcs)}",
+        f"{head} {' '.join(files)}",
         f"hierarchy -check -top {top}",
         "proc",
         "flatten",
         f"hierarchy -top {top}",
-        f"select -write {ports_txt} {top}/x:*",
     ]
     if rvfi:
-        lines.append(f"delete -port {top}/w:rvfi_*")
-    lines += ["opt_clean", f"rename {top} {rename_to}", f"write_rtlil {out_il}"]
+        lines += [f"write_rtlil {ys_path(prestrip_il)}", f"delete -port {top}/w:rvfi_*"]
+    lines += ["opt_clean", f"rename {top} {rename_to}", f"write_rtlil {ys_path(out_il)}"]
     return "\n".join(lines) + "\n"
+
+
+def init_wires(il_path):
+    """Names of wires that carry an `init` attribute (a power-up value) in an RTLIL file."""
+    names, pending = [], False
+    with open(il_path) as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("attribute \\init "):
+                pending = True
+            elif s.startswith("wire "):
+                if pending:
+                    names.append(s.split()[-1].lstrip("\\"))
+                pending = False
+            elif not s.startswith("attribute "):
+                pending = False
+    return names
 
 
 def main(argv=None):
@@ -229,6 +278,12 @@ def main(argv=None):
 
     if shutil.which("yosys", path=env["PATH"]) is None:
         return finish(False, "yosys not found on PATH")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.top):
+        return finish(False, f"top module name {args.top!r} is not a plain identifier")
+    problems = src_check.check(os.path.abspath(args.src))
+    if problems:
+        return finish(False, f"src hygiene (tools/src_check.py) failed: {problems[0]}"
+                             + (f" (+{len(problems) - 1} more)" if len(problems) > 1 else ""))
     srcs = sorted(glob.glob(os.path.join(os.path.abspath(args.src), "*.v")))
     if not srcs:
         return finish(False, f"no *.v files in {args.src}")
@@ -238,6 +293,10 @@ def main(argv=None):
                              "(run: git submodule update --init third_party/riscv-formal)")
 
     work = os.path.abspath(args.work)
+    try:
+        ys_path(work)
+    except UnsafePath as e:
+        return finish(False, str(e))
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     prelude = os.path.join(work, "rvfi_prelude.vh")
@@ -246,18 +305,22 @@ def main(argv=None):
 
     labels = {"gold": "A (RISCV_FORMAL, rvfi stripped)", "gate": "B (plain)"}
     il = {}
+    prestrip = os.path.join(work, "gold_prestrip.il")
     for name, rvfi in (("gold", True), ("gate", False)):
         il[name] = os.path.join(work, name + ".il")
         ys = os.path.join(work, name + ".ys")
+        try:
+            script = build_script(srcs, args.top, rvfi, il[name], name, prestrip, prelude)
+        except UnsafePath as e:
+            return finish(False, str(e))
         with open(ys, "w") as f:
-            f.write(build_script(srcs, args.top, rvfi, il[name], name,
-                                 os.path.join(work, name + "_ports.txt"), prelude))
+            f.write(script)
         log = os.path.join(work, name + ".log")
         if run_yosys(ys, log, env) != 0 or not os.path.isfile(il[name]):
             return finish(False, f"yosys build {labels[name]} failed (log {log}):\n{tail(log)}")
 
-    with open(os.path.join(work, "gold_ports.txt")) as f:
-        rvfi_ports = sorted(p for p in (l.strip().split("/")[-1] for l in f) if p.startswith("rvfi_"))
+    # The pre-strip dump is written before the rename, so the module still has the top's name.
+    rvfi_ports = sorted(p for p in rtlil_ports(prestrip, args.top) if p.startswith("rvfi_"))
     result["rvfi_ports"] = len(rvfi_ports)
 
     errors = []
@@ -266,18 +329,24 @@ def main(argv=None):
     if errors:
         return finish(False, "port check failed: " + "; ".join(errors))
 
+    inits = {name: init_wires(il[name]) for name in ("gold", "gate")}
+    if inits["gold"] or inits["gate"]:
+        shown = ", ".join(f"{labels[n]}: {', '.join(w[:6])}" for n, w in inits.items() if w)
+        return finish(False, f"initial values (init attributes) are not allowed: {shown}; the "
+                             f"chip has no power-up values and the proof ignores them")
+
     ys = os.path.join(work, "equiv.ys")
     equiv_il = os.path.join(work, "equiv.il")
     with open(ys, "w") as f:
         f.write("\n".join([
-            f"read_rtlil {il['gold']}",
-            f"read_rtlil {il['gate']}",
+            f"read_rtlil {ys_path(il['gold'])}",
+            f"read_rtlil {ys_path(il['gate'])}",
             "async2sync",
             "equiv_make gold gate equiv",
             "hierarchy -top equiv",
             f"equiv_simple -seq {args.seq}",
             f"equiv_induct -seq {args.seq}",
-            f"write_rtlil {equiv_il}",
+            f"write_rtlil {ys_path(equiv_il)}",
             "equiv_status -assert",
         ]) + "\n")
     log = os.path.join(work, "equiv.log")
