@@ -5,12 +5,10 @@
 // one line per retirement: "RETIRE <cycle> <insn hex> <trap>". Cycle 0 is the first
 // rising edge with rst_n high. It ends on a halt or after +max_cycles.
 //
-// iverilog -g2012 -DRISCV_FORMAL -I<riscv-formal>/checks -o tb timing_tb.v core.v
+// iverilog -g2012 -DRISCV_FORMAL -o tb timing_tb.v src/*.v   (RISCV_FORMAL is the only
+// define src/ sees)
 // vvp tb +hex=<64 KB byte image, one byte per line> [+max_cycles=N]
 `timescale 1ns/1ps
-`define RISCV_FORMAL_NRET 1
-`define RISCV_FORMAL_XLEN 32
-`define RISCV_FORMAL_ILEN 32
 
 module timing_tb;
 	reg clk = 0;

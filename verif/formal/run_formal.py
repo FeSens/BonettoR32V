@@ -8,10 +8,10 @@ Run it under the heavy-job lock:  lockf -k /tmp/bonetto-heavy.lock python3 verif
 Steps:
   1. Stage src/*.v and src/*.sv (plus *.vh/*.svh includes) into a per-PID work dir
      build/formal/work-<pid>/ (stale dirs of dead PIDs are reaped).
-  2. Pre-pass (yosys): elaborate the RISCV_FORMAL build of tt_um_fesens_r32v, check
-     its structure (no latches, every flip-flop on the rising edge of clk, no
-     formal-only cells), strip any formal statements and initial values from the
-     core, write core.il. The checkers are read separately, so the core's macros
+  2. Pre-pass (yosys): elaborate the RISCV_FORMAL build of tt_um_fesens_r32v (src/ is
+     read with -DRISCV_FORMAL and no other define), check its structure (no latches,
+     every flip-flop on the rising edge of clk, no formal-only cells), strip any
+     formal statements and initial values from the core, write core.il. The checkers are read separately, so the core's macros
      and modules cannot reach them (a module name clash is a yosys error).
   3. Depth D (never set by an agent): D = max(depth_floor, D_min) with
      D_min = reset_steps + max(first_retire_cycle, max_cycles_per_insn) +
@@ -210,21 +210,18 @@ LATCH_TYPES = {"$dlatch", "$adlatch", "$dlatchsr", "$sr"}
 
 
 def prepass(work, sdir, rtl):
-    """Elaborate the RISCV_FORMAL build, check structure, write core.il."""
-    defs = os.path.join(work, "core_defs.vh")
-    with open(defs, "w") as f:
-        f.write("`define RISCV_FORMAL\n`define RISCV_FORMAL_NRET 1\n"
-                "`define RISCV_FORMAL_XLEN 32\n`define RISCV_FORMAL_ILEN 32\n"
-                "`include \"rvfi_macros.vh\"\n")
+    """Elaborate the RISCV_FORMAL build, check structure, write core.il. src/ is read
+    with exactly one define, RISCV_FORMAL (contract: no riscv-formal macro prelude in
+    front of src/); the checkers' defines never reach it."""
     core_il = os.path.join(work, "core.il")
     struct_json = os.path.join(work, "struct.json")
     ys = os.path.join(work, "prepass.ys")
-    for p in [defs, sdir, RVF] + rtl:
+    for p in [sdir] + rtl:
         if re.search(r"\s", p):
             sys.exit(f"[formal] ERROR: path with whitespace not supported: {p}")
-    files = " ".join([defs] + rtl)
+    files = " ".join(rtl)
     with open(ys, "w") as f:
-        f.write(f"""read_verilog -sv -I{sdir} -I{RVF}/checks {files}
+        f.write(f"""read_verilog -sv -DRISCV_FORMAL {files}
 hierarchy -check -top {TOP}
 proc
 select -assert-none t:$initstate t:$anyconst t:$anyseq t:$anyinit t:$allconst t:$allseq
@@ -274,11 +271,10 @@ def pins_equiv(work, sdir, rtl):
     equivalent to the plain build (yosys equiv_make / equiv_simple / equiv_induct).
     The equivalence gate does the same on the synthesized netlists; this keeps the
     formal result self-contained."""
-    defs = os.path.join(work, "core_defs.vh")
     files = " ".join(rtl)
     ys = os.path.join(work, "equiv.ys")
     with open(ys, "w") as f:
-        f.write(f"""read_verilog -sv -I{sdir} {files}
+        f.write(f"""read_verilog -sv {files}
 hierarchy -check -top {TOP}
 proc
 flatten
@@ -287,7 +283,7 @@ setattr -unset init
 opt_clean
 rename {TOP} gold
 design -stash gold
-read_verilog -sv -I{sdir} -I{RVF}/checks {defs} {files}
+read_verilog -sv -DRISCV_FORMAL {files}
 hierarchy -check -top {TOP}
 proc
 flatten
@@ -349,7 +345,7 @@ def timing_from_retires(retires):
 def measure_timing(work, sdir, rtl, prog_hex):
     """Fallback: run timing_tb.v (Icarus) on the candidate."""
     tb = os.path.join(work, "timing_tb")
-    rc = run(["iverilog", "-g2012", "-DRISCV_FORMAL", f"-I{RVF}/checks", f"-I{sdir}", "-o", tb,
+    rc = run(["iverilog", "-g2012", "-DRISCV_FORMAL", "-o", tb,
               os.path.join(HERE, "timing_tb.v")] + rtl, cwd=work,
              log_path=os.path.join(work, "timing_build.log"))
     if rc != 0:

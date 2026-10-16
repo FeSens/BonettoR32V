@@ -94,6 +94,50 @@ assumed afterwards) and re-checks the rest in the same unrolling, so:
 A reach costs one extra satisfiable call in an unrolling the proof needs anyway. SBY's cover mode
 would solve step by step, and a separate reach task would unroll the design again.
 
+## Properties and the contract clauses they encode
+
+Every assertion, by check (one SBY task each; `insn_<name>` is 40 tasks). Each check also has
+the triggers listed under "reach", which must be reached (see "Non-vacuity").
+
+| Check | Assertions | Contract clause |
+|---|---|---|
+| structure (pre-pass) | no latches; every flip-flop `$dff`-family on the rising edge of `clk`; no formal-only cells in the core; initial values removed | 1: single clock domain, no latches, no negedge flip-flops, no reliance on power-up values |
+| equiv (pre-pass) | RVFI build with `rvfi_*` stripped is equivalent to the plain build | 6: RVFI logic drives no pin |
+| `insn_<name>` | `insn_trap`, `insn_halt` (trap and halt equal the spec's trap) | 4: fatal traps (ECALL, EBREAK, misaligned jump/branch target), trap = halt; nothing else traps |
+| | `insn_trap_rd_addr`, `insn_trap_wmask` (on a spec trap) | 4: no register write and no memory write; 6: only these are compared on a trapping retirement |
+| | `insn_rs1_zero`, `insn_rs2_zero`, `insn_rs1_addr`, `insn_rs2_addr` (non-trapping) | 6: register fields report the index read, unused fields 0 with rdata 0; 4: x0 reads 0 |
+| | `insn_rd_addr`, `insn_rd_wdata`, `insn_pc_wdata` (non-trapping) | 4: RV32E semantics (riscv-formal's rv32i model, E filter), FENCE a no-op; 6: a write to x0 reports rd 0, wdata 0 |
+| | `insn_rmask`, `insn_wmask`, `insn_mem_addr`, store data per lane | 6: exact first-byte address, LSB-aligned masks, lane k = byte at mem_addr + k; 3/4: misaligned accesses never trap |
+| | reach: `reach_insn`; also `reach_insn_trap` for JAL, JALR, branches, ECALL, EBREAK | non-vacuity |
+| reg | `reg_rs1`, `reg_rs2`, `reg_rs1_rs2` | 4: reads return the last value written (every encoding); 1: registers start unknown but do not change by themselves |
+| pc_fwd | `pc_fwd` | 4: PCs chain (order N's pc_rdata = order N-1's pc_wdata) |
+| pc_bwd | `pc_bwd_order`, `pc_bwd_pc` | 6: one instruction per pulse, order counts retirements; 4: PCs chain |
+| causal | `causal` | 6: in-order retirement; 4: register reads return the last write |
+| unique | `unique_order` | 6: `rvfi_order` counts retirements (no repeats) |
+| rvfi | `conv_intr`, `conv_mode`, `conv_ixl` | 6: intr 0, mode 3, ixl 1 |
+| | `conv_rs1_x0`, `conv_rs2_x0`, `conv_rd_x0`, `conv_rmask` (non-trapping); `conv_wmask` | 6: register and memory field conventions |
+| | `conv_trap_halt`, `conv_trap_rd_addr`, `conv_trap_wmask` | 4: a trap halts, no register or memory write; stricter reading: nothing halts without trapping |
+| | `conv_first_order`, `conv_first_pc`, `conv_order_next` | 6: order from 0; 1: execution starts at pc = 0 |
+| ill | `ill_trap`, `ill_halt`, `ill_rd_addr`, `ill_wmask` for `0x00000000` and `0xFFFFFFFF` | 4: fatal traps |
+| silent | `silent_retire`, `silent_write`, `silent_uo` (after a halting retirement) | 4: never retires again, never starts another SPI WRITE; 3: uo_out changes only on an IO store |
+| liveness | `liveness` (no 1,024-cycle window without a retirement, unless halted) | 4: latency cap |
+| bus_imem | `bus_imem_read`, `bus_imem_value` | 6: fetch completeness (own READ of all 4 bytes, before retirement); 3: fetch reads RAM at pc[15:0] (64 KB alias); 2: memory semantics |
+| bus_dmem | `bus_dmem_load_read`, `bus_dmem_load_value` (non-trapping) | 6: load completeness; 3: RAM bytes (addr[15:0] + k) mod 2^16, misaligned and wrapping |
+| | `bus_dmem_store_once`, `bus_dmem_store_value` | 3: store bytes; 2 rule 5: every byte sent is written; 6: traffic finishes before retirement |
+| | `bus_dmem_write_claimed`, `bus_dmem_read_claimed` | 6: transaction order (a fetch reads only its bytes, a load or store moves only its data); 3: an IO access never appears on the pins |
+| gpio | IO load lanes (unnamed, one per byte lane) | 3: byte X with X[1:0] = 0 reads `ui_in`, other IO bytes read 0 (misaligned multi-byte IO unspecified) |
+| | `gpio_uo_hold`, `gpio_uo_once`, `gpio_uo_cause`, `gpio_uo_value` | 3: uo_out changes only from an IO store writing byte 0, holds the new value no later than one cycle after it retires; 1: 0 after reset |
+| spi | `spi_uio_oe`, `spi_uio_out_hi`, `spi_uio_out_2` | 1: uio_oe constant, unused outputs 0 |
+| | `spi_reset_cs`, `spi_reset_sck`, `spi_reset_uo`, `spi_reset_valid` | 1: reset state of the pins; nothing retires in reset |
+| | `spi_rule1_prev`, `spi_rule1_now`, `spi_rule2` | 2: rules 1 and 2 |
+| | `spi_rule4_cmd`, `spi_rule4_header`, `spi_rule5_write` | 2: rules 4 and 5 |
+| | `spi_cs_at_valid` | 6: CS_n high at the retirement cycle |
+| reset | spi and rvfi checks with rst_n low for 1 to 8 edges | 1: rst_n low for at least one edge |
+| cover | reach only: a non-trapping retirement, a trapping one, a second retirement | riscv-formal's cover check |
+
+Rule 3 (MISO valid only while SCK is high) and rule 6 (no maximum phase length) are environment
+assumptions, not assertions: MISO is noise outside a held high phase, and phase lengths are free.
+
 ## Depth policy
 
 D is computed by the runner, never set by an agent, and recorded in `build/formal.json`:
