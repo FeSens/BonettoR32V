@@ -65,8 +65,14 @@ in sequence, not in parallel.
 1. Run `git log --oneline -3 <branch>` and confirm the sha the agent reported.
 2. Run `git worktree add ../bonetto-verify-NNN <sha>` in a clean worktree. Run
    `git submodule update --init` there too.
-3. Run `python3 tools/contract_check.py <champion_sha> <sha>`. It must exit 0.
-4. Run `make eval` in the verify worktree and read `build/eval.json`. Every gate must pass, and
+3. Run the contract check from the CHAMPION checkout (main), never from the candidate's worktree,
+   so a candidate's own tools can't certify themselves:
+   `python3 /Users/bonetto/bonetto/BonettoR32V/tools/contract_check.py --repo
+   /Users/bonetto/bonetto/BonettoR32V <champion_sha> <sha>`. It must exit 0. The candidate's
+   `tools/`, `verif/` and `test/` are then byte-identical to the champion's, so its `make eval`
+   runs the real gates.
+4. Run `make eval` (or its alias `make gates`) in the verify worktree and read
+   `build/eval.json`. Every gate must pass, and
    `area_um2` must beat the champion's.
 5. Read the diff (`git diff <champion_sha> <sha> -- src/`). Look for contract violations no gate
    catches:
