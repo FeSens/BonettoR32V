@@ -267,7 +267,7 @@ module bonetto_spi_check (
 		if (mon_en && !reset_q && rvfi_valid) spi_cs_at_valid: assert (mon_cs);
 	end
 
-	// Reach covers (bonetto_reach): a complete READ and a complete WRITE.
+	// Triggers (inline reach): a complete READ and a complete WRITE.
 	always @* begin
 		if (!reset) begin
 			`BONETTO_REACH(reach_spi_end_read, ev_end && ev_end_hdr && !ev_end_write)
@@ -363,7 +363,7 @@ module bonetto_gpio_check (
 		end
 	end
 
-	// Reach covers: an IO load and an IO store that writes byte 0.
+	// Triggers (inline reach): an IO load and an IO store that writes byte 0.
 	always @* begin
 		if (!reset) begin
 			`BONETTO_REACH(reach_gpio_load, ld_spec)

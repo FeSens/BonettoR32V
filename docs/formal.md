@@ -31,7 +31,8 @@ depth) counts as a failure.
    overlaps with the equivalence gate (`make equiv`) on purpose, so the formal result stands on
    its own.
 4. **Depth.** See below.
-5. **Tasks.** One SBY task per check, plus the reach tasks, run in parallel (at most 8).
+5. **Tasks.** One SBY task per check (each one proves its own triggers reachable, see below),
+   run in parallel (at most 8).
 
 ### Environment (assumptions)
 
@@ -60,7 +61,7 @@ and a WRITE ending mid-byte, an incomplete header, MISO noise while SCK is low).
 | Fork | Why |
 |---|---|
 | `rvfi_testbench.sv` | 16-bit cycle counter (stock: 8 bits, saturating at 255); free `check` (unbounded style); pins and monitor events for the checkers; free reset length for the `reset` check. |
-| `bonetto_insn_check` | Stock semantics plus: halt equals the spec's trap; a trap has no effect (rd, rmask and wmask all 0); register fields exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM. |
+| `bonetto_insn_check` | Stock semantics plus: halt equals the spec's trap; a trapping retirement is compared only on trap, halt, `rd_addr = 0` and `wmask = 0` (contract section 6); register fields of other retirements exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM. |
 | `bonetto_reg_check` | Stock (reads return the last write) plus: a register not yet written reads the same value every time. |
 | `bonetto_pc_bwd_check` | Stock pc_bwd only fires when order N+1 retires before N, never true in order (unreachable). The fork checks the time-adjacent pair: order + 1 and pc chaining. |
 | `bonetto_unique_check` | Stock unique fails on any core with a free trig. The fork counts retirements per order. |
@@ -75,15 +76,23 @@ when a register field the instruction uses names x16-x31 (the E filter). Those e
 reserved (UNSPECIFIED), so the instruction checks demand nothing of them. The consistency checks
 (reg, pc, causal, unique, rvfi, bus, gpio, silent, liveness) still apply to every retirement.
 
-### Non-vacuity: the reach tasks
+### Non-vacuity: inline reach
 
-Every check has one or more `reach_*` statements: its trigger (for an instruction check, a
-retirement of that instruction with `spec_valid`). The reach task instantiates all checkers in
-one design, keeps every assumption, turns each `reach_*` into `assert(!trigger)` and removes all
-other assertions. A BMC with `--keep-going` over the whole depth then falsifies every reachable
-trigger. A trace of the combined design is also a trace of each single check's design (fewer
-assumptions), so a trigger reached there is reachable in that check's own task. A check whose
-proof passes but whose trigger is not reached is `UNREACHED`.
+Every check has one or more `reach_*` statements: its triggers. For an instruction check that is
+a retirement of that instruction with `spec_valid`, and for JAL, JALR, the branches, ECALL and
+EBREAK also a trapping one. The runner defines `BONETTO_REACH_AS_ASSERT` in every task, so each
+`reach_*` is `assert(!trigger)` in the check's own design, and smtbmc runs with `--keep-going` in
+one solver window over the whole depth. smtbmc then drops each failed assertion (it is never
+assumed afterwards) and re-checks the rest in the same unrolling, so:
+
+- a failed `reach_*` assertion is a trigger reached within the depth;
+- any other failed assertion is a counterexample: the check is `FAIL`;
+- the last solver call, with every reached trigger dropped, is the proof of the check's
+  assertions: the check is `PASS` only if every required trigger was reached and nothing else
+  failed, `UNREACHED` if a required trigger was not reached.
+
+A reach costs one extra satisfiable call in an unrolling the proof needs anyway. SBY's cover mode
+would solve step by step, and a separate reach task would unroll the design again.
 
 ## Depth policy
 

@@ -64,6 +64,24 @@ def test_depth_policy():
     assert t["per_class"]["load"]["max_cycles"] == 230
 
 
+def test_inline_reach_verdicts():
+    """sby FAIL with only reach_* labels failed is a PASS; any other label is a FAIL;
+    a missing required trigger is UNREACHED; an unfinished run is a FAIL."""
+    c = run_formal.classify
+    req = ["reach_insn", "reach_insn_trap"]
+    det = lambda *l: {"failed": list(l)}
+    assert c("FAIL", det("reach_insn", "reach_insn_trap"), req)[0] == "PASS"
+    assert c("FAIL", det("reach_insn"), req)[0] == "UNREACHED"
+    assert c("PASS", det(), req)[0] == "UNREACHED"
+    v, info = c("FAIL", det("reach_insn", "insn_rd_wdata", "reach_insn_trap"), req)
+    assert v == "FAIL" and info["assertions"] == ["insn_rd_wdata"]
+    assert c("FAIL", det("wrapper.sv:315.7-315.50"), ["reach_gpio_load"])[0] == "FAIL"
+    for st in ("TIMEOUT", "UNKNOWN", "ERROR"):
+        assert c(st, det("reach_insn", "reach_insn_trap"), req)[0] == "FAIL"
+    assert c("FAIL", det(), req)[0] == "FAIL"
+    assert run_formal.insn_reach("jal") == req and run_formal.insn_reach("add") == ["reach_insn"]
+
+
 # ---------------------------------------------------------------------------
 # SPI monitor against a hand-written stub driver.
 
