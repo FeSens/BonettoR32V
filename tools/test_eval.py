@@ -373,12 +373,14 @@ def test_arch_adapter(repo, doc, ok):
 
 def good_area(netlist="build/synth/netlist.v"):
     return {"area_um2": 15432.1, "cells": 987, "by_type": {}, "by_module": {}, "flops": 120,
-            "latches": 0, "netlist": netlist}
+            "latches": 0, "netlist": netlist, "engine": "librelane"}
 
 
 @pytest.mark.parametrize("change,ok,msg", [
     ({}, True, "15432.1 um2, 987 cells, 120 flops"),
     ({"latches": 3}, False, "no latches"),
+    ({"engine": "yosys"}, False, "librelane engine"),
+    ({"engine": None}, False, "librelane engine"),
     ({"latches": None}, False, "no latches"),
     ({"area_um2": 0}, False, "bad area_um2"),
     ({"cells": "many"}, False, "bad cells"),

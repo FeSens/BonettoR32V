@@ -26,7 +26,9 @@ HEAVY_LOCK := lockf -k /tmp/bonetto-heavy.lock
 EVAL := $(PYTHON) tools/eval.py
 GATE_TARGETS := lint cosim equiv formal formal-deep arch area gl
 
-# Extra arguments for the physical runners (Task 8 defines them), e.g. HARDEN_ARGS=--tiles=1x2
+# Extra arguments for the physical runners (Task 8 defines them), e.g. HARDEN_ARGS='--tiles 3x2'.
+# harden_tt.sh and tilefit.py take the heavy lock themselves unless BONETTO_HEAVY_LOCKED=1; the
+# Makefile takes it once (so tilefit holds it across all its trials) and sets the variable.
 HARDEN_ARGS ?=
 TILEFIT_ARGS ?=
 
@@ -56,11 +58,11 @@ eval gates:
 
 harden:
 	@test -f tools/harden_tt.sh || { echo "harden: runner missing (tools/harden_tt.sh)"; exit 1; }
-	$(HEAVY_LOCK) bash tools/harden_tt.sh $(HARDEN_ARGS)
+	BONETTO_HEAVY_LOCKED=1 $(HEAVY_LOCK) bash tools/harden_tt.sh $(HARDEN_ARGS)
 
 tilefit:
 	@test -f physical/tilefit.py || { echo "tilefit: runner missing (physical/tilefit.py)"; exit 1; }
-	$(HEAVY_LOCK) $(PYTHON) physical/tilefit.py $(TILEFIT_ARGS)
+	BONETTO_HEAVY_LOCKED=1 $(HEAVY_LOCK) $(PYTHON) physical/tilefit.py $(TILEFIT_ARGS)
 
 test-tools:
 	$(PYTHON) -m pytest tools/ -q

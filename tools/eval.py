@@ -317,6 +317,8 @@ def gate_area(ctx):
         raise GateFail(f"gate area: bad area_um2 {area!r} in {out}")
     if not isinstance(cells, int) or cells <= 0:
         raise GateFail(f"gate area: bad cells {cells!r} in {out}")
+    if j.get("engine") != "librelane":
+        raise GateFail(f"gate area: engine {j.get('engine')!r}, the score needs the librelane engine")
     latches = j.get("latches")
     if latches != 0:
         raise GateFail(f"gate area: {latches!r} latches (contract v1 section 1: no latches)")

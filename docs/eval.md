@@ -36,7 +36,7 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 | 3 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` | exit 0 and `pass: true` |
 | 4 | formal | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
 | 5 | arch | `verif/arch-test/run_arch.py` | exit 0, `pass: true`, at least one test, every test `true` |
-| 6 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `latches == 0` (contract v1), the `netlist` file exists |
+| 6 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract v1), the `netlist` file exists |
 | 7 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
 
 Details:
