@@ -84,7 +84,7 @@ Both modes:
 | Check | Contract | Error text contains |
 |---|---|---|
 | `uio_oe` = 0x0B and `uio_out[7:4]`, `uio_out[2]` = 0 at every edge | 1 | `uio_oe =`, `bits [7:4] and [2]` |
-| while rst_n is low: CS_n = 1, SCK = 0, uo_out = 0 | 1 | `during reset` |
+| CS_n = 1, SCK = 0, uo_out = 0 after every edge with rst_n low, the first one included (reset is applied once, at the start) | 1 | `during reset` |
 | outputs change only at rising clk edges (not with clk falling or an input changing) | 1 | `outputs changed between rising clk edges` |
 | CS_n changes only while SCK is low | 2.1 | `CS_n changed while SCK was high` |
 | MOSI stable on rising SCK edges | 2.2 | `MOSI changed on a rising SCK edge` |
@@ -120,13 +120,14 @@ pins mode (the plain design):
 ## Timing report (`--timing-json`, rvfi mode)
 
 ```json
-{"first_retire_cycle": 118, "max_cycles_per_insn": 231,
- "per_class": {"alu": 117, "alu_imm": 118, "branch_not_taken": 117, "branch_taken": 117,
-               "fence": 117, "io_load": 117, "io_store": 117, "jal": 117, "jalr": 117,
-               "load": 231, "lui_auipc": 117, "shift": 117, "store": 231, "trap": 117}}
+{"first_retire_cycle": 115, "max_cycles_per_insn": 230,
+ "per_class": {"alu": 116, "alu_imm": 116, "branch_not_taken": 116, "branch_taken": 116,
+               "fence": 116, "io_load": 116, "io_store": 116, "jal": 116, "jalr": 116,
+               "load": 230, "lui_auipc": 116, "shift": 116, "store": 230, "trap": 116}}
 ```
 
-(Format example: selftest on a throwaway scratch core used to develop the harness, not the seed.) Cycles count rising clk edges. Reset release
+(The seed core on selftest: `run_cosim.py --mode rvfi --prog build/programs/selftest.hex
+--timing-json build/seed_timing.json`.) Cycles count rising clk edges. Reset release
 is the last edge with rst_n low; the first retirement's latency is the number of edges from there
 to its rvfi_valid edge, and each later latency is the number of edges since the previous rvfi_valid
 edge. `max_cycles_per_insn` is the largest latency, `per_class` the largest per instruction class
@@ -145,7 +146,8 @@ copies of the seed with one deliberate bug each, listed with their mode and expe
 
 ## Speed
 
-Measured on this Mac with a small multi-cycle scratch core (about 130 cycles per instruction):
-26.5 M cycles/s in rvfi mode and 29.7 M cycles/s in pins mode (`harness build/programs/coremark.hex`,
-104 M cycles in 3.9 s and 3.5 s). The full `--all` matrix (15 programs x 2 modes x 3 seeds, 90 runs)
-took 22 s with 8 parallel jobs, builds included.
+Measured on this Mac with the seed core (CoreMark: 791,682 instructions, 103.6 M cycles, CPI
+130.8): 22.0 M cycles/s in rvfi mode and 25.8 M cycles/s in pins mode (4.7 s and 4.0 s per CoreMark
+run, single run on a quiet machine; an earlier run under load measured 11.0 and 14.6). The full
+`--all` matrix (15 programs x 2 modes x 3 seeds, 90 runs) took 13.1 s wall clock with 8 parallel
+jobs, starting from no builds (programs and both Verilator models included).
