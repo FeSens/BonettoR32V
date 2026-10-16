@@ -115,20 +115,39 @@ def parse_liberty(lib):
     return cells
 
 
+# Source names end up in yosys commands (LibreLane's VERILOG_FILES, the rendered
+# synth_area.ys), where a name like `z.v; exec -- cmd; y.v` would inject commands. So src/
+# files must be plain `name.v`; explicit baseline lists (--files/--info) may add plain
+# directory components.
+SRC_NAME_RE = re.compile(r"^[A-Za-z0-9_]+\.v$")
+SRC_DIR_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def check_source_name(rel, allow_dirs):
+    parts = Path(rel).parts
+    ok = bool(parts) and SRC_NAME_RE.match(parts[-1]) and (
+        len(parts) == 1 or (allow_dirs and all(SRC_DIR_RE.match(d) for d in parts[:-1])))
+    if not ok or rel != "/".join(parts):
+        die(f"refusing source name {rel!r}: src/ files must match {SRC_NAME_RE.pattern}")
+
+
 def collect_sources(src, files, info):
-    if files:
-        rel = list(files)
-    elif info:
-        rel = list(info_source_files(info))
+    if files or info:
+        rel = list(files) if files else list(info_source_files(info))
+        for r in rel:
+            check_source_name(r, allow_dirs=True)
     else:
         rel = []
         for p in sorted(src.rglob("*")):
-            if p.suffix not in (".v", ".sv") or not p.is_file():
+            if not p.is_file():
                 continue
             parts = p.relative_to(src).parts
             if any(part.startswith("test_") for part in parts):
                 continue  # hypothesis unit tests (src/test_*) are not part of the design
-            rel.append(str(p.relative_to(src)))
+            name = str(p.relative_to(src))
+            if p.suffix in (".v", ".sv"):
+                check_source_name(name, allow_dirs=False)  # dies on .sv, subdirs, odd names
+                rel.append(name)
     for r in rel:
         if not (src / r).is_file():
             die(f"source {src / r} not found")
@@ -286,8 +305,9 @@ def run_yosys(st, rel, top, cfg, lib, root, params, hier):
         (d / "reports").mkdir(parents=True, exist_ok=True)
         fields = {
             "LIB_FULL": str(lib), "LIB": str(libsyn), "TOP": top,
+            # names were validated in collect_sources; quoted as defense in depth
             "READ_VERILOG": "\n".join(f"read_verilog -defer -noautowire -sv {defines} "
-                                      f"{st / 'src' / r}" for r in rel),
+                                      f"\"{st / 'src' / r}\"" for r in rel),
             "CHPARAM": "\n".join("chparam -set {} {} {}".format(*p.split("=", 1), top)
                                  for p in params),
             "FLATTEN": "flatten" if flatten else "",
@@ -373,6 +393,11 @@ def main():
     ap.add_argument("--param", action="append", default=[],
                     help="top-level parameter KEY=VALUE (baselines only)")
     a = ap.parse_args()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", a.top):
+        die(f"bad --top {a.top!r}")
+    for p in a.param:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_']+$", p):
+            die(f"bad --param {p!r}")
 
     t0 = time.time()
     src = Path(a.src).resolve()

@@ -217,6 +217,10 @@ def main():
     s = Search(a)
     s.outdir.mkdir(parents=True, exist_ok=True)
     best, lo = s.run()
+    if not a.keep_runs:  # keep the LibreLane run of the min-fraction trial only
+        for r in s.runs:
+            if best is None or r["tag"] != best["tag"]:
+                shutil.rmtree(s.outdir / r["tag"] / "proj" / "runs", ignore_errors=True)
     density = None
     if best is not None and best.get("stdcell_area_um2"):
         density = round(float(best["stdcell_area_um2"]) / best["placeable_um2"], 4)
@@ -227,7 +231,9 @@ def main():
         "density_definition": "standard-cell area of the min-fraction run (LibreLane "
                               "design__instance__area__stdcell) / placeable_um2",
         "target_density_pct": best["target_density_pct"] if best else None,
-        "highest_failing_fraction": round(s.geometry(lo)[1], 5) if best else None,
+        "highest_failing_fraction": max((r["fraction"] for r in s.runs if not r["pass"]),
+                                        default=None),
+        "lower_bound_fraction": round(lo, 5),
         "tiles": s.tiles, "die_box_um": s.die, "core_box_um": [round(v, 3) for v in s.core],
         "core_um2": round(s.core_w * s.core_h, 2),
         "blockage": "FP_OBSTRUCTIONS hard placement blockage over the right part of the core",

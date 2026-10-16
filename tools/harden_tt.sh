@@ -36,7 +36,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TT_TOOLS_URL="https://github.com/TinyTapeout/tt-support-tools"
-TT_TOOLS_SHA="01d5d2814fa9dd61e9d211e0b235a4a592a9316a"   # main on 2026-10-16 (CI uses ref main)
+TT_TOOLS_SHA="01d5d2814fa9dd61e9d211e0b235a4a592a9316a"   # main HEAD on 2026-10-16 (CI uses ref main)
 LIBRELANE_IMAGE="ghcr.io/librelane/librelane:3.0.14"
 PDK_HASH="8afc8346a57fe1ab7934ba5a6056ea8b43078e71"            # LibreLane 3.0.14 pdk_hashes.yaml
 PRECHECK_PDK_HASH="0536d02d875c8f67dd7cca3902ac457e62f20005"   # tt-gds-action/precheck@ttsky26d
