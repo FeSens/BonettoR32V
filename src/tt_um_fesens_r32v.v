@@ -66,14 +66,12 @@ module tt_um_fesens_r32v (
     localparam [4:0] S_IDLE = 5'd0,   // CS_n high; at ph 6 start a transaction
                      S_CMD  = 5'd1,   // ph 7..22: 8 command bits, SCK = clk/2
                      S_AHI  = 5'd2,   // address bits 15..8 from bufr, slow SCK
-                     S_ALW  = 5'd3,   // wait for ph 31
-                     S_ALD  = 5'd4,   // ph 0..7: bufr <- address bits 7..0
+                     S_ALD  = 5'd4,   // from ph 15: bufr <- address bits 7..0 at ph 0..7
                      S_ALO  = 5'd5,   // address bits 7..0 from bufr, slow SCK
                      S_FDAT = 5'd6,   // 32 instruction bits, SCK = clk/2
                      S_FEND = 5'd7,   // CS_n high, wait for ph 31
                      S_P1   = 5'd8,   // first execute pass
                      S_P2   = 5'd9,   // later execute passes
-                     S_SLW  = 5'd10,  // store: wait for ph 31
                      S_SLD  = 5'd11,  // store: bufr <- rs2 byte k
                      S_SEM  = 5'd12,  // store: emit byte k, slow SCK
                      S_LRW  = 5'd13,  // load: align to the slot grid
@@ -84,7 +82,7 @@ module tt_um_fesens_r32v (
                      S_RET  = 5'd18,  // retire (ph 0)
                      S_HALT = 5'd19;  // after a fatal trap
 
-    (* fsm_encoding = "none" *) reg [4:0] st;
+    reg  [4:0]   st;
     reg  [4:0]   ph;      // bit index at the ring taps
     reg  [4:0]   j;       // SPI bit counter, shift amount counter
     reg          cs_n, sck, mosi;
@@ -183,7 +181,7 @@ module tt_um_fesens_r32v (
         end
     endgenerate
 
-    wire [3:0] rs1_sel = (st == S_P2 && c_sh) ? rd_f : rs1_f;
+    wire [3:0] rs1_sel = (st == S_P2 && !insn[6]) ? rd_f : rs1_f;  // shifts read rd in P2
     wire rs1_t = taps[rs1_sel];
     wire rs2_t = taps[rs2_f];
     wire pc_t  = pcr[0] & ~pcz;
@@ -223,18 +221,21 @@ module tt_um_fesens_r32v (
     wire inc   = pc_t ^ (c4 & (ph != 5'd0));
 
     // ------------------------------------------------------------------------------------
-    // Shifts: P1 copies rs1 to rd and loads j; each P2 rotates rd left by 8 (through bufr)
-    // or by 1 (through cy) until j reaches its target. Bits that must not wrap are replaced
-    // with the fill as they enter the delay line during the first rotation.
+    // Shifts: P1 copies rs1 to rd and loads j with -shamt (left) or shamt (right) through the
+    // ALU; each P2 rotates rd left by 8 or by 1 (both through bufr) and adds that to
+    // j, until j wraps to 0: a left rotation by shamt, or by 32 - shamt for right shifts.
+    // Source bits that must not wrap (index >= j for left, < j for right) are replaced with
+    // the fill as they enter the delay line during the first rotation.
     // ------------------------------------------------------------------------------------
-    wire       d8       = sh_left ? (j[4:3] != 2'b11) : ~((j[4:3] == 2'b11) & (j[2:0] != 3'd0));
-    wire [4:0] jd       = j + (d8 ? 5'd8 : 5'd1);
-    wire [4:0] sh_tgt   = {5{sh_left}};
-    wire       masked   = sh_left ? (ph > j) : (ph < j);
+    wire       d8       = ~((j[4:3] == 2'b11) & (j[2:0] != 3'd0));   // 32 - j >= 8
+    wire [5:0] jd       = {1'b0, j} + (d8 ? 6'd8 : 6'd1);
+    wire       masked   = (ph < j) ^ sh_left;
     wire       fill     = ~sh_left & insn[30] & c4;
     wire       mask_now = ((st == S_P1) | cmp) & masked;
     wire       msrc     = mask_now ? fill : rs1_t;
-    wire       sh_w     = (st == S_P1) ? rs1_t : (d8 ? bufr[0] : cy);
+    wire       sh_w     = (st == S_P1) ? rs1_t : (d8 ? bufr[0] : bufr[7]);
+    // the last 8 (or 1) writes of a pass feed the next pass: they take the new rd bits
+    wire       sh_tail  = d8 ? (ph[4:3] == 2'b11) : (ph == 5'd31);
 
     // ------------------------------------------------------------------------------------
     // Loads
@@ -252,7 +253,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Datapath control
     // ------------------------------------------------------------------------------------
-    reg rd_we, rd_w, pc_we, pc_w, buf_we, buf_in, shmode;
+    reg rd_we, rd_w, pc_we, pc_w, buf_we, buf_in;
     always @(*) begin
         asel   = 2'd2;      // default sum = pc + 0: the carry stays 0 from ph 0
         bsel   = 2'd0;
@@ -263,7 +264,6 @@ module tt_um_fesens_r32v (
         pc_w   = inc;
         buf_we = 1'b0;
         buf_in = sum;
-        shmode = 1'b0;
         case (st)
             S_CMD: buf_we = ~mem & (ph[4:3] == 2'b01);           // fetch: pc[15:8]
             S_ALD: begin
@@ -272,6 +272,11 @@ module tt_um_fesens_r32v (
                     bsel = 2'd2;
                 end
                 buf_we = (ph[4:3] == 2'b00);                    // pc[7:0] or address[7:0]
+            end
+            S_ALO: if (mem & c_st) begin                        // last slot: bufr <- rs2[7:0]
+                asel   = 2'd0;
+                bsel   = 2'd1;
+                buf_we = (j == 5'd31) & (ph[4:3] == 2'b00);
             end
             S_SLD: begin
                 asel   = 2'd0;
@@ -288,14 +293,13 @@ module tt_um_fesens_r32v (
             end
             S_P1: begin
                 if (c_alu) begin
-                    asel  = 2'd1;
+                    asel  = c_sh ? 2'd0 : 2'd1;
                     bsel  = c_op ? 2'd1 : 2'd2;
-                    sub   = (c_op & insn[30] & (f3 == 3'b000)) | c_slt;
+                    sub   = (c_op & insn[30] & (f3 == 3'b000)) | c_slt | (c_sh & sh_left);
                     pc_we = 1'b1;
                     if (c_sh) begin
                         rd_we  = 1'b1;
                         rd_w   = rs1_t;
-                        shmode = 1'b1;
                         buf_we = 1'b1;
                         buf_in = msrc;
                     end else if (!c_slt) begin
@@ -334,9 +338,8 @@ module tt_um_fesens_r32v (
                 if (c_sh) begin
                     rd_we  = 1'b1;
                     rd_w   = sh_w;
-                    shmode = 1'b1;
                     buf_we = 1'b1;
-                    buf_in = (ph[4:3] == 2'b11) ? sh_w : msrc;
+                    buf_in = sh_tail ? sh_w : msrc;
                 end else if (c_slt) begin
                     rd_we = 1'b1;
                     rd_w  = (ph == 5'd0) & cmp;
@@ -383,9 +386,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
         // ALU carry / shift delay / load sign
-        if (shmode)
-            cy <= (st == S_P2 && ph == 5'd31) ? sh_w : msrc;
-        else if (st == S_LWR)
+        if (st == S_LWR)
             cy <= (lwin && ph[2:0] == 3'd7) ? bufr[2] : cy;
         else
             cy <= cout;
@@ -415,9 +416,9 @@ module tt_um_fesens_r32v (
         else if ((slow & slot_end) | fsample)
             j <= j + 5'd1;
         else if (st == S_P1 && c_sh && ph < 5'd5)
-            j <= {b_raw ^ sh_left, j[4:1]};
+            j <= {sum, j[4:1]};
         else if (st == S_P2 && c_sh && ph == 5'd31)
-            j <= jd;
+            j <= jd[4:0];
 
         // MOSI
         if (st == S_IDLE && ph == 5'd6)
@@ -451,11 +452,11 @@ module tt_um_fesens_r32v (
                     st   <= S_CMD;
                 end
                 S_CMD:  if (ph == 5'd22) st <= S_AHI;
-                S_AHI:  if (byte_end) st <= S_ALW;
-                S_ALW:  if (ph == 5'd31) st <= S_ALD;
+                S_AHI:  if (byte_end) st <= S_ALD;              // ph 15
                 S_ALD:  if (ph == 5'd14) st <= S_ALO;
                 // ALO ends at ph 6 with j = 0: the next cycle is already a slot start (d = 7)
-                S_ALO:  if (byte_end) st <= ~mem ? S_FDAT : c_st ? S_SLW : S_LRX;
+                // (stores load data byte 0 into bufr during the last slot)
+                S_ALO:  if (byte_end) st <= ~mem ? S_FDAT : c_st ? S_SLD : S_LRX;
                 S_FDAT: if (fsample && j == 5'd31) st <= S_FEND;
                 S_FEND: begin
                     cs_n <= 1'b1;
@@ -472,12 +473,11 @@ module tt_um_fesens_r32v (
                     else if (c_slt)
                         st <= S_P2;
                     else if (c_sh)
-                        st <= (j == sh_tgt) ? S_RET : S_P2;
+                        st <= (j == 5'd0) ? S_RET : S_P2;
                     else
                         st <= S_RET;
                 end
-                S_P2: if (ph == 5'd31 && !(c_sh && jd != sh_tgt)) st <= S_RET;
-                S_SLW: if (ph == 5'd31) st <= S_SLD;
+                S_P2: if (ph == 5'd31 && !(c_sh && !jd[5])) st <= S_RET;
                 S_SLD: if (ph[4:3] == j[4:3] + 2'd1 && ph[2:0] == 3'd6) st <= S_SEM;
                 S_SEM: if (byte_end) begin
                     if (j[4:3] == nm1) begin
