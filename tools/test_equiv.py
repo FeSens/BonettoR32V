@@ -113,7 +113,8 @@ def test_syntax_error_fails(tmp_path):
     ])
     rc, j, _ = run_equiv(tmp_path, src)
     assert rc == 1
-    assert "yosys build" in j["detail"]
+    # The differential preprocessor check (yosys parses too) now stops it before the build.
+    assert "preprocessor failed" in j["detail"] or "yosys build" in j["detail"]
 
 
 def test_file_name_injection_blocked_before_yosys(tmp_path):
@@ -143,6 +144,25 @@ def test_rvfi_only_initial_value_blocked(tmp_path):
     ])
     rc, j, _ = run_equiv(tmp_path, src)
     assert rc == 1 and "`initial` is not allowed" in j["detail"]
+
+
+def test_prestrip_init_on_rvfi_only_state_fails(tmp_path, monkeypatch, capsys):
+    # Review repro (eqp): a macro-pasted `initial` on RVFI-only state. After the rvfi strip that
+    # state and its init attribute are gone, so only the pre-strip check can see it. src_check
+    # rejects the macros first; bypass it here to test the second line on its own.
+    src = copy_fixture(tmp_path, "pass_observer", [
+        ("tt_um_fesens_r32v.v", "    reg [63:0] order_q;\n",
+         "    reg [63:0] order_q;\n`define P1 ini\n`define P2 tial\n"
+         "    `P1`P2 valid_q = 1'b1;\n"),
+    ])
+    monkeypatch.setattr(equiv.src_check, "check", lambda path: [])
+    monkeypatch.setattr(equiv.src_check, "check_differential", lambda path, env=None: [])
+    out = tmp_path / "equiv.json"
+    rc = equiv.main(["--src", str(src), "--work", str(tmp_path / "work"), "--out", str(out)])
+    detail = json.loads(out.read_text())["detail"]
+    assert rc == 1
+    assert "A before the rvfi strip: valid_q" in detail, detail
+    assert "B (plain)" not in detail and "A (RISCV_FORMAL, rvfi stripped)" not in detail
 
 
 def test_init_wires_reads_yosys_output(tmp_path):

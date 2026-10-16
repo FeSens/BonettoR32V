@@ -42,8 +42,6 @@ HEAVY_LOCK = ["lockf", "-k", os.environ.get("BONETTO_HEAVY_LOCK", "/tmp/bonetto-
 LATENCY_CAP = 1024                       # contract section 4
 COSIM_MODES = ("rvfi", "pins")
 COSIM_SEEDS = (1, 2, 3)
-RVFI_DEFINES = ["RISCV_FORMAL", "RISCV_FORMAL_NRET=1", "RISCV_FORMAL_XLEN=32",
-                "RISCV_FORMAL_ILEN=32"]
 EXPECT_RETIRED_KEYS = ("retired", "retired_count", "instret", "insns", "instructions")
 
 
@@ -158,32 +156,25 @@ def last_json_line(lines):
 # ---------------------------------------------------------------------------------------------
 
 def gate_lint(ctx):
-    """tools/src_check.py first, then verilator --lint-only -Wall over src/*.v (top
-    tt_um_fesens_r32v), plain and RISCV_FORMAL builds."""
+    """tools/src_check.py first (static rules, then the verilator/yosys differential
+    preprocessor check), then verilator --lint-only -Wall over src/*.v (top tt_um_fesens_r32v),
+    plain and RISCV_FORMAL builds."""
     problems = src_check.check(ctx.path("src"))
+    if not problems:
+        problems = src_check.check_differential(ctx.path("src"), ctx.env)
     if problems:
         shown = "; ".join(problems[:3]) + (f" (+{len(problems) - 3} more)"
                                            if len(problems) > 3 else "")
         raise GateFail(f"src hygiene (tools/src_check.py): {shown}")
     ctx.need_tool("lint", "verilator")
     srcs = ctx.src_files("lint")
-    inc = ctx.path("third_party", "riscv-formal", "checks")
-    if not os.path.isfile(os.path.join(inc, "rvfi_macros.vh")):
-        raise GateFail("gate lint: third_party/riscv-formal not initialized "
-                       "(git submodule update --init third_party/riscv-formal)")
-    work = os.path.join(ctx.build, "lint")
-    os.makedirs(work, exist_ok=True)
-    prelude = os.path.join(work, "rvfi_prelude.vh")
-    with open(prelude, "w") as f:
-        f.write('`include "rvfi_macros.vh"\n')
     # Paths go to Verilator as separate argv entries (no shell). They are absolute (so none can
     # read as an option) and must match SAFE_PATH, as a second line behind src_check.
-    for p in [inc, prelude] + srcs:
+    for p in srcs:
         if not SAFE_PATH.match(p):
             raise GateFail(f"gate lint: unsafe path {p!r}")
     base = ["verilator", "--lint-only", "-Wall", "--top-module", TOP]
-    builds = (("plain", []),
-              ("RISCV_FORMAL", ["-D" + d for d in RVFI_DEFINES] + ["-I" + inc, prelude]))
+    builds = (("plain", []), ("RISCV_FORMAL", ["-DRISCV_FORMAL"]))
     for label, extra in builds:
         log = "lint_" + label.lower()
         rc, lines = ctx.run(base + extra + srcs, log)

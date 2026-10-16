@@ -237,6 +237,48 @@ def test_lint_runs_src_hygiene_before_verilator(repo):
     assert not (repo / "build" / "logs" / "lint_plain.log").exists()   # verilator never ran
 
 
+@pytest.mark.skipif(not (HAVE_VERILATOR and HAVE_YOSYS), reason="verilator and yosys needed")
+def test_lint_runs_differential_backstop(repo, monkeypatch):
+    # Static rules bypassed: the lint gate must still run the verilator/yosys comparison.
+    with_src(repo)
+    top = repo / "src" / "tt_um_fesens_r32v.v"
+    top.write_text(top.read_text().replace("    assign uo_out  = gpio;\n",
+                                           "`ifdef verilator\n    assign uo_out  = ~gpio;\n"
+                                           "`else\n    assign uo_out  = gpio;\n`endif\n"))
+    monkeypatch.setattr(ev.src_check, "check", lambda path: [])
+    doc = run_gate(repo, "lint")
+    assert doc["pass"] is False
+    assert "differential check (plain)" in doc["detail"], doc["detail"]
+
+
+@pytest.mark.skipif(not (HAVE_VERILATOR and HAVE_YOSYS), reason="verilator and yosys needed")
+def test_equiv_runs_differential_backstop(tmp_path, monkeypatch):
+    import equiv
+    src = tmp_path / "src"
+    shutil.copytree(os.path.join(FIX, "pass_observer"), src)
+    top = src / "tt_um_fesens_r32v.v"
+    top.write_text(top.read_text().replace("    assign uo_out  = gpio;\n",
+                                           "`ifdef YOSYS\n    assign uo_out  = gpio;\n"
+                                           "`else\n    assign uo_out  = ~gpio;\n`endif\n"))
+    monkeypatch.setattr(equiv.src_check, "check", lambda path: [])
+    out = tmp_path / "e.json"
+    assert equiv.main(["--src", str(src), "--work", str(tmp_path / "w"), "--out", str(out)]) == 1
+    assert "differential check" in json.loads(out.read_text())["detail"]
+
+
+@pytest.mark.skipif(not (HAVE_VERILATOR and HAVE_YOSYS), reason="verilator and yosys needed")
+def test_bitserial_sample_passes_lint_and_equiv(repo):
+    sample = os.path.join(HERE, "test_fixtures", "src_check", "pass_bitserial")
+    for f in os.listdir(sample):
+        shutil.copy(os.path.join(sample, f), repo / "src" / f)
+    os.symlink(HERE, repo / "tools")
+    lint = run_gate(repo, "lint")
+    assert lint["pass"] is True, lint["detail"]
+    eq = run_gate(repo, "equiv")
+    assert eq["pass"] is True, eq["detail"]
+    assert eq["data"]["proved_by_induct"] == 0
+
+
 def test_lint_rejects_macro_split(repo):
     with_src(repo)
     top = repo / "src" / "tt_um_fesens_r32v.v"

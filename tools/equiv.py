@@ -26,11 +26,14 @@ How the proof can fail and pass:
   still removed (they drive nothing once the rvfi ports are gone).
 - `-mem2reg` turns arrays into registers with source-derived names (`rf[3]`), which match across
   builds; `equiv_make` rejects designs that still contain memories.
-- Initial values: neither build may carry an `init` attribute (from `initial` or `reg r = 0;`).
-  The proof ignores init values, so formal could otherwise assume a power-up value the chip lacks.
-- Before anything is built, tools/src_check.py must pass (file names, macros, includes,
-  initial). Every path written into a yosys script must match a strict safe-character pattern and
-  is double-quoted where yosys strips quotes (read_verilog, -I, write_rtlil, read_rtlil).
+- Initial values: no `init` attribute may appear in the plain build, in A after the strip, or in
+  A before the strip (gold_prestrip.il), where RVFI-only state still exists. The proof ignores
+  init values, so formal could otherwise assume a power-up value the chip lacks.
+- Before anything is built, tools/src_check.py must pass, static rules and the verilator/yosys
+  differential preprocessor check (contract section 1, restricted preprocessor). So the RVFI
+  build needs only -DRISCV_FORMAL: src/ can't use any other macro.
+- Every path written into a yosys script must match a strict safe-character pattern and is
+  double-quoted where yosys strips quotes (read_verilog, write_rtlil, read_rtlil).
 
 Usage: equiv.py [--src DIR] [--top NAME] [--out JSON] [--work DIR] [--seq N]
 Exit 0 on PASS, 1 on FAIL. Writes a JSON summary (default build/equiv.json).
@@ -60,17 +63,17 @@ def ys_path(path, quote=True):
     """An absolute path for a yosys script: validated against SAFE_PATH, then double-quoted.
 
     Yosys strips the quotes for file arguments (read_verilog, write_rtlil, read_rtlil) but keeps
-    them in `-I <dir>`, so include dirs go unquoted; SAFE_PATH already excludes whitespace,
-    quotes, `;` and `#`, the characters yosys's script tokenizer treats specially.
+    them in `-I <dir>`, so a dir given to -I would have to go unquoted (none is used now);
+    SAFE_PATH already excludes whitespace, quotes, `;` and `#`, the characters yosys's script
+    tokenizer treats specially.
     """
     p = os.path.abspath(path)
     if not SAFE_PATH.match(p):
         raise UnsafePath(f"path {p!r} has characters that are unsafe in a yosys script")
     return f'"{p}"' if quote else p
+
+
 TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
-RVFI_INCLUDE = os.path.join(REPO, "third_party", "riscv-formal", "checks")
-RVFI_DEFINES = ["RISCV_FORMAL", "RISCV_FORMAL_NRET=1", "RISCV_FORMAL_XLEN=32",
-                "RISCV_FORMAL_ILEN=32"]
 
 # Contract section 1: name -> (direction, width)
 TT_PORTS = {
@@ -211,15 +214,11 @@ def run_yosys(script, log, env):
     return p.returncode
 
 
-def build_script(srcs, top, rvfi, out_il, rename_to, prestrip_il, prelude):
+def build_script(srcs, top, rvfi, out_il, rename_to, prestrip_il):
     """Yosys script for one build. Paths are validated and quoted by ys_path; `top` and
     `rename_to` are checked identifiers."""
     files = [ys_path(s) for s in srcs]
-    if rvfi:
-        defs = " ".join("-D" + d for d in RVFI_DEFINES)
-        head = f"read_verilog -mem2reg {defs} -I {ys_path(RVFI_INCLUDE, quote=False)} {ys_path(prelude)}"
-    else:
-        head = "read_verilog -mem2reg"
+    head = "read_verilog -mem2reg -DRISCV_FORMAL" if rvfi else "read_verilog -mem2reg"
     lines = [
         f"{head} {' '.join(files)}",
         f"hierarchy -check -top {top}",
@@ -281,6 +280,8 @@ def main(argv=None):
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.top):
         return finish(False, f"top module name {args.top!r} is not a plain identifier")
     problems = src_check.check(os.path.abspath(args.src))
+    if not problems:
+        problems = src_check.check_differential(os.path.abspath(args.src), env)
     if problems:
         return finish(False, f"src hygiene (tools/src_check.py) failed: {problems[0]}"
                              + (f" (+{len(problems) - 1} more)" if len(problems) > 1 else ""))
@@ -288,9 +289,6 @@ def main(argv=None):
     if not srcs:
         return finish(False, f"no *.v files in {args.src}")
     result["src_files"] = [os.path.basename(s) for s in srcs]
-    if not os.path.isfile(os.path.join(RVFI_INCLUDE, "rvfi_macros.vh")):
-        return finish(False, "third_party/riscv-formal/checks/rvfi_macros.vh is missing "
-                             "(run: git submodule update --init third_party/riscv-formal)")
 
     work = os.path.abspath(args.work)
     try:
@@ -299,18 +297,16 @@ def main(argv=None):
         return finish(False, str(e))
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
-    prelude = os.path.join(work, "rvfi_prelude.vh")
-    with open(prelude, "w") as f:
-        f.write('`include "rvfi_macros.vh"\n')
 
-    labels = {"gold": "A (RISCV_FORMAL, rvfi stripped)", "gate": "B (plain)"}
+    labels = {"gold": "A (RISCV_FORMAL, rvfi stripped)", "gate": "B (plain)",
+              "prestrip": "A before the rvfi strip"}
     il = {}
     prestrip = os.path.join(work, "gold_prestrip.il")
     for name, rvfi in (("gold", True), ("gate", False)):
         il[name] = os.path.join(work, name + ".il")
         ys = os.path.join(work, name + ".ys")
         try:
-            script = build_script(srcs, args.top, rvfi, il[name], name, prestrip, prelude)
+            script = build_script(srcs, args.top, rvfi, il[name], name, prestrip)
         except UnsafePath as e:
             return finish(False, str(e))
         with open(ys, "w") as f:
@@ -329,8 +325,9 @@ def main(argv=None):
     if errors:
         return finish(False, "port check failed: " + "; ".join(errors))
 
-    inits = {name: init_wires(il[name]) for name in ("gold", "gate")}
-    if inits["gold"] or inits["gate"]:
+    il["prestrip"] = prestrip
+    inits = {name: init_wires(il[name]) for name in ("prestrip", "gold", "gate")}
+    if any(inits.values()):
         shown = ", ".join(f"{labels[n]}: {', '.join(w[:6])}" for n, w in inits.items() if w)
         return finish(False, f"initial values (init attributes) are not allowed: {shown}; the "
                              f"chip has no power-up values and the proof ignores them")

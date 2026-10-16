@@ -13,10 +13,11 @@ Allowed (CLAUDE.md, docs/contract.md section 7):
 Everything else fails, including deletions and renames out of src/ (renames are listed as a
 delete plus an add, so both paths are judged). Symlinks and submodules (gitlinks) fail anywhere.
 
-Every changed path that exists in HEAD must also be portable: only [A-Za-z0-9._+-] and `/`, no
-component starting with `-` (no whitespace, control characters, `;`, quotes, backslash or
-non-ASCII), and no case-fold collision with another path in HEAD (macOS checkouts are
-case-insensitive, so two such paths would show the tools one file and git another).
+Every changed path that exists in HEAD must also be portable: only [A-Za-z0-9._-] and `/` (the
+same characters src_check allows), no component starting with `-` (so no `+`, whitespace,
+control characters, `;`, quotes, backslash or non-ASCII), and no case-fold collision with another
+path in HEAD (macOS checkouts are case-insensitive, so two such paths would show the tools one
+file and git another).
 
 Independently of the path list, it fingerprints the don't-touch list: every path in it must have
 the same git object id in BASE and HEAD (the riscv-formal submodule pointer included).
@@ -31,7 +32,7 @@ import re
 import subprocess
 import sys
 
-PORTABLE_COMPONENT = re.compile(r"^[A-Za-z0-9._+][A-Za-z0-9._+-]*$")
+PORTABLE_COMPONENT = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
 
 DONT_TOUCH = ["verif", "tools", "test", "third_party", "info.yaml", "src/config.json",
               "docs/contract.md", "CLAUDE.md", "Makefile", ".github", "loop", ".claude"]
@@ -58,7 +59,7 @@ def portable(path):
         if comp in ("", ".", ".."):
             return f"bad path component {comp!r}"
         if not PORTABLE_COMPONENT.match(comp):
-            return (f"component {comp!r} has characters outside [A-Za-z0-9._+-] or starts "
+            return (f"component {comp!r} has characters outside [A-Za-z0-9._-] or starts "
                     f"with '-'")
     return ""
 

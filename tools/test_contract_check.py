@@ -247,7 +247,8 @@ def commit_index(repo, msg="index change"):
 @pytest.mark.parametrize("path", ["src/a b.v", "src/a;b.v", 'src/a"b.v', "src/a'b.v",
                                   "src/a\\b.v", "src/café.v", "src/a\tb.v", "src/a\x01b.v",
                                   "src/-Wno-fatal.v", "src/sub/-x.v", "src/a$b.v",
-                                  "src/z.v; log INJECTED; log x.v"])
+                                  "src/z.v; log INJECTED; log x.v", "src/regs+mux.v",
+                                  "src/+define+X.v"])
 def test_non_portable_paths_fail(repo, path):
     index_add(repo, path)
     commit_index(repo)
@@ -259,7 +260,7 @@ def test_non_portable_paths_fail(repo, path):
 def test_portable_odd_but_legal_names_pass(repo):
     index_add(repo, "src/alu_v2.v")
     index_add(repo, "src/test_alu/vec-1.hex")
-    index_add(repo, "src/regs+mux.v")
+    index_add(repo, "src/regs.mux_v1.v")
     commit_index(repo)
     ok, lines = run(repo)
     assert ok, lines

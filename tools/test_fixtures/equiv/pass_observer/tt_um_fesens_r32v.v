@@ -12,7 +12,28 @@ module tt_um_fesens_r32v (
     input  wire       clk,
     input  wire       rst_n
 `ifdef RISCV_FORMAL
-    , `RVFI_OUTPUTS
+    ,
+    output wire        rvfi_valid,
+    output wire [63:0] rvfi_order,
+    output wire [31:0] rvfi_insn,
+    output wire        rvfi_trap,
+    output wire        rvfi_halt,
+    output wire        rvfi_intr,
+    output wire [1:0]  rvfi_mode,
+    output wire [1:0]  rvfi_ixl,
+    output wire [4:0]  rvfi_rs1_addr,
+    output wire [4:0]  rvfi_rs2_addr,
+    output wire [31:0] rvfi_rs1_rdata,
+    output wire [31:0] rvfi_rs2_rdata,
+    output wire [4:0]  rvfi_rd_addr,
+    output wire [31:0] rvfi_rd_wdata,
+    output wire [31:0] rvfi_pc_rdata,
+    output wire [31:0] rvfi_pc_wdata,
+    output wire [31:0] rvfi_mem_addr,
+    output wire [3:0]  rvfi_mem_rmask,
+    output wire [3:0]  rvfi_mem_wmask,
+    output wire [31:0] rvfi_mem_rdata,
+    output wire [31:0] rvfi_mem_wdata
 `endif
 );
     wire [7:0] gpio;

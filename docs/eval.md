@@ -40,12 +40,11 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 | 7 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
 
 Details:
-- **RVFI build flags** (lint and equiv): `-DRISCV_FORMAL -DRISCV_FORMAL_NRET=1
-  -DRISCV_FORMAL_XLEN=32 -DRISCV_FORMAL_ILEN=32`, include path
-  `third_party/riscv-formal/checks`, and a generated prelude file `` `include "rvfi_macros.vh" ``
-  read before `src/*.v`. So the top module can use `` `RVFI_OUTPUTS `` without including
-  anything; src_check forbids including it from `src/`. Declaring the RVFI ports explicitly (as
-  the seed does) works in every gate.
+- **RVFI build flags** (lint, equiv and the differential check): just `-DRISCV_FORMAL`.
+  - The restricted preprocessor (contract section 1) forbids every macro use, so the RVFI ports
+    must be declared explicitly inside `` `ifdef RISCV_FORMAL ``, as the seed does.
+  - `` `RVFI_OUTPUTS `` is a macro use and fails src_check, even though the contract's section 1
+    example still shows it. That example should change.
 - **Paths on command lines:** Verilator gets each path as its own argv entry, absolute, and
   checked against `^/[A-Za-z0-9_./+-]+$`. Yosys scripts get the same check plus double quotes
   where yosys strips them.
@@ -60,41 +59,74 @@ Details:
 
 ## Src hygiene (tools/src_check.py)
 
-Each tool predefines different macros: Verilator `VERILATOR`, yosys `YOSYS` and `SYNTHESIS`, SBY
-`FORMAL`, TT's gate-level flow `GL_TEST`/`FUNCTIONAL`/`SIM`, cocotb `COCOTB_SIM`. A design could
-use them to show each tool a different circuit while equiv (yosys on both sides) still passes.
-File names also reach tool scripts. So src_check runs first in the lint gate and again inside
-`tools/equiv.py`, and either FAILs on:
+This enforces contract section 1, "Restricted preprocessor".
+
+Each tool predefines different macros: Verilator `VERILATOR` (and lowercase `verilator`,
+`verilator3`, `coverage_block_off`), yosys `YOSYS` and `SYNTHESIS`, SBY `FORMAL`, TT's
+gate-level flow `GL_TEST`/`FUNCTIONAL`/`SIM`. Each also handles preprocessor corners (include
+search order, macro pasting) differently. A design could use either to show each tool a
+different circuit while equiv (yosys on both sides) still passes. File names also reach tool
+scripts.
+
+So src_check is an allowlist, enforced on a real tokenizer, plus a differential backstop. It
+runs first in the lint gate and again inside `tools/equiv.py`.
 
 **Names and layout**
-- any entry under `src/` (recursively) not matching `^[A-Za-z0-9_][A-Za-z0-9_.-]*$`;
-- any symlink under `src/`;
-- any subdirectory except `test_*` (a hypothesis's own unit tests) and `__pycache__` (Python
-  creates it when `src/test_*.py` runs). No gate reads either.
-- any `.v` file not matching `^[A-Za-z0-9_]+\.v$`;
-- any `.sv` or `.svh` file (contract section 1: plain Verilog).
+- any entry under `src/` (recursively) not matching `^[A-Za-z0-9_][A-Za-z0-9_.-]*$` fails;
+- any symlink under `src/` fails;
+- any subdirectory fails, except `test_*` (a hypothesis's own unit tests) and `__pycache__`
+  (Python creates it when `src/test_*.py` runs). No gate reads either.
+- any `.v` file not matching `^[A-Za-z0-9_]+\.v$` fails;
+- any `.sv` or `.svh` file fails (contract section 1: plain Verilog).
 
-**HDL rules** (in `src/*.v` and every file they include; comments are skipped, escaped
-identifiers handled the way the tools read them)
-- `` `ifdef ``, `` `ifndef `` and `` `elsif `` may only test `RISCV_FORMAL` or a macro
-  `` `define ``'d in `src/` itself.
-- `` `define `` and `` `undef `` may not name a tool macro: `SYNTHESIS, YOSYS, VERILATOR, FORMAL,
-  SIM, SIMULATION, FUNCTIONAL, USE_POWER_PINS, UNIT_DELAY, GL_TEST, IVERILOG, ICARUS, COCOTB_SIM,
-  VCS, MODEL_TECH, QUESTA, XCELIUM, SYSTEMVERILOG`, or any name starting with `RISCV_FORMAL`,
-  `RVFI_`, `rvformal_`, `COCOTB`, `VERILATOR`, `YOSYS`, `SYNTHESIS`, `FORMAL`, `SIM`, `__` or
-  `SV_`.
-- `` `undefineall `` and `` `` `` token pasting are not allowed.
-- `` `include `` only `"name"`, where `name` is a bare file that exists in `src/`.
-- No `initial` and no declaration initializers (`reg r = 0;`). The chip has no power-up values,
-  and formal must not assume one.
-- No attributes or pragma comments that make synthesis differ from simulation:
-  - attributes `(* full_case *)`, `(* parallel_case *)`, `(* init *)`, `(* nosync *)`,
-    `(* nolatches *)`, `(* blackbox *)`, `(* whitebox *)`, `(* lib_whitebox *)`,
-    `(* nomem2reg *)`;
-  - comments containing `translate_off`, `translate_on`, `full_case` or `parallel_case`.
-- No non-ASCII characters in code.
+**Tokens of every `src/*.v`** (comments and strings handled, escaped identifiers read whole as
+the tools read them):
+1. **Directives.** The only directives allowed are `` `ifdef RISCV_FORMAL ``,
+   `` `ifndef RISCV_FORMAL ``, `` `else ``, `` `endif ``, `` `default_nettype none|wire `` and
+   `` `timescale <1|10|100><unit>/<1|10|100><unit> ``.
+   - Each must be alone on its line, and the `ifdef`/`endif` nesting must balance.
+   - Every other backtick token fails: `` `define ``, any macro use (`` `RVFI_OUTPUTS ``,
+     `` `__LINE__ ``), `` `include ``, `` `undef ``, `` `elsif ``, `` `celldefine ``,
+     `` `resetall ``, `` `line ``, `` `pragma ``, and stray sequences such as `` `` `` or
+     `` `" ``.
+   - Use `parameter`/`localparam` instead of macros.
+2. **No power-up values.**
+   - The token `initial` fails anywhere outside comments and strings.
+   - Initializers on variable declarations fail: `reg`, `integer`, `time`, `real`, `realtime`,
+     and the SystemVerilog `logic`, `bit`, `int`, `byte`, `shortint`, `longint`, ANSI output
+     ports included.
+   - `parameter` and `localparam` (typed or not) are fine.
+   - `wire w = e;` is a continuous assignment, not a power-up value, and stays allowed: the
+     contract names `reg` and `integer` only, and the seed uses the form throughout.
+3. **No attributes.** `(*` fails unless it is the `@(*)` sensitivity list (whitespace allowed
+   inside, `@ (*)` and `@*` too).
+4. **No tool metacomments.** A comment fails when its first word is `verilator`, `synopsys`,
+   `synthesis`, `pragma` or `yosys` (any case), or when it contains `translate_`, `lint_off`,
+   `full_case` or `parallel_case`. Lint must be clean without suppressions.
+5. **Plain ASCII.** Carriage returns (CRLF), other control characters (tab and newline aside) and
+   non-ASCII bytes fail anywhere in the file. So do unterminated comments and strings.
 
-Run it alone with `python3 tools/src_check.py [--src DIR]`.
+**Differential backstop.** For the plain and the RISCV_FORMAL builds, src_check preprocesses
+`src/*.v` (sorted) twice: with `verilator -E -P` and with yosys `read_verilog -ppdump`.
+- It tokenizes both outputs without comments or whitespace.
+- It drops `` `timescale `` (yosys consumes it) and yosys's `` `file_push ``/`` `file_pop ``
+  markers.
+- It requires identical token streams, and fails on any difference or preprocessor error.
+
+This catches tool-specific behavior the static rules might miss. With static rules bypassed, it
+alone catches the reviewer's `` `ifdef verilator `` split.
+
+Run it alone with `python3 tools/src_check.py [--src DIR] [--no-differential]`.
+
+Fixtures in `tools/test_fixtures/src_check/`:
+- **`fail_*`:** the review repros, which must fail: Verilator lowercase predefine plus dead-region
+  define, macro-pasted initial on RVFI-only state, cross-file define, include search order,
+  attribute or `=` built from macros, pasted initial, `SIMD_WIDTH` define, `(* full_case *)`
+  after `@(* )`.
+- **`pass_*`:** must pass. `pass_bitserial` is a realistic bit-serial sample (generate loop,
+  function, typed localparams and parameters, `` `default_nettype none ``, `` `timescale ``,
+  `always @(*)`, an `ifdef RISCV_FORMAL` port block); it also passes lint and equiv. The others
+  are a generate loop, `parameter integer`/`localparam integer`, and `@(* )`.
 
 ## build/eval.json
 
@@ -144,14 +176,20 @@ Run it alone with `python3 tools/src_check.py [--src DIR]`.
 ## Equivalence gate (tools/equiv.py)
 
 Contract section 6: logic under `ifdef RISCV_FORMAL` may only compute RVFI outputs.
-- **First:** src_check must pass (see above).
-- **A (gold):** `read_verilog -mem2reg` with the RVFI build flags, `hierarchy -check -top`,
-  `proc`, `flatten`, `delete -port` on every `rvfi_*` wire, `opt_clean`.
+- **First:** src_check must pass (see above), the static rules and the differential backstop.
+- **A (gold):** `read_verilog -mem2reg -DRISCV_FORMAL`, `hierarchy -check -top`, `proc`,
+  `flatten`, `delete -port` on every `rvfi_*` wire, `opt_clean`.
 - **B (gate):** the same without the define.
 - **Ports:** both builds must expose exactly the eight TT ports with the contract's directions
   and widths.
-- **No initial values:** neither build may carry an `init` attribute. The proof ignores init
-  values, so otherwise formal could assume a power-up value the chip lacks.
+- **No initial values:** no `init` attribute may appear in any of three places:
+  - B;
+  - A after the strip;
+  - A before the strip (`gold_prestrip.il`). That is where RVFI-only state still exists, so a
+    power-up value on RVFI-only state shows up only there.
+
+  The proof ignores init values, so otherwise formal could assume a power-up value the chip
+  lacks.
 - **Proof:** `async2sync`, `equiv_make gold gate equiv`, `equiv_simple -seq 5`,
   `equiv_induct -seq 5`, `equiv_status -assert`.
 - **Coverage:** every one of the 24 TT output bits must be the output of a `$equiv` cell.
@@ -216,9 +254,9 @@ has to be reachable from that repository; worktrees share the object store.
   - renames out of `src/` (a rename is judged as a delete plus an add, so a rename into `src/`
     also fails on its deleted source);
   - symlinks and submodules (gitlinks) anywhere, `src/` included.
-- **Portable paths:** every changed path present in HEAD must use only `[A-Za-z0-9._+-]` and
-  `/`, with no component starting with `-`. That rules out whitespace, control characters, `;`,
-  quotes, backslash and non-ASCII.
+- **Portable paths:** every changed path present in HEAD must use only `[A-Za-z0-9._-]` and
+  `/` (the characters src_check allows), with no component starting with `-`. That rules out
+  `+`, whitespace, control characters, `;`, quotes, backslash and non-ASCII.
 - **Case collisions:** no changed path, or any of its parent directories, may collide under
   case folding with another path in HEAD. macOS checkouts are case-insensitive.
 - **Fingerprint:** independently, every path in the don't-touch list (CLAUDE.md) must have the
@@ -268,7 +306,8 @@ From then on `show` returns the previous merged entry. A `rolled_back` entry mus
 current champion's sha.
 
 **Champion-round results** (tile fraction, deep formal pass) go onto the champion's own entry
-with `annotate`. It rewrites that one line; git keeps the history.
+with `annotate`. It rewrites that one line; comment lines, blank lines and every other entry stay
+byte for byte, and git keeps the history.
 
 `add` refuses:
 - a duplicate or non-numeric id;

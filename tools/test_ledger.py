@@ -229,6 +229,27 @@ def test_annotate_tile_fraction_shows_on_board(paths, tmp_path, capsys):
     assert "tile fraction 0.375" in capsys.readouterr().out
 
 
+def test_annotate_preserves_comments_and_blank_lines(paths, tmp_path):
+    add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500)
+    add(paths, tmp_path, "001", HYP1, "rejected", 21000.0, 1600)
+    with open(paths[0]) as f:
+        lines = f.readlines()
+    text = "# BonettoR32V ledger: one JSON object per line\n\n" + lines[0] + \
+           "# round 1\n" + "\n" + lines[1]
+    with open(paths[0], "w") as f:
+        f.write(text)
+    assert cli(paths, "annotate", "--id", "001", "--notes-append", "area grew") == 0
+    after = open(paths[0]).read().split("\n")
+    before = text.split("\n")
+    assert len(after) == len(before)
+    changed = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
+    assert changed == [5]                                  # only entry 001's line
+    assert after[0] == "# BonettoR32V ledger: one JSON object per line"
+    assert after[1] == "" and after[3] == "# round 1" and after[4] == ""
+    assert after[2] == before[2]                           # entry 000 byte for byte
+    assert '"notes": "area grew"' in after[5]
+
+
 def test_annotate_errors(paths, tmp_path, capsys):
     add(paths, tmp_path, "000", SEED, "merged", 20000.0, 1500)
     assert cli(paths, "annotate", "--id", "009", "--tile-fraction", "0.5") == 1

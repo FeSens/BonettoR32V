@@ -317,10 +317,21 @@ def main(argv=None):
             print("ledger: run `python3 tools/ledger.py board` and commit loop/")
         elif args.cmd == "annotate":
             entries = annotate(entries, args)
+            target = next(e for e in entries if e.get("id") == args.id)
+            # Rewrite only the target's line; comment and blank lines stay byte for byte.
+            with open(args.ledger) as f:
+                raw = f.readlines()
+            out, done = [], False
+            for line in raw:
+                s = line.strip()
+                if not done and s and not s.startswith("#") and json.loads(s).get("id") == args.id:
+                    out.append(json.dumps(target, ensure_ascii=False) + "\n")
+                    done = True
+                else:
+                    out.append(line)
             tmp = args.ledger + ".tmp"
             with open(tmp, "w") as f:
-                for e in entries:
-                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                f.writelines(out)
             os.replace(tmp, args.ledger)
             print(f"ledger: annotated {args.id}; run `python3 tools/ledger.py board`")
         elif args.cmd == "board":
