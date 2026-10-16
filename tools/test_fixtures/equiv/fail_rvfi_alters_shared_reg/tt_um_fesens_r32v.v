@@ -1,4 +1,4 @@
-// Equivalence-gate MUTANT (top unchanged; the mutation is in fx_core.v).
+// Equivalence-gate MUTANT (top unchanged; the mutation is in r32v_fx_core.v).
 // tools/equiv.py must FAIL on this design.
 `default_nettype none
 
@@ -41,7 +41,7 @@ module tt_um_fesens_r32v (
     wire       retire;
     wire [7:0] acc;
 
-    fx_core core (
+    r32v_fx_core core (
         .clk    (clk),
         .rst_n  (rst_n),
         .din    (ui_in),

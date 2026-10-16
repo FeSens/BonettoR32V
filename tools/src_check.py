@@ -25,6 +25,9 @@ Tokens of every src/*.v (check_hdl), comments and strings handled:
      that contain translate_, lint_off, full_case or parallel_case, fail.
   5. Carriage returns, other control characters (tab and newline aside) and non-ASCII fail
      anywhere in the file.
+  6. Every module (and macromodule, primitive, interface, program, checker, package, class,
+     config) is named tt_um_fesens_r32v or r32v_[A-Za-z0-9_]*, as a plain identifier, so no
+     design module can shadow a checker's (rvfi_wrapper, tb, spiram_23lc512, iss, ...).
 
 Differential backstop (check_differential): for the plain and the RISCV_FORMAL builds, preprocess
 src/*.v (sorted) with `verilator -E -P` and with yosys `read_verilog -ppdump`, tokenize both
@@ -50,6 +53,11 @@ TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-
 
 VARIABLE_TYPES = {"reg", "integer", "time", "real", "realtime", "logic", "bit", "int", "byte",
                   "shortint", "longint"}
+# Keywords that name a design element at file scope (Verilog-2005 plus the SystemVerilog units
+# Verilator accepts); the name that follows each must pass MODULE_NAME_RE.
+DEFINITION_KEYWORDS = {"module", "macromodule", "primitive", "interface", "program", "checker",
+                       "package", "class", "config"}
+MODULE_NAME_RE = re.compile(r"^(tt_um_fesens_r32v|r32v_[A-Za-z0-9_]*)$")
 METACOMMENT_FIRST = {"verilator", "synopsys", "synthesis", "pragma", "yosys"}
 METACOMMENT_ANY = re.compile(r"translate_|lint_off|full_case|parallel_case", re.I)
 TIMESCALE_RE = re.compile(r"^\s*`timescale\s+(1|10|100)\s*(s|ms|us|ns|ps|fs)\s*/\s*(1|10|100)\s*"
@@ -275,6 +283,20 @@ def check_declarations(name, toks):
     return errors
 
 
+def check_module_names(name, toks):
+    """Every definition is tt_um_fesens_r32v or r32v_*, so none can shadow a checker's module."""
+    errors = []
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "id" or text not in DEFINITION_KEYWORDS:
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if nxt is None or nxt[0] != "id" or not MODULE_NAME_RE.match(nxt[1]):
+            got = repr(nxt[1]) if nxt else "end of file"
+            errors.append(f"src/{name}:{line}: {text} name {got} must be tt_um_fesens_r32v or "
+                          f"start with r32v_ (contract section 1)")
+    return errors
+
+
 def check_hdl(src):
     errors = []
     for name in verilog_files(src):
@@ -299,6 +321,7 @@ def check_hdl(src):
                 errors.append(f"src/{name}:{line}: `initial` is not allowed (no power-up values, "
                               f"contract section 1)")
         errors += check_declarations(name, toks)
+        errors += check_module_names(name, toks)
         for ctext, line in comments:
             body = ctext[2:-2] if ctext.startswith("/*") else ctext[2:]
             first = re.match(r"[\s*/]*([A-Za-z_]+)", body)

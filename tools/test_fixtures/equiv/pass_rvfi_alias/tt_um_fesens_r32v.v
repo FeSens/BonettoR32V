@@ -43,7 +43,7 @@ module tt_um_fesens_r32v (
     wire       retire;
     wire [7:0] acc;
 
-    fx_core core (
+    r32v_fx_core core (
         .clk    (clk),
         .rst_n  (rst_n),
         .din    (ui_in),

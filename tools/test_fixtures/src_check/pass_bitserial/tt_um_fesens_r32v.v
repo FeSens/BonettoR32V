@@ -66,7 +66,7 @@ module tt_um_fesens_r32v (
     reg [W-1:0] a_sr, b_sr, sum_sr, gpio_q;
     wire        s_bit, c_next;
 
-    serial_add #(.INVERT(0)) u_add (
+    r32v_serial_add #(.INVERT(0)) u_add (
         .a(a_sr[0]), .b(b_sr[0]), .cin(carry), .s(s_bit), .cout(c_next)
     );
 

@@ -105,6 +105,12 @@ the tools read them):
    `full_case` or `parallel_case`. Lint must be clean without suppressions.
 5. **Plain ASCII.** Carriage returns (CRLF), other control characters (tab and newline aside) and
    non-ASCII bytes fail anywhere in the file. So do unterminated comments and strings.
+6. **Module names.** Every `module` is named `tt_um_fesens_r32v` or `r32v_[A-Za-z0-9_]*`, as a
+   plain identifier, so no design module can shadow a checker's (`rvfi_wrapper`, `tb`,
+   `spiram_23lc512`, `iss`, ...).
+   - The same rule covers `macromodule`, `primitive` and the SystemVerilog units Verilator
+     accepts (`interface`, `program`, `checker`, `package`, `class`, `config`).
+   - Escaped names (`\r32v_x`), `$` in a name, and a lifetime keyword after `module` all fail.
 
 **Differential backstop.** For the plain and the RISCV_FORMAL builds, src_check preprocesses
 `src/*.v` (sorted) twice: with `verilator -E -P` and with yosys `read_verilog -ppdump`.

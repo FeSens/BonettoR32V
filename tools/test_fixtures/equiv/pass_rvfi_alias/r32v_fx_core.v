@@ -2,7 +2,7 @@
 // toggling clock-like output (asynchronous reset). Copied into every equiv fixture.
 `default_nettype none
 
-module fx_core (
+module r32v_fx_core (
     input  wire       clk,
     input  wire       rst_n,
     input  wire [7:0] din,
@@ -31,4 +31,10 @@ module fx_core (
 
     assign retire = (ptr == 2'd3);
     assign acc    = rf[1];
+`ifdef RISCV_FORMAL
+    // RVFI-only aliases of shared state (unused here; they only exist to test naming).
+    wire [7:0] a_rf1  = rf[1];
+    wire [7:0] a_gpio = gpio;
+    wire [1:0] a_ptr  = ptr;
+`endif
 endmodule

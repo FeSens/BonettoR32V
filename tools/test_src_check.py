@@ -291,6 +291,56 @@ def test_attribute_instances_rejected(src, attr):
     one(src, "attribute instance")
 
 
+# --- module names ------------------------------------------------------------------------------
+
+SUB = "module {name}(input wire a, output wire y);\n  assign y = ~a;\nendmodule\n"
+NAME_MSG = "must be tt_um_fesens_r32v or start with r32v_ (contract section 1)"
+
+
+@pytest.mark.parametrize("bad", ["rvfi_wrapper", "tb", "spiram_23lc512", "iss"])
+def test_checker_module_names_fail(src, bad):
+    top(src)
+    (src / "extra.v").write_text(SUB.format(name=bad))
+    errs = problems(src)
+    assert errs == [f"src/extra.v:1: module name '{bad}' {NAME_MSG}"], errs
+
+
+def test_r32v_module_passes(src):
+    top(src)
+    (src / "r32v_alu.v").write_text(SUB.format(name="r32v_alu"))
+    (src / "regs.v").write_text(SUB.format(name="r32v_") + SUB.format(name="r32v_regfile_2"))
+    assert problems(src) == []
+
+
+@pytest.mark.parametrize("bad", ["R32V_alu", "r32valu", "tt_um_fesens_r32v_core", "r32v_a$b",
+                                 "\\r32v_alu ", "\\tt_um_fesens_r32v ", "alu_r32v_"])
+def test_near_miss_module_names_fail(src, bad):
+    top(src)
+    (src / "extra.v").write_text(SUB.format(name=bad))
+    one(src, NAME_MSG)
+
+
+@pytest.mark.parametrize("unit", ["macromodule tb(input wire a); endmodule",
+                                  "primitive iss(output y, input a);\n  table 0 : 1 ; 1 : 0 ;\n"
+                                  "  endtable\nendprimitive",
+                                  "interface tb; endinterface", "program tb; endprogram",
+                                  "checker tb; endchecker", "package iss; endpackage",
+                                  "class tb; endclass", "config tb; endconfig",
+                                  "module automatic r32v_alu; endmodule"])
+def test_other_definition_kinds_are_named_too(src, unit):
+    top(src)
+    (src / "extra.v").write_text(unit + "\n")
+    one(src, NAME_MSG)
+
+
+def test_module_name_checked_inside_rvfi_block_and_after_the_top(src):
+    top(src, raw=TOP.format(body="  assign uo_out = 8'd0;") + "`ifdef RISCV_FORMAL\n"
+             + SUB.format(name="rvfi_wrapper") + "`endif\n" + SUB.format(name="tb"))
+    errs = problems(src)
+    assert errs == [f"src/tt_um_fesens_r32v.v:5: module name 'rvfi_wrapper' {NAME_MSG}",
+                    f"src/tt_um_fesens_r32v.v:9: module name 'tb' {NAME_MSG}"], errs
+
+
 # --- metacomments, encoding --------------------------------------------------------------------
 
 @pytest.mark.parametrize("c", ["/* verilator lint_off UNUSED */", "/*verilator public*/",

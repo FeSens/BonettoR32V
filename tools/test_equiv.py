@@ -91,7 +91,7 @@ def test_wrong_port_width_fails(tmp_path):
 def test_rvfi_only_reset_difference_fails(tmp_path):
     # A different reset value under RISCV_FORMAL is a behavior difference at the pins.
     src = copy_fixture(tmp_path, "pass_observer", [
-        ("fx_core.v", "            gpio <= 8'd0;\n",
+        ("r32v_fx_core.v", "            gpio <= 8'd0;\n",
          "`ifdef RISCV_FORMAL\n            gpio <= 8'd1;\n`else\n            gpio <= 8'd0;\n`endif\n"),
     ])
     rc, j, _ = run_equiv(tmp_path, src)
@@ -109,7 +109,7 @@ def test_no_sources_fails(tmp_path):
 
 def test_syntax_error_fails(tmp_path):
     src = copy_fixture(tmp_path, "pass_observer", [
-        ("fx_core.v", "endmodule", "endmodul"),
+        ("r32v_fx_core.v", "endmodule", "endmodul"),
     ])
     rc, j, _ = run_equiv(tmp_path, src)
     assert rc == 1
@@ -139,7 +139,7 @@ def test_macro_split_blocked(tmp_path):
 
 def test_rvfi_only_initial_value_blocked(tmp_path):
     src = copy_fixture(tmp_path, "pass_observer", [
-        ("fx_core.v", "    reg [1:0] ptr;\n",
+        ("r32v_fx_core.v", "    reg [1:0] ptr;\n",
          "    reg [1:0] ptr;\n`ifdef RISCV_FORMAL\n    initial ptr = 2'd0;\n`endif\n"),
     ])
     rc, j, _ = run_equiv(tmp_path, src)

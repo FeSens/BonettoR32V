@@ -2,7 +2,7 @@
 `default_nettype none
 `timescale 1ns/1ps
 
-module serial_add #(
+module r32v_serial_add #(
     parameter integer INVERT = 0
 ) (
     input  wire a,

@@ -2,7 +2,7 @@
 // toggling clock-like output (asynchronous reset). Copied into every equiv fixture.
 `default_nettype none
 
-module fx_core (
+module r32v_fx_core (
     input  wire       clk,
     input  wire       rst_n,
     input  wire [7:0] din,

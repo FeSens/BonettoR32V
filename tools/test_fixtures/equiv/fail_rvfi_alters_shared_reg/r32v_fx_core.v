@@ -1,8 +1,8 @@
-// Fixture submodule: a 4-entry register file (no reset), a pointer, a GPIO register and a
-// toggling clock-like output (asynchronous reset). Copied into every equiv fixture.
+// Equivalence-gate MUTANT: in the RISCV_FORMAL build, an RVFI-only counter clears the GPIO
+// register (state both builds share) when it reaches 0xBEEF. tools/equiv.py must FAIL.
 `default_nettype none
 
-module fx_core (
+module r32v_fx_core (
     input  wire       clk,
     input  wire       rst_n,
     input  wire [7:0] din,
@@ -14,6 +14,10 @@ module fx_core (
 );
     reg [7:0] rf [0:3];
     reg [1:0] ptr;
+`ifdef RISCV_FORMAL
+    reg [15:0] dbg_q;
+    always @(posedge clk or negedge rst_n) if (!rst_n) dbg_q <= 16'd0; else dbg_q <= dbg_q + 16'd1;
+`endif
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -24,6 +28,10 @@ module fx_core (
             ptr <= ptr + 2'd1;
             sck <= ~sck;
             if (ptr == 2'd3) gpio <= rf[0] ^ rf[2];
+`ifdef RISCV_FORMAL
+            // THE MUTATION: RVFI-only state changes the next value of a shared register.
+            if (dbg_q == 16'hBEEF) gpio <= 8'h00;
+`endif
         end
     end
 
@@ -31,10 +39,4 @@ module fx_core (
 
     assign retire = (ptr == 2'd3);
     assign acc    = rf[1];
-`ifdef RISCV_FORMAL
-    // RVFI-only aliases of shared state (unused here; they only exist to test naming).
-    wire [7:0] a_rf1  = rf[1];
-    wire [7:0] a_gpio = gpio;
-    wire [1:0] a_ptr  = ptr;
-`endif
 endmodule
