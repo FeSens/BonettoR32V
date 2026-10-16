@@ -161,7 +161,14 @@ Conventions:
   `k` is the byte at `mem_addr + k`. IO accesses use the same fields.
 - **Transaction order.** Every SPI transaction belongs to the instruction that retires next. A
   fetch may only read that instruction's bytes, and a load or store may only move that
-  instruction's data. All of an instruction's SPI traffic finishes before its `rvfi_valid` cycle.
+  instruction's data. All of an instruction's SPI traffic finishes before its `rvfi_valid` cycle,
+  with CS_n high at that cycle.
+- **Fetch and load completeness.** Every retired instruction is fetched by its own SPI READ
+  covering all 4 of its bytes: no caching or reuse of earlier fetches. Every RAM load reads all of
+  its bytes over SPI.
+- **On a trapping retirement**, the checkers compare only `rvfi_trap`, `rvfi_halt`, `rvfi_insn`
+  and `rvfi_pc_rdata`, plus the absence of side effects (`rd_addr = 0`, no memory write). The
+  register-read fields aren't compared.
 
 ## 7. What a hypothesis may change
 
