@@ -21,8 +21,9 @@ How the proof can fail and pass:
 - `opt_clean` runs without `-purge`. With `-purge`, opt_clean keeps one name per net and may
   pick an RVFI-only alias (for example `wire [7:0] obs = acc;`) in A but the original name in B,
   so the shared register goes unmatched and only `equiv_induct` (whose base case yosys does not
-  check) can prove it. Without `-purge`, every source name survives, so shared state stays matched;
-  the RVFI-only cells are still removed (they drive nothing once the rvfi ports are gone).
+  check) can try to prove it. On fixture pass_rvfi_alias that gives a false FAIL. Without
+  `-purge`, every source name survives, so shared state stays matched; the RVFI-only cells are
+  still removed (they drive nothing once the rvfi ports are gone).
 - `-mem2reg` turns arrays into registers with source-derived names (`rf[3]`), which match across
   builds; `equiv_make` rejects designs that still contain memories.
 
