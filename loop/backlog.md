@@ -9,7 +9,7 @@ budget comes from `docs/storage.md` and NanoV's signoff:
 
 | # | Idea | Est. saving | Notes |
 |---|---|---|---|
-| 001 | Bit-serial core with an always-rotating flip-flop register file | seed minus ~13k (the seed is parallel) | RUNNING (hyp/001-bitserial) |
+| 001 | Bit-serial core with an always-rotating flip-flop register file | measured: 47,724.5 -> 17,503.0 µm² (LibreLane engine) | WAITING FOR GATES (hyp/001-bitserial 9a39f1d) |
 | B1 | One staging shift register reused as the SPI address buffer (MSB-first 16 bits), the load/store byte reverser, the shift buffer and the instruction immediate, by lifetime | 300-700 µm² | needs the 001 structure |
 | B2 | Keep only decoded instruction fields, not the full 32-bit IR: consume immediates serially as they arrive or from the staging register | 200-400 µm² | the fetch bit order is 7..0, 15..8, ...: decode on the fly |
 | B3 | PC upper half: a 16-bit rotating register with a lazy carry. Only JALR, AUIPC, JAL links and the 0xFFFF+4 wrap touch it | 0-150 µm² | the full 32-bit PC is architectural; the saving is in the logic, not the flip-flops |
@@ -25,7 +25,7 @@ budget comes from `docs/storage.md` and NanoV's signoff:
 |---|---|---|---|
 | P1 | Placement density sweep inside TT's allowed knobs (`PL_TARGET_DENSITY_PCT` up to 95, as NanoV did) | tile fraction | regular shift-register nets route well |
 | P2 | Hand-placed register-file array (rows of rotating flip-flops abutted, taps at one edge) | tile fraction, timing | standard cells only; LVS and gate-level sim cover it |
-| P3 | Check whether LibreLane keeps dfxtp_1 or upsizes to dfxtp_2 (+1.25 µm² x ~550) | ~700 µm² | if the resizer upsizes, constrain it (max fanout or slew settings within TT's allowed config) |
+| P3 | Instantiate dfxtp_1 explicitly. The PDK's `no_synth.cells` excludes it, so every inferred flip-flop is dfxtp_2 (21.27 vs 20.02 µm²) | ~730 µm² on H001 | needs contract v1.1 (allowed-cell list + contract-owned models); first find out why the PDK excludes it |
 
 ## Exotic (contract v1.1, only if the structural wins run out)
 
