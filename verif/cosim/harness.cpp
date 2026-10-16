@@ -402,29 +402,33 @@ int Harness::run(const uint8_t* img) {
         struct F {
           const char* name;
           uint64_t got, exp;
+          bool on_trap;  // compared on a trapping retirement too (contract section 6)
         } fields[] = {
-            {"rvfi_order", top_->rvfi_order, retired_},
-            {"rvfi_insn", top_->rvfi_insn, e.insn},
-            {"rvfi_pc_rdata", top_->rvfi_pc_rdata, e.pc},
-            {"rvfi_trap", top_->rvfi_trap, e.trap},
-            {"rvfi_halt", top_->rvfi_halt, e.halt},
-            {"rvfi_intr", top_->rvfi_intr, 0},
-            {"rvfi_mode", top_->rvfi_mode, 3},
-            {"rvfi_ixl", top_->rvfi_ixl, 1},
-            {"rvfi_rs1_addr", top_->rvfi_rs1_addr, e.rs1},
-            {"rvfi_rs1_rdata", top_->rvfi_rs1_rdata, e.rs1v},
-            {"rvfi_rs2_addr", top_->rvfi_rs2_addr, e.rs2},
-            {"rvfi_rs2_rdata", top_->rvfi_rs2_rdata, e.rs2v},
-            {"rvfi_rd_addr", top_->rvfi_rd_addr, e.rd},
-            {"rvfi_rd_wdata", top_->rvfi_rd_wdata, e.rdv},
-            {"rvfi_pc_wdata", top_->rvfi_pc_wdata, e.trap ? top_->rvfi_pc_wdata : e.npc},
-            {"rvfi_mem_rmask", top_->rvfi_mem_rmask, e.rmask},
-            {"rvfi_mem_wmask", top_->rvfi_mem_wmask, e.wmask},
+            // channel conventions, every pulse
+            {"rvfi_order", top_->rvfi_order, retired_, true},
+            {"rvfi_intr", top_->rvfi_intr, 0, true},
+            {"rvfi_mode", top_->rvfi_mode, 3, true},
+            {"rvfi_ixl", top_->rvfi_ixl, 1, true},
+            // a trapping retirement: trap, halt, insn, pc_rdata, and no side effects
+            {"rvfi_insn", top_->rvfi_insn, e.insn, true},
+            {"rvfi_pc_rdata", top_->rvfi_pc_rdata, e.pc, true},
+            {"rvfi_trap", top_->rvfi_trap, e.trap, true},
+            {"rvfi_halt", top_->rvfi_halt, e.halt, true},
+            {"rvfi_rd_addr", top_->rvfi_rd_addr, e.rd, true},
+            {"rvfi_mem_wmask", top_->rvfi_mem_wmask, e.wmask, true},
+            // everything else only on a normal retirement
+            {"rvfi_rs1_addr", top_->rvfi_rs1_addr, e.rs1, false},
+            {"rvfi_rs1_rdata", top_->rvfi_rs1_rdata, e.rs1v, false},
+            {"rvfi_rs2_addr", top_->rvfi_rs2_addr, e.rs2, false},
+            {"rvfi_rs2_rdata", top_->rvfi_rs2_rdata, e.rs2v, false},
+            {"rvfi_rd_wdata", top_->rvfi_rd_wdata, e.rdv, false},
+            {"rvfi_pc_wdata", top_->rvfi_pc_wdata, e.npc, false},
+            {"rvfi_mem_rmask", top_->rvfi_mem_rmask, e.rmask, false},
             {"rvfi_mem_addr", top_->rvfi_mem_addr,
-             (e.rmask | e.wmask) ? e.maddr : top_->rvfi_mem_addr},
+             (e.rmask | e.wmask) ? e.maddr : top_->rvfi_mem_addr, false},
         };
         for (const F& f : fields) {
-          if (f.got != f.exp) {
+          if ((f.on_trap || !e.trap) && f.got != f.exp) {
             fail(fmt("RVFI mismatch at %s: %s = 0x%llx, expected 0x%llx", who.c_str(), f.name,
                      (unsigned long long)f.got, (unsigned long long)f.exp));
             break;

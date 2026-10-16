@@ -50,8 +50,10 @@ than a byte. FENCE is any MISC-MEM encoding with funct3 = 0.
 Register-field convention (contract section 6, "the register index the core actually read"):
 LUI, AUIPC, JAL report no sources; JALR reports rs1; branches rs1 and rs2; loads rs1; stores rs1
 and rs2; OP-IMM rs1; OP rs1 and rs2; FENCE, ECALL, EBREAK and the illegal words report nothing.
-A trapping JALR or taken branch still reports the sources it read (it needs them to find the
-target); it never reports rd.
+On a trapping retirement the harness compares only trap, halt, insn and pc_rdata, plus
+rd_addr = 0 and mem_wmask = 0 (contract section 6). The register-read fields, rd_wdata, pc_wdata
+and the other memory fields are free there. (The ISS still reports the sources a trapping JALR or
+taken branch read.)
 
 Cross-check: `test_iss.py` runs selftest, gpio_demo and coremark (791,686 retirements) on spike
 and on the ISS and compares pc, instruction, register write, store address and data, and load
@@ -98,7 +100,7 @@ rvfi mode (design built with `RISCV_FORMAL`):
 
 | Check | Contract | Error text contains |
 |---|---|---|
-| every retirement: order, insn, pc_rdata, pc_wdata (not on a trap), trap, halt, intr = 0, mode = 3, ixl = 1, rs1/rs2/rd addr and data, mem masks, mem addr (when a mask is set), rdata/wdata on the masked lanes | 4, 6 | `RVFI mismatch at retirement #N (pc, insn): field = got, expected` |
+| every retirement: order, intr = 0, mode = 3, ixl = 1, insn, pc_rdata, trap, halt, rd_addr, mem_wmask; on a normal retirement also pc_wdata, rs1/rs2 addr and data, rd_wdata, mem_rmask, mem addr (when a mask is set), rdata/wdata on the masked lanes | 4, 6 | `RVFI mismatch at retirement #N (pc, insn): field = got, expected` |
 | every SPI transaction ends before the next rvfi_valid and touches only that instruction's bytes: its 4 fetch bytes, its RAM load bytes, its RAM store bytes with their values; IO accesses never appear on SPI | 3, 6 | `SPI READ/WRITE of byte ... is not part of retirement #N` |
 | CS_n is high in every rvfi_valid cycle | 6 | `SPI transaction still open at` |
 | each retired instruction's fetch bytes and RAM load bytes were read in full, its store bytes written | 6 | `retired without reading` / `without writing` |

@@ -111,5 +111,20 @@
   "fail": {
    "rvfi": "SPI transaction still open"
   }
+ },
+ "legal_trap_fields": {
+  "desc": "Legal: arbitrary rs1/rs2 fields, rd_wdata and pc_wdata on trapping retirements (contract section 6 compares only trap, halt, insn, pc_rdata, rd_addr = 0 and no memory write).",
+  "progs": [
+   "trap_jalr",
+   "trap_branch",
+   "trap_ecall",
+   "trap_ones",
+   "selftest"
+  ],
+  "pass": [
+   "rvfi",
+   "pins"
+  ],
+  "fail": {}
  }
 }

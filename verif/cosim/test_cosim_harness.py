@@ -180,15 +180,26 @@ def test_mutant_fails(programs, name):
     spec = m[name]
     src = COSIM / "mutants" / name
     assert (src / "tt_um_fesens_r32v.v").exists()
-    prog = PROGS / f"{spec.get('prog', 'selftest')}.hex"
-    for mode in spec.get("pass", []):
-        s, _ = run_cosim.run_one(mode, prog, 1, src=src)
-        assert s["pass"], f"{name} should pass {mode} mode: {s['error']}"
-    for mode, err in spec["fail"].items():
-        for seed in spec.get("seeds", [1]):
-            s, _ = run_cosim.run_one(mode, prog, seed, src=src)
-            assert not s["pass"], f"{name} passed {mode} mode (seed {seed})"
-            assert s["error"] and err in s["error"], f"{name} {mode} seed {seed}: {s['error']}"
+    progs = spec.get("progs", [spec.get("prog", "selftest")])
+    for prog in (PROGS / f"{p}.hex" for p in progs):
+        for mode in spec.get("pass", []):
+            s, _ = run_cosim.run_one(mode, prog, 1, src=src)
+            assert s["pass"], f"{name} should pass {mode} mode on {prog.name}: {s['error']}"
+        for mode, err in spec["fail"].items():
+            for seed in spec.get("seeds", [1]):
+                s, _ = run_cosim.run_one(mode, prog, seed, src=src)
+                assert not s["pass"], f"{name} passed {mode} mode (seed {seed})"
+                assert s["error"] and err in s["error"], f"{name} {mode} seed {seed}: {s['error']}"
+
+
+def test_trap_retirement_compares_only_the_contract_fields():
+    """Contract section 6: on a trapping retirement only trap, halt, insn, pc_rdata, rd_addr = 0
+    and no memory write are compared. legal_trap_fields reports arbitrary rs fields, rd_wdata and
+    pc_wdata there and must pass; trap_writes_rd (rd_addr != 0 on a trap) must fail."""
+    m = manifest()
+    assert m["legal_trap_fields"]["pass"] == ["rvfi", "pins"] and not m["legal_trap_fields"]["fail"]
+    assert {"trap_jalr", "trap_branch"} <= set(m["legal_trap_fields"]["progs"])
+    assert m["trap_writes_rd"]["fail"] == {"rvfi": "rvfi_rd_addr"}
 
 
 def test_every_required_mutant_class_is_present():
