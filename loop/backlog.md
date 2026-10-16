@@ -1,9 +1,18 @@
 # Hypothesis backlog (lead-maintained)
 
-The lead keeps this ranked. Estimates are the lead's, not measured, until a hypothesis runs. The
-budget comes from `docs/storage.md` and NanoV's signoff:
-- a 1x1 tile holds about 14.6k µm² of synthesized cells (routed at 95% density);
-- the always-rotating flip-flop register file alone is 10,133 µm².
+The lead keeps this ranked. Estimates are the lead's, not measured, until a hypothesis runs.
+
+**Budget, measured** by Task 8 in TT's stock flow (LibreLane 3.0.14):
+- **1x1 geometry.** The free core is 15,919 µm², and global placement adds a pin-density
+  adjustment of about 1,972 µm².
+- **NanoV doesn't fit.** It is 14,661.6 µm² of cells and fails 1x1 at GPL-0301 (104.5%
+  utilization). NanoV's own signed-off 1x1 needed a patched LibreLane.
+- **The stock-flow 1x1 cap** is therefore about 13.9k µm² of cells, timing-repair buffers
+  included. Routing at 86% density passed in 1x2.
+- **Hold repair is not in `area_um2`.** The seed in 3x2 got 607 hold buffers plus 465 clock
+  delay buffers, which is +26%. NanoV got none.
+- **The on-die register file alone** is 10.9k µm² (512 flops x 21.27). On-die architectural
+  state therefore cannot fit a 1x1 microcontroller (H002 explores the register file in RAM).
 
 ## Structural (the big wins)
 
@@ -25,6 +34,8 @@ budget comes from `docs/storage.md` and NanoV's signoff:
 |---|---|---|---|
 | P1 | Placement density sweep inside TT's allowed knobs (`PL_TARGET_DENSITY_PCT` up to 95, as NanoV did) | tile fraction | regular shift-register nets route well |
 | P2 | Hand-placed register-file array (rows of rotating flip-flops abutted, taps at one edge) | tile fraction, timing | standard cells only; LVS and gate-level sim cover it |
+| P4 | Find a TT-allowed config knob that disables or shrinks GPL's pin-density adjustment (NanoV patched `-disable_pin_density_adjust` into gpl.tcl) | up to ~1,970 µm² of 1x1 capacity | the knob must be in TT's allowed `config.json` set; precheck must pass |
+| P5 | Hold-repair minimization: compact clock tree in 1x1, and a design with fewer direct flop-to-flop paths, or ring stages with logic between them | tile fraction | measure with harden: `dlygate4sd3_1` count |
 | P3 | Instantiate dfxtp_1 explicitly. The PDK's `no_synth.cells` excludes it, so every inferred flip-flop is dfxtp_2 (21.27 vs 20.02 µm²) | ~730 µm² on H001 | needs contract v1.1 (allowed-cell list + contract-owned models); first find out why the PDK excludes it |
 
 ## Exotic (contract v1.1, only if the structural wins run out)
