@@ -394,7 +394,7 @@ interface in `docs/contract.md`. Every task reads both.
   4. Verify: a clean worktree at the reported sha, `make eval`, `contract_check.py`.
   5. Merge sequentially with a re-eval after each.
   6. Ledger, push, worktree cleanup.
-  The skill also covers champion rounds (harden, mindie, deep formal, TT CI) and physical rounds.
+  The skill also covers champion rounds (harden, tilefit, deep formal, TT CI) and physical rounds.
 - `agent-brief.md` is the template: the hypothesis, the contract pointers, allowed paths, the
   `make eval` loop, the report format (sha, area before and after, gates, what it tried) and the
   rules (no edits outside allowed paths; report evaluation doubts instead of working around them).
