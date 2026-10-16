@@ -79,12 +79,14 @@ runs first in the lint gate and again inside `tools/equiv.py`.
 - any `.v` file not matching `^[A-Za-z0-9_]+\.v$` fails;
 - any `.sv` or `.svh` file fails (contract section 1: plain Verilog).
 
-**Tokens of every `src/*.v`** (comments and strings handled, escaped identifiers read whole as
-the tools read them):
+**Tokens of every `src/*.v`** (comments and strings handled as Verilator, yosys and Icarus
+handle them; escaped identifiers read whole and then rejected by rule 11):
 1. **Directives.** The only directives allowed are `` `ifdef RISCV_FORMAL ``,
    `` `ifndef RISCV_FORMAL ``, `` `else ``, `` `endif ``, `` `default_nettype none|wire `` and
    `` `timescale <1|10|100><unit>/<1|10|100><unit> ``.
    - Each must be alone on its line, and the `ifdef`/`endif` nesting must balance.
+   - `` `default_nettype `` and `` `timescale `` sit outside `module ... endmodule`, and a
+     `` `timescale `` precision may not be coarser than its unit.
    - Every other backtick token fails: `` `define ``, any macro use (`` `RVFI_OUTPUTS ``,
      `` `__LINE__ ``), `` `include ``, `` `undef ``, `` `elsif ``, `` `celldefine ``,
      `` `resetall ``, `` `line ``, `` `pragma ``, and stray sequences such as `` `` `` or
@@ -112,15 +114,71 @@ the tools read them):
      accepts (`interface`, `program`, `checker`, `package`, `class`, `config`).
    - Escaped names (`\r32v_x`), `$` in a name, and a lifetime keyword after `module` all fail.
 
+**Constructs that simulate differently from the synthesized circuit.** Rules 7 to 12 run on the
+token stream each build compiles: `ifdef RISCV_FORMAL` resolved for the plain and the
+RISCV_FORMAL build, directive lines dropped. Lint and equiv run Verilator and yosys, which
+ignore or reject many of these constructs, while Icarus RTL simulation honors them. Review round
+3 showed `assign #1000 uo_out = q;` passing src_check, lint and equiv, while Icarus RTL showed
+`uo_out=xx` and the synthesized netlist showed `a5`.
+
+7. **No timing controls.**
+   - A `#` is allowed only as `<name> #(`, where `<name>` is a design module name: the
+     parameter port list `module r32v_x #(` or a parameterized instantiation `r32v_x #(...)`.
+     So `assign #5`, `assign #(5)`, `wire #1 w`, `q <= #1 d`, `#5 stmt`, `##1` and `mod #5 u`
+     all fail.
+   - `always` must be followed by `@`, and `@` may only follow `always`, so there are no waits
+     and no intra-assignment events.
+   - The event control is `@(*)`, `@*` or a list of `posedge`/`negedge` signals joined by `or`
+     or `,`. A level-sensitive list (`@(a)`, `@(a or b)`) fails: Icarus honors an incomplete
+     list, synthesis does not.
+8. **System tasks and functions.** Only `$signed` and `$unsigned` are allowed (the seed uses
+   both). Every other `$name` fails: `$display`, `$random`, `$time`, `$finish`, `$clog2`,
+   `$readmemh`, and so on.
+9. **Keywords.** These fail:
+   - procedural and simulation-only: `specify`, `specparam`, `defparam`, `force`, `release`,
+     `deassign`, `wait`, `fork`/`join`, `disable`, `event` and its `->` trigger, `task`,
+     `final`;
+   - SystemVerilog assertions;
+   - the types `real`, `realtime`, `time`;
+   - UDPs (`primitive`, `table`);
+   - resolved and pulled nets: `tri`, `tri0`, `tri1`, `triand`, `trior`, `trireg`, `wand`,
+     `wor`, `uwire`, `supply0`/`supply1`, `pullup`, `pulldown`;
+   - drive and charge strengths;
+   - `always_comb`, `always_ff`, `always_latch` (contract section 1 says plain Verilog);
+   - the gate primitives (`and`, `or`, `nand`, `nor`, `xor`, `xnor`, `buf`, `not`,
+     `bufif0/1`, `notif0/1`, `nmos`, `pmos`, `cmos`, `tran*`, `rtran*`, ...). `or` is allowed
+     only as the separator inside an event control.
+10. **No hierarchical references.** A `.` is allowed only in a named connection, right after
+    `(` or `,` and followed by `name(` (ports and `#(.W(8))`). So `u.sig`, `g[0].sig`,
+    `rvfi_wrapper.uut.x`, `.*` and implicit `.name` all fail.
+11. **No escaped identifiers, string literals or real literals.**
+    - Icarus expands macros inside escaped identifiers (`\r`__ICARUS__` becomes `\r1`).
+    - A lone `\` (a backslash line continuation outside a macro) is an escaped identifier too.
+    - With system tasks gone, nothing in a design needs a string.
+12. **Functions read nothing stale.** A function's local variable, or its own result, must not
+    be read before it is assigned on every path.
+    - The walker understands `begin/end`, `if/else` (both branches), `case` (only with
+      `default`), `for` (the init assigns its variable), `while`, `repeat` and assignments. A
+      partial assignment (`t[0] = ...`) never counts as a full one.
+    - Anything else in a function body fails, as "cannot follow its body".
+    - Why: Icarus keeps a function's locals between calls, but synthesis makes them undefined.
+      With `begin f = t; t = a; end`, Verilator lint is clean and yosys synthesizes it, yet
+      Icarus RTL shows `a5` where the netlist shows `xx`.
+    - A result left partly unassigned is not caught. Verilator `-Wall` flags locals that are
+      never written.
+
 **Differential backstop.** For the plain and the RISCV_FORMAL builds, src_check preprocesses
-`src/*.v` (sorted) twice: with `verilator -E -P` and with yosys `read_verilog -ppdump`.
-- It tokenizes both outputs without comments or whitespace.
+`src/*.v` (sorted) three times: with `verilator -E -P`, with yosys `read_verilog -ppdump` and
+with `iverilog -E`.
+- It tokenizes all three outputs without comments or whitespace.
 - It drops `` `timescale `` (yosys consumes it) and yosys's `` `file_push ``/`` `file_pop ``
   markers.
-- It requires identical token streams, and fails on any difference or preprocessor error.
+- It requires identical token streams, and fails on any difference, any preprocessor error, or
+  any Icarus preprocessor warning.
 
 This catches tool-specific behavior the static rules might miss. With static rules bypassed, it
-alone catches the reviewer's `` `ifdef verilator `` split.
+alone catches the reviewer's `` `ifdef verilator `` split and Icarus's macro expansion inside an
+escaped identifier.
 
 Run it alone with `python3 tools/src_check.py [--src DIR] [--no-differential]`.
 
@@ -129,10 +187,18 @@ Fixtures in `tools/test_fixtures/src_check/`:
   define, macro-pasted initial on RVFI-only state, cross-file define, include search order,
   attribute or `=` built from macros, pasted initial, `SIMD_WIDTH` define, `(* full_case *)`
   after `@(* )`.
-- **`pass_*`:** must pass. `pass_bitserial` is a realistic bit-serial sample (generate loop,
-  function, typed localparams and parameters, `` `default_nettype none ``, `` `timescale ``,
-  `always @(*)`, an `ifdef RISCV_FORMAL` port block); it also passes lint and equiv. The others
-  are a generate loop, `parameter integer`/`localparam integer`, and `@(* )`.
+  - Round 3 adds: assign, nonblocking and net delays, defparam, hierarchical references (own
+    port, upward into `rvfi_wrapper`), a bare `always`, `$random`/`$time`/`$finish`/`$fopen`,
+    `specify`, `wand`, `tri0`, `tri1`, `event`, `force`, `real`, an escaped identifier with a
+    backtick, a stale function local, and a level-sensitive list.
+  - The delay, stale-local and level-sensitive fixtures also fail the real lint and equiv
+    gates.
+- **`pass_*`:** must pass.
+  - `pass_bitserial` is a realistic bit-serial sample (generate loop, function, typed
+    localparams and parameters, `` `default_nettype none ``, `` `timescale ``, `always @(*)`,
+    an `ifdef RISCV_FORMAL` port block). It also passes lint and equiv.
+  - The others are a generate loop, `parameter integer`/`localparam integer`, `@(* )`, and the
+    reviewer's minimal lint-clean top (`pass_minimal`).
 
 ## build/eval.json
 

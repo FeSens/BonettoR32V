@@ -156,8 +156,8 @@ def last_json_line(lines):
 # ---------------------------------------------------------------------------------------------
 
 def gate_lint(ctx):
-    """tools/src_check.py first (static rules, then the verilator/yosys differential
-    preprocessor check), then verilator --lint-only -Wall over src/*.v (top tt_um_fesens_r32v),
+    """tools/src_check.py first (static rules, then the verilator/yosys/iverilog
+    differential preprocessor check), then verilator --lint-only -Wall over src/*.v (top tt_um_fesens_r32v),
     plain and RISCV_FORMAL builds."""
     problems = src_check.check(ctx.path("src"))
     if not problems:

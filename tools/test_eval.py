@@ -16,8 +16,10 @@ sys.path.insert(0, HERE)
 import eval as ev  # noqa: E402
 
 FIX = os.path.join(HERE, "test_fixtures", "equiv")
-HAVE_VERILATOR = shutil.which("verilator", path=ev.tool_env()["PATH"]) is not None
-HAVE_YOSYS = shutil.which("yosys", path=ev.tool_env()["PATH"]) is not None
+# The real lint and equiv gates run the three-way preprocessor backstop.
+HAVE_PP = all(shutil.which(t, path=ev.tool_env()["PATH"])
+              for t in ("verilator", "yosys", "iverilog"))
+PP_REASON = "verilator, yosys and iverilog needed"
 
 
 @pytest.fixture(autouse=True)
@@ -200,7 +202,7 @@ def test_lint_without_sources_fails(repo):
 
 # --- lint (real verilator) ---------------------------------------------------------------------
 
-@pytest.mark.skipif(not HAVE_VERILATOR, reason="verilator not on PATH")
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
 def test_lint_clean_fixture_passes(repo):
     with_src(repo)
     doc = run_gate(repo, "lint")
@@ -208,7 +210,7 @@ def test_lint_clean_fixture_passes(repo):
     assert "plain and RISCV_FORMAL" in doc["detail"]
 
 
-@pytest.mark.skipif(not HAVE_VERILATOR, reason="verilator not on PATH")
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
 @pytest.mark.parametrize("where,label", [("plain", "plain"), ("rvfi", "RISCV_FORMAL")])
 def test_lint_warning_fails(repo, where, label):
     with_src(repo)
@@ -237,7 +239,7 @@ def test_lint_runs_src_hygiene_before_verilator(repo):
     assert not (repo / "build" / "logs" / "lint_plain.log").exists()   # verilator never ran
 
 
-@pytest.mark.skipif(not (HAVE_VERILATOR and HAVE_YOSYS), reason="verilator and yosys needed")
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
 def test_lint_runs_differential_backstop(repo, monkeypatch):
     # Static rules bypassed: the lint gate must still run the verilator/yosys comparison.
     with_src(repo)
@@ -251,7 +253,7 @@ def test_lint_runs_differential_backstop(repo, monkeypatch):
     assert "differential check (plain)" in doc["detail"], doc["detail"]
 
 
-@pytest.mark.skipif(not (HAVE_VERILATOR and HAVE_YOSYS), reason="verilator and yosys needed")
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
 def test_equiv_runs_differential_backstop(tmp_path, monkeypatch):
     import equiv
     src = tmp_path / "src"
@@ -266,7 +268,7 @@ def test_equiv_runs_differential_backstop(tmp_path, monkeypatch):
     assert "differential check" in json.loads(out.read_text())["detail"]
 
 
-@pytest.mark.skipif(not (HAVE_VERILATOR and HAVE_YOSYS), reason="verilator and yosys needed")
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
 def test_bitserial_sample_passes_lint_and_equiv(repo):
     sample = os.path.join(HERE, "test_fixtures", "src_check", "pass_bitserial")
     for f in os.listdir(sample):
@@ -277,6 +279,26 @@ def test_bitserial_sample_passes_lint_and_equiv(repo):
     eq = run_gate(repo, "equiv")
     assert eq["pass"] is True, eq["detail"]
     assert eq["data"]["proved_by_induct"] == 0
+
+
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
+@pytest.mark.parametrize("fixture,needle", [
+    ("fail_assign_delay", "`#` delay control is not allowed"),
+    ("fail_nb_delay", "`#` delay control is not allowed"),
+    ("fail_function_stale_local", "function f reads t before assigning it"),
+    ("fail_level_sensitivity", "event control must be @(*)"),
+])
+def test_round3_splits_fail_lint_and_equiv(repo, fixture, needle):
+    # Review round 3: each of these passed src_check, lint and equiv while Icarus RTL simulation
+    # disagreed with the synthesized netlist. Both gates now stop them at src_check.
+    sample = os.path.join(HERE, "test_fixtures", "src_check", fixture)
+    for f in os.listdir(sample):
+        shutil.copy(os.path.join(sample, f), repo / "src" / f)
+    os.symlink(HERE, repo / "tools")
+    lint = run_gate(repo, "lint")
+    assert lint["pass"] is False and needle in lint["detail"], lint["detail"]
+    eq = run_gate(repo, "equiv")
+    assert eq["pass"] is False and needle in eq["detail"], eq["detail"]
 
 
 def test_lint_rejects_macro_split(repo):
@@ -290,7 +312,7 @@ def test_lint_rejects_macro_split(repo):
 
 # --- equiv adapter (real tools/equiv.py) -------------------------------------------------------
 
-@pytest.mark.skipif(not HAVE_YOSYS, reason="yosys not on PATH")
+@pytest.mark.skipif(not HAVE_PP, reason=PP_REASON)
 @pytest.mark.parametrize("fixture,ok", [("pass_observer", True), ("fail_rvfi_drives_pin", False)])
 def test_equiv_adapter(repo, fixture, ok):
     with_src(repo, fixture)

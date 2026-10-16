@@ -29,8 +29,8 @@ How the proof can fail and pass:
 - Initial values: no `init` attribute may appear in the plain build, in A after the strip, or in
   A before the strip (gold_prestrip.il), where RVFI-only state still exists. The proof ignores
   init values, so formal could otherwise assume a power-up value the chip lacks.
-- Before anything is built, tools/src_check.py must pass, static rules and the verilator/yosys
-  differential preprocessor check (contract section 1, restricted preprocessor). So the RVFI
+- Before anything is built, tools/src_check.py must pass, static rules and the
+  verilator/yosys/iverilog differential preprocessor check (contract section 1, restricted preprocessor). So the RVFI
   build needs only -DRISCV_FORMAL: src/ can't use any other macro.
 - Every path written into a yosys script must match a strict safe-character pattern and is
   double-quoted where yosys strips quotes (read_verilog, write_rtlil, read_rtlil).

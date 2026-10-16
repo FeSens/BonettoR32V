@@ -4,7 +4,10 @@
 Runs first in the lint gate, and tools/equiv.py runs it before building anything. Verilator,
 yosys, SBY, Icarus and LibreLane each predefine different macros and handle preprocessor corners
 differently, so src/ may only use a tiny allowlisted subset, checked on a real tokenizer, with a
-differential backstop that compares what two real preprocessors produce.
+differential backstop that compares what three real preprocessors produce. Constructs that
+simulate differently from the synthesized circuit (delays, waits, system tasks, resolved nets,
+hierarchical references, stale function locals, ...) fail too, so RTL simulation, the formal and
+equivalence models and the netlist all describe one circuit.
 
 Layout (check_layout):
   - every entry under src/ (recursively) matches ^[A-Za-z0-9_][A-Za-z0-9_.-]*$; no symlinks;
@@ -29,10 +32,29 @@ Tokens of every src/*.v (check_hdl), comments and strings handled:
      config) is named tt_um_fesens_r32v or r32v_[A-Za-z0-9_]*, as a plain identifier, so no
      design module can shadow a checker's (rvfi_wrapper, tb, spiram_23lc512, iss, ...).
 
+Constructs that simulate differently from what synthesis builds (check_constructs; tokens on
+directive lines are not code and are skipped):
+  7. Timing: `#` only as `<name> #(` where <name> is a design module name (the parameter port
+     list `module r32v_x #(` or a parameterized instantiation `r32v_x #(`), so no delay control
+     anywhere. `always` must be followed by `@`, `@` must follow `always`, and the event control
+     is @(*), @* or a list of posedge/negedge signals (no level-sensitive lists).
+  8. System tasks and functions: only $signed and $unsigned.
+  9. Keywords: specify, specparam, defparam, force, release, deassign, wait, fork/join, disable,
+     event (and the `->` trigger), task, final, SystemVerilog assertions, real, realtime, time,
+     primitive, table, tri*, wand, wor, trireg, uwire, supply0/1, pullup, pulldown, drive and
+     charge strengths, always_comb/always_ff/always_latch, and the gate primitives (`or` only as
+     the separator inside an event control).
+ 10. No hierarchical references: `.` only in named connections, right after `(` or `,` and
+     followed by `name(`.
+ 11. No escaped identifiers, string literals or real literals.
+ 12. Functions: a local variable (or the function's own result) must not be read before it is
+     assigned on every path (no stale or uninitialized values; Icarus keeps them between calls,
+     synthesis makes them undefined).
+
 Differential backstop (check_differential): for the plain and the RISCV_FORMAL builds, preprocess
-src/*.v (sorted) with `verilator -E -P` and with yosys `read_verilog -ppdump`, tokenize both
-without comments or whitespace, drop `timescale (yosys consumes it) and yosys's file markers, and
-require identical token streams.
+src/*.v (sorted) with `verilator -E -P`, yosys `read_verilog -ppdump` and `iverilog -E`, tokenize
+all three without comments or whitespace, drop `timescale (yosys consumes it) and yosys's file
+markers, and require identical token streams.
 
 Usage: src_check.py [--src DIR] [--no-differential]. Exit 0 when clean, 1 with one line per
 problem.
@@ -58,6 +80,25 @@ VARIABLE_TYPES = {"reg", "integer", "time", "real", "realtime", "logic", "bit", 
 DEFINITION_KEYWORDS = {"module", "macromodule", "primitive", "interface", "program", "checker",
                        "package", "class", "config"}
 MODULE_NAME_RE = re.compile(r"^(tt_um_fesens_r32v|r32v_[A-Za-z0-9_]*)$")
+SYSTEM_FUNCTIONS_OK = {"$signed", "$unsigned"}
+# Keywords whose meaning is simulation-only, tool-dependent or not plain Verilog.
+FORBIDDEN_KEYWORDS = {
+    "specify", "endspecify", "specparam", "defparam", "force", "release", "deassign", "wait",
+    "fork", "join", "join_any", "join_none", "disable", "event", "task", "endtask", "final",
+    "assert", "assume", "cover", "restrict", "property", "endproperty", "sequence",
+    "endsequence", "expect",
+    "real", "realtime", "time",
+    "primitive", "endprimitive", "table", "endtable",
+    "tri", "tri0", "tri1", "triand", "trior", "trireg", "wand", "wor", "uwire", "supply0",
+    "supply1", "pullup", "pulldown", "strong0", "strong1", "pull0", "pull1", "weak0", "weak1",
+    "highz0", "highz1", "small", "medium", "large",
+    "always_comb", "always_ff", "always_latch",
+}
+GATE_PRIMITIVES = {"and", "or", "nand", "nor", "xor", "xnor", "buf", "not", "bufif0", "bufif1",
+                   "notif0", "notif1", "nmos", "pmos", "rnmos", "rpmos", "cmos", "rcmos", "tran",
+                   "tranif0", "tranif1", "rtran", "rtranif0", "rtranif1"}
+REAL_RE = re.compile(r"[0-9][0-9_]*(\.[0-9_]+)?([eE][+-]?[0-9_]+)?")
+TIME_UNITS = {"s": 10 ** 15, "ms": 10 ** 12, "us": 10 ** 9, "ns": 10 ** 6, "ps": 10 ** 3, "fs": 1}
 METACOMMENT_FIRST = {"verilator", "synopsys", "synthesis", "pragma", "yosys"}
 METACOMMENT_ANY = re.compile(r"translate_|lint_off|full_case|parallel_case", re.I)
 TIMESCALE_RE = re.compile(r"^\s*`timescale\s+(1|10|100)\s*(s|ms|us|ns|ps|fs)\s*/\s*(1|10|100)\s*"
@@ -206,9 +247,14 @@ def check_directives(name, toks, lines):
     errors = []
     stack = []                                   # one entry per open ifdef: has_else
     seen_lines = {}
+    in_module = False
     for idx, (kind, text, line) in enumerate(toks):
+        if kind == "id" and text in ("module", "macromodule", "endmodule"):
+            in_module = text != "endmodule"
         if kind != "dir":
             continue
+        if text in ("timescale", "default_nettype") and in_module:
+            errors.append(f"src/{name}:{line}: `{text} must be outside module ... endmodule")
         where = f"src/{name}:{line}"
         raw = lines[line - 1] if line - 1 < len(lines) else ""
         code = re.sub(r"//.*$", "", raw).strip()
@@ -240,9 +286,13 @@ def check_directives(name, toks, lines):
             if not re.fullmatch(r"`default_nettype\s+(none|wire)", code):
                 errors.append(f"{where}: only `default_nettype none or wire, alone on its line")
         elif text == "timescale":
-            if not TIMESCALE_RE.match(code):
+            m = TIMESCALE_RE.match(code)
+            if not m:
                 errors.append(f"{where}: malformed `timescale (alone on its line, e.g. "
                               f"`timescale 1ns/1ps)")
+            elif int(m.group(3)) * TIME_UNITS[m.group(4)] > \
+                    int(m.group(1)) * TIME_UNITS[m.group(2)]:
+                errors.append(f"{where}: `timescale precision is coarser than its unit")
         else:
             errors.append(f"{where}: `{text} is not allowed (contract section 1: only `ifdef/"
                           f"`ifndef RISCV_FORMAL, `else, `endif, `default_nettype, `timescale)")
@@ -297,6 +347,331 @@ def check_module_names(name, toks):
     return errors
 
 
+def build_tokens(toks, rvfi):
+    """The code tokens one build compiles: `ifdef/`ifndef RISCV_FORMAL resolved, directive lines
+    (which hold only the directive, see check_directives) dropped."""
+    dir_lines = {line for kind, _, line in toks if kind == "dir"}
+    active, out = [], []
+    for kind, text, line in toks:
+        if kind == "dir":
+            if text in ("ifdef", "ifndef"):
+                active.append(rvfi if text == "ifdef" else not rvfi)
+            elif text == "else" and active:
+                active[-1] = not active[-1]
+            elif text == "endif" and active:
+                active.pop()
+        elif line not in dir_lines and all(active):
+            out.append((kind, text, line))
+    return out
+
+
+def close_of(toks, p):
+    """Index of the bracket closing the one at toks[p], or None."""
+    depth = 0
+    for q in range(p, len(toks)):
+        if toks[q][0] != "op":
+            continue
+        if toks[q][1] in ("(", "[", "{"):
+            depth += 1
+        elif toks[q][1] in (")", "]", "}"):
+            depth -= 1
+            if depth == 0:
+                return q
+    return None
+
+
+def event_list_ok(inner):
+    """@( ... ) contents: a lone *, or posedge/negedge <id>[<index>] joined by `or` or `,`."""
+    if [t for _, t, _ in inner] == ["*"]:
+        return True
+    p = 0
+    while True:
+        if p + 1 >= len(inner) or inner[p][1] not in ("posedge", "negedge") or \
+                inner[p + 1][0] != "id":
+            return False
+        p += 2
+        if p < len(inner) and inner[p][1] == "[":
+            q = close_of(inner, p)
+            if q is None:
+                return False
+            p = q + 1
+        if p == len(inner):
+            return True
+        if inner[p][1] not in ("or", ","):
+            return False
+        p += 1
+
+
+def check_constructs(name, toks):
+    """Rules 7-11: constructs that simulate differently from the synthesized circuit."""
+    errors = []
+
+    def err(line, msg):
+        errors.append(f"src/{name}:{line}: {msg} (contract section 1)")
+
+    n = len(toks)
+    in_event = set()
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "op" or text != "@":
+            continue
+        if not (i and toks[i - 1][:2] == ("id", "always")):
+            err(line, "`@` event control is only allowed directly after `always` (no waits or "
+                      "intra-assignment events)")
+        nxt = toks[i + 1][1] if i + 1 < n else None
+        if nxt == "*":
+            continue
+        close = close_of(toks, i + 1) if nxt == "(" else None
+        if close is None or not event_list_ok(toks[i + 2:close]):
+            err(line, "event control must be @(*), @* or a list of posedge/negedge signals (a "
+                      "level-sensitive list simulates differently from the synthesized logic)")
+        if close is not None:
+            in_event.update(range(i + 2, close))
+    for i, (kind, text, line) in enumerate(toks):
+        prev = toks[i - 1] if i else ("", "", 0)
+        nxt = toks[i + 1] if i + 1 < n else ("", "", 0)
+        if kind == "id":
+            if text in FORBIDDEN_KEYWORDS:
+                err(line, f"`{text}` is not allowed")
+            elif text in GATE_PRIMITIVES and not (text == "or" and i in in_event):
+                err(line, f"`{text}` is not allowed (gate primitive; `or` only inside an event "
+                          f"control)")
+            elif text == "always" and nxt[1] != "@":
+                err(line, "`always` must be followed by an event control: @(posedge clk), @(*) "
+                          "or @*")
+        elif kind == "sys" and text not in SYSTEM_FUNCTIONS_OK:
+            err(line, f"system task/function `{text}` is not allowed (only $signed, $unsigned)")
+        elif kind == "escid":
+            err(line, f"escaped identifier {text!r} is not allowed (plain identifiers only)")
+        elif kind == "str":
+            err(line, f"string literal {text[:30]!r} is not allowed")
+        elif kind == "num" and "'" not in text and REAL_RE.fullmatch(text) and \
+                ("." in text or "e" in text.lower()):
+            err(line, f"real literal {text!r} is not allowed")
+        elif kind == "op" and text == "#":
+            if not (nxt[1] == "(" and prev[0] == "id" and MODULE_NAME_RE.match(prev[1])):
+                err(line, "`#` delay control is not allowed (`#(` only after a design module "
+                          "name: `module r32v_x #(` or an `r32v_x #(` instantiation)")
+        elif kind == "op" and text == "->":
+            err(line, "`->` event trigger is not allowed")
+        elif kind == "op" and text == ".":
+            if prev[0] in ("id", "escid") or prev[1] in ("]", ")"):
+                err(line, f"hierarchical reference `{prev[1]}.{nxt[1]}` is not allowed")
+            elif not (prev[1] in ("(", ",") and nxt[0] == "id" and i + 2 < n
+                      and toks[i + 2][1] == "("):
+                err(line, "`.` is only allowed in a named connection: `.name(`")
+    return errors
+
+
+class FunctionShapeError(Exception):
+    pass
+
+
+class FunctionScan:
+    """Rule 12: definite assignment of function locals before any read.
+
+    Walks one function's statements (begin/end, if/else, case with default, for, while, repeat,
+    blocking or nonblocking assignments). D is the set of locals assigned in full on every path
+    so far; a read of a local outside D fails. Partial assignments (x[i] = ...) never make a
+    local definite. Anything the walker does not understand fails, so the check stays strict.
+    """
+
+    def __init__(self, fname, toks):
+        self.file, self.toks, self.errors, self.reported = fname, toks, [], set()
+        self.locals, self.func = set(), None
+
+    def tok(self, p):
+        if p >= len(self.toks):
+            raise FunctionShapeError("unexpected end of function")
+        return self.toks[p][1]
+
+    def find(self, p, sym):
+        depth = 0
+        for q in range(p, len(self.toks)):
+            k, t, _ = self.toks[q]
+            if k != "op":
+                continue
+            if t in ("(", "[", "{"):
+                depth += 1
+            elif t in (")", "]", "}"):
+                depth -= 1
+            elif t == sym and depth == 0:
+                return q
+        raise FunctionShapeError(f"missing {sym!r}")
+
+    def close(self, p):
+        if self.tok(p) != "(":
+            raise FunctionShapeError("expected (")
+        q = close_of(self.toks, p)
+        if q is None:
+            raise FunctionShapeError("unbalanced (")
+        return q
+
+    def reads(self, a, b, D):
+        for q in range(a, b):
+            k, t, line = self.toks[q]
+            called = q + 1 < len(self.toks) and self.toks[q + 1][1] == "("
+            if k == "id" and t in self.locals and t not in D and not called and \
+                    t not in self.reported:
+                self.reported.add(t)
+                self.errors.append(f"src/{self.file}:{line}: function {self.func} reads {t} "
+                                   f"before assigning it on every path (an uninitialized or "
+                                   f"stale value; contract section 1)")
+
+    def assign(self, a, b, D):
+        eq, depth = None, 0
+        for q in range(a, b):
+            k, t, _ = self.toks[q]
+            depth += k == "op" and t in ("(", "[", "{")
+            depth -= k == "op" and t in (")", "]", "}")
+            if depth == 0 and k == "op" and t in ("=", "<="):
+                eq = q
+                break
+        if eq is None:
+            raise FunctionShapeError("expected an assignment")
+        self.reads(eq + 1, b, D)
+        elems = [(a, eq)]
+        if self.tok(a) == "{":
+            if close_of(self.toks, a) != eq - 1:
+                raise FunctionShapeError("malformed concatenation target")
+            elems, s, depth = [], a + 1, 0
+            for q in range(a + 1, eq):
+                t = self.toks[q][1]
+                depth += t in ("(", "[", "{")
+                depth -= t in (")", "]", "}")
+                if (t == "," and depth == 0) or q == eq - 1:
+                    elems.append((s, q))
+                    s = q + 1
+        full = set()
+        for s, e in elems:
+            if s >= e or self.toks[s][0] != "id":
+                raise FunctionShapeError("malformed assignment target")
+            if e - s == 1:
+                full.add(self.toks[s][1])
+            else:
+                self.reads(s + 1, e, D)
+        return D | full
+
+    def decls(self, p):
+        while self.tok(p) in VARIABLE_TYPES or self.tok(p) in ("parameter", "localparam"):
+            q = self.find(p, ";")
+            if self.tok(p) in VARIABLE_TYPES:
+                depth, skip = 0, False
+                for k, t, _ in self.toks[p + 1:q]:
+                    depth += t in ("(", "[", "{")
+                    depth -= t in (")", "]", "}")
+                    if depth == 0 and t == "=":
+                        skip = True
+                    elif depth == 0 and t == ",":
+                        skip = False
+                    elif depth == 0 and k == "id" and not skip and t not in ("signed",
+                                                                            "unsigned"):
+                        self.locals.add(t)
+            p = q + 1
+        return p
+
+    def stmt(self, p, D):
+        t = self.tok(p)
+        if t == "begin":
+            p += 1
+            if self.tok(p) == ":":
+                p += 2
+            p = self.decls(p)
+            while self.tok(p) != "end":
+                p, D = self.stmt(p, D)
+            return p + 1, D
+        if t == "if":
+            c = self.close(p + 1)
+            self.reads(p + 2, c, D)
+            p, d1 = self.stmt(c + 1, D)
+            if p < len(self.toks) and self.tok(p) == "else":
+                p, d2 = self.stmt(p + 1, D)
+                return p, d1 & d2
+            return p, D
+        if t in ("case", "casez", "casex"):
+            c = self.close(p + 1)
+            self.reads(p + 2, c, D)
+            p, outs, dflt = c + 1, [], False
+            while self.tok(p) != "endcase":
+                if self.tok(p) == "default":
+                    dflt, p = True, p + 1
+                    if self.tok(p) == ":":
+                        p += 1
+                else:
+                    q = self.find(p, ":")
+                    self.reads(p, q, D)
+                    p = q + 1
+                p, d = self.stmt(p, D)
+                outs.append(d)
+            return p + 1, (frozenset.intersection(*outs) if dflt and outs else D)
+        if t == "for":
+            c = self.close(p + 1)
+            s1 = self.find(p + 2, ";")
+            s2 = self.find(s1 + 1, ";")
+            d1 = self.assign(p + 2, s1, D)
+            self.reads(s1 + 1, s2, d1)
+            p, d2 = self.stmt(c + 1, d1)
+            self.assign(s2 + 1, c, d2)
+            return p, d1
+        if t in ("while", "repeat"):
+            c = self.close(p + 1)
+            self.reads(p + 2, c, D)
+            p, _ = self.stmt(c + 1, D)
+            return p, D
+        if t == ";":
+            return p + 1, D
+        q = self.find(p, ";")
+        return q + 1, self.assign(p, q, D)
+
+    def run(self):
+        """toks run from `function` up to (not including) `endfunction`."""
+        line = self.toks[0][2]
+        try:
+            p, depth = 1, 0
+            while self.tok(p) != ";" or depth:
+                k, t, _ = self.toks[p]
+                if t == "(" and depth == 0 and self.func:     # ANSI port list
+                    p = self.close(p) + 1
+                    continue
+                depth += t in ("(", "[", "{")
+                depth -= t in (")", "]", "}")
+                if k == "id" and depth == 0 and t not in ("automatic", "signed", "unsigned") \
+                        and t not in VARIABLE_TYPES:
+                    self.func = t
+                p += 1
+            if not self.func:
+                raise FunctionShapeError("no function name")
+            self.locals.add(self.func)
+            p += 1
+            while self.tok(p) in ("input", "output", "inout"):
+                p = self.find(p, ";") + 1
+            p = self.decls(p)
+            D = frozenset()
+            while p < len(self.toks):
+                p, D = self.stmt(p, D)
+        except FunctionShapeError as e:
+            self.errors.append(f"src/{self.file}:{line}: function {self.func or '?'}: src_check "
+                               f"cannot follow its body ({e}); write it with begin/end, if/else, "
+                               f"case, for and assignments (contract section 1)")
+        return self.errors
+
+
+def check_functions(name, toks):
+    errors = []
+    i = 0
+    while i < len(toks):
+        if toks[i][:2] != ("id", "function"):
+            i += 1
+            continue
+        end = next((j for j in range(i, len(toks)) if toks[j][:2] == ("id", "endfunction")),
+                   None)
+        if end is None:
+            errors.append(f"src/{name}:{toks[i][2]}: function without endfunction")
+            break
+        errors += FunctionScan(name, toks[i:end]).run()
+        i = end + 1
+    return errors
+
+
 def check_hdl(src):
     errors = []
     for name in verilog_files(src):
@@ -322,6 +697,15 @@ def check_hdl(src):
                               f"contract section 1)")
         errors += check_declarations(name, toks)
         errors += check_module_names(name, toks)
+        # Rules 7-12 run on what each build actually compiles: the plain and the RISCV_FORMAL
+        # token streams, ifdefs resolved and directive lines dropped.
+        seen = set(errors)
+        for rvfi in (False, True):
+            code = build_tokens(toks, rvfi)
+            for e in check_constructs(name, code) + check_functions(name, code):
+                if e not in seen:
+                    seen.add(e)
+                    errors.append(e)
         for ctext, line in comments:
             body = ctext[2:-2] if ctext.startswith("/*") else ctext[2:]
             first = re.match(r"[\s*/]*([A-Za-z_]+)", body)
@@ -385,10 +769,25 @@ def verilator_pp(files, rvfi, env):
     return p.stdout, None
 
 
+def iverilog_pp(files, rvfi, env, work):
+    out = os.path.join(work, "ivl_pp.v")
+    cmd = ["iverilog", "-E", "-o", out] + (["-DRISCV_FORMAL"] if rvfi else []) + files
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    msg = (p.stderr + p.stdout).strip()
+    if p.returncode != 0 or msg:            # Icarus only warns on, e.g., an undefined macro
+        return None, msg.splitlines()[:1] or [f"exit {p.returncode}"]
+    with open(out) as f:
+        return f.read(), None
+
+
+PREPROCESSORS = ("verilator", "yosys", "iverilog")
+
+
 def check_differential(src, env=None):
-    """Compare verilator -E -P and yosys -ppdump token streams, plain and RISCV_FORMAL."""
+    """Compare verilator -E -P, yosys -ppdump and iverilog -E token streams, plain and
+    RISCV_FORMAL."""
     env = env or tool_env()
-    for tool in ("verilator", "yosys"):
+    for tool in PREPROCESSORS:
         if shutil.which(tool, path=env["PATH"]) is None:
             return [f"differential check: {tool} not on PATH"]
     files = [os.path.join(os.path.abspath(src), f) for f in verilog_files(src)]
@@ -401,22 +800,28 @@ def check_differential(src, env=None):
     with tempfile.TemporaryDirectory() as work:
         for rvfi in (False, True):
             label = "RISCV_FORMAL" if rvfi else "plain"
-            vtext, verr = verilator_pp(files, rvfi, env)
-            ytext, yerr = yosys_ppdump(files, rvfi, env, work)
-            if verr or yerr:
+            outs = {"verilator": verilator_pp(files, rvfi, env),
+                    "yosys": yosys_ppdump(files, rvfi, env, work),
+                    "iverilog": iverilog_pp(files, rvfi, env, work)}
+            failed = [(tool, err) for tool, (_, err) in outs.items() if err]
+            if failed:
                 errors.append(f"differential check ({label}): preprocessor failed: "
-                              f"{(verr or yerr)}")
+                              f"{failed[0][0]}: {failed[0][1]}")
                 continue
             try:
-                a, b = normalized(vtext), normalized(ytext)
+                streams = {tool: normalized(text) for tool, (text, _) in outs.items()}
             except LexError as e:
                 errors.append(f"differential check ({label}): cannot tokenize output ({e})")
                 continue
-            if a != b:
+            a = streams["verilator"]
+            for tool in PREPROCESSORS[1:]:
+                b = streams[tool]
+                if a == b:
+                    continue
                 k = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-                errors.append(f"differential check ({label}): verilator and yosys preprocess "
+                errors.append(f"differential check ({label}): verilator and {tool} preprocess "
                               f"src/ differently at token {k}: verilator "
-                              f"{' '.join(a[max(0, k - 3):k + 4])!r} vs yosys "
+                              f"{' '.join(a[max(0, k - 3):k + 4])!r} vs {tool} "
                               f"{' '.join(b[max(0, k - 3):k + 4])!r}")
     return errors
 
@@ -426,7 +831,7 @@ def main(argv=None):
     ap.add_argument("--src", default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "src"))
     ap.add_argument("--no-differential", action="store_true",
-                    help="static rules only (skip the verilator/yosys preprocessor comparison)")
+                    help="static rules only (skip the three-way preprocessor comparison)")
     args = ap.parse_args(argv)
     errors = check(args.src)
     if not errors and not args.no_differential:

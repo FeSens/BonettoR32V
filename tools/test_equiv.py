@@ -12,8 +12,10 @@ sys.path.insert(0, HERE)
 import equiv  # noqa: E402
 
 FIX = os.path.join(HERE, "test_fixtures", "equiv")
-HAVE_YOSYS = shutil.which("yosys", path=equiv.tool_env()["PATH"]) is not None
-pytestmark = pytest.mark.skipif(not HAVE_YOSYS, reason="yosys not on PATH")
+# equiv.py runs src_check's three-way preprocessor backstop before yosys.
+HAVE_TOOLS = all(shutil.which(t, path=equiv.tool_env()["PATH"])
+                 for t in ("verilator", "yosys", "iverilog"))
+pytestmark = pytest.mark.skipif(not HAVE_TOOLS, reason="verilator, yosys and iverilog needed")
 
 
 def run_equiv(tmp_path, src):
