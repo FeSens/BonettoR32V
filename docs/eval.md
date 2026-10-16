@@ -77,8 +77,9 @@ Details:
 - `pass` is true only if all seven gates ran and passed.
 - A gate after the first failure has `{"pass": null, "detail": "not run (stopped after X
   failed)"}`, and `stopped_at` names the failing gate.
-- `dirty` is true when `git status --porcelain` is non-empty at the start, so the sha doesn't
-  describe what was evaluated. `ledger.py add --verdict merged` refuses a dirty eval.
+- `dirty` is true when `git status --porcelain --ignore-submodules=untracked` is non-empty at the
+  start, so the sha doesn't describe what was evaluated. `ledger.py add --verdict merged` refuses
+  a dirty eval.
 - `area_um2`, `cells` come from the area gate and `cpi` from cosim; each is null when its gate
   didn't run.
 - The file is deleted when `make eval` starts, so a crashed run never leaves a stale pass behind.

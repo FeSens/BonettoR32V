@@ -444,7 +444,9 @@ def main(argv=None):
 
     ctx = Ctx(args.repo, verbose=args.verbose or bool(args.gate))
     sha = git(ctx.repo, "rev-parse", "HEAD") or "unknown"
-    status = git(ctx.repo, "status", "--porcelain")
+    # Untracked scratch files inside a submodule don't change what is evaluated; a moved
+    # submodule commit or an edited tracked file does.
+    status = git(ctx.repo, "status", "--porcelain", "--ignore-submodules=untracked")
     dirty = None if status is None else bool(status)
     t0 = time.time()
 
