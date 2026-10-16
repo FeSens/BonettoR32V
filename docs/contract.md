@@ -94,9 +94,9 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
     Writes to other IO bytes are ignored.
   - Misaligned IO accesses (`addr[1:0] != 0` with `n > 1`) are unspecified; no test uses them.
   - An IO access never appears on the SPI pins.
-- **`ui_in` timing.** An IO load samples `ui_in` after the previous instruction retires and before
-  its own retirement. The cosim changes `ui_in` only directly after retirements, and formal holds
-  it constant.
+- **`ui_in` timing.** An IO load samples `ui_in` after its own fetch transaction has completed
+  (CS_n has risen after the fetch) and before its own retirement. The cosim changes `ui_in` only
+  shortly after retirements (within 2 cycles), and formal holds it constant.
 - **`uo_out` timing.** `uo_out` changes only as the result of an IO store that writes byte 0. It
   holds the new value no later than one cycle after that store retires.
 
