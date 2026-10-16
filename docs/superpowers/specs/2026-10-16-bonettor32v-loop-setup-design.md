@@ -280,3 +280,21 @@ loop.
 - How the SPI monitor feeds riscv-formal's bus checks, and the exact depth formula.
 - The blockage search method (which edge, binary search granularity).
 - The ledger's schema and the agent brief template.
+
+## Addendum (2026-10-16): measured budget and the microcontroller
+
+- **What a 1x1 tile holds.** NanoV-1tile's signoff gives a die of 161 x 111.52 µm and a core of
+  16,493 µm² (instance area). Its 14,653 µm² synthesized design routed at 95% target density.
+  With its register file on the die, NanoV needed 21,578 µm² (135%) and didn't fit. It reached 1x1
+  only by moving registers into the SPI RAM, which our contract forbids.
+- **Our floor.** The architectural state alone (480 register bits, 32 PC bits, 8 GPIO bits) is
+  about 520 flip-flops, roughly 10.4-11k µm² depending on the flip-flop size synthesis picks. The
+  core will therefore be about 12-14k µm² unless storage gets denser than flip-flops.
+- **The microcontroller target** (asked by the user, my estimate, not measured):
+  - minimum viable set: GPIO direction on uio[7:4], a timer with compare, UART TX, interrupts
+    (minimal Zicsr: mepc, mcause, MIE, mret, fixed mtvec), boot from SPI flash;
+  - UART RX and hardware PWM if area allows;
+  - SPI and I2C to peripherals bit-banged.
+  The set is about 4-5.5k µm². Fitting core plus MCU in 1x1 needs the core around 9-10k µm², which
+  likely needs latch storage (contract v1.1) or a better idea. Peripherals and interrupts are
+  contract changes (pins, memory map, ISA) and go to the user before they're adopted.
