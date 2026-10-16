@@ -10,8 +10,11 @@
   names, at the seed's depth.
 - The seed (src/) PASSES the full suite (checks.cfg). Set BONETTO_SKIP_SEED=1 to skip.
 
-Formal runs take the heavy-job lock (lockf -k /tmp/bonetto-heavy.lock).
+The formal runs (mutants, seed) take the heavy-job lock /tmp/bonetto-heavy.lock once
+for the whole session (the same lock as `lockf -k /tmp/bonetto-heavy.lock`). If you
+already run pytest under that lock, set BONETTO_HEAVY_LOCK_HELD=1.
 """
+import fcntl
 import json
 import os
 import shutil
@@ -24,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 RUN = os.path.join(HERE, "run_formal.py")
 MUT_DIR = os.path.join(HERE, "mutants")
-LOCK = ["lockf", "-k", "/tmp/bonetto-heavy.lock"] if shutil.which("lockf") else []
+LOCK_PATH = "/tmp/bonetto-heavy.lock"
 
 sys.path.insert(0, HERE)
 import run_formal  # noqa: E402
@@ -37,8 +40,23 @@ def mutants():
                   if os.path.isfile(os.path.join(MUT_DIR, d, "expect.json")))
 
 
+@pytest.fixture(scope="session")
+def heavy_lock():
+    """Hold the heavy-job lock for every formal run of the session (one acquisition)."""
+    if os.environ.get("BONETTO_HEAVY_LOCK_HELD") == "1":
+        yield
+        return
+    with open(LOCK_PATH, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def formal(args, timeout=4 * 3600):
-    cmd = LOCK + [sys.executable, RUN] + args
+    """run_formal.py; callers depend on the heavy_lock fixture."""
+    cmd = [sys.executable, RUN] + args
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout + p.stderr
 
@@ -253,7 +271,7 @@ prep -flatten -nordff -top stub_tb
 # Mutants and the seed.
 
 @pytest.fixture(scope="session")
-def seed_timing(tmp_path_factory):
+def seed_timing(tmp_path_factory, heavy_lock):
     out = tmp_path_factory.mktemp("timing") / "seed_timing.json"
     rc, text = formal(["--timing-only", str(out)], timeout=3600)
     assert rc == 0, text[-3000:]
@@ -261,7 +279,7 @@ def seed_timing(tmp_path_factory):
 
 
 @pytest.mark.parametrize("mutant", mutants())
-def test_mutant_fails(mutant, tmp_path, seed_timing):
+def test_mutant_fails(mutant, tmp_path, seed_timing, heavy_lock):
     mdir = os.path.join(MUT_DIR, mutant)
     expect = json.load(open(os.path.join(mdir, "expect.json")))
     src = tmp_path / "src"
@@ -287,7 +305,7 @@ def test_mutant_fails(mutant, tmp_path, seed_timing):
 
 
 @pytest.mark.skipif(os.environ.get("BONETTO_SKIP_SEED") == "1", reason="BONETTO_SKIP_SEED=1")
-def test_seed_passes(tmp_path):
+def test_seed_passes(tmp_path, heavy_lock):
     out = tmp_path / "formal.json"
     rc, text = formal(["--out", str(out)])
     res = json.load(open(out))
