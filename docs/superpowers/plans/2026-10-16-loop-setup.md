@@ -14,8 +14,8 @@ zero).
     a C++ RV32E ISS;
   - an SV SPI monitor in the riscv-formal wrapper that feeds riscv-formal's bus checks;
   - a Verilog SPI RAM model in TT's cocotb testbench, which also runs on the gate-level netlist.
-- **Scoring.** A fast LibreLane or yosys synthesis area for every candidate. A min-die LibreLane
-  hardening run for champions.
+- **Scoring.** A fast LibreLane or yosys synthesis area for every candidate. For champions, an
+  in-tile LibreLane fit: the smallest share of the real 1x1 TT tile they sign off in.
 
 **Tech Stack:**
 - Verilog-2005 RTL (yosys, Verilator and Icarus all accept it), Verilator 5.047, C++17.
@@ -168,7 +168,8 @@ interface in `docs/contract.md`. Every task reads both.
   - `rvfi` builds with `-DRISCV_FORMAL` and compares every retirement field with `Iss::step`.
   - `pins` builds without the define. It compares the final RAM image, the `uo_out` change trace
     and the halt against the ISS.
-- Cycle cap: `1000 * ISS retired count + 10000`.
+- Latency cap: a watchdog fails the run if any retirement gap exceeds 1,024 cycles (or the first
+  retirement comes later than 1,024 cycles after reset), per contract section 4.
 
 - [ ] **Step 1:** Write `test_cosim_harness.py`. Each mutant must FAIL with a specific error:
   - samples MISO while SCK is low;
@@ -229,10 +230,21 @@ interface in `docs/contract.md`. Every task reads both.
   `{"pass", "checks": {name: "PASS|FAIL|UNREACHED"}, "depth", "runtime_s"}`. Any `UNREACHED` counts
   as a FAIL.
 - Rules:
-  - **Unbounded mode.** Use `RISCV_FORMAL_UNBOUNDED`: `check` and `trig` are free inputs, so BMC
-    checks every retirement up to the depth. The bounded testbench's 8-bit cycle counter can't
-    reach past 255.
-  - **Depth.** Computed as `reset + 2 * max_cycles_per_insn + margin`, never set by hand.
+  - **Contract-owned forks in `verif/formal/checks/`, not edits to the submodule:**
+    - **Testbench.** A 16-bit cycle counter. The insn, reg, pc, causal, unique and bus checks use
+      `RISCV_FORMAL_UNBOUNDED`, so the solver picks the check cycle and BMC covers every retirement
+      up to the depth.
+    - **Liveness.** It triggers on any retirement (free `trig`) and checks at trigger + 1,024 (the
+      contract's latency cap), as far as the depth allows.
+    - **Bus checks.** Misaligned-aware (shadow bytes, not words), aware of the 16-bit alias, and
+      blind to GPIO (`addr[31]` accesses).
+    - **New models and checks.** ECALL, EBREAK and FENCE models, and a "silent after halt" check
+      (no retirement and no SPI WRITE after `rvfi_halt`).
+  - **Depth.** D is the deepest the Mac finishes within the time budget, and it must cover at least
+    two retirements of the measured common case (`reset + 2 * max_cycles_per_insn` from
+    selftest). D is recorded in `build/formal.json` and never set by an agent. Slower instances are
+    left to cosim and the architecture tests: depth-limited proofs plus cosim is the
+    per-candidate policy.
   - **No ALIGNED_MEM.** Misaligned accesses are architecture.
   - **E filter.** Encodings that name x16-x31 are excluded from the instruction checks
     (`spec_valid` gated) and left to reg, pc and causal consistency.
@@ -300,14 +312,14 @@ interface in `docs/contract.md`. Every task reads both.
   4. Pass at gate level.
   5. Commit.
 
-### Task 8: Area, hardening and min-die tooling
+### Task 8: Area, hardening and tile-fit tooling
 
 **Files:**
 - Create:
   - `tools/area.py`, `tools/synth_area.ys`;
   - `tools/harden_tt.sh` (tt-support-tools `--create-user-config` then `--harden`, LibreLane in
     Docker, PDK via ciel at the version LibreLane 3.0.14 pins);
-  - `physical/mindie.py`, `physical/config_mindie.json`;
+  - `physical/tilefit.py`;
   - `docs/baselines.md`.
 
 **Interfaces:**
@@ -320,9 +332,11 @@ interface in `docs/contract.md`. Every task reads both.
     consumed by Task 7.
   - `harden_tt.sh` writes `build/harden/summary.json`:
     `{"pass", "drc", "lvs", "antenna", "setup_wns", "hold_wns", "utilization", "die_um2"}`.
-  - `mindie.py` binary-searches the core area at the tile's aspect ratio. Signoff is clean when
-    every check in `harden_tt.sh` passes. Output: `build/mindie.json` as `{"min_die_um2",
-    "density", "runs": [...]}`.
+  - `tilefit.py` runs inside the real TT 1x1 template (`tt_tool` config, same die, pins and PDN).
+    It adds a hard placement blockage over the right-hand part of the core area, leaving routing
+    free, and binary-searches the blockage width for the smallest placeable fraction at which
+    every signoff check in `harden_tt.sh` stays clean. Output: `build/tilefit.json` as
+    `{"min_fraction", "placeable_um2", "density", "runs": [...]}`.
 - Baselines: NanoV-1tile (github.com/WaiMingLee888/nanov-1tile-tinytapeout-sky) and SERV
   (github.com/olofk/serv, with the RF in its own flip-flops), each cloned into the scratchpad and
   run through `area.py`. Numbers go in `docs/baselines.md`.
@@ -332,7 +346,7 @@ interface in `docs/contract.md`. Every task reads both.
   2. Then on the seed.
   3. `harden_tt.sh` on NanoV passes (it proves the local flow).
   4. Then on the seed (at the tile size that fits it).
-  5. Run `mindie.py` on the seed.
+  5. Run `tilefit.py` on whichever of NanoV and the seed fits in 1x1.
   6. Commit.
 
 ### Task 9: Eval, contract check, ledger
@@ -343,8 +357,15 @@ interface in `docs/contract.md`. Every task reads both.
 
 **Interfaces:**
 - Produces:
-  - `make eval` runs lint, cosim, formal (fast), arch, area and gl in that order and stops at the
-    first failure. It writes `build/eval.json`: `{"sha", "pass", "gates": {name: {"pass",
+  - `make eval` runs lint, cosim, equiv, formal (fast), arch, area and gl in that order and stops
+    at the first failure.
+  - `make equiv` (`tools/equiv.py`):
+    1. Synthesize the RISCV_FORMAL build with yosys, delete its `rvfi_*` ports and run
+       `opt_clean -purge`.
+    2. Prove it equivalent to the plain build: `equiv_make`, `equiv_simple -seq 5`,
+       `equiv_induct`, `equiv_status -assert`. Fall back to eqy if the yosys equiv flow can't
+       match the state.
+    3. Test it with a mutant where RVFI logic drives `uo_out`, which must FAIL. It writes `build/eval.json`: `{"sha", "pass", "gates": {name: {"pass",
     "detail"}}, "area_um2", "cells", "cpi", "timestamp"}`.
   - `contract_check.py BASE HEAD` exits 1 when any changed path is outside `src/**` (minus
     `src/config.json`), `physical/**` (when `--physical`) or `src/test_*`. It also fingerprints the
@@ -383,7 +404,7 @@ interface in `docs/contract.md`. Every task reads both.
 ### Task 11: Champion zero and CI
 
 - [ ] **Step 1:** `make eval` passes on main. Then run `make harden` for the tile config the seed
-  needs, and `make mindie`.
+  needs, and `make tilefit` if it fits in 1x1.
 - [ ] **Step 2:** Set the `info.yaml` tiles and source_files. Re-enable the gds, test and docs
   workflows (`gh workflow enable`), push, and confirm the TT gds, precheck and gl_test runs are
   green.

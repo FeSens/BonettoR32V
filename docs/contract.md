@@ -40,13 +40,15 @@ module tt_um_fesens_r32v (
   rising edge at which `rst_n` is low. While `rst_n` is low, CS_n = 1, SCK = 0 and `uo_out` = 0.
   After the release, execution starts at `pc = 0`.
 - Single clock domain: every flip-flop is clocked on the rising edge of `clk`.
-- Latches are allowed only with an enable that is glitch-free: a flip-flop output, or the output of
-  a sky130 clock-gating cell driven by `clk`.
+- No latches in v1. sky130 latches only time safely (STA sees them) when enabled through a
+  clock-gating cell from `clk`, and the formal and cosim tools can't read the PDK's UDP cell
+  models. Contract v1.1 adds clock-gated latches with contract-owned cell models when the loop
+  needs them.
 - No negative-edge flip-flops, no internal tristates, no combinational loops.
 - The design must not rely on power-up values. Registers, the register file included, may start
   unknown. Checkers randomize them (cosim) or leave them as X (gate-level test).
-- Only `sky130_fd_sc_hd` cells may be instantiated. Plain RTL is preferred; instantiating a cell is
-  allowed when it's the point (latches, clock gates).
+- Plain synthesizable Verilog only. No instantiated cells in v1; synthesis maps to
+  `sky130_fd_sc_hd`.
 
 ## 2. SPI memory protocol (23LC512-compatible, mode 0)
 
@@ -108,9 +110,13 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   core never retires again and never starts another SPI WRITE.
 - **Reserved encodings are UNSPECIFIED.** That covers every other encoding that isn't one of the
   instructions above, including RV32E encodings whose register fields name x16-x31. The core may
-  do anything with them, but its RVFI trace must stay consistent: register reads return the last
-  value written, PCs chain, and memory traffic matches the pins. Cosim programs never contain
-  reserved encodings.
+  give them any effect, but two rules hold:
+  - It must either retire them or trap and halt. It may never hang on one: liveness applies.
+  - Its RVFI trace must stay consistent: register reads return the last value written, PCs chain,
+    and memory traffic matches the pins.
+  Cosim programs never contain reserved encodings.
+- **Latency cap.** The first instruction retires within 1,024 cycles of reset release, and every
+  later one within 1,024 cycles of the previous retirement. A halted core is exempt.
 - **FENCE** (every FENCE encoding, FENCE.TSO and PAUSE included) is a no-op that retires normally.
 - **Misaligned loads and stores never trap** (section 3).
 - **Program termination.** Test programs end with EBREAK. The checkers detect the halt and read
@@ -127,8 +133,9 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
 ## 6. RVFI (formal and cosim builds only)
 
 Ports exist only under `` `ifdef RISCV_FORMAL ``. Logic under that define may only compute RVFI
-outputs; it must not change the design's behavior on the pins. The pin-level cosim and the
-gate-level test run builds without the define to enforce this.
+outputs; nothing that drives a pin may depend on it. The equivalence gate enforces this: the RVFI
+build with its RVFI ports stripped must be equivalent to the plain build. The pin-level cosim and
+the gate-level test also run the plain build.
 
 The core has one retirement channel (NRET = 1), with riscv-formal's standard names:
 `rvfi_valid, rvfi_order[63:0], rvfi_insn[31:0], rvfi_trap, rvfi_halt, rvfi_intr, rvfi_mode[1:0],

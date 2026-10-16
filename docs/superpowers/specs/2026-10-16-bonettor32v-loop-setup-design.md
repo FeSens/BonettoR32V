@@ -101,8 +101,8 @@ holds CS_n low as long as it likes; the memory models accept any legal mode-0 wa
 - Tests end with EBREAK. The testbench sees the halt and reads results from RAM.
 
 **Clock and signoff:** STA closes at 20 MHz (50 ns, `CLOCK_PERIOD` in TT's `src/config.json`) at
-every corner TT's flow checks. A slower target leaves room for latch-based and dual-edge tricks and
-needs fewer upsized cells. The RP2040 emulator and the 23LC512 both run comfortably below this.
+every corner TT's flow checks. A slower target needs fewer upsized cells and leaves timing room for
+latch-based register files later. Contract v1 is posedge-only with no negative-edge logic. The RP2040 emulator and the 23LC512 both run comfortably below this.
 
 **Cells:** sky130_fd_sc_hd only (TT's library). Latches are allowed.
 
@@ -130,10 +130,19 @@ one passes.
      instruction, load data came from the addressed bytes, and stores wrote exactly the claimed
      bytes.
    - A small custom check ties GPIO stores to `uo_out` and GPIO loads to `ui_in`.
-   - **Depth.** BMC depth comes from the candidate's measured worst-case cycles per instruction
-     (from cosim), not from the agent. A cover on each check proves its target is reachable within
-     that depth, so a slow core can't pass vacuously.
-   - A deep, slower configuration runs on champions only.
+   - **Contract-owned forks.** riscv-formal's stock testbench counts cycles in 8 bits and stops at
+     255. Its bus checks assume aligned memory and full 32-bit bus addresses. So `verif/formal`
+     carries its own testbench and bus checks: misaligned-aware, aware of the 64 KB alias, with GPIO
+     handled by its own check. It also adds ECALL, EBREAK and FENCE models and a "silent after halt"
+     check.
+   - **Depth policy.** Instructions with data-dependent latency mean no BMC depth covers every slow
+     instance on the Mac. So per-candidate formal is depth-limited:
+     - it proves every instruction instance that retires within depth D, plus liveness up to the
+       contract's latency cap where feasible;
+     - D is set by measured runtime, and reachability covers prove the checks aren't vacuous;
+     - slow instances (for example large shift amounts) are covered by cosim and the architecture
+       tests, which hit every shift amount.
+     Champions also run a deeper suite; a champion that fails it is rolled back.
 3. **Cosim at the pins.** Verilator runs the TT top module against a C++ model of the 23LC512 and
    the GPIO pins, retirement by retirement against a reference ISS (RV32E with this exact memory
    map and trap behavior). Programs:
@@ -144,10 +153,14 @@ one passes.
 4. **Official architecture tests:** riscv-arch-test, RV32E base subset, with signatures compared
    against the reference.
 5. **Gate-level simulation:** the selftest and the GPIO program, run on the synthesized sky130
-   netlist. This catches `ifdef` cheating and differences between simulation and synthesis.
-6. **Cycle cap:** each test must finish within a fixed budget (on the order of 1,000 cycles per
-   instruction on average). The cap exists so tests terminate, not to score speed.
-7. **Contract check:** the candidate's diff only touches allowed paths. Contract files are
+   netlist. This catches differences between simulation and synthesis.
+6. **Equivalence:** the RISCV_FORMAL build, with its RVFI ports stripped and the logic that only
+   feeds them removed, must be sequentially equivalent to the plain build (yosys `equiv_*` or eqy).
+   Formal then proves the design that ships, and RVFI logic can't influence the pins.
+7. **Latency cap:** every instruction retires within 1,024 cycles of the previous retirement, and
+   the first within 1,024 cycles of reset (contract section 4). Cosim enforces it on every
+   instruction. It bounds tests and formal depth, not speed.
+8. **Contract check:** the candidate's diff only touches allowed paths. Contract files are
    fingerprinted before and after the agent runs.
 
 The ISS, the memory models and the formal wrapper are cross-checked once at setup, against each
@@ -159,10 +172,13 @@ other and against the seed core.
   yosys script (flatten, sky130_fd_sc_hd typical-corner liberty, ABC, `stat -liberty`). It's
   deterministic, takes seconds and is broken down by cell type and module. A smaller number wins.
   Ties go to fewer cells, then fewer cycles on the test programs.
-- **Physical score (champions, and physical hypotheses):** the smallest die area at which
-  LibreLane's classic flow, with TT's settings except die size, finishes clean: DRC (magic and
-  klayout), LVS, antenna, setup and hold at all corners, and an IR-drop report. This number is
-  what "packed" means: it charges for routing overhead, not just cells.
+- **Physical score (champions, and physical hypotheses):** measured inside the real TT 1x1 tile
+  template (its die, pins and PDN), because that's where the microcontroller has to fit. It's the
+  smallest fraction of the tile's core area the design can be squeezed into, by a hard placement
+  blockage over the rest. Signoff must stay clean throughout: DRC (magic and klayout), LVS,
+  antenna, setup and hold at all corners, and an IR-drop report. The rest of the tile is room for
+  peripherals. This number is what "packed" means: it charges for routing overhead, not just
+  cells.
 - **Manufacturability gate (each new champion):** `tt_tool --harden` into a real 1x1 tile, locally,
   plus TT's gds / precheck / gl_test GitHub Actions on the private repo.
 - **Reference points:** NanoV-1tile and SERV, run through the same area script, give the numbers to
@@ -173,7 +189,9 @@ other and against the seed core.
 - Flow knobs: placement density, `GRT_ALLOW_CONGESTION`, and the PDN / tap / decap strategy where
   TT's config allows it.
 - Standard-cell macros:
-  - hand-placed regular arrays, such as the latch register file with shared write and read lines;
+  - hand-placed regular arrays, such as the latch register file with shared write and read lines
+    (needs contract v1.1: clock-gated latches with contract-owned cell models for formal and
+    cosim, since the PDK's UDP models can't be read by yosys or Verilator);
   - hardened as sub-blocks or placed by script, then integrated.
   LVS plus gate-level simulation cover them exactly, since they're built only from standard cells.
 - No custom cells and no hand-drawn layout (non-goal above).
@@ -193,7 +211,7 @@ BonettoR32V/                    private GitHub repo FeSens/BonettoR32V
     cosim/                      Verilator harness, 23LC512 + GPIO model, reference ISS
     programs/                   selftest, GPIO demo, CoreMark (rv32e), random-stream generator
     arch-test/                  riscv-arch-test target for this platform
-  physical/                     LibreLane configs, min-die search, macro scripts (lead-owned;
+  physical/                     LibreLane configs, in-tile blockage search, macro scripts (lead-owned;
                                 physical hypotheses edit here)
   third_party/riscv-formal      pinned submodule
   tools/                        eval: lint, area, harden, score, contract check, ledger (contract)
@@ -234,9 +252,9 @@ Each round, the lead does six things.
 
 On top of the rounds:
 
-- **Champion rounds**, when the champion changes: hardening, min-die search, TT actions and the
+- **Champion rounds**, when the champion changes: hardening, the in-tile blockage search, TT actions and the
   deep formal configuration.
-- **Physical rounds:** hypotheses on floorplan and macros, scored on min-die.
+- **Physical rounds:** hypotheses on floorplan and macros, scored on the in-tile physical score.
 
 The procedure lives in `.claude/skills/area-loop/SKILL.md`, so any later session can pick up the
 loop.
@@ -260,5 +278,5 @@ loop.
 - Module structure of the seed, the exact yosys script, the ISS implementation language, test
   program contents.
 - How the SPI monitor feeds riscv-formal's bus checks, and the exact depth formula.
-- The min-die search method (binary search on a square die versus the tile's aspect ratio).
+- The blockage search method (which edge, binary search granularity).
 - The ledger's schema and the agent brief template.

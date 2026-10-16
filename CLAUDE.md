@@ -2,7 +2,7 @@
 
 Goal: the smallest correct RV32E core on Tiny Tapeout sky130 (programs from SPI RAM, GPIO). It's
 step one toward a full microcontroller in ONE 1x1 tile. The score is silicon area: RTL cell area
-first, then the smallest die that hardens clean. Speed isn't scored.
+first, then the smallest share of the real 1x1 tile that hardens clean. Speed isn't scored.
 
 - `docs/contract.md`: the exact interface (pins, SPI protocol, memory map, EEI, RVFI). Read it
   first.
@@ -17,11 +17,11 @@ first, then the smallest die that hardens clean. Speed isn't scored.
 | 1 | RV32E per docs/contract.md section 4: every instruction correct, all fatal traps halt with `rvfi_trap = rvfi_halt = 1` | riscv-formal (rv32e config), cosim against the ISS, riscv-arch-test |
 | 2 | The pins follow the SPI waveform rules (contract section 2), and every SPI transaction matches the RVFI-reported fetch, load or store | formal bus checks via the SPI monitor, cosim memory model |
 | 3 | GPIO behaves per contract section 3 | formal GPIO check, cosim |
-| 4 | Logic under `ifdef RISCV_FORMAL` only observes; the design without it behaves identically | cosim of the build without the define, gate-level test |
+| 4 | Logic under `ifdef RISCV_FORMAL` only observes; the design without it behaves identically | equivalence gate (RVFI-stripped build equals plain build), plain-build cosim, gate-level test |
 | 5 | Registers live on the die; no hard-wired GPRs; no state in the SPI RAM other than program data | review and formal (reg check) |
 | 6 | The design doesn't rely on power-up values | cosim with random init (several seeds), gate-level X propagation |
-| 7 | sky130_fd_sc_hd only, one posedge clock, glitch-free latch enables only | lint and review |
-| 8 | Tests finish within the cycle cap | cosim |
+| 7 | Plain RTL, one posedge clock, no latches in v1 (contract section 1) | lint and review |
+| 8 | Every instruction retires within 1,024 cycles of the previous one | cosim watchdog, formal liveness |
 | 9 | A candidate's diff touches only allowed paths | `tools/contract_check.py` |
 
 ## Don't-touch list (hypothesis agents never modify these)
@@ -49,10 +49,11 @@ this design pass". If a gate looks wrong, report it to the lead; don't route aro
 | `make cosim` | Verilator cosim: selftest, GPIO, CoreMark, random streams, RVFI and non-RVFI builds |
 | `make arch` | riscv-arch-test RV32E subset |
 | `make gl` | gate-level test of the synthesized netlist |
+| `make equiv` | the RVFI-stripped build equals the plain build |
 | `make area` | the fast score: sky130 cell area, broken down |
 | `make eval` | every gate plus the score, writing `build/eval.json` |
 | `make harden` | TT 1x1 hardening (LibreLane) |
-| `make mindie` | the physical score: the smallest die that hardens clean |
+| `make tilefit` | the physical score: the smallest fraction of the real 1x1 tile the design signs off in |
 
 ## Working rules
 
@@ -67,5 +68,6 @@ this design pass". If a gate looks wrong, report it to the lead; don't route aro
   - Push over HTTPS:
     `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.
 - **Mac load.**
-  - One heavy job at a time: formal, hardening or a min-die search.
+  - One heavy job at a time: formal, hardening or a tile-fit search. Wrap them in
+    `lockf -k /tmp/bonetto-heavy.lock`.
   - Cosim and area runs are light.
