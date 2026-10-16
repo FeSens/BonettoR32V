@@ -149,16 +149,33 @@ rm -f "$PROJ/src/user_config.json" "$PROJ/src/config_merged.json"
 rsync -a --exclude .git "$ENV_DIR/tt-support-tools/" "$PROJ/tt/"
 [ -n "$OVERLAY" ] && OVERLAY="$(abspath "$OVERLAY")"
 
-python3 -I - "$PROJ" "$KEEP_INFO" "$TILES" "$OVERLAY" <<'PY'
+python3 -I - "$PROJ" "$KEEP_INFO" "$TILES" "$OVERLAY" <<'PY' || exit 2
 import json, re, sys
 from pathlib import Path
 proj, keep, tiles, overlay = Path(sys.argv[1]), sys.argv[2] == "1", sys.argv[3], sys.argv[4]
 info = (proj / "info.yaml").read_text().splitlines()
+# Source names reach yosys command strings (tt_tool's port check, LibreLane), where a name
+# like `z.v; exec -- cmd; y.v` would inject commands: src/ files must be plain `name.v`.
+NAME, DIR = re.compile(r"^[A-Za-z0-9_]+\.v$"), re.compile(r"^[A-Za-z0-9_]+$")
+def bad(rel, allow_dirs):
+    parts = rel.split("/")
+    return not (NAME.match(parts[-1]) and (len(parts) == 1 or
+                (allow_dirs and all(DIR.match(d) for d in parts[:-1]))))
+if keep:
+    m = re.search(r"source_files\s*:\s*\n((?:\s*-.*\n|\s*#.*\n)+)", "\n".join(info) + "\n")
+    listed = re.findall(r'^\s*-\s*"?([^"\n#]+?)"?\s*(?:#.*)?$', m.group(1), re.M) if m else []
+    for f in listed:
+        if bad(f, allow_dirs=True):
+            sys.exit(f"harden_tt.sh: refusing source name {f!r} in info.yaml")
 if not keep:
     src = proj / "src"
     files = sorted(str(p.relative_to(src)) for p in src.rglob("*")
                    if p.is_file() and p.suffix in (".v", ".sv")
                    and not any(x.startswith("test_") for x in p.relative_to(src).parts))
+    for f in files:
+        if bad(f, allow_dirs=False):
+            sys.exit(f"harden_tt.sh: refusing source name {f!r}: src/ files must match "
+                     f"{NAME.pattern}")
     out, skip = [], False
     for line in info:
         if re.match(r"^\s*source_files\s*:", line):

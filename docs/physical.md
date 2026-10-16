@@ -5,8 +5,8 @@ Three tools score a candidate, from cheap to expensive:
 | Tool | Score | Runtime on this Mac | Load |
 |---|---|---|---|
 | `tools/area.py` | flattened sky130 cell area after TT's own synthesis step | 4 to 8 s | light |
-| `tools/harden_tt.sh` | TT's full GDS flow plus TT's precheck, pass or fail | about 4 min (NanoV, 1x2) | heavy, takes the lock |
-| `physical/tilefit.py` | smallest share of the real TT tile that still signs off clean | 7 hardening runs | heavy, takes the lock per run |
+| `tools/harden_tt.sh` | TT's full GDS flow plus TT's precheck, pass or fail | 4 to 5 min (NanoV 1x2, seed 3x2) | heavy, takes the lock |
+| `physical/tilefit.py` | smallest share of the real TT tile that still signs off clean | 7 hardening runs, about 25 min plus lock waits (NanoV 1x2) | heavy, takes the lock per run |
 
 ## Pins and versions
 
@@ -58,6 +58,12 @@ tools/area.py --top tt_um_fesens_r32v --src src/
 - **Sources.** By default, every `*.v` and `*.sv` under `--src`, minus any path component
   starting with `test_`. TT's `info.yaml` list isn't used, since hypotheses can't edit it.
   `--files` or `--info` override this (baselines).
+- **Name check.** Source names reach yosys command strings, so a file named
+  `z.v; exec -- cmd; y.v` would inject commands. Every collected `src/` file must therefore
+  match `^[A-Za-z0-9_]+\.v$`: no `.sv`, no subdirectories, nothing else. Otherwise the tool exits
+  with status 2. Explicit baseline lists may add plain `[A-Za-z0-9_]+` directory components.
+  `--top` and `--param` are checked the same way, and the yosys fallback also quotes paths.
+  `harden_tt.sh` applies the same rule before `tt_tool` sees the list.
 - **Speed.** 3.6 to 7.7 s per call (flat and hierarchical runs in parallel), measured on NanoV
   and SERV.
 - **Determinism.** Two NanoV runs gave identical JSON, `runtime_s` aside, and a byte-identical
@@ -133,13 +139,14 @@ Exit status: 0 = pass, 1 = it doesn't sign off, 2 = tool error.
 `lockf` yourself: the second lock waits on the first forever. If you already hold the lock, set
 `BONETTO_HEAVY_LOCKED=1`.
 
-**Proof.** NanoV with its own config (`--tiles 1x2`) passed every check, the precheck included:
+**Proof.** Two runs passed every check, the precheck included:
 
-- runtime: LibreLane 186 s plus precheck 43 s;
-- setup worst slack 23.94 ns, hold worst slack 0.085 ns;
-- utilization 0.452.
+- NanoV with its own config, `--tiles 1x2`: LibreLane 186 s plus precheck 43 s; setup worst
+  slack 23.94 ns, hold worst slack 0.085 ns; utilization 0.452.
+- The seed, `--tiles 3x2`: LibreLane 253 s plus precheck 59 s; setup worst slack 20.56 ns,
+  hold worst slack 0.115 ns; utilization 0.573.
 
-The 1x1 run is under "Findings".
+The 1x1 and 2x2 failures are under "Findings".
 
 ## `physical/tilefit.py`: the physical score
 
@@ -157,11 +164,16 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
   0.46 um site grid. The 1x1 core is (2.76, 2.72) to (158.24, 108.80), which is 16,493.3 um2.
 - **Pass.** A trial passes when its `summary.json` passes: every check above, the precheck
   included.
-- **Density.** Trials use the config's `PL_TARGET_DENSITY_PCT` (60 in TT's template). If global
-  placement stops with GPL-0302 (target density below the remaining area's utilization), the
-  trial reruns once at OpenROAD's suggested density plus 1, capped at 100. GPL-0301
-  (utilization above 100 %) means the cells don't fit. So density goes up only when the
-  blockage forces it, and every run records the density it used.
+- **Density.** Trials keep the config's `PL_TARGET_DENSITY_PCT` (60 in TT's template).
+  LibreLane 3.0.14's OpenROAD raises the target itself when the free area is too small for it.
+  It logs warning GPL-0302, "Automatically adjusting to uniform density". The seed in 2x2, for
+  example, ran at 0.76 instead of 0.60.
+  - So density goes up only when the blockage forces it, and every run records the target
+    placement actually used (`gpl_target_density`).
+  - GPL-0301 means the cells don't fit at all: utilization above 100 %, counting OpenROAD's
+    pin-density area adjustment.
+  - If a future OpenROAD turns GPL-0302 back into an error, the trial reruns once at the
+    suggested density plus 1.
 - **Search.**
   1. The full tile first. If it fails, `min_fraction` is null.
   2. The lower bound is the synthesized cell area over the core area, a fraction that can't pass.
@@ -190,8 +202,28 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
 - **Our 1x1 has no room for a flip-flop register file.**
   - 16 x 32 RF bits as `dfxtp_2` alone are 10,890 um2 (512 x 21.27).
   - SERV with its RF cut to 16 registers synthesizes to 30,820 um2 (docs/baselines.md).
-  - So the seed won't fit 1x1, and its tilefit runs in a larger tile (`--tiles`) until it
-    shrinks.
+  - The seed (47,725 um2 synthesized) passes in 3x2, not in 2x2 (docs/baselines.md). Neither
+    NanoV nor the seed fits 1x1 in the stock flow, so the 1x1 tilefit has no candidate yet.
+    `--tiles` runs it in a bigger tile meanwhile; NanoV in 1x2 is the worked example.
+- **Hold fixing is a large physical cost for the seed.** 1,285 timing-repair buffers
+  (12,238 um2) on 47,725 um2 of logic, 607 of them hold buffers. `area.py` can't see this;
+  tilefit and harden do.
+
+## Which flip-flop and latch cells the flow uses
+
+- **`dfxtp_1` is excluded from synthesis.** It's on the PDK's `no_synth.cells`
+  (`libs.tech/openlane/sky130_fd_sc_hd/no_synth.cells`), which LibreLane strips from the
+  liberty before synthesis (`SYNTH_EXCLUDED_CELL_FILE`). So `dfflibmap` maps every flop to
+  `dfxtp_2` (21.27 um2; `dfxtp_1` is 20.02 um2).
+- **The resizer doesn't bring `dfxtp_1` back.** PnR's dont_use list is only `drc_exclude.cells`
+  (`PNR_EXCLUDED_CELL_FILE`), so OpenROAD would be allowed to use `dfxtp_1`, but it never
+  downsizes flops for area. NanoV's final 1x2 netlist has 196 `dfxtp_2` and no `dfxtp_1`.
+- **`dlxtp_1` is on neither list.** LibreLane's `SYNTH_LATCH_MAP` (`latch_map.v`) maps yosys
+  `$_DLATCH_P_` to `sky130_fd_sc_hd__dlxtp_1` explicitly, and `$_DLATCH_N_` to `dlxtn_1`. The
+  other latch cells are on `no_synth.cells`: `dlrtp`, `dlrtn`, `dlrbp`, `dlrbn`, `dlxbn`,
+  `dlxbp` and the clock gates `dlclkp` and `sdlclkp`.
+- **Other `_1` cells.** `no_synth.cells` also removes `inv_1`, `nand2_1`, `nor2_1`, `xnor2_1`,
+  the `clkbuf` and `clkinv` cells and 141 `_1` cells in all. `mux2_1` stays.
 
 ## Docker on this Mac
 

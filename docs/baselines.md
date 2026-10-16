@@ -13,6 +13,7 @@ not committed.
 | SERV, RV32E-sized | `serv_rf_top`, `WITH_CSR=0`, RF depth cut to 16 registers (our edit) | 30,819.6 | 2,405 | 678 | 0 | 16 x 32, flops |
 | SERV, no CSR | `serv_rf_top`, `WITH_CSR=0` | 53,550.1 | 4,169 | 1,190 | 0 | 32 x 32, flops |
 | SERV, as shipped | `serv_rf_top`, default parameters | 60,204.0 | 4,672 | 1,336 | 0 | 32 x 32 + 4 CSR, flops |
+| Our seed (97153ff) | `tt_um_fesens_r32v`, the full TT top | 47,724.5 | 4,065 | 631 | 0 | 15 x 32, flops |
 
 The TT 1x1 core is 16,493.3 um2: (2.76, 2.72) to (158.24, 108.80) inside a 161 x 111.52 um die.
 
@@ -73,7 +74,27 @@ By module (hierarchical synthesis, own cells only; their total is 17,737.0 um2):
   - 0 magic, route and KLayout DRC errors, LVS clean, 0 antenna violations;
   - 964 max-slew and 10 max-cap violations (not gated by TT);
   - LibreLane 186 s plus precheck 43 s.
-- **Tile fraction:** TILEFIT_NANOV
+- **Tile fraction** (`physical/tilefit.py --tiles 1x2 --keep-info-sources`, NanoV's config,
+  7 runs, 31 min including lock waits):
+  - min_fraction 0.5148 of the 1x2 core, which is 17,634.4 um2 placeable. That's more than the
+    whole 1x1 core (16,493.3 um2), consistent with the 1x1 failure.
+  - Density at that fraction: 0.865 (15,249.6 um2 of placed cells and taps).
+  - The next step down, 0.5059 (17,330.4 um2), fails at global placement: GPL-0301, 101.0 %.
+
+  Every run:
+
+  | Fraction | Placeable (um2) | Result | Run time |
+  |---:|---:|---|---:|
+  | 1.0000 | 34,255.4 | pass | 300 s |
+  | 0.7130 | 24,424.7 | pass | 226 s |
+  | 0.5710 | 19,560.0 | pass | 282 s |
+  | 0.4970 | 17,026.3 | fail, GPL-0301 102.9 % | 11 s |
+  | 0.5325 | 18,242.5 | pass | 196 s |
+  | 0.5148 | 17,634.4 | pass | 200 s |
+  | 0.5059 | 17,330.4 | fail, GPL-0301 101.0 % | 663 s (mostly waiting for the lock) |
+
+  All passing runs are clean on every check, the precheck included. Setup worst slack is about
+  23.9 ns and hold worst slack 0.07 to 0.10 ns.
 
 ## SERV
 
@@ -122,6 +143,55 @@ o211a_2 60 (600.6), o21a_2 52 (455.4), a211o_2 40 (400.4), and2_2 47 (352.8).
 SERV without CSRs, top cell types: dfxtp_2 1,190 (25,311.8 um2, 47.3 %), mux2_1 1,196
 (13,467.9, 25.2 %), a221o_2 267 (3,006.6), or2_2 447 (2,796.4), a22o_2 272 (2,722.6), nor2_2
 182 (1,138.6), o211a_2 72 (720.7), nand2_2 89 (556.8), o21a_2 56 (490.5), buf_2 67 (335.3).
+
+## The seed (setup/seed 97153ff, merged here)
+
+- Command: `tools/area.py --top tt_um_fesens_r32v --src src/`, 9 to 10 s per run.
+- Two runs gave identical JSON (`runtime_s` aside) and byte-identical netlists.
+- Result: **47,724.5 um2, 4,065 cells, 631 flops, 0 latches.** One module, so by_module equals
+  the score.
+- The `--engine yosys` fallback (yosys 0.64) gives 47,505.6 um2 (0.46 % less), as on NanoV.
+- The seed agent's estimate of 38.7k um2 came from a different yosys script. The real flow's
+  number is the one above.
+
+| Cell type | Count | Area (um2) | Share |
+|---|---:|---:|---:|
+| dfxtp_2 | 631 | 13,421.6 | 28.1 % |
+| mux2_1 | 893 | 10,055.9 | 21.1 % |
+| mux4_2 | 182 | 4,098.9 | 8.6 % |
+| nor2_2 | 335 | 2,095.8 | 4.4 % |
+| or2_2 | 201 | 1,257.5 | 2.6 % |
+| nand2_2 | 198 | 1,238.7 | 2.6 % |
+| xnor2_2 | 73 | 1,187.4 | 2.5 % |
+| a21o_2 | 135 | 1,182.4 | 2.5 % |
+| o211a_2 | 116 | 1,161.1 | 2.4 % |
+| o21ai_2 | 101 | 884.6 | 1.9 % |
+
+Hardening the seed (`tools/harden_tt.sh --tiles NxM`, the repo's `src/config.json`):
+
+- **2x2: does not fit.**
+  - Global placement auto-raised the target density from 0.60 to 0.76 (utilization 75.9 %,
+    including a 5,885.7 um2 pin-density adjustment).
+  - The resizer added 575 hold buffers, which took the standard-cell area to 62,931.6 um2.
+  - Global routing finished congested: demand 58,147 against 42,898 resources (135.6 %), total
+    overflow 17,713. TT's config allows that (`GRT_ALLOW_CONGESTION`).
+  - Detailed routing was still in its first iteration after 29 min, with 76,388 violations at
+    60 %. I stopped it there, so the 2x2 failure is inferred from the routing overflow, not from
+    a finished run.
+- **3x2: PASSES**, every check including TT's precheck. So 3x2 is the smallest tile it's
+  proven to fit.
+  - utilization 0.573: 63,547.2 um2 of placed cells and taps in a 110,874 um2 core;
+  - target density stayed at 0.60 (GPL utilization 49.5 %), and global routing ran at 46.6 %
+    with no overflow;
+  - setup worst slack 20.56 ns, hold worst slack 0.115 ns, 0 violations at every corner;
+  - 0 magic, route and KLayout DRC errors, LVS clean, 0 antenna violations;
+  - 2,252 max-slew and 24 max-cap violations (not gated by TT);
+  - LibreLane 253 s plus precheck 59 s.
+- **Timing repair grows the seed by a quarter.** The resizer inserts 1,285 timing-repair
+  buffers worth 12,238 um2, on top of the 47,725 um2 of logic: 607 `dlygate4sd3_1` hold
+  buffers ("Inserted 607 hold buffers", hold margin 0.1 ns from TT's
+  `PL_RESIZER_HOLD_SLACK_MARGIN`), 465 `clkdlybuf4s25_1`, and `buf_2`, `buf_4` and `buf_6`.
+  NanoV in 1x2 needed no hold buffers. `area.py` doesn't see this overhead; tilefit does.
 
 ## What this means for the loop
 

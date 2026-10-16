@@ -16,11 +16,13 @@ A trial passes when harden_tt.sh's summary says pass: completed flow, magic DRC,
 KLayout DRC (precheck decks), LVS, antenna, setup and hold at every corner, power grid,
 disconnected pins, and TT's precheck.
 
-Placement density: TT's config sets PL_TARGET_DENSITY_PCT (60). When a trial's global placement
-stops with GPL-0302 (target density below the utilization of the remaining area), the trial is
-rerun once with the density OpenROAD suggests plus one point (capped at 100); GPL-0301
-(utilization above 100 %) means the cells do not fit at all. So density is raised only when the
-blockage forces it, and every run records the density it used.
+Placement density: trials keep the config's PL_TARGET_DENSITY_PCT (60 in TT's template). The
+OpenROAD in LibreLane 3.0.14 raises the target itself when the free area is too small for it
+(warning GPL-0302, "Automatically adjusting to uniform density"), so the density is raised only
+when the blockage forces it; each run records the target global placement actually used
+(gpl_target_density). GPL-0301 (utilization above 100 %, counting OpenROAD's pin-density area
+adjustment) means the cells do not fit at all. If a future OpenROAD made GPL-0302 an error
+again, the trial is rerun once at the suggested density plus one point.
 
 Search: the full tile (fraction 1.0) is checked first; the lower bound is the synthesized cell
 area over the core area (cells alone would fill the placeable area there, so it cannot pass).
@@ -135,6 +137,12 @@ class Search:
         errlog = out / "proj" / "runs" / "wokwi" / "error.log"
         if errlog.exists():
             err = errlog.read_text(errors="replace")
+        gpl_density = None
+        for gl in sorted((out / "proj" / "runs" / "wokwi").glob(
+                "*-openroad-globalplacement/openroad-globalplacement.log")):
+            dens = re.findall(r"Placement target density:\s*([0-9.]+)", gl.read_text(errors="replace"))
+            if dens:
+                gpl_density = float(dens[0])
         rec = {
             "tag": tag, "fraction": round(frac, 5), "x_cut_um": round(x_cut, 3),
             "placeable_um2": round(placeable, 2), "target_density_pct": density
@@ -142,6 +150,7 @@ class Search:
             "pass": bool(s["pass"]), "checks": s["checks"], "failure": s.get("failure"),
             "utilization": s.get("utilization"), "stdcell_area_um2": s.get("stdcell_area_um2"),
             "setup_ws": s.get("setup_ws"), "hold_ws": s.get("hold_ws"),
+            "gpl_target_density": gpl_density,
             "runtime_s": dt, "summary": str(sfile),
         }
         self.runs.append(rec)
