@@ -263,7 +263,7 @@ with the same checks and depths as `checks.cfg` (only the cap and timeout differ
 | seed, fast | 227 s | 190 s |
 | seed, deep (D = 463, liveness 1,487) | 1,072 s | 941 s |
 | bit-serial 9a39f1d, fast | 4,402 s (73 min) | 2,805 s (47 min) |
-| bit-serial 9a39f1d, deep | not run (see below) | see the task 5 report |
+| bit-serial 9a39f1d, deep | not run (memory, see below) | stopped after 16 min (memory, see below) |
 
 The slowest tasks (proof task seconds, Mac / hwe-bench):
 
@@ -274,9 +274,13 @@ The slowest tasks (proof task seconds, Mac / hwe-bench):
 
 On the Mac the bit-serial fast run is bound by total work: 28,303 task-seconds over 8 jobs is
 3,538 s even with perfect packing. On hwe-bench it is bound by its longest task, reg at 2,779 s.
-An earlier bit-serial run of every check at the full depth (1,475), 8 jobs on hwe-bench, still had
-every instruction group and bus_dmem running after 60 minutes, so it was stopped. Deep on a
-bit-serial core takes hours.
+Deep on a bit-serial core takes hours, and memory bounds its parallelism. An earlier run of
+every check at the full depth (1,475), 8 jobs on hwe-bench, still had every instruction group and
+bus_dmem running after 60 minutes, so it was stopped. The committed deep config with 10 jobs on
+hwe-bench was stopped after 16 minutes. Its 11 bitwuzla processes held 3.4 to 5.7 GB each and
+were still growing, and the host was down to 4 GB available of 62. Run deep on such a core with
+at most one job per 8 GB of RAM (`--jobs`). The Mac has 32 GB (memory per task was not measured
+there).
 
 Levers if a candidate is slower than 9a39f1d (none is in the gate today):
 
