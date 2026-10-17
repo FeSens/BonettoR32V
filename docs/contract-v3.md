@@ -214,7 +214,7 @@ The sequence counts toward the first instruction's latency (section 4).
 
 - **CSR instructions** follow the spec: CSRRW with rd = x0 does not need to read, and CSRRS/C
   with rs1 = x0 (or zimm = 0) do not write. The reset values of `mtvec`, `mepc`, `mscratch` and
-  `mcause` are arbitrary. `mstatus.MIE` and `mie.MEIE` reset to 0.
+  `mcause` are arbitrary. `mstatus.MIE`, `mstatus.MPIE` and `mie.MEIE` reset to 0.
 - **Synchronous traps** (the instruction has no other effect):
   - ECALL: `mcause = 11`.
   - EBREAK: `mcause = 3`.
@@ -376,14 +376,16 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 - **Signoff clock: 40 MHz** (T = 25 ns, `CLOCK_PERIOD` in `src/config.json`), the user's target.
   - STA closes at every TT corner. The lead may move it in the performance phase, up to the
     memory limits of section 2 and a 50 MHz IO ceiling, unless a measurement proves more.
-- **Physical:** the flow is TT's (LibreLane 3.0.14, sky130A, `sky130_fd_sc_hd`), in a 1x1 tile.
+- **Physical:** the flow is TT's (LibreLane 3.0.14, sky130A, `sky130_fd_sc_hd`), in a **1x2 tile**.
+  The user chose it on 2026-10-17: the full peripheral set measured about 20k µm² against about
+  11.5k for a 1x1.
   Results count only when clean: DRC, LVS, antenna, setup and hold at every corner, and the
   precheck.
-- **Build phase:** the MCU passes every gate and hardens clean in 1x1.
+- **Build phase:** the MCU passes every gate and hardens clean in 1x2.
 - **Performance phase:**
   - **Score:** CoreMark iterations per second, which is `f_clk / cycles per iteration`. Cycles
     come from the cosim CoreMark run (code in flash, data in PSRAM, the real chip models).
-  - **Constraints:** every gate passes, the candidate hardens clean in 1x1, and every peripheral
+  - **Constraints:** every gate passes, the candidate hardens clean in 1x2, and every peripheral
     stays.
   - **Tiebreak:** synthesized area.
   - **Formal** runs at final signoff and on every tenth merged improvement. Every other gate runs
