@@ -68,12 +68,15 @@ CUSTOM_COMPILE_DEPS += $(INPUTS_STAMP)
 
 # oss-cad-suite's bin/vvp is a wrapper script that points PYTHONHOME at oss-cad-suite's own
 # Python, so cocotb's embedded interpreter can't start ("Failed to import encodings module").
-# Its real binaries are in ../libexec: use those. Other Icarus installs are unaffected.
+# Its real binaries are in ../libexec: use those. Only on macOS (where this repo's toolchain lives);
+# other hosts and other Icarus installs (TT's CI) are untouched.
+ifeq ($(shell uname -s),Darwin)
 ifeq ($(ICARUS_BIN_DIR),)
 OSS_LIBEXEC := $(abspath $(dir $(shell command -v vvp 2>/dev/null))../libexec)
 ifneq ($(wildcard $(OSS_LIBEXEC)/vvp $(OSS_LIBEXEC)/iverilog),)
 ifneq ($(shell grep -l PYTHONHOME $(dir $(shell command -v vvp 2>/dev/null))vvp 2>/dev/null),)
 ICARUS_BIN_DIR := $(OSS_LIBEXEC)
+endif
 endif
 endif
 endif

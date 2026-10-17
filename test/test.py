@@ -49,6 +49,18 @@ def val(sig, what):
     return int(v)
 
 
+def check_uio_out(sig):
+    """CS_n (bit 0) and SCK (bit 3) must be 0 or 1, bits 7:4 and 2 must be 0. MOSI (bit 1) is
+    left alone: the contract constrains it only at rising SCK edges (the RAM model checks it
+    there), so X on it elsewhere is legal."""
+    s = str(sig.value)  # MSB first: s[7 - i] is bit i
+    assert len(s) == 8, s
+    for i in (0, 3):
+        assert s[7 - i] in "01", f"uio_out = {s}: bit {i} is X or Z"
+    for i in (2, 4, 5, 6, 7):
+        assert s[7 - i] == "0", f"uio_out = {s}: bits [7:4] and [2] must be 0"
+
+
 @cocotb.test()
 async def test_gpio_demo(dut):
     """gpio_demo's uo_out sequence (pins ui_in schedule, seed 1) equals the reference."""
@@ -79,7 +91,7 @@ async def test_gpio_demo(dut):
         await FallingEdge(dut.clk)  # outputs have settled half a period after the rising edge
         cycle += 1
         assert val(dut.uio_oe, "uio_oe") == 0x0B, "uio_oe must be 0x0b"
-        assert val(dut.uio_out, "uio_out") & 0xF4 == 0, "uio_out[7:4] and [2] must be 0"
+        check_uio_out(dut.uio_out)
         uo = val(dut.uo_out, "uo_out")
         if uo != last:
             n = len(seen)
