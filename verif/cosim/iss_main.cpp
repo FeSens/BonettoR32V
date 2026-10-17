@@ -20,7 +20,7 @@
 // Contract v3 mode (verif/cosim/iss3.h, docs/contract-v3.md):
 //
 //   iss_main --v3 <prog.hex> [--max N] [--json] [--log] [--vread SLOT=V]... [--irq N]...
-//            [--check-init]
+//            [--check-init] [--dump-psram PATH]
 //
 // prog.hex is a flash image in $readmemh form (sparse, @addr records; unset bytes read 0xFF). The
 // run prints the retired count, the uo_out GPIO-mode trace (GPIO_OUT & ~ALTFN, one entry per
@@ -37,6 +37,9 @@
 //                   first instruction boundary from there where irq_allowed(); repeatable, each
 //                   request is taken once.
 //   --check-init    exit 5 when a register or an arbitrary-reset CSR is read before any write.
+//   --dump-psram P  write the final 8 MiB PSRAM image to P (raw bytes from PSRAM byte 0; bytes
+//                   no store wrote hold the model's seed pattern), whatever the end reason.
+//                   verif/arch-test/run_arch.py --v3 reads the signature from it.
 // Exit codes: 0 selfloop, 2 unspecified, 3 region, 4 max, 5 --check-init failed, 1 usage or I/O.
 #include <algorithm>
 #include <cstdio>
@@ -142,7 +145,7 @@ int usage() {
 int usage_v3() {
   std::fprintf(stderr,
                "usage: iss_main --v3 <prog.hex> [--max N] [--json] [--log] [--vread SLOT=V]... "
-               "[--irq N]... [--check-init]\n");
+               "[--irq N]... [--check-init] [--dump-psram PATH]\n");
   return 1;
 }
 
@@ -164,6 +167,7 @@ int main_v3(int argc, char** argv) {
   const char* hex = nullptr;
   uint64_t max = 50000000ULL;
   bool json = false, log = false, check_init = false;
+  const char* dump_psram = nullptr;
   std::map<uint32_t, std::deque<uint32_t>> vq;  // --vread values per slot
   std::vector<uint64_t> irqs;                   // --irq requests
   for (int i = 1; i < argc; i++) {
@@ -180,6 +184,7 @@ int main_v3(int argc, char** argv) {
     else if (a == "--json") json = true;
     else if (a == "--log") log = true;
     else if (a == "--check-init") check_init = true;
+    else if (a == "--dump-psram") dump_psram = next();
     else if (a == "--irq") irqs.push_back(std::strtoull(next(), nullptr, 0));
     else if (a == "--vread") {
       const char* s = next();
@@ -253,6 +258,16 @@ int main_v3(int argc, char** argv) {
     }
   }
 
+  if (dump_psram) {
+    std::vector<uint8_t> m(v3::PSRAM_SIZE);
+    for (uint32_t a = 0; a < v3::PSRAM_SIZE; a++) m[a] = iss.psram(a);
+    FILE* f = std::fopen(dump_psram, "wb");
+    const bool ok = f && std::fwrite(m.data(), 1, m.size(), f) == m.size();
+    if (!f || std::fclose(f) != 0 || !ok) {
+      std::fprintf(stderr, "cannot write %s\n", dump_psram);
+      return 1;
+    }
+  }
   if (json) {
     std::printf(
         "{\"summary\":true,\"retired\":%llu,\"end\":\"%s\",\"end_pc\":%u,\"end_insn\":%u,"
