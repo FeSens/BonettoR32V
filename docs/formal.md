@@ -225,15 +225,14 @@ The `_1024` mutants must PASS and the `_1025` ones must FAIL (`test_mutant_fails
 This is a safety property, checked by BMC: every window that closes within the depth (D +
 1,024) is checked, and windows that close later are not. A core that stops retiring after the
 first few instructions fails, because its window closes within the depth. An unbounded proof
-(`abc pdr`) did not converge on the seed: frame 126 after about 16 minutes, stopped. The BMC
-runs in 64-step windows (see "Engines tried").
+(`abc pdr`) did not converge on the seed: frame 126 after about 16 minutes, stopped.
 
 ## Fast and deep
 
 | | fast (`checks.cfg`, every candidate) | deep (`checks-deep.cfg`, champions) |
 |---|---|---|
 | checks | every check except liveness | every check, liveness included |
-| depth | short depth, per class group | full depth D; liveness D + 1,024 (64-step windows) |
+| depth | short depth, per class group | full depth D; liveness D + 1,024 |
 | instruction tasks | 9 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
 | task timeout | 7,200 s | 21,600 s |
 | depth cap | 2,048 | 4,096 |
@@ -261,7 +260,7 @@ with the same checks and depths as `checks.cfg` (only the cap and timeout differ
 
 | run | Mac, 8 jobs | hwe-bench, 18 jobs |
 |---|---|---|
-| seed, fast | 227 s | 190 s |
+| seed, fast | 227 s | 190 s (191 s with 10 jobs, in the test suite) |
 | seed, deep (D = 463, liveness 1,487) | 1,072 s | 941 s |
 | bit-serial 9a39f1d, fast | 4,402 s (73 min) | 2,805 s (47 min) |
 | bit-serial 9a39f1d, deep | not run (memory, see below) | stopped after 16 min (memory, see below) |
@@ -297,11 +296,16 @@ Levers if a candidate is slower than 9a39f1d (none is in the gate today):
   - Proofs use `step=all`: one solver call checks every step up to the depth. Windows of 64
     steps for every proof took 520 s on the seed's fast config, against 302 s with one call
     (hwe-bench, 8 jobs each, the two runs side by side).
-  - Liveness (deep) uses 64-step windows. At depth 1,487 it found `stall_first_1025`'s
-    counterexample (step 1,026) in 56 s and proved `stall_first_1024` in 323 s. With one call,
-    `hang_reserved`'s counterexample was still running after 30 minutes and was stopped. A
-    single call has to find a trace of the full depth, even when the violation is at step
-    1,026.
+  - Liveness also uses one call. 64-step windows were tried at depth 1,487 (hwe-bench):
+    - they found `stall_first_1025`'s counterexample (step 1,026) in 56 s and proved
+      `stall_first_1024` in 323 s;
+    - but the seed's own proof was still running after 33 minutes, at 16 GB, against 658 s with
+      one call.
+
+    A single call has to find a trace of the full depth even when the violation is at step
+    1,026, so a liveness counterexample can take longer than a proof. At depth 1,487 (see
+    "Mutants"), the counterexamples took 296 to 1,832 s and the proofs 87 to 309 s (658 s for
+    the seed's own).
 - **yices** stalls on the bus checks.
 - **abc bmc3**: see above.
 - **abc pdr**:
@@ -313,6 +317,35 @@ Levers if a candidate is slower than 9a39f1d (none is in the gate today):
   earlier run on a differently loaded Mac, single-instruction proofs at the same depth took 79 to
   222 s each (the first 16 to finish, mean 153 s): about 6,100 task-seconds for 40. Class groups
   at the short depth are the cheapest arrangement measured.
+
+## Mutants
+
+`mutants/make_mutants.py` generates them: each is the seed with one bug, plus `expect.json`.
+`test_mutant_fails` runs each one on the seed's timing (cosim: first retirement at cycle 115,
+so fast depths 234 and 348, deep D = 463), with `--only` its checks and `--deep` when a check is
+deep-only. A FAIL must be a counterexample: a failed assertion (or the pins equivalence), never
+a timeout or an error. The `_1024` stall mutants must PASS.
+
+Measured at commit 738a135 on hwe-bench. "Proof" is the check's proof task, in seconds.
+
+| mutant | bug | check | result: failed assertions | proof |
+|---|---|---|---|---|
+| cs_sck_high | CS_n rises with SCK still high | spi | FAIL: `spi_rule1_prev` | 9 s |
+| gpio_any_byte | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold`, `gpio_uo_cause`, `gpio_uo_value` | 62 s |
+| load_half_swap | LH/LHU bytes swapped | bus_dmem | FAIL: `bus_dmem_load_value` | 92 s |
+| miso_low | samples MISO while SCK is low | bus_imem | FAIL: `bus_imem_value` | 10 s |
+| mosi_rise | MOSI changes while SCK is high | spi | FAIL: `spi_rule2`, `spi_rule4_cmd` | 10 s |
+| norvfi_diff | uo_out inverted in the plain build only | equiv | FAIL (pre-pass) | 5 s (whole run) |
+| reg_wrong_index | even rd writes one register up | reg | FAIL: `reg_rs1` | 50 s |
+| rvfi_rd | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` | 15 s |
+| sub_decode | SUB decoded as ADD | insn_sub | FAIL: `insn_rd_wdata` | 14 s |
+| trap_continues | fetches again after a fatal trap | silent | FAIL: `silent_write`, `silent_retire` | 37 s |
+| write_midbyte | store WRITE one bit short | bus_dmem, spi | FAIL: `bus_dmem_store_once`, `bus_dmem_store_value`; `spi_rule5_write` | 94 s, 42 s |
+| hang_reserved | custom-0 opcode hangs | liveness (deep) | FAIL: `liveness` (retirements at steps 230 and 460, then none) | 1,832 s |
+| stall_first_1024 | first retirement at edge 1,024 | liveness (deep) | PASS | 87 s |
+| stall_first_1025 | first retirement at edge 1,025 | liveness (deep) | FAIL: `liveness` (first retirement at step 1,026) | 296 s |
+| stall_later_1024 | a gap of 1,024 edges | liveness (deep) | PASS | 309 s |
+| stall_later_1025 | a gap of 1,025 edges | liveness (deep) | FAIL: `liveness` (retirements at steps 230 and 1,255) | 1,348 s |
 
 ## Fail fast, scheduling, remote runs
 
