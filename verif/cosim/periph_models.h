@@ -15,7 +15,8 @@
 //              2^D cycles).
 //   PwmMeter   measures one output's period and high time after a settling period.
 //   TimerLoop  ui[0] follows uo[7] (the IR loopback).
-//   GpioStim   ui_in from a script of [cycle, value] pairs.
+//   GpioStim   ui_in from a script of [cycle, value] pairs (before the first entry: ui[1], the
+//              UART RX line, idles high; every other pin 0).
 #pragma once
 
 #include <algorithm>
@@ -88,6 +89,15 @@ class UartTerm {
 
   // ---- TX: the design sends on uo[0] ----
   void set_div(uint32_t div) { div_ = div; }
+  // Strict: a stop bit of 0 is a framing error at once. Use it where the harness knows when the
+  // pin carries UART TX (rvfi mode: the ISS's ALTFN); without it a stop bit of 0 followed by the
+  // line staying low to the end of the run is no byte (the pin may have gone back to GPIO 0).
+  void set_strict(bool strict) { strict_ = strict; }
+  // Lenient: the harness can't tell when the pin carries UART TX at all (pins mode, a program
+  // the ISS can't run alone, so its ALTFN writes are unknown). A stop bit of 0 followed by the
+  // line rising later is then no frame either (the pin may have gone to GPIO 0, then 1): it is
+  // abandoned, and the expected TX bytes catch a design that sends such a frame.
+  void set_lenient(bool lenient) { lenient_ = lenient; }
   uint32_t div() const { return div_; }
   uint32_t bit_time() const { return div_ + 1; }
   // One cycle: the TX line after edge t. gate = the pin carries UART TX (ALTFN[0] = 1, or always
@@ -106,6 +116,13 @@ class UartTerm {
       return true;
     }
     if (held_low_) {
+      if (line && lenient_) {
+        held_low_ = false;
+        abandoned_++;
+        armed_ = true;
+        prev_ = true;
+        return true;
+      }
       if (line)
         return fail(pfmt("UART TX framing error: the frame that started at cycle %llu has a stop "
                          "bit of 0 (the line was low at cycle %llu), then the line rose at cycle "
@@ -130,6 +147,10 @@ class UartTerm {
                        (unsigned long long)r, (unsigned long long)t0_, (unsigned long long)B));
     if (r % B == 0 && r >= B && r <= 8 * B) cur_ |= (uint8_t)((line ? 1 : 0) << (r / B - 1));
     if (r == 9 * B && !line) {
+      if (strict_)
+        return fail(pfmt("UART TX framing error: the frame that started at cycle %llu has a stop "
+                         "bit of 0 (the line was low at cycle %llu; contract 5.5)",
+                         (unsigned long long)t0_, (unsigned long long)t));
       held_low_ = true;
       in_frame_ = false;
       return true;
@@ -175,7 +196,8 @@ class UartTerm {
   int32_t ppm_;
   std::deque<Rx> rx_;
   uint64_t rx_sent_ = 0;
-  bool armed_ = false, in_frame_ = false, held_low_ = false, prev_ = true;
+  bool armed_ = false, in_frame_ = false, held_low_ = false, prev_ = true, strict_ = false;
+  bool lenient_ = false;
   bool started_ = false, completed_ = false;
   uint64_t t0_ = 0, abandoned_ = 0;
   uint8_t cur_ = 0;
@@ -397,11 +419,13 @@ struct TimerLoop {
   static bool ui0(uint8_t uo) { return (uo >> 7) & 1; }
 };
 
-// ui_in from a script: entry [c, v] drives v from relative cycle c on (0 before the first entry).
+// ui_in from a script: entry [c, v] drives v from relative cycle c on. Before the first entry the
+// value is `idle`: ui[1] (UART RX) high, every other pin 0.
+constexpr uint8_t UI_IDLE = 0x02;
 class GpioStim {
  public:
-  explicit GpioStim(std::vector<std::pair<uint64_t, uint8_t>> script = {})
-      : s_(std::move(script)) {
+  explicit GpioStim(std::vector<std::pair<uint64_t, uint8_t>> script = {}, uint8_t idle = UI_IDLE)
+      : s_(std::move(script)), v_(idle) {
     std::stable_sort(s_.begin(), s_.end(),
                      [](const std::pair<uint64_t, uint8_t>& a,
                         const std::pair<uint64_t, uint8_t>& b) { return a.first < b.first; });
@@ -416,7 +440,7 @@ class GpioStim {
  private:
   std::vector<std::pair<uint64_t, uint8_t>> s_;
   size_t i_ = 0;
-  uint8_t v_ = 0;
+  uint8_t v_;
 };
 
 }  // namespace periph

@@ -8,7 +8,8 @@ run_cosim.py --v3). The contract v2 tests are in test_cosim_harness_v2.py until 
    RVFI script given as plusargs (one Verilator build per mode); the scripts come from tiny
    hand-assembled programs run on the reference ISS (iss_main --v3 --log), so every retirement
    matches the ISS unless a test changes it on purpose.
-3. The tcem_stall mutant (ruling R12) and run_cosim.py --v3 (ruling R18).
+3. The tcem_stall mutant (ruling R12), run_cosim.py --v3 and its program list (ruling R18), the v3
+   liveness fuzz.
 
 Every program here is hand-encoded (no RISC-V compiler needed), so the suite runs on hwe-bench.
 Run: pytest verif/cosim/test_cosim_harness.py -v
@@ -60,6 +61,7 @@ def csrrsi(rd, csr, zimm): return (csr << 20) | (zimm << 15) | (6 << 12) | (rd <
 
 
 ECALL = 0x00000073
+WFI = 0x10500073
 SELF = 0x0000006F  # jal x0, 0: the program end (retired twice)
 GPIO_OUT, ALTFN, UART_DATA, UART_CTRL, SPI_DATA, SPI_CTRL = 0, 8, 44, 48, 52, 56  # slot offsets
 
@@ -214,8 +216,31 @@ def stub(mode, hexf, tmp, pins=None, rets=None, cycles=None, expect=None, seed=1
     return res
 
 
+def stub_setup_error(mode, hexf, tmp, expect):
+    """A harness run that must stop as a setup error (exit 2, no JSON). Returns its stderr."""
+    exe = run_cosim.ensure_built(mode, PLAYBACK, v3=True)
+    _n[0] += 1
+    ep = tmp / f"expect{_n[0]}.json"
+    ep.write_text(json.dumps(expect))
+    p = subprocess.run([str(exe), str(hexf), "--expect", str(ep)], capture_output=True, text=True,
+                       timeout=300)
+    assert p.returncode == 2, (p.returncode, p.stdout[-2000:], p.stderr[-2000:])
+    return p.stderr
+
+
 def every(n, step=100, first=100):
     return [first + step * k for k in range(n)]
+
+
+def wave(pins, lo, hi, f):
+    """Set uo for every cycle in [lo, hi) from f(cycle), recording only the changes."""
+    prev = None
+    for c in range(lo, hi):
+        v = f(c)
+        if v != prev:
+            pins.set_uo(c, v)
+            prev = v
+    return pins
 
 
 # ------------------------------------------------------------------------------------------------
@@ -299,13 +324,18 @@ def test_uart_tx_exact_bit_time(tools, tmp_path, mode):
     assert r["uart_tx"] == "U" and r["end"] == "selfloop"
     r = stub(mode, hexf, tmp_path, pins, rets, every(12), dict(exp, uart_div=15))
     assert not r["pass"] and "not on a bit boundary" in r["error"], r["error"]
-    # the frame starting later than DIV+2 cycles after the write retired (rvfi mode)
-    if mode == "rvfi":
+    # R28 (contract 5.5, 7c5740e): the start bit begins within DIV+2 cycles after the UART_DATA
+    # store retires (cycle 700): a start at 718 passes, at 719 fails (rvfi mode sees the store)
+    for start, ok in ((718, True), (719, False)):
         late = Pins().set_uo(301, 0x01)
-        late.uart_frame(721, 0x55, 17, 0x00)
+        late.uart_frame(start, 0x55, 17, 0x00)
         late.set_uo(901, 0x5B).set_uo(1001, 0x5A)
         r = stub(mode, hexf, tmp_path, late, rets, every(12), exp)
-        assert not r["pass"] and "no UART start bit within DIV+2" in r["error"], r["error"]
+        if mode == "pins" or ok:
+            assert r["pass"], (start, r["error"])
+        else:
+            assert not r["pass"] and "no UART start bit within DIV+2" in r["error"], r["error"]
+            assert "cycle 719:" in r["error"], r["error"]
 
 
 def test_uart_busy_read_follows_pins(tools, tmp_path):
@@ -516,33 +546,302 @@ def test_pins_mode_judges_volatile_programs_by_result(tools, tmp_path):
     assert r["pass"] and r["end"] == "result_gpio" and r["deterministic"] is False, r
 
 
-@pytest.mark.parametrize("mode", ["rvfi", "pins"])
-def test_spi_master_pins(tools, tmp_path, mode):
-    """Contract 5.6 at the pins: MOSI changes only while SCK is low, phases are 2^D cycles, and
-    (rvfi mode) the byte on MOSI is the byte the program wrote to SPI_DATA."""
-    prog = [lui(1, 0x80000), addi(2, 0, 0x70), sw(2, ALTFN, 1),    # uo[4..6]: CS_n, SCK, MOSI
+PROG_SPI = [lui(1, 0x80000), addi(2, 0, 0x70), sw(2, ALTFN, 1),    # uo[4..6]: CS_n, SCK, MOSI
             addi(2, 0, 2), sw(2, SPI_CTRL, 1),                     # CS_n = 0, D = 1
             addi(2, 0, 0xA5), sw(2, SPI_DATA, 1),                  # transfer 0xA5 (#6 at 700)
             sw(0, ALTFN, 1), addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
-    hexf = flash_hex(tmp_path / "spi.hex", {0: prog})
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_spi_master_pins(tools, tmp_path, mode):
+    """Contract 5.6 at the pins: MOSI changes only while SCK is low, phases are 2^D cycles, and the
+    byte on MOSI is the byte the program wrote to SPI_DATA (rvfi mode: the retired store; pins
+    mode, deterministic programs: the reference run's write, R33), and spi_tx_expect when given."""
+    hexf = flash_hex(tmp_path / "spi.hex", {0: PROG_SPI})
     rets = iss_log(hexf)
     exp = {"spi_div_d": 1, "result_gpio": 0x5A}
 
-    def run(byte, glitch=None):
+    def run(byte, glitch=None, expect=exp):
         pins = Pins().set_uo(301, 0x10).set_uo(501, 0x00)  # CS_n high (reset 1), then low
         assert pins.spi_xfer(702, byte, 2, 0x00, glitch) == 734
         pins.set_uo(801, 0x00).set_uo(1001, 0x5A)
-        return stub(mode, hexf, tmp_path, pins, rets, every(12), exp)
+        return stub(mode, hexf, tmp_path, pins, rets, every(12), expect)
 
     r = run(0xA5)
     assert r["pass"], r["error"]
     r = run(0xA5, glitch=705)
     assert not r["pass"] and "MOSI (uo[6]) changed" in r["error"], r["error"]
     r = run(0xA4)
+    assert not r["pass"] and "SPI MOSI sent 0xa4" in r["error"], r["error"]
+    if mode == "pins":
+        assert "reference run's SPI_DATA write #0 is 0xa5" in r["error"], r["error"]
+    r = run(0xA5, expect=dict(exp, spi_tx_expect=[0xA5]))
+    assert r["pass"], r["error"]
+    r = run(0xA5, expect=dict(exp, spi_tx_expect=[0xA6]))
+    assert not r["pass"] and "spi_tx_expect" in r["error"], r["error"]
+
+
+def test_spi_div_d_must_be_at_least_1(tools, tmp_path):
+    """R29 (contract 5.6, 7c5740e): D = 0 is UNSPECIFIED, so spi_div_d 0 is a setup error."""
+    hexf = flash_hex(tmp_path / "spi.hex", {0: PROG_SPI})
+    err = stub_setup_error("pins", hexf, tmp_path, {"spi_div_d": 0, "result_gpio": 0x5A})
+    assert "spi_div_d must be an integer 1..7" in err, err
+
+
+def test_spi_data_read_matches_miso(tools, tmp_path):
+    """rvfi mode: an SPI_DATA read after a transfer returns the byte the echo device drove on MISO
+    (0xFF before its first received byte)."""
+    prog = PROG_SPI[:7] + [addi(5, 0, 0), lw(4, SPI_DATA, 1)] + PROG_SPI[7:]  # read at #8 (900)
+    hexf = flash_hex(tmp_path / "spird.hex", {0: prog})
+    pins = Pins().set_uo(301, 0x10).set_uo(501, 0x00)
+    pins.spi_xfer(702, 0xA5, 2, 0x00)
+    pins.set_uo(1001, 0x00).set_uo(1201, 0x5A)
+    exp = {"spi_div_d": 1, "result_gpio": 0x5A}
+    for v, ok in ((0xFF, True), (0x00, False)):
+        rets = iss_log(hexf, "--vread", f"13={v}")
+        r = stub("rvfi", hexf, tmp_path, pins, rets, every(14), exp)
+        if ok:
+            assert r["pass"], r["error"]
+        else:
+            assert not r["pass"] and "SPI_DATA read 0x00" in r["error"], r["error"]
+            assert "the device sent 0xff on MISO" in r["error"], r["error"]
+
+
+def test_spi_transfer_in_flight_at_end_fails(tools, tmp_path):
+    """rvfi mode: a run that ends with an SPI transfer still in progress fails (the program keeps
+    the SPI pins, final_altfn 0x70)."""
+    prog = PROG_SPI[:7] + [addi(5, 0, 0), addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "spiend.hex", {0: prog})
+    rets = iss_log(hexf)
+    pins = Pins().set_uo(301, 0x10).set_uo(501, 0x00)
+    for k in range(4):  # four bits of 0xA5, then SCK stays low
+        m = ((0xA5 >> (7 - k)) & 1) << 6
+        pins.set_uo(702 + 4 * k, m).set_uo(704 + 4 * k, m | 0x20)
+    pins.set_uo(718, 0x00).set_uo(1001, 0x0A)
+    exp = {"spi_div_d": 1, "result_gpio": 0x5A, "final_altfn": 0x70}
+    rets += [rets[-1]] * 30  # the self-loop keeps retiring while the harness waits for the transfer
+    r = stub("rvfi", hexf, tmp_path, pins, rets, every(42), exp)
+    assert not r["pass"] and "(first rising SCK edge at cycle 704) was still in progress" in (
+        r["error"]), r["error"]
+
+
+PROG_UART = [lui(1, 0x80000), addi(2, 0, 1), sw(2, ALTFN, 1),      # ALTFN = 1: uo[0] is UART TX
+             addi(2, 0, 16), sw(2, UART_CTRL, 1),                  # DIV = 16
+             addi(2, 0, 0x55), sw(2, UART_DATA, 1),                # send 'U' (retires at 700)
+             addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), sw(0, ALTFN, 1),  # result, ALTFN = 0
+             SELF]
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_uart_stop_bit_zero(tools, tmp_path, mode):
+    """A frame whose stop bit is 0 and whose line then stays low: rvfi mode knows ALTFN, so it is a
+    framing error at once; pins mode can't tell it from the pin going back to GPIO 0 (no byte),
+    and then the reference's UART_DATA write has no frame (R33)."""
+    hexf = flash_hex(tmp_path / "uart.hex", {0: PROG_UART})
+    rets = iss_log(hexf)
+    bits = [0] + [(0x55 >> k) & 1 for k in range(8)] + [0]
+
+    def uo(c):
+        line = bits[(c - 705) // 17] if 705 <= c < 705 + 170 else (0 if c >= 705 else 1)
+        base = 0x5A if c >= 901 else 0x00
+        return base | (line if c < 1001 else 0) if c >= 301 else 0
+
+    pins = wave(Pins(), 1, 1200, uo)
+    r = stub(mode, hexf, tmp_path, pins, rets, every(12), {"uart_div": 16, "result_gpio": 0x5A})
     if mode == "rvfi":
-        assert not r["pass"] and "SPI MOSI sent 0xa4" in r["error"], r["error"]
+        assert not r["pass"] and "stop bit of 0" in r["error"], r["error"]
     else:
-        assert r["pass"], r["error"]  # pins mode can't relate the byte to the store
+        assert not r["pass"] and "UART TX sent 0 bytes, the reference run wrote 1" in r["error"], (
+            r["error"])
+
+
+def test_uart_orphan_frame_fails(tools, tmp_path):
+    """rvfi mode: a UART frame on the pins that no UART_DATA write started fails at the next
+    retirement."""
+    prog = PROG_UART[:5] + [addi(5, 0, 0), addi(6, 0, 0)] + PROG_UART[7:]  # no UART_DATA write
+    hexf = flash_hex(tmp_path / "orphan.hex", {0: prog})
+    rets = iss_log(hexf)
+    pins = Pins().set_uo(301, 0x01)
+    pins.uart_frame(605, 0x55, 17, 0x00)
+    pins.set_uo(901, 0x5B).set_uo(1001, 0x5A)
+    r = stub("rvfi", hexf, tmp_path, pins, rets, every(12), {"uart_div": 16, "result_gpio": 0x5A})
+    assert not r["pass"] and "a UART TX frame started at cycle 605" in r["error"], r["error"]
+    assert "is not a UART_DATA write" in r["error"], r["error"]
+
+
+def test_uart_txidle_read_follows_pins(tools, tmp_path):
+    """R30: IRQ_PEND.TXIDLE = !TX_BUSY, checked against the pins like TX_BUSY: 0 while the frame
+    is in progress over the whole reading instruction, 1 when no frame is."""
+    prog = PROG_UART[:7] + [addi(5, 0, 0), lw(4, 64, 1)] + PROG_UART[7:]  # IRQ_PEND read, #8
+    hexf = flash_hex(tmp_path / "txidle.hex", {0: prog})
+
+    def run(idle, t7, t8):
+        rets = iss_log(hexf, "--vread", f"16={0x08 if idle else 0x00}")
+        cycles = every(7) + [t7, t8] + [1100, 1200, 1300, 1400, 1500]
+        pins = Pins().set_uo(301, 0x01)
+        pins.uart_frame(705, 0x55, 17, 0x00)
+        pins.set_uo(1201, 0x5B).set_uo(1301, 0x5A)
+        return stub("rvfi", hexf, tmp_path, pins, rets, cycles,
+                    {"uart_div": 16, "uart_tx_expect": "U", "result_gpio": 0x5A})
+
+    assert run(False, 720, 760)["pass"]
+    r = run(True, 720, 760)
+    assert not r["pass"] and "TXIDLE (IRQ_PEND[3], = !TX_BUSY) read 1" in r["error"], r["error"]
+    assert run(True, 900, 1000)["pass"]
+    r = run(False, 900, 1000)
+    assert not r["pass"] and "TXIDLE (IRQ_PEND[3], = !TX_BUSY) read 0" in r["error"], r["error"]
+
+
+def test_gpio_in_read_window(tools, tmp_path):
+    """R30 (contract 6): a GPIO_IN load returns ui_in as the design saw it at an edge of the load's
+    execution or the 3 before it (the previous retirement p = 300, this one t = 400: edges
+    298-400). ui[1] idles high where no UART RX model drives it (R24)."""
+    prog = [lui(1, 0x80000), addi(5, 0, 0), addi(6, 0, 0), lw(2, 4, 1),  # GPIO_IN at #3 (400)
+            addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "gin.hex", {0: prog})
+    pins = Pins().set_uo(601, 0x5A)
+
+    def run(v, script):
+        exp = {"result_gpio": 0x5A}
+        if script is not None:
+            exp["gpio_script"] = script
+        return stub("rvfi", hexf, tmp_path, pins, iss_log(hexf, "--vread", f"1={v}"), every(8),
+                    exp)
+
+    # anchor = the first retirement (100); script cycle c applies from edge 100 + c on
+    a = [[0, 0x12], [198, 0x22]]  # 0x12 up to edge 297, 0x22 from 298
+    b = [[0, 0x12], [199, 0x22]]  # 0x12 up to edge 298
+    assert run(0x22, a)["pass"]
+    r = run(0x12, a)
+    assert not r["pass"] and "GPIO_IN read 0x12" in r["error"], r["error"]
+    assert "at most 3 cycles stale" in r["error"], r["error"]
+    assert run(0x12, b)["pass"]
+    r = run(0x55, a)
+    assert not r["pass"] and "GPIO_IN read 0x55" in r["error"], r["error"]
+    assert run(0x02, None)["pass"]  # no script: ui_in = 0x02 (UART RX idle high)
+    r = run(0x00, None)
+    assert not r["pass"] and "GPIO_IN read 0x00" in r["error"], r["error"]
+
+
+def test_mip_meip_taken_from_rd_wdata(tools, tmp_path):
+    """R14: a csrr of mip takes MEIP (bit 11) from the design's rvfi_rd_wdata; its other bits read
+    0 and are compared."""
+    hexf = flash_hex(tmp_path / "mip.hex", {0: [csrrs(2, 0x344, 0), SELF]})
+    for v in (0x800, 0):
+        rets = iss_log(hexf, "--vread", f"32={v}")
+        assert rets[0]["rdv"] == v
+        r = stub("rvfi", hexf, tmp_path, Pins(), rets, every(3))
+        assert r["pass"], (v, r["error"])
+    rets = iss_log(hexf, "--vread", "32=0x800")
+    rets[0]["rdv"] = 0x801
+    r = stub("rvfi", hexf, tmp_path, Pins(), rets, every(3))
+    assert not r["pass"] and "rvfi_rd_wdata = 0x801, expected 0x800" in r["error"], r["error"]
+
+
+def test_wfi_latency_exemption(tools, tmp_path):
+    """R31 (contract 4): WFI retires, then may stall. Only the gap that starts at a WFI's
+    retirement is exempt from the 2,048-cycle cap (at the retirement and in the watchdog); the gap
+    before a WFI is not, and neither is the same gap after another instruction."""
+    hexf = flash_hex(tmp_path / "wfi.hex", {0: [WFI, SELF]})
+    r = stub("rvfi", hexf, tmp_path, Pins(), iss_log(hexf), [100, 3100, 3200])
+    assert r["pass"] and r["max_cycles_per_insn"] == 100, r
+    for prog in ([addi(1, 0, 1), WFI, SELF], [addi(1, 0, 1), SELF]):
+        hexb = flash_hex(tmp_path / "wfib.hex", {0: prog})
+        rets = iss_log(hexb)
+        r = stub("rvfi", hexb, tmp_path, Pins(), rets, [100] + [3100 + 100 * k for k in
+                                                               range(len(rets) - 1)])
+        assert r["error"].startswith("cycle 2149: latency cap: no retirement within 2048 cycles "
+                                     "of the previous retirement"), r["error"]
+
+
+PROG_VOL_ALT = [lui(1, 0x80000), lw(6, 4, 1), addi(2, 0, 1), sw(2, ALTFN, 1),  # ends ALTFN = 1
+                addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_result_gpio_on_gpio_pins_only(tools, tmp_path, mode):
+    """R24: result_gpio is compared on the pins in GPIO mode at the end, ~final_altfn. A program
+    that ends with uo[0] as the idle UART line shows 0x5B for result_gpio 0x5A."""
+    hexf = flash_hex(tmp_path / "alt.hex", {0: PROG_VOL_ALT})
+    rets = iss_log(hexf, "--vread", "1=2")
+    pins = Pins().set_uo(401, 0x01).set_uo(601, 0x5B)
+    ok = {"result_gpio": 0x5A, "final_altfn": 1}
+    r = stub(mode, hexf, tmp_path, pins, rets, every(8), ok)
+    assert r["pass"], r["error"]
+    if mode == "pins":
+        assert r["end"] == "result_gpio"
+    r = stub(mode, hexf, tmp_path, pins, rets, every(8), {"result_gpio": 0x5A},
+             extra=("--max-cycles", "20000"))
+    if mode == "rvfi":
+        assert not r["pass"] and "ended with ALTFN = 0x01" in r["error"], r["error"]
+    else:
+        assert not r["pass"] and "timeout after 20001 cycles" in r["error"], r["error"]
+    if mode == "pins":  # 0xEE outside final_altfn fails at once
+        bad = Pins().set_uo(401, 0x01).set_uo(601, 0xEF)
+        r = stub(mode, hexf, tmp_path, bad, rets, every(8), ok)
+        assert not r["pass"] and "self-check failed" in r["error"], r["error"]
+
+
+def test_degenerate_result_compare_is_a_setup_error(tools, tmp_path):
+    """R24: result_gpio & ~final_altfn = 0 or final_altfn = 0xFF compares nothing an idle design
+    wouldn't pass: exit 2."""
+    hexf = flash_hex(tmp_path / "alt.hex", {0: PROG_VOL_ALT})
+    err = stub_setup_error("pins", hexf, tmp_path, {"result_gpio": 1, "final_altfn": 1})
+    assert "degenerate" in err, err
+    err = stub_setup_error("rvfi", hexf, tmp_path, {"result_gpio": 0x5A, "final_altfn": 255})
+    assert "final_altfn must be an integer 0..254" in err, err
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_fail_value_fails_fast(tools, tmp_path, mode):
+    """GPIO_OUT = 0xEE (the default trap or a failed check) fails at once: rvfi mode at the store's
+    retirement, pins mode when the pins show it."""
+    prog = [lui(1, 0x80000), lw(6, 4, 1), addi(2, 0, 0xEE), sw(2, GPIO_OUT, 1),  # #3 at 400
+            addi(5, 0, 0), SELF]
+    hexf = flash_hex(tmp_path / "ee.hex", {0: prog})
+    rets = iss_log(hexf, "--vread", "1=2")
+    r = stub(mode, hexf, tmp_path, Pins().set_uo(401, 0xEE), rets, every(7), {"result_gpio": 0x5A})
+    assert not r["pass"] and "self-check failed" in r["error"], r["error"]
+    assert ("cycle 400:" if mode == "rvfi" else "cycle 401:") in r["error"], r["error"]
+
+
+PROG_PWM = [lui(1, 0x80000), addi(2, 0, 5), sw(2, 32, 1),            # PWM_DUTY0 = 5
+            lui(2, 2), addi(2, 2, 0x409), sw(2, 28, 1),              # PWM_CTRL: PER 9, Q 1, on
+            addi(2, 0, 2), sw(2, ALTFN, 1),                          # uo[1] = PWM0 (#7, 800)
+            addi(3, 0, 0xA5), sw(3, GPIO_OUT, 1),                    # the 0xA5 mark (#9, 1000)
+            addi(5, 0, 0), sw(0, ALTFN, 1),                          # ALTFN = 0 (#11, 1200)
+            addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_pwm_through_the_harness(tools, tmp_path, mode):
+    """expect.json pwm: after the 0xA5 mark (on the GPIO-mode pins), PWM0 on uo[1] must run with
+    period (PER+1) 2^Q = 20 and high min(DUTY, PER+1) 2^Q = 10, measured after one settling
+    period, within 4 periods; rvfi mode also fails ALTFN[1] cleared before the measurement ends."""
+    hexf = flash_hex(tmp_path / "pwm.hex", {0: PROG_PWM})
+    rets = iss_log(hexf)
+    exp = {"pwm": [{"ch": 0, "per": 9, "q": 1, "duty": 5}], "result_gpio": 0x5A}
+
+    def uo(c, stop=10**9):
+        base = 0x5A if c >= 1401 else 0xA5 if c >= 1001 else 0x00
+        pwm = 801 <= c < min(1201, stop) and (c - 801) % 20 < 10
+        return base | (0x02 if pwm else 0)
+
+    r = stub(mode, hexf, tmp_path, wave(Pins(), 1, 1700, uo), rets, every(16), exp)
+    assert r["pass"], r["error"]
+    bad = dict(exp, pwm=[{"ch": 0, "per": 10, "q": 1, "duty": 5}])  # expects period 22
+    r = stub(mode, hexf, tmp_path, wave(Pins(), 1, 1700, uo), rets, every(16), bad)
+    assert not r["pass"] and "PWM0 (uo[1])" in r["error"] and "expected period 22" in r["error"], (
+        r["error"])
+    r = stub(mode, hexf, tmp_path, wave(Pins(), 1, 1700, lambda c: uo(c, stop=1010)), rets,
+             every(16), exp)
+    assert not r["pass"] and "no rising edge in the two periods after settling" in r["error"], (
+        r["error"])
+    if mode == "rvfi":  # ALTFN cleared 20 cycles after the mark, before the first measured edge
+        cycles = every(10) + [1010, 1020, 1300, 1400, 1500, 1600]
+        r = stub(mode, hexf, tmp_path, wave(Pins(), 1, 1700, uo), rets, cycles, exp)
+        assert not r["pass"] and "ALTFN bit 1 was cleared before the measurement" in r["error"], (
+            r["error"])
 
 
 # ------------------------------------------------------------------------------------------------
@@ -573,6 +872,10 @@ def test_run_cosim_v3_cli(tools, tmp_path):
     plan |= {f"trap_{t}" for t in ("ecall", "ebreak", "jal", "jalr", "branch", "zero", "ones")}
     plan |= {f"random_{n}" for n in range(1, 7)}
     assert set(run_cosim.V3_PROGRAMS) == plan and len(run_cosim.V3_PROGRAMS) == len(plan)
+    # --all --v3 runs every program `make list` reports; the plan's 26 must be among them
+    listed = sorted(plan) + ["gpio_demo", "uart_echo_fast"]
+    assert run_cosim.missing_v3_programs(listed) == []
+    assert run_cosim.missing_v3_programs([p for p in listed if p != "wfi"]) == ["wfi"]
     assert run_cosim.build_dir_for("rvfi", run_cosim.SRC, "", False, v3=True).name == "rvfi-v3"
 
 

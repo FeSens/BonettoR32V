@@ -6,10 +6,10 @@
 //   harness --fuzz-liveness K [--fuzz-cap N] [--seed S] [--clk-ns 25]
 //   Arguments starting with '+' go to the design ($value$plusargs; the test fixtures use them).
 //
-// prog.hex is a sparse $readmemh flash image (unset bytes 0xFF), loaded once and shared by the
-// QSPI Pmod model (pmod.h) and the reference ISS (iss3.h). --seed picks the random power-up state
-// of every flip-flop, the bus noise, the reset length and the memories' power-up modes
-// (pmod_init_for_seed: seeds 1-4 cover all four). --expect is the program's expect.json.
+// prog.hex is a sparse $readmemh flash image (unset bytes 0xFF), loaded once into one buffer that
+// the QSPI Pmod model (pmod.h) uses and the reference ISS (iss3.h) copies. --seed picks the random
+// power-up state of every flip-flop, the bus noise, the reset length and the memories' power-up
+// modes (pmod_init_for_seed: seeds 1-4 cover all four). --expect is the program's expect.json.
 //
 // Built twice by build.sh:
 //   rvfi mode (RVFI_MODE, design built with RISCV_FORMAL): the ISS runs in lockstep with the
@@ -17,25 +17,29 @@
 //     values for volatile bits (IoHooks, from rvfi_mem_rdata; mip.MEIP from rvfi_rd_wdata). A
 //     retirement with rvfi_intr = 1 that doesn't follow a trap is an interrupt entry: the ISS
 //     takes it (take_interrupt), and it fails if the ISS has interrupts masked. The latency cap
-//     (2,048 cycles, contract 4; a gap next to a WFI is exempt) is checked at each retirement and
-//     by a watchdog. GPIO-mode uo pins follow the ISS's GPIO_OUT/ALTFN within one cycle of the
-//     store's retirement and change for no other reason (contract 6). TX_BUSY and SPI BUSY reads
-//     must match the transfers the pin models see, and UART/SPI bytes on the pins must be the
-//     bytes the program wrote. The program ends with jal x0, 0 retired twice at the same pc; the
-//     harness runs 2,048 more cycles, then compares every PSRAM byte the program wrote.
+//     (2,048 cycles, contract 4; only the gap that starts at a WFI's retirement is exempt, R31) is
+//     checked at each retirement and by a watchdog. GPIO-mode uo pins follow the ISS's
+//     GPIO_OUT/ALTFN within one cycle of the store's retirement and change for no other reason
+//     (contract 6). GPIO_IN reads equal ui_in at an edge of the load's execution or the 3 before
+//     (R30). TX_BUSY, IRQ_PEND.TXIDLE and SPI BUSY reads match the transfers the pin models see,
+//     a UART start bit comes within DIV+2 cycles after its UART_DATA store retires (R28), and
+//     UART/SPI bytes on the pins are the bytes the program wrote. The program ends with
+//     jal x0, 0 retired twice at the same pc; the harness runs 2,048 more cycles, then compares
+//     every PSRAM byte the program wrote; no transfer may still be in flight.
 //   pins mode (plain design): no RVFI. A program whose standalone ISS run reaches its self-loop
 //     without reading a volatile bit or enabling interrupts (mstatus.MIE and mie.MEIE both 1) is
-//     deterministic: the uo pins must go through the ISS's GPIO
-//     states in order, every PSRAM write outside the core region must write the byte of some
-//     store of that run, and the final PSRAM must match it. Any other program is judged by its
-//     self-check (uo_out = expect.json result_gpio, written with ALTFN = 0), the pin checkers and
-//     the UART output.
+//     deterministic: the uo pins must go through the ISS's GPIO states in order, every PSRAM
+//     write outside the core region must write the byte of some store of that run, the final
+//     PSRAM must match it, and the UART frames and SPI transfers must carry its UART_DATA and
+//     SPI_DATA bytes (R33). Any other program is judged by its self-check (the GPIO-mode pins,
+//     ~final_altfn, show result_gpio; R24), the pin checkers and the expected UART/SPI bytes;
+//     PSRAM writes go unchecked there (no reference stores).
 // Both modes: the Pmod chip models and bus rules (contract 2, pmod.h) on every cycle, the reset
-// state (section 1), outputs that only change at rising clk edges, PSRAM writes outside the core
-// region only with bytes of stores (contract 8), the peripheral pin models (periph_models.h:
-// UART bit times, SPI waveform and echo device, PWM periods), and CoreMark timing marks (uo_out
-// changes to 0xC0, then 0xC1; coremark_cycles_per_iter = the cycles between them / expect.json
-// coremark_iters).
+// state (section 1), outputs that only change at rising clk edges, the peripheral pin models
+// (periph_models.h: UART bit times, SPI waveform and echo device, PWM periods after the 0xA5
+// mark), and CoreMark timing marks (the GPIO-mode pins change to 0xC0, then 0xC1;
+// coremark_cycles_per_iter = the cycles between them / expect.json coremark_iters). The marks
+// are masked with ALTFN (R24) and looked for only when expect.json lists pwm / coremark_iters.
 //
 // The last stdout line is a JSON summary. Exit 0 = pass, 1 = fail, 2 = usage or setup error.
 #include <verilated.h>
@@ -80,8 +84,10 @@ constexpr uint64_t DEFAULT_BUDGET = 50000000;  // cycles, for programs the ISS c
 constexpr uint64_t PRE_RUN_CAP = 200000000;    // standalone ISS retirements
 constexpr uint64_t RESULT_STABLE = 3 * LAT_CAP;  // pins mode: result_gpio held this long = end
 constexpr uint32_t FUZZ_SPAN = 0x10000;          // fuzz: random program bytes at flash 0..64 KB
-constexpr uint32_t SLOT_UART_DATA = 11, SLOT_UART_CTRL = 12, SLOT_SPI_DATA = 13,
-                   SLOT_SPI_CTRL = 14;
+constexpr uint32_t SLOT_GPIO_IN = 1, SLOT_UART_DATA = 11, SLOT_UART_CTRL = 12, SLOT_SPI_DATA = 13,
+                   SLOT_SPI_CTRL = 14, SLOT_IRQ_PEND = 16;
+constexpr uint64_t UI_STALE = 3;      // contract 6: GPIO_IN at most 3 cycles stale
+constexpr uint64_t UI_HIST = 1 << 13;  // ui_in history kept for the GPIO_IN check (edges)
 
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 std::string fmt(const char* f, ...) {
@@ -258,6 +264,8 @@ struct Expect {
   std::string uart_tx_expect;
   bool have_spi = false;
   uint32_t spi_div_d = 0;
+  bool have_spi_tx_expect = false;
+  std::string spi_tx_expect;  // the MOSI bytes, in order
   struct Pwm {
     int ch;
     uint32_t per, q, duty;
@@ -267,6 +275,7 @@ struct Expect {
   std::vector<std::pair<uint64_t, uint8_t>> gpio_script;
   bool have_result = false;
   uint8_t result_gpio = 0;
+  uint8_t final_altfn = 0;  // ALTFN at the end: result_gpio is compared on the other pins (R24)
   uint64_t coremark_iters = 0;
 };
 
@@ -325,9 +334,23 @@ bool load_expect(const char* path, Expect* ex, std::string* err) {
     ex->uart_tx_expect = v->s;
   }
   if (const JVal* v = j.get("spi_div_d"); v && v->t != JVal::Null) {
-    if (!uint_of(v, &u) || u > 7) return bad("spi_div_d", "an integer 0..7");
+    // contract 5.6: D >= 1 (D = 0 is UNSPECIFIED; the device's MISO hold needs 2-cycle phases)
+    if (!uint_of(v, &u) || u < 1 || u > 7) return bad("spi_div_d", "an integer 1..7");
     ex->have_spi = true;
     ex->spi_div_d = (uint32_t)u;
+  }
+  if (const JVal* v = j.get("spi_tx_expect"); v && v->t != JVal::Null) {
+    if (v->t == JVal::Str) {
+      ex->spi_tx_expect = v->s;
+    } else if (v->t == JVal::Arr) {
+      for (const JVal& e : v->a) {
+        if (!uint_of(&e, &u) || u > 255) return bad("spi_tx_expect", "a string or a list of bytes");
+        ex->spi_tx_expect += (char)u;
+      }
+    } else {
+      return bad("spi_tx_expect", "a string or a list of bytes");
+    }
+    ex->have_spi_tx_expect = true;
   }
   if (const JVal* v = j.get("pwm"); v && v->t != JVal::Null) {
     if (v->t != JVal::Arr) return bad("pwm", "a list of {ch, per, q, duty}");
@@ -358,6 +381,18 @@ bool load_expect(const char* path, Expect* ex, std::string* err) {
     if (!uint_of(v, &u) || u > 255) return bad("result_gpio", "an integer 0..255");
     ex->have_result = true;
     ex->result_gpio = (uint8_t)u;
+  }
+  if (const JVal* v = j.get("final_altfn"); v && v->t != JVal::Null) {
+    if (!uint_of(v, &u) || u > 254) return bad("final_altfn", "an integer 0..254");
+    ex->final_altfn = (uint8_t)u;
+  }
+  if (ex->have_result && (ex->result_gpio & ~ex->final_altfn & 0xFF) == 0) {
+    // R24: the self-check compares the GPIO-mode pins with result_gpio & ~final_altfn; all 0 is
+    // what an idle design shows
+    *err = fmt("%s: result_gpio 0x%02x & ~final_altfn 0x%02x is 0, a degenerate self-check (an "
+               "idle design passes it)",
+               path, ex->result_gpio, ex->final_altfn);
+    return false;
   }
   if (const JVal* v = j.get("coremark_iters"); v && v->t != JVal::Null) {
     if (!uint_of(v, &u) || u == 0) return bad("coremark_iters", "a positive integer");
@@ -691,6 +726,11 @@ class Harness {
   uint64_t ref_retired_ = 0;   // its retirements (deterministic)
   uint64_t ref_tail_ = 0;      // its retirements after the last GPIO change
   GState ref_final_;
+  struct SerialWrite {
+    uint8_t byte;
+    uint32_t div;  // UART: DIV; SPI: D (from the control register at the write)
+  };
+  std::vector<SerialWrite> ref_uart_, ref_spi_;  // its UART_DATA / SPI_DATA byte-0 writes
   StoreSet stores_;
   Written written_;
   GpioTrack gpio_;
@@ -701,7 +741,8 @@ class Harness {
   uint64_t retired_ = 0, last_ret_ = 0, max_gap_ = 0, first_gap_ = 0;
   std::map<std::string, uint64_t> per_class_;
   uint32_t last_insn_ = 0;
-  bool next_is_wfi_ = false, last_trap_ = false, uninit_seen_ = false;
+  bool last_trap_ = false;
+  std::vector<uint8_t> ui_hist_ = std::vector<uint8_t>(UI_HIST, 0);  // ui_in seen at edge e
   uint64_t prog_end_ = INF;  // edge the program ended (selfloop / final state / result)
   uint64_t end_at_ = INF;    // edge the run stops (after the drain)
   uint64_t cycles_ = 0;
@@ -712,12 +753,14 @@ class Harness {
   uint64_t cm_start_ = INF, cm_end_ = INF;
   uint64_t result_since_ = INF;
   uint64_t pwm_marker_ = INF;
+  bool marker_was_ = false, fail_was_ = false;  // rvfi: GPIO_OUT showed 0xA5 / 0xEE last time
+  bool cm_was0_ = false, cm_was1_ = false;      // the pins showed 0xC0 / 0xC1 last cycle
   bool vread_used_ = false;
   uint32_t vread_slot_ = 0, vread_val_ = 0;
   XferTrack ut_, st_;  // UART TX, SPI master (rvfi)
   const char* end_reason_ = "fail";
   uint64_t interrupts_ = 0, retired_at_end_ = 0;
-  uint8_t prev_gpio_out_ = 0, ui_held_ = 0;
+  uint8_t ui_held_ = 0;
   uint64_t ui_until_ = 0;
   bool rx_queued_ = false;
 
@@ -741,6 +784,14 @@ class Harness {
 #endif
   }
   GState iss_gpio() const { return GState{iss_.io().gpio_out(), iss_.io().altfn()}; }
+  // R24: a GPIO value v "shows" want on the pins not in alt (the pins in GPIO mode)
+  static bool gmatch(uint8_t v, uint8_t want, uint8_t alt) {
+    return ((v ^ want) & ~alt & 0xFF) == 0;
+  }
+  // The ALTFN the marks (0xA5, 0xC0/0xC1) are masked with: the ISS's in rvfi mode; in pins mode
+  // the tracked state's (deterministic programs) or final_altfn plus the pwm pins.
+  uint8_t mark_alt() const;
+  bool serial_ref_check(bool uart, size_t k, uint8_t byte, uint64_t t0);
 
   bool pre_run();
   bool pre_run_body();
@@ -760,7 +811,8 @@ class Harness {
   bool xfer_done(XferTrack& x, uint64_t t0, uint64_t end, uint8_t byte, const char* what);
   bool xfer_deadline(XferTrack& x, const char* what);
   void xfer_gate(XferTrack& x, bool gate, uint64_t settle);
-  bool busy_read(XferTrack& x, bool value, uint64_t p, const char* what);
+  bool busy_read(XferTrack& x, bool busy, int raw, uint64_t p, const char* what);
+  bool gpio_in_read(uint8_t value, uint64_t p, const std::string& who);
   std::vector<GState> predictions() const;
   uint64_t uart_settle() const { return 11 * (uint64_t)uart_.bit_time() + uart_.div() + 8; }
   uint64_t spi_settle() const { return LAT_CAP + 18 * (uint64_t)spi_.half() + 8; }
@@ -791,6 +843,7 @@ bool Harness::pre_run_body() {
   uint64_t n = 0, last_change = 0;
   StoreSet stores;
   Written written;
+  std::vector<SerialWrite> uart_w, spi_w;
   bool loop = false;
   while (n < PRE_RUN_CAP) {
     if (ref.irq_allowed()) {  // an interrupt may come at any boundary from here
@@ -813,6 +866,14 @@ bool Harness::pre_run_body() {
         stores.add((r.maddr + k) & (v3::PSRAM_SIZE - 1), (uint8_t)(r.mwdata >> (8 * k)));
         written.mark(r.maddr + k);
       }
+    if (r.wmask && area_of(r.maddr) == Area::Io && (r.maddr & 3) == 0) {
+      const uint32_t slot = (r.maddr >> 2) & 31;
+      const uint8_t a = ref.io().altfn();  // only writes whose port the pins show count
+      if (slot == SLOT_UART_DATA && (a & 1))
+        uart_w.push_back(SerialWrite{(uint8_t)r.mwdata, ref.io().r[SLOT_UART_CTRL] & 0x1FFF});
+      if (slot == SLOT_SPI_DATA && (a & 0x70) == 0x70)
+        spi_w.push_back(SerialWrite{(uint8_t)r.mwdata, (ref.io().r[SLOT_SPI_CTRL] >> 1) & 7});
+    }
     GState s{ref.io().gpio_out(), ref.io().altfn()};
     if (!gsame(s, cur)) cur = s, states.push_back(s), last_change = n;
     if (ref.selfloop()) {
@@ -830,6 +891,8 @@ bool Harness::pre_run_body() {
     ref_retired_ = n;
     ref_tail_ = n - last_change;
     ref_final_ = cur;
+    ref_uart_ = std::move(uart_w);
+    ref_spi_ = std::move(spi_w);
 #ifndef RVFI_MODE
     stores_ = std::move(stores);
     for (uint32_t a : written.list()) written_.mark(a);
@@ -838,10 +901,14 @@ bool Harness::pre_run_body() {
     // keep the final bytes in the ISS member for the compare
     iss_ = std::move(ref);
 #endif
-    if (ex_.have_result && ref_final_.g != ex_.result_gpio)
-      return fail(fmt("test program bug: expect.json result_gpio = 0x%02x, but the ISS ends with "
-                      "GPIO_OUT = 0x%02x",
-                      ex_.result_gpio, ref_final_.g));
+    if (ex_.have_result && !gmatch(ref_final_.g, ex_.result_gpio, ex_.final_altfn))
+      return fail(fmt("test program bug: expect.json result_gpio = 0x%02x (final_altfn 0x%02x), "
+                      "but the ISS ends with GPIO_OUT = 0x%02x",
+                      ex_.result_gpio, ex_.final_altfn, ref_final_.g));
+    if (ex_.have_result && ref_final_.a != ex_.final_altfn)
+      return fail(fmt("test program bug: expect.json final_altfn = 0x%02x, but the ISS ends with "
+                      "ALTFN = 0x%02x",
+                      ex_.final_altfn, ref_final_.a));
   }
   budget_ = o_.max_cycles ? o_.max_cycles : det_ ? LAT_CAP * (n + 16) : DEFAULT_BUDGET;
   return true;
@@ -906,16 +973,48 @@ uint8_t Harness::next_ui(uint8_t uo) {
   const bool models = ex_.have_uart || ex_.have_spi || ex_.loop_uo7_to_ui0 || !stim_.empty();
   uint8_t ui;
   if (!models && det_) {
-    // a deterministic program reads no input: drive noise, changing every 16-79 cycles
-    if (t_ >= ui_until_) ui_held_ = (uint8_t)noise_.next(), ui_until_ = t_ + 16 + noise_.next() % 64;
+    // a deterministic program reads no input: drive noise, changing every 16-79 cycles; ui[1]
+    // (UART RX) stays idle high, as everywhere no UART RX model drives it (R24)
+    if (t_ >= ui_until_) {
+      ui_held_ = (uint8_t)(noise_.next() | periph::UI_IDLE);
+      ui_until_ = t_ + 16 + noise_.next() % 64;
+    }
     ui = ui_held_;
   } else {
-    ui = (anchor_ != INF && t_ + 1 >= anchor_) ? stim_.value(t_ + 1 - anchor_) : 0;
+    ui = (anchor_ != INF && t_ + 1 >= anchor_) ? stim_.value(t_ + 1 - anchor_) : periph::UI_IDLE;
   }
   if (ex_.have_uart) ui = (uint8_t)((ui & ~2u) | (uart_.rx_level(t_ + 1) ? 2u : 0u));
   if (ex_.have_spi) ui = (uint8_t)((ui & ~8u) | (spi_.miso(t_ + 1, noise_.next() & 1) ? 8u : 0u));
   if (ex_.loop_uo7_to_ui0) ui = (uint8_t)((ui & ~1u) | (periph::TimerLoop::ui0(uo) ? 1u : 0u));
   return ui;
+}
+
+uint8_t Harness::mark_alt() const {
+#ifdef RVFI_MODE
+  return iss_.io().altfn();
+#else
+  if (det_) return gpio_.current().a;
+  uint8_t a = ex_.final_altfn;
+  for (const Expect::Pwm& p : ex_.pwm) a |= (uint8_t)(1u << (p.ch == 7 ? 7 : p.ch + 1));
+  return a;
+#endif
+}
+
+// pins mode, deterministic programs (R33): UART frame / SPI transfer k carries the reference run's
+// k-th UART_DATA / SPI_DATA byte-0 write.
+bool Harness::serial_ref_check(bool uart, size_t k, uint8_t byte, uint64_t t0) {
+  const std::vector<SerialWrite>& w = uart ? ref_uart_ : ref_spi_;
+  const char* what = uart ? "UART TX" : "SPI MOSI";
+  const char* reg = uart ? "UART_DATA" : "SPI_DATA";
+  if (k >= w.size())
+    return fail(fmt("%s sent 0x%02x (#%zu, started at cycle %llu), but the reference run wrote "
+                    "only %zu bytes to %s",
+                    what, byte, k, (unsigned long long)rel(t0), w.size(), reg));
+  if (w[k].byte != byte)
+    return fail(fmt("%s sent 0x%02x (#%zu, started at cycle %llu), but the reference run's %s "
+                    "write #%zu is 0x%02x",
+                    what, byte, k, (unsigned long long)rel(t0), reg, k, w[k].byte));
+  return true;
 }
 
 // The pin models, once per cycle after the design's outputs at edge t_.
@@ -925,21 +1024,38 @@ bool Harness::peripherals(uint8_t uo) {
   const bool decode_uart = true, track_spi = true;
 #else
   const uint8_t alt = det_ ? gpio_.current().a : 0xFF;  // volatile programs: can't tell
-  const bool decode_uart = ex_.have_uart, track_spi = ex_.have_spi;
+  const bool ref_serial = det_;  // R33: compare with the reference run's writes
+  const bool decode_uart = ex_.have_uart || ex_.have_tx_expect || (det_ && !ref_uart_.empty());
+  const bool track_spi = ex_.have_spi || ex_.have_spi_tx_expect || (det_ && !ref_spi_.empty());
 #endif
   if (decode_uart) {
+#ifndef RVFI_MODE
+    // the next frame's bit time: the reference's DIV at the matching write (expect.json
+    // uart_div, when given, wins, as in rvfi mode)
+    if (ref_serial && !ex_.have_uart && !uart_.tx_in_frame() &&
+        uart_.tx_frames().size() < ref_uart_.size())
+      uart_.set_div(ref_uart_[uart_.tx_frames().size()].div);
+#endif
     if (!uart_.tx_step(t_, uo & 1, alt & 1)) return fail(uart_.error());
 #ifdef RVFI_MODE
-    if (uart_.tx_started() &&
-        !xfer_start(ut_, t_, uart_.div() + 2 + BUSY_SLACK, "a UART TX frame"))
+    if (uart_.tx_started() && !xfer_start(ut_, t_, uart_.div() + 2, "a UART TX frame"))
       return false;
     if (uart_.tx_completed()) {
       const periph::UartFrame& f = uart_.tx_frames().back();
       if (!xfer_done(ut_, f.t0, f.end, f.byte, "UART TX")) return false;
     }
+#else
+    if (ref_serial && uart_.tx_completed()) {
+      const periph::UartFrame& f = uart_.tx_frames().back();
+      if (!serial_ref_check(true, uart_.tx_frames().size() - 1, f.byte, f.t0)) return false;
+    }
 #endif
   }
   if (track_spi) {
+#ifndef RVFI_MODE
+    if (ref_serial && !ex_.have_spi && !spi_.in_xfer() && spi_.xfers().size() < ref_spi_.size())
+      spi_.set_d(ref_spi_[spi_.xfers().size()].div);
+#endif
     if (!spi_.step(t_, (uo >> 4) & 1, (uo >> 5) & 1, (uo >> 6) & 1, (alt & 0x70) == 0x70))
       return fail(spi_.error());
 #ifdef RVFI_MODE
@@ -950,13 +1066,16 @@ bool Harness::peripherals(uint8_t uo) {
       const periph::SpiXfer& x = spi_.xfers().back();
       if (!xfer_done(st_, x.first_rise, x.last_fall, x.mosi, "SPI MOSI")) return false;
     }
+#else
+    if (ref_serial && spi_.done()) {
+      const periph::SpiXfer& x = spi_.xfers().back();
+      if (!serial_ref_check(false, spi_.xfers().size() - 1, x.mosi, x.first_rise)) return false;
+    }
 #endif
   }
   if (!ex_.pwm.empty()) {
 #ifndef RVFI_MODE
-    uint8_t mask = 0;
-    for (const Expect::Pwm& p : ex_.pwm) mask |= (uint8_t)(1u << (p.ch == 7 ? 7 : p.ch + 1));
-    if (pwm_marker_ == INF && ((uo ^ PWM_MARKER) & ~mask & 0xFF) == 0) start_meters(t_);
+    if (pwm_marker_ == INF && gmatch(uo, PWM_MARKER, mark_alt())) start_meters(t_);
 #endif
     for (size_t i = 0; i < meters_.size(); i++) {
       periph::PwmMeter& m = meters_[i];
@@ -964,7 +1083,7 @@ bool Harness::peripherals(uint8_t uo) {
 #ifdef RVFI_MODE
       if (!((alt >> meter_pin_[i]) & 1))
         return fail(fmt("%s: ALTFN bit %d was cleared before the measurement finished (after the "
-                        "0xA5 marker the output must keep running for up to 3 periods: one to "
+                        "0xA5 marker the output must keep running for up to 4 periods: one to "
                         "settle, then one full period measured from a rising edge)",
                         m.name().c_str(), meter_pin_[i]));
 #endif
@@ -973,25 +1092,33 @@ bool Harness::peripherals(uint8_t uo) {
         return fail(m.name() + ": the measurement did not finish");
     }
   }
+  if (ex_.coremark_iters) {  // R21, R24: the marks on the GPIO-mode pins
+    const uint8_t ma = mark_alt();
+    const bool m0 = gmatch(uo, CM_START, ma), m1 = gmatch(uo, CM_END, ma);
+    if (cm_start_ == INF && m0 && !cm_was0_) cm_start_ = t_;
+    else if (cm_start_ != INF && cm_end_ == INF && m1 && !cm_was1_) cm_end_ = t_;
+    cm_was0_ = m0;
+    cm_was1_ = m1;
+  }
   if (uo != uo_last_) {
-    if (uo == CM_START && cm_start_ == INF) cm_start_ = t_;
-    else if (uo == CM_END && cm_start_ != INF && cm_end_ == INF) cm_end_ = t_;
     if (uo_seen_.size() < 4096) uo_seen_.push_back(uo);
     uo_last_ = uo;
   }
 #ifndef RVFI_MODE
-  if (!det_) {  // judged by the self-check: uo_out = result_gpio, held
-    if (ex_.result_gpio != GPIO_FAIL && uo == GPIO_FAIL)
-      return fail("the program's self-check failed: uo_out = 0xee (the default trap or a failed "
-                  "check)");
-    if (uo == ex_.result_gpio) {
+  if (!det_) {  // judged by the self-check: the GPIO-mode pins show result_gpio, held (R24)
+    const uint8_t fa = ex_.final_altfn;
+    if (!gmatch(ex_.result_gpio, GPIO_FAIL, fa) && gmatch(uo, GPIO_FAIL, fa))
+      return fail(fmt("the program's self-check failed: uo_out = 0x%02x shows 0xee on the pins "
+                      "outside final_altfn 0x%02x (the default trap or a failed check)",
+                      uo, fa));
+    if (gmatch(uo, ex_.result_gpio, fa)) {
       if (result_since_ == INF) result_since_ = t_;
     } else {
       result_since_ = INF;
       if (prog_end_ != INF)
-        return fail(fmt("uo_out changed from result_gpio 0x%02x to 0x%02x after the program "
-                        "ended",
-                        ex_.result_gpio, uo));
+        return fail(fmt("uo_out changed from result_gpio 0x%02x (final_altfn 0x%02x) to 0x%02x "
+                        "after the program ended",
+                        ex_.result_gpio, fa, uo));
     }
     if (prog_end_ == INF && result_since_ != INF && t_ - result_since_ >= RESULT_STABLE) {
       prog_end_ = result_since_;
@@ -1034,15 +1161,50 @@ bool Harness::final_checks() {
                         a, 0x01000000u | a, got, want, (unsigned long long)(t_ - prog_end_)));
     }
 #ifdef RVFI_MODE
-  if (ex_.have_result && iss_.io().gpio_out() != ex_.result_gpio)
-    return fail(fmt("the program's self-check failed: it ended with GPIO_OUT = 0x%02x, "
-                    "expect.json result_gpio is 0x%02x",
-                    iss_.io().gpio_out(), ex_.result_gpio));
+  if (ex_.have_result) {
+    const GState g = iss_gpio();
+    if (!gmatch(g.g, ex_.result_gpio, ex_.final_altfn))
+      return fail(fmt("the program's self-check failed: it ended with GPIO_OUT = 0x%02x, "
+                      "expect.json result_gpio is 0x%02x (final_altfn 0x%02x)",
+                      g.g, ex_.result_gpio, ex_.final_altfn));
+    if (g.a != ex_.final_altfn)
+      return fail(fmt("test program bug: the program ended with ALTFN = 0x%02x, but expect.json "
+                      "final_altfn is 0x%02x",
+                      g.a, ex_.final_altfn));
+  }
+  // nothing may still be in flight when the run ends
+  if (spi_.in_xfer())
+    return fail(fmt("an SPI transfer (first rising SCK edge at cycle %llu) was still in progress "
+                    "at the end of the run",
+                    (unsigned long long)rel(spi_.xfer_first_rise())));
+  if (ut_.pend.active || st_.pend.active)
+    return fail(fmt("the %s write that retired at cycle %llu had not started its transfer at the "
+                    "end of the run",
+                    ut_.pend.active ? "UART_DATA" : "SPI_DATA",
+                    (unsigned long long)rel(ut_.pend.active ? ut_.pend.s : st_.pend.s)));
 #endif
   if (!uart_.tx_finish(t_)) return fail(uart_.error());
   if (ex_.have_tx_expect && uart_.tx_text() != ex_.uart_tx_expect)
     return fail(fmt("UART TX sent %s, expect.json uart_tx_expect is %s",
                     json_str(uart_.tx_text()).c_str(), json_str(ex_.uart_tx_expect).c_str()));
+  if (ex_.have_spi_tx_expect) {
+    std::string mosi;
+    for (const periph::SpiXfer& x : spi_.xfers()) mosi += (char)x.mosi;
+    if (mosi != ex_.spi_tx_expect)
+      return fail(fmt("SPI MOSI sent %s, expect.json spi_tx_expect is %s", json_str(mosi).c_str(),
+                      json_str(ex_.spi_tx_expect).c_str()));
+  }
+#ifndef RVFI_MODE
+  if (det_ && uart_.tx_frames().size() != ref_uart_.size())
+    return fail(fmt("UART TX sent %zu bytes, the reference run wrote %zu to UART_DATA with "
+                    "ALTFN[0] set (R33; a write while TX_BUSY = 1 is ignored, so a program that "
+                    "doesn't poll TX_BUSY isn't deterministic)",
+                    uart_.tx_frames().size(), ref_uart_.size()));
+  if (det_ && spi_.xfers().size() != ref_spi_.size())
+    return fail(fmt("SPI MOSI sent %zu bytes, the reference run wrote %zu to SPI_DATA with "
+                    "ALTFN[6:4] set (R33)",
+                    spi_.xfers().size(), ref_spi_.size()));
+#endif
   if (ex_.coremark_iters && (cm_start_ == INF || cm_end_ == INF))
     return fail("expect.json has coremark_iters, but uo_out never changed to 0xc0 and then to "
                 "0xc1 (the CoreMark timing marks)");
@@ -1167,20 +1329,41 @@ bool Harness::xfer_deadline(XferTrack& x, const char* what) {
   return true;
 }
 
-// R20: a TX_BUSY / BUSY read must match what the pins show over the reading instruction.
-bool Harness::busy_read(XferTrack& x, bool value, uint64_t p, const char* what) {
+// R20: a TX_BUSY / BUSY / TXIDLE read must match what the pins show over the reading
+// instruction. busy: the busy level the read reports; raw: the bit as read.
+bool Harness::busy_read(XferTrack& x, bool busy, int raw, uint64_t p, const char* what) {
   if (!x.gated) return true;
   const int m = x.busy.must(p + 1, t_);
-  if (m == 1 && !value)
-    return fail(fmt("%s read 0 in the instruction retiring now (cycles %llu-%llu), but the pins "
-                    "show its transfer in progress (or its start pending) over all of it "
+  if (m == 1 && !busy)
+    return fail(fmt("%s read %d (not busy) in the instruction retiring now (cycles %llu-%llu), but "
+                    "the pins show its transfer in progress (or its start pending) over all of it "
                     "(contract 5.5, 5.6)",
-                    what, (unsigned long long)rel(p + 1), (unsigned long long)rel(t_)));
-  if (m == 0 && value)
-    return fail(fmt("%s read 1 in the instruction retiring now (cycles %llu-%llu), but no "
+                    what, raw, (unsigned long long)rel(p + 1), (unsigned long long)rel(t_)));
+  if (m == 0 && busy)
+    return fail(fmt("%s read %d (busy) in the instruction retiring now (cycles %llu-%llu), but no "
                     "transfer was in progress or pending on the pins (contract 5.5, 5.6)",
-                    what, (unsigned long long)rel(p + 1), (unsigned long long)rel(t_)));
+                    what, raw, (unsigned long long)rel(p + 1), (unsigned long long)rel(t_)));
   return true;
+}
+
+// R30 (contract 6): GPIO_IN reads ui_in as sampled during the load's execution, at most 3 cycles
+// stale: the value must be the ui_in the design saw at some edge in [p + 1 - 3, t].
+bool Harness::gpio_in_read(uint8_t value, uint64_t p, const std::string& who) {
+  uint64_t lo = std::max(p + 1 > UI_STALE ? p + 1 - UI_STALE : 0, reset_edges_ - 1);
+  if (t_ - lo >= UI_HIST) lo = t_ - UI_HIST + 1;
+  std::string seen;
+  int nseen = 0;
+  for (uint64_t e = lo; e <= t_; e++) {
+    const uint8_t v = ui_hist_[e % UI_HIST];
+    if (v == value) return true;
+    if ((e == lo || v != ui_hist_[(e - 1) % UI_HIST]) && nseen++ < 6)
+      seen += fmt("%s0x%02x", nseen > 1 ? ", " : "", v);
+  }
+  return fail(fmt("GPIO_IN read 0x%02x at %s, but ui_in was %s%s at the edges of cycles %llu-%llu "
+                  "(the load's execution and the 3 cycles before it; contract 6: at most 3 cycles "
+                  "stale)",
+                  value, who.c_str(), seen.c_str(), nseen > 6 ? ", ..." : "",
+                  (unsigned long long)rel(lo), (unsigned long long)rel(t_)));
 }
 
 bool Harness::compare(const Retire& e, const std::string& who) {
@@ -1206,8 +1389,10 @@ bool Harness::compare(const Retire& e, const std::string& who) {
       {"rvfi_rs1_rdata", top_->rvfi_rs1_rdata, e.rs1v, trap_reads},
       {"rvfi_rs2_addr", top_->rvfi_rs2_addr, e.rs2, trap_reads},
       {"rvfi_rs2_rdata", top_->rvfi_rs2_rdata, e.rs2v, trap_reads},
-      {"rvfi_rd_wdata", top_->rvfi_rd_wdata, e.rdv, false},
-      {"rvfi_mem_rmask", top_->rvfi_mem_rmask, e.rmask, false},
+      // a trap writes no register and accesses no memory: rd_addr = 0, so rd_wdata = 0 (RVFI),
+      // and its masks are 0 (contract 8)
+      {"rvfi_rd_wdata", top_->rvfi_rd_wdata, e.trap ? 0u : e.rdv, true},
+      {"rvfi_mem_rmask", top_->rvfi_mem_rmask, e.trap ? 0u : e.rmask, true},
       {"rvfi_mem_addr", top_->rvfi_mem_addr, (e.rmask | e.wmask) ? e.maddr : top_->rvfi_mem_addr,
        false},
   };
@@ -1228,7 +1413,9 @@ bool Harness::compare(const Retire& e, const std::string& who) {
 // One rvfi_valid: interrupt entry if any, then the ISS steps with the design's volatile values.
 bool Harness::retirement() {
   const uint64_t p = last_ret_, gap = t_ - p;
-  const bool exempt = last_insn_ == INSN_WFI || next_is_wfi_;
+  // R31 (contract 4): only the gap that starts at a WFI's retirement is exempt (WFI retires, then
+  // may stall); the gap before a WFI and an interrupt entry before one are not
+  const bool exempt = retired_ > 0 && last_insn_ == INSN_WFI;
   if (gap > LAT_CAP && !exempt)
     return fail(fmt("latency cap: retirement #%llu (pc 0x%08x, insn 0x%08x) came %llu cycles after "
                     "%s (limit %llu, contract 4)",
@@ -1265,7 +1452,7 @@ bool Harness::retirement() {
     return fail(fmt("test program bug: the ISS hit %s at retirement #%llu (pc 0x%08x, insn "
                     "0x%08x)",
                     unspecified_what(e), (unsigned long long)retired_, e.pc, e.insn));
-  if (iss_.uninit_read() && !uninit_seen_)
+  if (iss_.uninit_read())
     return fail(fmt("test program bug: a register or arbitrary-reset CSR is read before any write "
                     "at pc 0x%08x (the design's value is unknown)",
                     iss_.uninit_pc()));
@@ -1305,8 +1492,8 @@ bool Harness::retirement() {
     if (slot == SLOT_UART_DATA) {
       if (!ex_.have_uart && !uart_.tx_in_frame())
         uart_.set_div(iss_.io().r[SLOT_UART_CTRL] & 0x1FFF);
-      if (!xfer_write(ut_, p, t_, (uint8_t)e.mwdata, t_ + uart_.div() + 2 + BUSY_SLACK))
-        return false;
+      // R28 (contract 5.5): the start bit begins within DIV+2 cycles after the store retires
+      if (!xfer_write(ut_, p, t_, (uint8_t)e.mwdata, t_ + uart_.div() + 2)) return false;
     } else if (slot == SLOT_SPI_DATA) {
       if (!ex_.have_spi && !spi_.in_xfer()) spi_.set_d((iss_.io().r[SLOT_SPI_CTRL] >> 1) & 7);
       if (!xfer_write(st_, p, t_, (uint8_t)e.mwdata, t_ + LAT_CAP)) return false;
@@ -1319,12 +1506,18 @@ bool Harness::retirement() {
     return fail(fmt("an SPI transfer started at cycle %llu, but %s is not an SPI_DATA write",
                     (unsigned long long)rel(st_.orphan_t0), who.c_str()));
   if (vread_used_) {
+    const int tx_busy = (vread_val_ >> 13) & 1, spi_busy = (vread_val_ >> 4) & 1,
+              txidle = (vread_val_ >> 3) & 1;
     if (vread_slot_ == SLOT_UART_CTRL &&
-        !busy_read(ut_, (vread_val_ >> 13) & 1, p, "TX_BUSY (UART_CTRL[13])"))
+        !busy_read(ut_, tx_busy, tx_busy, p, "TX_BUSY (UART_CTRL[13])"))
+      return false;
+    if (vread_slot_ == SLOT_IRQ_PEND &&
+        !busy_read(ut_, !txidle, txidle, p, "TXIDLE (IRQ_PEND[3], = !TX_BUSY)"))
       return false;
     if (vread_slot_ == SLOT_SPI_CTRL &&
-        !busy_read(st_, (vread_val_ >> 4) & 1, p, "BUSY (SPI_CTRL[4])"))
+        !busy_read(st_, spi_busy, spi_busy, p, "BUSY (SPI_CTRL[4])"))
       return false;
+    if (vread_slot_ == SLOT_GPIO_IN && !gpio_in_read((uint8_t)vread_val_, p, who)) return false;
     if (vread_slot_ == SLOT_SPI_DATA && ex_.have_spi && st_.gated && !spi_.xfers().empty() &&
         st_.busy.must(p + 1, t_) == 0) {
       const periph::SpiXfer& x = spi_.xfers().back();
@@ -1334,14 +1527,18 @@ bool Harness::retirement() {
                         vread_val_ & 0xFF, who.c_str(), x.miso));
     }
   }
+  // R24: the marks and 0xEE on the GPIO-mode pins (GPIO_OUT outside ALTFN / final_altfn)
   const uint8_t go = iss_.io().gpio_out();
-  if (go == PWM_MARKER && prev_gpio_out_ != PWM_MARKER) start_meters(t_);
-  if (ex_.have_result && ex_.result_gpio != GPIO_FAIL && go == GPIO_FAIL &&
-      prev_gpio_out_ != GPIO_FAIL)
-    return fail(fmt("the program's self-check failed: %s wrote GPIO_OUT = 0xee (the default trap "
-                    "or a failed check)",
-                    who.c_str()));
-  prev_gpio_out_ = go;
+  const bool mk = gmatch(go, PWM_MARKER, iss_.io().altfn());
+  if (!ex_.pwm.empty() && mk && !marker_was_) start_meters(t_);
+  marker_was_ = mk;
+  const bool fl = gmatch(go, GPIO_FAIL, ex_.final_altfn);
+  if (ex_.have_result && !gmatch(ex_.result_gpio, GPIO_FAIL, ex_.final_altfn) && fl &&
+      !fail_was_)
+    return fail(fmt("the program's self-check failed: %s wrote GPIO_OUT = 0x%02x, 0xee outside "
+                    "final_altfn 0x%02x (the default trap or a failed check)",
+                    who.c_str(), go, ex_.final_altfn));
+  fail_was_ = fl;
   // bookkeeping
   if (retired_ == 0) {
     first_gap_ = gap;
@@ -1354,8 +1551,6 @@ bool Harness::retirement() {
   last_insn_ = e.insn;
   last_trap_ = e.trap;
   retired_++;
-  uint32_t w;
-  next_is_wfi_ = peek_insn(iss_, iss_.pc(), &w) && w == INSN_WFI;
   if (iss_.selfloop() && prog_end_ == INF) {
     prog_end_ = t_;
     cycles_ = rel(t_);
@@ -1388,13 +1583,20 @@ int Harness::run() {
 #ifdef RVFI_MODE
     gpio_.init(iss_gpio());
     gpio_.set_alts(predictions());
-    uint32_t w;
-    next_is_wfi_ = peek_insn(iss_, iss_.pc(), &w) && w == INSN_WFI;
-    prev_gpio_out_ = iss_.io().gpio_out();
+    marker_was_ = gmatch(iss_.io().gpio_out(), PWM_MARKER, iss_.io().altfn());
+    fail_was_ = gmatch(iss_.io().gpio_out(), GPIO_FAIL, ex_.final_altfn);
+    uart_.set_strict(true);  // ALTFN is known: a stop bit of 0 is a framing error
 #else
+    uart_.set_lenient(!det_);  // ALTFN unknown: a cut frame may be the pin going back to GPIO
     if (!det_ && !ex_.have_result)
-      fail("pins mode can't judge this program: it reads volatile registers, so the ISS can't run "
-           "it alone, and expect.json has no result_gpio");
+      fail("pins mode can't judge this program: it reads volatile registers or enables "
+           "interrupts, so the ISS can't run it alone, and expect.json has no result_gpio");
+    else if (!det_ && ex_.have_tx_expect && !ex_.have_uart)
+      fail("pins mode needs expect.json uart_div to decode uart_tx_expect for a program the ISS "
+           "can't run alone");
+    else if (!det_ && ex_.have_spi_tx_expect && !ex_.have_spi)
+      fail("pins mode needs expect.json spi_div_d to check spi_tx_expect for a program the ISS "
+           "can't run alone");
 #endif
   }
   bool passed = false;
@@ -1434,7 +1636,7 @@ int Harness::run() {
       if (!xfer_deadline(ut_, "no UART start bit within DIV+2 cycles (contract 5.5)") ||
           !xfer_deadline(st_, "no SPI transfer within the latency cap"))
         break;
-      if (!(last_insn_ == INSN_WFI || next_is_wfi_) && t_ - last_ret_ >= LAT_CAP + 1) {
+      if (!(retired_ > 0 && last_insn_ == INSN_WFI) && t_ - last_ret_ >= LAT_CAP + 1) {
         fail(fmt("latency cap: no retirement within %llu cycles of %s (next pc 0x%08x)",
                  (unsigned long long)LAT_CAP,
                  retired_ ? "the previous retirement" : "reset release", iss_.pc()));
@@ -1480,6 +1682,7 @@ int Harness::run() {
     const bool rst_change = (t_ + 1 == reset_edges_);
     top_->rst_n = t_ + 1 >= reset_edges_;
     top_->ui_in = next_ui(uo);
+    ui_hist_[(t_ + 1) % UI_HIST] = top_->ui_in;  // what the design samples at edge t_ + 1
     top_->uio_in = pmod_.uio_in();
     top_->eval();
     tick_trace(2 * t_ + 2);
@@ -1687,20 +1890,20 @@ FuzzRun fuzz_one(const Opts& o, uint32_t k, const uint8_t* img, uint32_t probe_a
   int64_t after_probe = -1;
   auto failf = [&](uint64_t t, const std::string& why) {
     res.pass = false;
-    res.error = (t < reset_edges ? fmt("reset edge %llu: ", (unsigned long long)t)
-                                 : fmt("cycle %llu: ", (unsigned long long)(t - (reset_edges - 1)))) +
-                why;
+    res.error =
+        (t < reset_edges ? fmt("reset edge %llu: ", (unsigned long long)t)
+                         : fmt("cycle %llu: ", (unsigned long long)(t - (reset_edges - 1)))) +
+        why;
   };
   auto word_at = [&](uint32_t pc, uint32_t* w) {  // flash only (the image); else unknown
     if (area_of(pc) != Area::Flash) return false;
     *w = 0;
-    for (uint32_t b = 0; b < 4; b++) *w |= (uint32_t)img[(pc + b) & (v3::FLASH_SIZE - 1)] << (8 * b);
+    for (uint32_t b = 0; b < 4; b++)
+      *w |= (uint32_t)img[(pc + b) & (v3::FLASH_SIZE - 1)] << (8 * b);
     return true;
   };
-  auto wfi_next = [&]() {
-    uint32_t w;
-    return last_insn == INSN_WFI || (word_at(next_pc, &w) && w == INSN_WFI);
-  };
+  // R31: only the gap that starts at a WFI's retirement is exempt
+  auto after_wfi = [&]() { return res.retired > 0 && last_insn == INSN_WFI; };
   top.clk = 0;
   top.rst_n = 0;
   top.ena = 1;
@@ -1714,7 +1917,7 @@ FuzzRun fuzz_one(const Opts& o, uint32_t k, const uint8_t* img, uint32_t probe_a
   (void)cap;
   (void)probe_addr;
   (void)probe;
-  (void)wfi_next;
+  (void)after_wfi;
   (void)last_pc;
   (void)after_probe;
 #endif
@@ -1744,7 +1947,7 @@ FuzzRun fuzz_one(const Opts& o, uint32_t k, const uint8_t* img, uint32_t probe_a
     if (!in_reset) {
       if (top.rvfi_valid) {
         const uint64_t gap = t - last_ret;
-        const bool exempt = wfi_next();
+        const bool exempt = after_wfi();
         if (gap > LAT_CAP && !exempt) {
           failf(t, fmt("latency cap: retirement #%llu (pc 0x%08x, insn 0x%08x) came %llu cycles "
                        "after %s (limit %llu)",
@@ -1779,7 +1982,7 @@ FuzzRun fuzz_one(const Opts& o, uint32_t k, const uint8_t* img, uint32_t probe_a
         }
       }
       if (t - last_ret >= LAT_CAP + 1) {
-        if (wfi_next()) {  // a WFI stall: legal while mip.MEIP & mie.MEIE = 0
+        if (after_wfi()) {  // a WFI stall: legal while mip.MEIP & mie.MEIE = 0
           res.wfi_stall = true;
           res.cycles = t - (reset_edges - 1);
           break;

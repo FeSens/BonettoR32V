@@ -21,23 +21,35 @@ harness <prog.hex> [--seed S] [--expect PATH] [--clk-ns 25] [--max-cycles C] [--
         [--dump-psram PATH] [-v]
 harness --fuzz-liveness K [--fuzz-cap N] [--seed S]
 run_cosim.py --v3 --mode rvfi|pins --prog P [--seed S] [--src DIR] [--clk-ns 25]
-run_cosim.py --v3 --all [--src DIR] [--no-make]    # the plan's 26 programs x 2 modes x seeds 1-4
-                                                   # + the fuzz at seeds 1-5 -> build/cosim.json
+run_cosim.py --v3 --all [--src DIR] [--no-make]
 ```
 
+`--all --v3` covers every program `make -C verif/programs list` reports (28 today: the plan's 26
+plus gpio_demo and uart_echo_fast; the plan's 26 must be among them, else a setup error). Each
+runs in both modes at seeds 1-4, and the rvfi-mode fuzz runs at seeds 1-5. The result goes to
+`build/cosim.json` with `"contract": "v3"`.
+
 **Flash image and seeds.**
-- `prog.hex` is a sparse `$readmemh` flash image. Unset bytes are 0xFF. It is loaded once, and
-  `PmodBus` and `Iss3` share the same 16 MiB buffer.
+- `prog.hex` is a sparse `$readmemh` flash image. Unset bytes are 0xFF. It is loaded once into a
+  16 MiB buffer: `PmodBus` reads it, and `Iss3` takes its own copy.
 - The seed picks the Pmod power-up mode, as `(seed - 1) % 4`: standard or continuous-read flash,
   times PSRAM in SPI or QPI mode.
 - The seed also picks the reset length: `1 + ((seed + 8) * 5) % 9` edges, so seed 1 uses one.
 
 **Summary JSON (the last stdout line).**
 - `pass`, `retired`, `cycles`, `cpi`, `max_cycles_per_insn`, `first_retire_cycle`.
+  - In rvfi mode, `cycles` runs to the self-loop's retirement.
+  - In pins mode, `cycles` and `cpi` are the time until the final pin state: the pins reach the
+    reference's final GPIO state (deterministic programs), or `result_gpio` first shows (other
+    programs). pins mode can't see the self-loop.
 - `end`: `selfloop`, `result_gpio` or `fail`.
 - `uart_tx`, `error`, `psram_writes`.
-- `coremark_cycles_per_iter`: an integer, or null without marks. Never 0.
-- Extra keys: `mode`, `deterministic`, `per_class`, `interrupts`, `uo_trace`, `reset_edges`.
+- `coremark_cycles_per_iter`: an integer (`%.6f` when N doesn't divide), or null without marks.
+  Never 0.
+- Extra keys:
+  - `mode`, `deterministic`, `per_class`, `interrupts`, `uo_trace`, `reset_edges`;
+  - `sim_cycles`: every edge simulated, the drain included;
+  - `sim_seconds`: the wall-clock time.
 
 `run_cosim.py` adds `coremark_cycles_per_iter` to its KEYS in both builds; v2 always reports null.
 
@@ -45,40 +57,68 @@ run_cosim.py --v3 --all [--src DIR] [--no-make]    # the plan's 26 programs x 2 
 program counts as *deterministic* if that run reaches its self-loop (`jal x0, 0` retired twice)
 without reading a volatile IO bit and without enabling interrupts (`mstatus.MIE` and `mie.MEIE`
 both 1).
-- **Test program bugs.** These fail before simulation: a reserved or unspecified step, a register
-  or arbitrary-reset CSR read before any write, and a deterministic run whose final `GPIO_OUT`
-  differs from `result_gpio`.
+- **Test program bugs.** These fail before simulation:
+  - a reserved or unspecified step;
+  - a register or arbitrary-reset CSR read before any write;
+  - a deterministic run whose final `GPIO_OUT & ~final_altfn` differs from
+    `result_gpio & ~final_altfn`, or whose final ALTFN isn't `final_altfn`.
 - **rvfi mode** runs `Iss3` in lockstep with the design.
-  - Every RVFI field is compared (contract 8).
+  - Every RVFI field is compared (contract 8). On a trap that includes `rd_addr = 0`,
+    `rd_wdata = 0` and both masks 0.
   - IO loads take the design's volatile bits (R13), and `mip.MEIP` comes from `rvfi_rd_wdata`
     (R14).
   - A retirement with `rvfi_intr = 1` that doesn't follow a trap is an interrupt entry, handled by
     `take_interrupt()`. It fails with `interrupt while masked` unless MIE and MEIE are both 1.
+  - The contract 4 clause "the core takes the interrupt before retiring more than one further
+    instruction" is not checked. MEIP isn't observable outside reads of mip and IRQ_PEND.
   - The run ends 2,048 cycles after the self-loop.
+  - Every PSRAM write outside the core region must carry a byte of a retired store (contract 8).
+  - Every byte the program stored is compared at the end.
 - **pins mode, deterministic program.**
   - uo_out must step through the reference run's GPIO states.
-  - PSRAM writes must match its stores.
-  - The final PSRAM must equal its written bytes.
+  - PSRAM writes must match its stores (contract 8), and the final PSRAM must equal its written
+    bytes.
+  - UART frames and SPI transfers carry its UART_DATA / SPI_DATA bytes, in order and in number
+    (R33). Only writes made while ALTFN shows the port count.
   - The end is (tail + 2) x 2,048 cycles after the pins reach the final state, where tail is the
     reference's retirements after its last GPIO change.
 - **pins mode, any other program.** It is judged by:
-  - its self-check: uo_out = `result_gpio` (written with ALTFN = 0) held for 3 x 2,048 cycles, and
-    0xEE fails at once;
+  - its self-check (R24): the pins outside `final_altfn` show `result_gpio` for 3 x 2,048 cycles,
+    and 0xEE on those pins fails at once;
   - the pin checkers;
-  - the UART text.
+  - `uart_tx_expect` and `spi_tx_expect`, which need `uart_div` / `spi_div_d` to decode.
 
-  Without `result_gpio` the harness reports `pins mode can't judge this program`.
+  There is no reference run, so neither PSRAM attribution (contract 8) nor a memory compare
+  applies. Without `result_gpio` the harness reports `pins mode can't judge this program`.
 
-**`expect.json`** (optional; `run_cosim.py` passes `<name>.expect.json` when it exists):
+**Inputs.**
+- ui[1] (UART RX) idles high wherever no UART RX model drives it: before the anchor, as GpioStim's
+  value before its first entry, and in the noise driven for deterministic programs.
+- A `gpio_script` value is driven as written.
+- The anchor:
+  - rvfi mode: the first retirement;
+  - pins mode: the first edge with 4 flash bytes read, or reset release + 2,048.
+
+**`expect.json`** (optional; `run_cosim.py` passes `<name>.expect.json` when it exists).
+Malformed fields are setup errors (exit 2, no JSON):
 
 | Field | Meaning |
 |---|---|
-| `result_gpio` | the final GPIO_OUT meaning pass, on all 8 uo pins (write it with ALTFN = 0) |
-| `uart_div`, `uart_rx`, `uart_rate_ppm`, `uart_tx_expect` | `uart_rx` entries are `[cycle, byte]` or `[cycle, byte, ppm]`. The cycle counts from the anchor: in rvfi mode the first retirement; in pins mode the first edge with 4 flash bytes read, or reset release + 2,048. Bit edge k sits at round(k (DIV+1) (1 + ppm/10^6)), so positive ppm is slower. `uart_tx_expect` is the exact TX byte string. |
-| `spi_div_d` | the SPI echo device on ui[3]. It replies with the previous byte (0xFF first) and holds each MISO bit from its rising SCK edge through 3 cycles after it (R20). |
-| `pwm` | `[{ch, per, q, duty}]`, checked after GPIO_OUT changes to 0xA5. Period (PER+1) 2^Q, high min(DUTY, PER+1) 2^Q, measured exactly after one settling period, within 4 periods. `ch` 7 is the timer output on uo[7] (`per` 65535 without auto-reload). |
+| `result_gpio`, `final_altfn` | The final GPIO_OUT meaning pass, compared on the pins in GPIO mode at the end: `(uo ^ result_gpio) & ~final_altfn` (R24). `final_altfn` defaults to 0. Setup errors: `result_gpio & ~final_altfn == 0`, and `final_altfn = 0xFF`. |
+| `uart_div`, `uart_rx`, `uart_rate_ppm`, `uart_tx_expect` | `uart_rx` entries are `[cycle, byte]` or `[cycle, byte, ppm]`, with the cycle counted from the anchor. Bit edge k sits at round(k (DIV+1) (1 + ppm/10^6)), so positive ppm is slower. `uart_tx_expect` is the exact TX byte string. |
+| `spi_div_d`, `spi_tx_expect` | `spi_div_d` (1..7; R29: D ≥ 1) puts the SPI echo device on ui[3]. It replies with the previous byte (0xFF first) and holds each MISO bit from its rising SCK edge through 3 cycles after it (contract 5.6, c7d9910). `spi_tx_expect` gives the MOSI bytes in order, as a string or a list of bytes. |
+| `pwm` | `[{ch, per, q, duty}]`, checked after the GPIO-mode pins show 0xA5. Period (PER+1) 2^Q, high min(DUTY, PER+1) 2^Q, measured exactly after one settling period, within 4 periods. `ch` 7 is the timer output on uo[7] (`per` 65535 without auto-reload, `q` = P, `duty` = CMP). Extra keys (`pin`) are ignored. |
 | `loop_uo7_to_ui0`, `gpio_script` | ui[0] follows uo[7]; ui_in from `[[cycle, value], ...]` relative to the anchor |
-| `coremark_iters` | N: `coremark_cycles_per_iter` = cycles from uo_out = 0xC0 to uo_out = 0xC1, divided by N (R21) |
+| `coremark_iters` | N: `coremark_cycles_per_iter` = cycles from the GPIO-mode pins showing 0xC0 to their showing 0xC1, divided by N (R21, R24) |
+
+The 0xA5 and 0xC0/0xC1 marks are looked for only when `pwm` / `coremark_iters` is present. They
+are masked with ALTFN:
+- rvfi mode: the ISS's ALTFN;
+- pins mode, deterministic programs: the tracked state's ALTFN;
+- pins mode, other programs: `final_altfn` plus the `pwm` pins.
+
+Task 4's `psram_window` isn't read. Every byte the program stored, outside the core region, is
+compared instead (a superset in rvfi mode and for deterministic programs).
 
 **Checks with their error texts.**
 
@@ -87,66 +127,103 @@ Pins and bus rules:
 - Reset values: `during reset`.
 - Outputs change only at rising edges: `outputs changed between rising clk edges`.
 - PSRAM writes outside the core region carry bytes of stores (retired ones in rvfi mode, the
-  reference's in pins mode): `matches no retired|reference store ... (contract 8)`.
+  reference's for deterministic programs in pins mode): `matches no retired|reference store ...
+  (contract 8)`.
 - Final PSRAM: `final PSRAM byte`.
 
-Latency cap (rvfi mode):
+Latency cap (rvfi mode, R31):
 - 2,048 cycles, at the retirement and by a watchdog: `latency cap: retirement #N ... came G
   cycles after` and `latency cap: no retirement within 2048 cycles`.
-- A gap next to a WFI is exempt.
+- Only the gap that starts at a WFI's retirement is exempt (WFI retires, then may stall).
+- Neither the gap before a WFI nor an interrupt entry before one is exempt.
+- In the fuzz, a sub-run that ends in a WFI stall passes.
 
 GPIO (contract 6):
 - In rvfi mode a pin may change while the store executes, and must change no later than 1 cycle
   after it retires: `one cycle after the store`.
 - A change with no store behind it: `uo_out changed to`.
+- In rvfi mode, a GPIO_IN load returns the ui_in the design saw at an edge in [p+1-3, t] (R30;
+  p = the previous retirement, t = this one): `GPIO_IN read`.
 
 UART (5.5):
 - Exact bit times: `not on a bit boundary`, `framing error`.
-- A start bit within DIV+2 of the UART_DATA write (rvfi mode): `no UART start bit within DIV+2`.
-- The sent byte is the written byte.
-- A TX_BUSY read equals the frame in progress at the sampling time, with DIV+2 start latency and
-  2 cycles of slack (R20): `TX_BUSY (UART_CTRL[13]) read`.
+- In rvfi mode (ALTFN known) a stop bit of 0 fails at once: `stop bit of 0`.
+- In pins mode a stop bit of 0, followed by the line staying low to the end, is no byte.
+- A start bit at most DIV+2 cycles after the UART_DATA store's retirement edge (rvfi mode, R28,
+  7c5740e; no slack): `no UART start bit within DIV+2`.
+- The sent byte is the written byte: rvfi mode via the retired store, pins mode via the reference
+  run (R33).
+- A frame no write started (rvfi mode): `is not a UART_DATA write`.
+- TX_BUSY and IRQ_PEND.TXIDLE (= !TX_BUSY) reads (R20, R30): `TX_BUSY (UART_CTRL[13]) read`,
+  `TXIDLE (IRQ_PEND[3], = !TX_BUSY) read`. A read must equal the frame in progress at the sampling
+  time, allowing the DIV+2 start latency and 2 cycles of slack.
 
 SPI (5.6):
 - MOSI changes only while SCK is low: `MOSI (uo[6]) changed`.
 - Phases are exactly 2^D: `high phase of`, `low phase of`.
-- The MOSI byte is the SPI_DATA byte (rvfi mode): `SPI MOSI sent`.
+- The MOSI byte is the SPI_DATA byte: `SPI MOSI sent`. rvfi mode checks the retired store, pins
+  mode the reference run.
 - BUSY reads follow the pins.
+- An SPI_DATA read after a transfer equals the byte the device drove (rvfi mode): `SPI_DATA read`.
 
-PWM: the meter's message.
+End of the run (rvfi mode): no UART frame, SPI transfer or started write may still be in flight:
+`still in progress at the end of the run`.
+
+PWM: the meter's message. In rvfi mode, clearing ALTFN before the measurement ends fails:
+`ALTFN bit N was cleared`.
 
 Self-check: `the program's self-check failed`.
 
-**Self-tests.** `pytest verif/cosim/test_cosim_harness.py` runs the following.
+**Self-tests.** `pytest verif/cosim/test_cosim_harness.py` (40 tests) runs the following.
 - **Pin-model unit tests.** These use `build/cosim/test_periph`, built by `build.sh` with no
   arguments. The UART RX edges are recomputed exactly in Python.
 - **Harness tests on `test_fixtures/playback`.** This stub replays a pin script (`+PINS=`) and an
   RVFI script (`+RVFI=`). The RVFI scripts come from hand-encoded programs run on
   `iss_main --v3 --log`. One build per mode covers:
   - UART bit time 17 against DIV 16 and DIV 15;
-  - busy reads;
+  - the start bit at DIV+2 (passes) and DIV+3 (fails);
+  - the stop bit of 0;
+  - orphan frames;
+  - TX_BUSY and TXIDLE reads;
   - interrupt follow and masked interrupts;
+  - mip.MEIP from `rvfi_rd_wdata`;
   - PSRAM write attribution;
   - the latency cap at 2,048 and 2,049;
+  - the WFI exemption;
   - the self-loop drain window;
   - the GPIO 1-cycle rule;
+  - the GPIO_IN window;
+  - `result_gpio` / `final_altfn` and the degenerate setup errors;
+  - 0xEE fast fail;
   - CoreMark marks;
   - volatile programs in pins mode;
-  - the SPI master pins.
+  - the SPI master pins, `spi_tx_expect` and the reference bytes;
+  - SPI_DATA against MISO;
+  - an SPI transfer in flight at the end;
+  - `spi_div_d` 0;
+  - the PWM path (mark, (PER+1)·2^Q, settle and deadline, ALTFN cleared early).
 - **The `mutants/tcem_stall` stub** (R12). PSRAM CS_n stays low past 320 cycles, and both modes
   fail with `tCEM`.
-- **`run_cosim.py --v3`** and the v3 fuzz.
+- **`run_cosim.py --v3`**, the program-list rule, and the v3 fuzz.
 
-**Measured on the MCU seed.** The seed is setup/v3-seed 45a78ef, run with its own unit-test
-programs (`src/test_v3/prog`) on hwe-bench, seeds 1-4, both modes. These programs are not the
-plan's set:
-- Passing: boot, uart_echo (+1 %), pwm (as a GPIO program), irq_timer (11 interrupts followed)
-  and irq_latency.
-- The trap programs pass in pins mode and fail in rvfi mode with `rvfi_intr = 0x0, expected
-  0x1`. The seed doesn't set `rvfi_intr` on a trap handler's first instruction, which contract 8
-  requires.
-- csr is a `test program bug`: it reads mstatus (MPIE arbitrary) before any write.
-- The rvfi-mode fuzz passes seeds 1-5. Each takes 28 s (2,056 sub-runs, worst gap 1,319).
+**Measured on the MCU seed** (fix round 1).
+- **Setup.**
+  - Design: setup/v3-seed 5879b91.
+  - Programs: Task 4's setup/v3-programs de2629d, built on the Mac (`make list`: 28 programs).
+  - Command: `run_cosim.py --all --v3 --no-make --src <seed src> --jobs 6` on hwe-bench.
+  - Wall clock: 271 s for 224 runs and 5 fuzz seeds.
+- **Results.**
+  - 208 of 224 runs pass. The 26 programs other than uart_echo / uart_echo_fast pass 8 of 8 (2 modes x 4 seeds).
+  - uart_echo and uart_echo_fast fail 0 of 8, in both modes, with `the program's self-check failed` at cycle 47,189. The cause is the program's check 0x11, which expects TX_BUSY = 1 in the instruction right after the send.
+    - c7d9910 dropped that rule.
+    - On the seed, the 400-cycle frame ends before that load retires 660 cycles later. The read of 0 is legal, and the harness accepts it.
+    - Task 4 is fixing the program.
+  - The first frame met the DIV+2 start rule (R28) on all 4 seeds.
+  - The rvfi-mode fuzz passes seeds 1-5: 2,056 sub-runs each, 2,048 probes retired, worst gap 1,319.
+- **Timing.**
+  - Worst non-exempt retirement gap: 1,188, and 1,716 in wfi.
+  - CPI in rvfi mode: 709-830.
+  - CoreMark: `coremark_cycles_per_iter` = 578,875,473 (ITERATIONS = 1).
 
 **Contract v2, the core region.** RAM bytes 0xFF80-0xFFFF, in every 64 KB alias, may hold the
 core's x1..x15, pc and scratch in a private layout. The checkers follow from that:

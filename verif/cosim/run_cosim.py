@@ -23,9 +23,9 @@ Everything (the `make cosim` gate):
 builds the programs, runs every program in both modes under seeds 1, 2 and 3, writes
 build/cosim.json and exits 0 only if every run passes.
   run_cosim.py --all --v3 [--src DIR] [--jobs N] [--no-make]
-runs the contract v3 programs (V3_PROGRAMS, plan Task 4) in both modes under seeds 1-4 (the four
-memory power-up modes, pmod_init_for_seed) and the rvfi-mode liveness fuzz under seeds 1-5, and
-writes build/cosim.json.
+runs every program `make -C verif/programs list` reports (it must include the plan's 26,
+V3_PROGRAMS) in both modes under seeds 1-4 (the four memory power-up modes, pmod_init_for_seed)
+and the rvfi-mode liveness fuzz under seeds 1-5, and writes build/cosim.json.
 
 The liveness fuzz (contract section 4 on reserved encodings; docs/cosim.md):
   run_cosim.py --fuzz-liveness --seed S [--mode rvfi|pins] [--fuzz-runs K] [--fuzz-cap N]
@@ -75,7 +75,7 @@ FUZZ_SEEDS_V3 = (1, 2, 3, 4, 5)
 LAT_CAP_V3 = 2048                   # contract 4
 CLK_NS = 25.0                       # contract 7: 40 MHz signoff
 LOG_RING_V3, LOG_RING_V3_END = 0x7F0000, 0x7F0800  # PSRAM bytes (CPU 0x017F_0000)
-V3_PROGRAMS = (                     # plan Task 4 "Produces"
+V3_PROGRAMS = (                     # plan Task 4 "Produces": a subset of `make list`
     "selftest", "csr", "trap_ecall", "trap_ebreak", "trap_jal", "trap_jalr", "trap_branch",
     "trap_zero", "trap_ones", "irq_timer", "irq_stress", "wfi", "coherence", "uart_echo",
     "spi_loop", "pwm", "ir_loop", "gpio_edge", "mem_init_check", "random_1", "random_2",
@@ -402,9 +402,14 @@ def run_all(src: Path, jobs: int, make: bool = True) -> int:
     return 0 if ok else 1
 
 
+def missing_v3_programs(progs) -> list:
+    """The plan's programs (V3_PROGRAMS) that a program list lacks."""
+    return [p for p in V3_PROGRAMS if p not in set(progs)]
+
+
 def run_all_v3(src: Path, jobs: int, make: bool = True) -> int:
-    """The contract v3 gate: V3_PROGRAMS x both modes x seeds 1-4, plus the rvfi-mode liveness
-    fuzz under seeds 1-5. Writes build/cosim.json."""
+    """The contract v3 gate: every program `make list` reports (a superset of V3_PROGRAMS) x both
+    modes x seeds 1-4, plus the rvfi-mode liveness fuzz under seeds 1-5. Writes build/cosim.json."""
     t0 = time.time()
     out_path = ROOT / "build" / "cosim.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,7 +430,14 @@ def run_all_v3(src: Path, jobs: int, make: bool = True) -> int:
             ensure_built(mode, src, v3=True)
         except RuntimeError as e:
             return setup_fail(str(e))
-    progs = list(V3_PROGRAMS)
+    try:
+        progs = program_list()
+    except subprocess.CalledProcessError as e:
+        return setup_fail(f"make -C verif/programs list failed: {e.stderr[-2000:]}")
+    lacking = missing_v3_programs(progs)
+    if lacking:
+        return setup_fail("make -C verif/programs list lacks the plan's programs: " +
+                          ", ".join(lacking))
     missing = [p for p in progs if not (PROGS / f"{p}.hex").exists()]
     runs = [(m, PROGS / f"{p}.hex", s) for p in progs if p not in missing
             for m in MODES for s in SEEDS_V3]

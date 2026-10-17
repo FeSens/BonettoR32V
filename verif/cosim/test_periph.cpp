@@ -154,6 +154,27 @@ std::string uart_tx_framing() {
       if (!u.tx_step(t, held[t], true)) return "held low: " + u.error();
     if (!u.tx_finish(held.size()) || !u.tx_frames().empty()) return "held low gave a byte";
   }
+  // lenient (pins mode, ALTFN unknown): stop bit 0, then the line rises: no frame, no error,
+  // and the next frame decodes
+  {
+    std::vector<int> a = w;  // the framing-error wave above, then 'B'
+    std::vector<int> b = tx_wave('B', 16, 10, 10);
+    a.insert(a.end(), b.begin(), b.end());
+    UartTerm u(15);
+    u.set_lenient(true);
+    for (uint64_t t = 0; t < a.size(); t++)
+      if (!u.tx_step(t, a[t], true)) return "lenient: " + u.error();
+    if (u.tx_text() != "B" || u.tx_abandoned() != 1) return "lenient decoded '" + u.tx_text() + "'";
+  }
+  // strict (rvfi mode: ALTFN known): the same held-low stop bit is a framing error at once
+  {
+    UartTerm u(15);
+    u.set_strict(true);
+    bool ok = true;
+    for (uint64_t t = 0; t < held.size() && ok; t++) ok = u.tx_step(t, held[t], true);
+    if (ok || u.error().find("stop bit of 0") == std::string::npos)
+      return "strict: held-low stop bit accepted";
+  }
   // the line starts low (GPIO 0 before ALTFN): the decoder waits for idle high first
   {
     std::vector<int> a(40, 0);
@@ -314,7 +335,8 @@ std::string pwm_meter() {
 
 std::string gpio_stim_and_loop() {
   GpioStim g({{50, 0x0F}, {10, 0x01}, {100, 0xF0}});
-  if (g.value(0) != 0 || g.value(10) != 0x01 || g.value(49) != 0x01 || g.value(50) != 0x0F ||
+  if (g.value(0) != UI_IDLE || UI_IDLE != 0x02 || g.value(9) != 0x02 || g.value(10) != 0x01 ||
+      g.value(49) != 0x01 || g.value(50) != 0x0F ||
       g.value(150) != 0xF0 || !g.finished())
     return "script values";
   if (TimerLoop::ui0(0x80) != 1 || TimerLoop::ui0(0x7F) != 0) return "loop";
