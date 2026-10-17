@@ -225,14 +225,15 @@ The `_1024` mutants must PASS and the `_1025` ones must FAIL (`test_mutant_fails
 This is a safety property, checked by BMC: every window that closes within the depth (D +
 1,024) is checked, and windows that close later are not. A core that stops retiring after the
 first few instructions fails, because its window closes within the depth. An unbounded proof
-(`abc pdr`) did not converge on the seed: frame 126 after about 16 minutes, stopped.
+(`abc pdr`) did not converge on the seed: frame 126 after about 16 minutes, stopped. The BMC
+runs in 64-step windows (see "Engines tried").
 
 ## Fast and deep
 
 | | fast (`checks.cfg`, every candidate) | deep (`checks-deep.cfg`, champions) |
 |---|---|---|
 | checks | every check except liveness | every check, liveness included |
-| depth | short depth, per class group | full depth D; liveness D + 1,024 |
+| depth | short depth, per class group | full depth D; liveness D + 1,024 (64-step windows) |
 | instruction tasks | 9 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
 | task timeout | 7,200 s | 21,600 s |
 | depth cap | 2,048 | 4,096 |
@@ -292,7 +293,15 @@ Levers if a candidate is slower than 9a39f1d (none is in the gate today):
 
 ### Engines tried
 
-- **bitwuzla** (chosen) through smtbmc, `step=all` for proofs.
+- **bitwuzla** (chosen) through smtbmc.
+  - Proofs use `step=all`: one solver call checks every step up to the depth. Windows of 64
+    steps for every proof took 520 s on the seed's fast config, against 302 s with one call
+    (hwe-bench, 8 jobs each, the two runs side by side).
+  - Liveness (deep) uses 64-step windows. At depth 1,487 it found `stall_first_1025`'s
+    counterexample (step 1,026) in 56 s and proved `stall_first_1024` in 323 s. With one call,
+    `hang_reserved`'s counterexample was still running after 30 minutes and was stopped. A
+    single call has to find a trace of the full depth, even when the violation is at step
+    1,026.
 - **yices** stalls on the bus checks.
 - **abc bmc3**: see above.
 - **abc pdr**:
