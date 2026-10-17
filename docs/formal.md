@@ -101,15 +101,23 @@ waveform rules apply after it. `wrapper.sv` computes, at each retirement:
 
 - `bon_fetch_touch`: the fetch touches the region, `pc_rdata[15:0] >= 0xFF7D` (one of
   `pc[15:0] + k`, k < 4, is a region byte);
-- the data access touches the region, from the specification's address only, never from
-  what the core claims (`rvfi_mem_*`), so a core can neither dodge the stop nor trigger it by
-  misreporting. For an RV32E load or store, `addr = rs1_rdata + imm` (`rs1 = x0` reads 0), with
-  `n` bytes; it touches the region iff `addr[31] = 0` and `addr[15:0] >= 0xFF80 - (n - 1)`.
-  That covers an access inside the region, one that straddles 0xFF7F/0xFF80, one that wraps at
-  64 KB (touching 0xFFFD-0xFFFF), and one that crosses 0x7FFFFFFF into `addr[31] = 1` (its first
-  bytes are 0xFFFD-0xFFFF of the RAM). A reserved encoding (a used register field x16-x31) has
-  no spec address and never stops the checks: its `rs1_rdata` is unconstrained, so it must not
-  pick the stop;
+- the data access touches the region:
+  - for an RV32E instruction (`spec_insn`: one of the 40 instruction models' `spec_valid`, E
+    filter included, decoded by `rvfi_isa_rv32e` in the wrapper, or a fatal-trap word), from
+    the specification's address only, never from what the core claims (`rvfi_mem_*`), so a
+    core can neither dodge the stop nor trigger it by misreporting. For a load or store,
+    `addr = rs1_rdata + imm` (`rs1 = x0` reads 0), with `n` bytes; it touches the region iff
+    `addr[31] = 0` and `addr[15:0] >= 0xFF80 - (n - 1)`. That covers an access inside the
+    region, one that straddles 0xFF7F/0xFF80, one that wraps at 64 KB (touching
+    0xFFFD-0xFFFF), and one that crosses 0x7FFFFFFF into `addr[31] = 1` (its first bytes are
+    0xFFFD-0xFFFF of the RAM);
+  - for a reserved encoding (a used register field x16-x31, an undefined funct3, ...), which
+    has no spec access, from the access it claims (non-trapping `rvfi_mem_*`, same formula).
+    The hyp/002 cores decode such encodings as loads and stores (x17 as x1, say) and touch the
+    region with them: without this rule their own register slots get overwritten and the
+    checks after it fail on a legal core (seen at 5d23efc: reg, bus_dmem, insn_group5). A core
+    cannot use it to end the checks, because formal, not the core, picks the instruction
+    stream;
 - `bon_region_ret`: either, at this retirement; `bon_stopped`: a region retirement has happened
   before this step. `BONETTO_FULL` = neither.
 
@@ -127,7 +135,7 @@ assertions apply to the group's own instructions (`spec_valid`), like the full c
 The stop only removes traces from the comparison after a region-touching instruction. Formal
 picks the instruction stream, so every program that never touches the region (as every test
 program, contract section 3) is still checked in full: the touch is the trace's choice, and the
-core cannot fake one. (An earlier version also stopped on a claimed region access; the mutant
+core cannot fake one. (282f6d8 stopped on any claimed region access; the mutant
 `claim_region_stop`, an ADD with a wrong result that claims a read at 0xFF80, passed it.)
 
 ### The bus checks (transaction identity)
@@ -357,9 +365,9 @@ improvement, not per candidate.
 0.4 GB + 3.7 MB per step of its depth: measured about 1.4 GB of bitwuzla at depth 348 (the
 seed) and 6.1 GB at depth 1,623 (V2). The runner caps the job count at the memory budget
 divided by that need at the deepest task's depth (`mem_jobs`; `formal.json` records `jobs`).
-The budget is `$BONETTO_FORMAL_MEM_GB` if set, else 85 % of `MemAvailable` on Linux (so other
-users' jobs on a shared host count), else half the RAM on macOS (the Mac is shared with other
-agents). On hwe-bench with about 55 GB available that is 18 jobs for the seed but 7 for V2; on
+The budget is `$BONETTO_FORMAL_MEM_GB` if set (forwarded to a remote run; set it to split a
+host between concurrent runs), else 85 % of `MemAvailable` on Linux (so other users' jobs on a
+shared host count), else half the RAM on macOS (the Mac is shared with other agents). On hwe-bench with about 55 GB available that is 18 jobs for the seed but 7 for V2; on
 the Mac 8 for the seed and 2 for V2. Before this cap, 10 V2 jobs pushed hwe-bench 11 GB into
 swap. Some tasks need several times the estimate: `reset` (free reset length) reached 22 GB at
 depth 1,222 on fc07cc3, against 4.9 GB estimated, so it counts five times (`TASK_MEM_WEIGHT`).
