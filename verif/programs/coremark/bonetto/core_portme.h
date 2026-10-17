@@ -19,7 +19,8 @@
 #define MAIN_HAS_NOARGC 1
 #define MAIN_HAS_NORETURN 0
 
-/* Static data area: the stack sits in the 2 KB above the log ring and only holds call frames. */
+/* Static data area: the stack sits in the 1,920 bytes between the log ring and the core region
+ * (0xF800-0xFF7F; contract v2 section 3) and only holds call frames. */
 #define MEM_METHOD MEM_STATIC
 #define MEM_LOCATION "STATIC"
 #define SEED_METHOD SEED_VOLATILE

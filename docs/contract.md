@@ -229,6 +229,10 @@ Conventions:
     - for a RAM store, WRITEs that write only that store's bytes, each byte exactly once (a store
       may be split into several WRITEs);
     - nothing else (IO accesses never appear on the pins).
+  - or a **null READ**: a READ whose CS_n rises after its full 24-bit header with no data bit
+    clocked. It touches no byte; any number are allowed, anywhere.
+  - A READ's partly clocked last byte counts as addressed (so a fetch with one extra bit fails,
+    and a region READ that clocks a bit past 0xFFFF is not a region transaction).
 - **Fetch and load completeness.** Every retired instruction is fetched by its own SPI READ
   covering all 4 of its bytes: no caching or reuse of earlier fetches. Every RAM load reads all of
   its bytes over SPI.
