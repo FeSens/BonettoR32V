@@ -269,7 +269,13 @@ the end marker).
 - **Cycles:** a run takes 4,570,994 (`misalign-sh-01`) to 12,399,419 (`bltu-01`) cycles. Each
   test's count is the same under every seed. Most of a short test is `RVMODEL_BOOT`'s copy of the
   4 KiB `.data` section.
-- **One host** (`--phase all` on hwe-bench, seed 133d76b): see the Task 6 fix-round-1 report.
+- **One host** (setup/v3-arch b79ee0c, seed `origin/setup/v3-seed` 133d76b `src/`): `--phase all
+  --jobs 16` on hwe-bench passes 53 of 53 under seeds 1-4 with spike in the Zicclsm form, with the
+  same cycles as above.
+  - The `tools/hwe_run.sh --third-party` call took 3 min 27 s in total. That includes the first
+    mirror of `third_party/` (767 MB) and the Verilator build.
+  - Its images are byte-identical to the Mac's (53 of 53 sha256 equal: the xPack GCC 15.2.0 arm64
+    and x86_64 builds), and so are its references.
 
 A mutant of the seed whose trap entry writes `mcause ^ 1` (seed 1) fails `ecall`, `ebreak`,
 `misalign-beq-01`, `misalign-jal-01`, `misalign2-jalr-01` and `misalign-lhu-01` (its final
