@@ -1,5 +1,5 @@
-/* GPIO demo, contract v3: counts on GPIO_OUT, reads GPIO_IN (ui_in) and echoes it XOR a pattern,
- * then stores a word, a halfword, two bytes and a misaligned word to PSRAM, reads them back with
+/* GPIO demo, contract v3: counts on GPIO_OUT, reads GPIO_IN (ui_in) and echoes it XOR a pattern
+ * (bits 6:0, with bit 7 folded into bit 0, so every ui_in bit shows on uo_out), then stores a word, a halfword, two bytes and a misaligned word to PSRAM, reads them back with
  * every load width and checks them. Every stored value depends on ui_in, so neither the stores
  * nor the checks fold at compile time; the program passes whatever ui_in is. It then shows folds
  * of the PSRAM words on GPIO_OUT and ends with GPIO_OUT = 0x5A (crt0), or 0xEE with the failing
@@ -19,7 +19,7 @@ int main(void) {
   for (uint8_t i = 1; i <= 20; i++) {
     GPIO_OUT = i;                               /* count */
     uint8_t v = (uint8_t)GPIO_IN;               /* ui_in */
-    GPIO_OUT = (uint8_t)((v ^ 0x3C) & 0x7F);    /* echo */
+    GPIO_OUT = (uint8_t)(((v ^ 0x3C) & 0x7F) ^ (v >> 7)); /* echo, ui_in[7] into bit 0 */
     acc = (uint8_t)(acc + v);
   }
   /* PSRAM: every store width, then loads with zero and sign extension. Misaligned accesses never
