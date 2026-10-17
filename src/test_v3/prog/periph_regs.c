@@ -24,6 +24,7 @@ int main(void) {
   PWM_DUTY0 = 0xFFFFFFFF; CHECK(PWM_DUTY0 == 0x3FF);
   PWM_DUTY1 = 0xFFFFFFFF; CHECK(PWM_DUTY1 == 0x3FF);
   PWM_DUTY2 = 0xFFFFFFFF; CHECK(PWM_DUTY2 == 0x3FF);
+  (void)UART_DATA;               /* uo0 (GPIO) toggled ui1: the UART received a frame at DIV 0 */
   UART_CTRL = 0xFFFFFFFF; CHECK(UART_CTRL == 0x1FFF);
   SPI_CTRL = 0xFFFFFFFE; CHECK(SPI_CTRL == 0xE);
   SPI_CTRL = 0xFFFFFFFF; CHECK(SPI_CTRL == 0xF);

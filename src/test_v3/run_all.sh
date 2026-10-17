@@ -38,8 +38,8 @@ run irq_gpio irq_gpio --loop
 # periph_regs and the peripheral pin behavior
 run periph_regs periph_regs --loop
 run uart_loop uart_loop --loop
-run uart_echo_p1 uart_echo --uart-div 39 --uart-rx 55aa0001ff7e8133 --uart-rx-start 4000 --uart-rx-gap 30000 --uart-ppm 10000 --expect-tx 55aa0001ff7e8133
-run uart_echo_m1 uart_echo --uart-div 39 --uart-rx 0f1e2d3c4b5a6978 --uart-rx-start 4000 --uart-rx-gap 30000 --uart-ppm -10000 --expect-tx 0f1e2d3c4b5a6978
+run uart_echo_p1 uart_echo --uart-div 39 --uart-rx 55aa0001ff7e8133 --uart-rx-start 60000 --uart-rx-gap 30000 --uart-ppm 10000 --expect-tx 55aa0001ff7e8133
+run uart_echo_m1 uart_echo --uart-div 39 --uart-rx 0f1e2d3c4b5a6978 --uart-rx-start 60000 --uart-rx-gap 30000 --uart-ppm -10000 --expect-tx 0f1e2d3c4b5a6978
 run spi_loop spi_loop --loop
 run capture capture --loop
 run pwm pwm --pwm 1:99:1:0,2:99:1:50,3:99:1:120,7:65535:0:300

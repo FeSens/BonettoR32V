@@ -22,8 +22,8 @@ int main(void) {
   CHECK(xfer(0x96) == 0x96);
   SPI_CTRL = (7u << 1);            /* a transfer outlasts an instruction */
   SPI_DATA = 0x11;
+  SPI_DATA = 0x22;                 /* ignored: busy (one instruction later) */
   CHECK(SPI_CTRL & SPI_BUSY);
-  SPI_DATA = 0x22;                 /* ignored: busy */
   while (SPI_CTRL & SPI_BUSY) { }
   CHECK(SPI_DATA == 0x11);
   SPI_CTRL = 1;

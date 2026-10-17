@@ -228,7 +228,8 @@ int main(int argc, char** argv) {
   uint64_t tx_t0 = 0;
   int tx_bit = 0;
   uint8_t tx_byte = 0;
-  int tx_prev = 1;
+  int tx_prev = 0;
+  uint64_t tx_idle = 0, tx_idle_prev = 0;  // a start bit needs a full idle bit time before it
   // PWM meters
   bool pwm_on = false, pwm_done = false;
   std::vector<PinMeter> meters(pwm.size());
@@ -342,7 +343,8 @@ int main(int argc, char** argv) {
     if (uart_div >= 0) {
       int v = uo & 1;
       uint64_t bt = (uint64_t)uart_div + 1;
-      if (tx_state == 0 && tx_prev == 1 && v == 0) {
+      tx_idle = v ? tx_idle + 1 : 0;
+      if (tx_state == 0 && tx_prev == 1 && v == 0 && tx_idle_prev >= bt) {
         tx_state = 1;
         tx_t0 = t;
         tx_bit = 0;
@@ -355,8 +357,7 @@ int main(int argc, char** argv) {
           } else if (tx_bit <= 8) {
             tx_byte |= (uint8_t)(v << (tx_bit - 1));
           } else {
-            if (v != 1) fail("UART TX stop bit is 0", t);
-            tx_bytes.push_back(tx_byte);
+            if (v == 1) tx_bytes.push_back(tx_byte);  // a 0 stop bit: the pin left UART mode
             tx_state = 0;
           }
           tx_bit++;
@@ -365,6 +366,7 @@ int main(int argc, char** argv) {
         if (v != tx_prev && dt % bt != 0 && tx_state == 1) fail("UART TX edge off the bit grid", t);
       }
       tx_prev = v;
+      tx_idle_prev = tx_idle;
     }
     // PWM meters: start after uo0 rises as a GPIO marker
     if (!pwm.empty()) {

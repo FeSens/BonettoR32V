@@ -57,7 +57,7 @@ class Pmod {
     int cf = out & 1, cr = (out >> 6) & 1, s = (out >> 3) & 1;
     if (!cf && !cr) return fail("both CS_n low");
     if (cf && cr && s) return fail("SCK high with both CS_n high");
-    if (!first_) {
+    {  // the previous state starts as reset: both CS_n high, SCK low (the harness checks it)
       if ((cf != pcf_ || cr != pcr_) && (ps_ || s)) return fail("CS_n changed while SCK high");
       // transaction ends
       if (!pcf_ && cf) end_txn(0);
@@ -79,7 +79,6 @@ class Pmod {
         if (drive_ && (oe & 0x04)) return fail("contention on SD1 (core drives during memory data-out)");
       }
     }
-    first_ = false;
     ps_ = s;
     pcf_ = cf;
     pcr_ = cr;
@@ -95,7 +94,6 @@ class Pmod {
   uint64_t rng_;
   uint64_t tcem_;
   uint64_t t_ = 0;
-  bool first_ = true;
   int ps_ = 0, pcf_ = 1, pcr_ = 1;
   uint8_t pout_ = 0, poe_ = 0;
   // transaction

@@ -273,7 +273,7 @@ inline Retire Iss3::step() {
       r.maddr = ea;
       r.rmask = (uint8_t)((1u << n) - 1);
       if (ea >> 31) {
-        if (n > 1 && (ea & 3)) return reserved();
+        if (ea & (n - 1)) return reserved();  // IO: naturally aligned only (contract 5)
         unsigned s = (ea >> 2) & 31, b = ea & 3;
         uint32_t vm = io_volatile_mask(s);
         uint32_t w = io_value(s);
@@ -305,7 +305,7 @@ inline Retire Iss3::step() {
       r.wmask = (uint8_t)((1u << n) - 1);
       r.mwdata = v;
       if (ea >> 31) {
-        if (n > 1 && (ea & 3)) return reserved();
+        if (ea & (n - 1)) return reserved();  // IO: naturally aligned only (contract 5)
         r.io = true;
         unsigned s = (ea >> 2) & 31, b = ea & 3;
         for (unsigned k = 0; k < n && b + k < 4; k++) io_write_byte(s, b + k, (uint8_t)(v >> (8 * k)));
