@@ -1320,8 +1320,10 @@ def _run_remote(args, host, tempfile):
             fwd += ["--only", args.only] if args.only else []
             fwd += ["--keep-going"] if args.keep_going else []
             jobs = args.jobs or REMOTE_JOBS
+            mem = os.environ.get("BONETTO_FORMAL_MEM_GB")   # a budget set here holds there
+            mem_env = f"BONETTO_FORMAL_MEM_GB={shlex.quote(mem)} " if mem else ""
             inner = (f"flock ../formal.lock env BONETTO_OSS_CAD={shlex.quote(REMOTE_OSS)} "
-                     f"BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
+                     f"{mem_env}BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
                      f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
                      f"--out out/formal.json --jobs {jobs} --keep "
                      + " ".join(shlex.quote(a) for a in cfg_arg + fwd))
