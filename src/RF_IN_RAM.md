@@ -257,3 +257,97 @@ CoreMark, head design. The cycle behavior of 12a5186 and head is identical.
 ## 8. The pc in RAM too (optional second variant)
 
 To be filled after the attempt.
+
+## 9. Hypothesis 005: a logic diet on variant 2
+
+Branch `hyp/005-v2-diet`, from variant 2 (b9a5211, x1..x15 and the pc in the region) merged with
+main. Every number below is `make area` on the current config (`_1` cells, AREA 2) unless it says
+median. ABC moves a design by about +-50 µm² under trivial rewrites, so each step was also judged on
+the median area of 10 or 30 noise variants (operand swaps and ternary rewrites of the same file).
+
+| | µm² | cells | flops |
+|---|---|---|---|
+| base (b9a5211 + main, 163d4a0) | 5,186.2 | 605 | 99 |
+| H005 head | 4,779.6 | 546 | 96 |
+
+### Steps
+
+| commit | step | µm² | median (n) |
+|---|---|---|---|
+| e5be6fc | CS_n is combinational (`~ep[2] \| mask`), no flop | 5,138.7 | |
+| e139432 | spec-minimum decode (traps: insn[0] = 0, opcode[6:4] = 111, misaligned JAL); insn[1] not stored | 5,097.4 | |
+| 1d359e3 | immediate from three shared selectors | 5,084.9 | |
+| c7c3f97 | the ALU shares propagate/generate between sum, carry, logic ops and compares | 5,051.1 | |
+| 3276174 | no boot slot (the first P and a first branch's PX are masked to read pc = 0); END retires | 5,046.1 | 5,061.1 (10) |
+| ced6b7b | every slot starts at phase 16; family placements move to ring write ports and constant taps | 5,028.6 | 5,033.6 (10) |
+| f76fcc3 | the + 4 / + 2 carry lives in cy (one flop less) | 4,993.5 | 4,991.6 (10) |
+| fc5946d | CMD goes to DATA on ~j[5] | 4,972.3 | 4,969.8 (10) |
+| c50f725 | j loads 40 on every IDLE clock (neutral, simpler) | 4,978.5 | 4,970.4 (10) |
+| 09a0c4d | a data phase ends at the first strobe with j >= its length (8, 16, 32) | 4,921.0 | 4,918.4 (30) |
+| bf07cfb | phase compares use the reachable range (ph <= 32); the shift pre-roll and the shift-amount capture match cheaper patterns from their known start | 4,860.9 | 4,883.4 (30) |
+| 3fe8799 | JALR's target[1] test goes through the address-alignment accumulator | 4,828.4 | 4,849.0 (30) |
+| 0d636be | don't-care simplifications (SCK high only in CMD/DATA, cmp and cy clears, B's sub and logic select) | 4,829.6 | 4,828.4 (30) |
+| 414e38e | store data at ring position 31 and a 16-clock wait between a store WRITE's address and data: the data uses the address taps, one 8:1 tap mux goes | 4,779.6 | 4,809.6 (30) |
+
+The last step is free in cycles on average: the 16 clocks fill the M slot's third lap, so the next
+slot starts at the same clock and CoreMark's CPI doesn't move. A store retires 16 clocks later,
+so its own retirement gap grows by 16 and the next instruction's shrinks by 16.
+
+### Cycles (harness, CoreMark plus the directed and random programs)
+
+| | CoreMark CPI | worst gap | first instruction |
+|---|---|---|---|
+| base | 741.0 | 893 | 993 |
+| H005 | 766.0 | 956 (SW; JALR 924) | 924 |
+
+Every slot starts at phase 16, so a gap is deterministic up to the wait of at most 32 clocks after the
+previous retirement. The margin under 1,024 is 68 cycles.
+
+### The instruction register in the region (contract a62e67e allows it): not feasible here
+
+Measured knockout bounds, on 3fe8799's logic (4,828.4 µm², 554 cells, 96 flops; median of 30:
+4,849.0). The IR bits read stand-in ring bits, so all decode and immediate logic stays and only the
+storage and capture go. The bounds leave out what an off-die IR adds (stash slot types, region
+addressing, a second immediate source), so the real saving would be smaller.
+
+| variant | µm² | flops | median (30) | saving bound |
+|---|---|---|---|---|
+| none (all 31 bits on die) | 4,828.4 | 96 | 4,849.0 | 0 |
+| the 9 immediate-only bits off die (insn[31], [29:25], [24], [19], [11]) | 4,608.2 | 87 | 4,596.9 | 220 to 252 |
+| all 31 bits off die | 3,957.5 | 65 | 3,928.8 | 871 to 920 |
+
+Cycles rule it out. A slot is a whole number of 33-clock laps: 66 for up to 7 data bits, 99 for up
+to 24, 132 for up to 40. SW takes 940 cycles (956 now) and JALR 924. Every IR bit except insn[19]
+feeds the SW, JALR, load or branch immediate, or a register field those classes need. A bit off the
+die needs a region WRITE after the fetch and a read-back before use, at least 66 cycles each, so SW
+needs at least 1,072 and JALR at least 1,056. Capturing the immediate straight into the ring during F
+(no stash) leaves no room for pc[31:16], which JALR's W4 needs for rd = pc + 4, so JALR needs a pc
+re-read: at least 1,056 again. insn[19] alone (used only by U and J types) would save one 30 µm²
+flop and cost two slots plus their control, so it wasn't built.
+
+### What didn't pay (measured, reverted)
+
+- Another immediate structure (median 5,153.7 vs 5,084.9) and an 8-bit rotating IR field for the
+  immediate (4,982.9 vs 4,970.4).
+- Slot encodings: 80 random encodings, median 5,124, best 5,034, no better than the hand encoding.
+- insn[0] folded into cmp (4,994.1 vs 4,991.6).
+- MOSI left free outside transactions (median 4,924.1 vs 4,918.4).
+- uo_out as enable flops with the reset folded into enable and data (median 4,906.6 vs 4,883.4).
+- Load data on the store-data port with a 16-clock W wait (median 4,819.6 vs 4,809.6).
+- BH always 16 bits: SB and SH must still read the full rs2 for RVFI.
+- Dropping the shift pre-roll's wait state: the offset it absorbs doesn't fit in j's 64-clock count.
+
+### Risks
+
+- Formal hasn't run (the eval's formal runner is missing on main).
+- The phase-range simplifications rely on ph never passing 32 (it is reset) and on the shift
+  pre-roll always starting at phase 32 (B of a shift always ends at phase 31).
+- Reserved encodings are covered by the liveness fuzz only.
+
+### Tests
+
+- `make eval MAX_AREA=5186.3` on 790daf2 (414e38e with main merged): lint, area, cosim (90 runs plus
+  the liveness fuzz, CPI 764.92, worst retirement gap 956), arch (43), equiv and gl pass; formal
+  fails only because its runner is missing.
+- Harness (stricter than the contract): 220 of 220 runs (22 programs, both modes, 5 seeds),
+  including CoreMark and the directed first-instruction tests in `src/test_rfram`.
