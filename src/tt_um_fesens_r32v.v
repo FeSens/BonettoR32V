@@ -128,7 +128,6 @@ module tt_um_fesens_r32v (
     wire is_fence  = (opcode == 7'b0001111);
     wire uses_rd   = is_lui | is_auipc | is_jal | is_jalr | is_load | is_opimm | is_op;
     wire uses_rs1  = is_jalr | is_branch | is_load | is_store | is_opimm | is_op;
-    wire uses_rs2  = is_branch | is_store | is_op;
     wire legal     = uses_rd | uses_rs1 | is_fence;   // a known opcode
     wire trap_dec  = ~legal | (is_jal & insn[21]);
 
@@ -490,19 +489,18 @@ module tt_um_fesens_r32v (
     genvar gi;
     // logical bit m of a ring is at phase 2m mod 33, which sits at position (2m - ph) mod 33
     wire [65:0] pcd   = {pcr, pcr};
-    wire [65:0] pcsh  = pcd >> (6'd33 - ph);
-    wire [32:0] pcrot = pcsh[32:0];
     wire [31:0] pcv;
     generate
         for (gi = 0; gi < 32; gi = gi + 1) begin : g_pcv
-            assign pcv[gi] = pcrot[(2 * gi) % 33];
+            assign pcv[gi] = pcd[7'd33 + ((2 * gi) % 33) - {1'b0, ph}];
         end
     endgenerate
+    wire        uses_rs2 = is_branch | is_store | is_op;
 
     reg [63:0] r_order;
     reg [31:0] r_rs1, r_rs2, r_rd, r_pc, r_mrd;
     integer    mi;
-    wire [5:0] dj = j - 6'd1;
+    wire [4:0] dj = j[4:0] - 5'd1;
     always @(posedge clk) begin
         if (!rst_n)
             r_order <= 64'd0;
