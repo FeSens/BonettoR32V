@@ -128,6 +128,43 @@ def insn_name(w):
     return "?"
 
 
+# groups=class: instruction groups by timing class (each group's depth=short uses the
+# slowest measured class among its members), split so that no group is much larger
+# than the others.
+CLASS_GROUPS = [
+    ["add", "sub", "sll", "slt", "sltu"], ["xor", "srl", "sra", "or", "and"],
+    ["addi", "slti", "sltiu", "xori", "ori"], ["andi", "slli", "srli", "srai"],
+    ["beq", "bne", "blt", "bge", "bltu", "bgeu"],
+    ["lui", "auipc", "jal", "jalr", "fence", "ecall", "ebreak"],
+    ["lb", "lh", "lw"], ["lbu", "lhu"], ["sb", "sh", "sw"],
+]
+INSN_CLASS = {"lui": "lui", "auipc": "auipc", "jal": "jal", "jalr": "jalr", "fence": "fence",
+              "ecall": "system", "ebreak": "system"}
+for _i in ("beq", "bne", "blt", "bge", "bltu", "bgeu"):
+    INSN_CLASS[_i] = "branch"
+for _i in ("lb", "lh", "lw", "lbu", "lhu"):
+    INSN_CLASS[_i] = "load"
+for _i in ("sb", "sh", "sw"):
+    INSN_CLASS[_i] = "store"
+for _i in ("addi", "slti", "sltiu", "xori", "ori", "andi", "slli", "srli", "srai"):
+    INSN_CLASS[_i] = "alu_imm"
+for _i in ("add", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and"):
+    INSN_CLASS[_i] = "alu_reg"
+
+
+def class_max_cycles(timing, insns):
+    """Slowest measured class among `insns` (falls back to max_cycles_per_insn when the
+    timing has no per-class data or misses a class)."""
+    pc = timing.get("per_class") or {}
+    vals = []
+    for i in insns:
+        c = pc.get(INSN_CLASS.get(i, ""))
+        if not c or c.get("max_cycles") is None:
+            return int(timing["max_cycles_per_insn"])
+        vals.append(int(c["max_cycles"]))
+    return max(vals)
+
+
 def is_reach_label(lbl):
     return lbl.startswith("reach_")
 
@@ -456,14 +493,16 @@ def pick_depth(cfg, timing):
     return depth, d_min
 
 
-def short_depth(cfg, timing):
-    """Per-check option depth=short: reset + first_retire + max_cycles_per_insn + margin.
+def short_depth(cfg, timing, insns=None):
+    """Per-check option depth=short: reset + first_retire + max_cycles_per_insn + margin
+    (for an instruction group, the slowest measured class among its members instead of
+    max_cycles_per_insn).
     Covers any instruction as the first retirement (pc 0, free registers and memory) and
     any instruction as the second retirement after a first one that is no slower than the
     measured first retirement (an ALU op, or a JALR that sets an arbitrary pc). Not
     covered: two slow (memory) instructions in a row."""
-    return (cfg["reset_steps"] + int(timing["first_retire_cycle"]) +
-            int(timing["max_cycles_per_insn"]) + cfg["depth_margin"])
+    mx = class_max_cycles(timing, insns) if insns else int(timing["max_cycles_per_insn"])
+    return cfg["reset_steps"] + int(timing["first_retire_cycle"]) + mx + cfg["depth_margin"]
 
 
 # ---------------------------------------------------------------------------
@@ -1012,11 +1051,11 @@ def main():
         f"max_cycles_per_insn={timing['max_cycles_per_insn']} -> D_min={d_min}, D={depth}")
     d_short = short_depth(cfg, timing)
     result["depth_policy"]["d_short"] = d_short
-    deepest = max((d_short if o.get("depth") == "short" else depth) + int(o.get("depth_add", 0))
-                  for _, _, o in cfg["checks"])
-    log(f"short depth (depth=short checks) = {d_short}; deepest task = {deepest}")
+    # The cap bounds the candidate-derived depth (liveness's fixed +1,024 is not counted).
+    deepest = max(d_short if o.get("depth") == "short" else depth for _, _, o in cfg["checks"])
+    log(f"short depth (depth=short checks) = {d_short}; deepest base depth = {deepest}")
     if deepest > cfg["depth_cap"]:
-        result["error"] = (f"deepest task depth {deepest} exceeds depth_cap={cfg['depth_cap']}: "
+        result["error"] = (f"base depth {deepest} exceeds depth_cap={cfg['depth_cap']}: "
                            f"too slow for the formal policy")
         log(result["error"])
         finish(1)
@@ -1032,22 +1071,29 @@ def main():
         timeout = int(opts.get("timeout", cfg["timeout_s"]))
         ekey = opts.get("engine", kind if kind in cfg["engines"] else "bmc")
         eng = cfg["engines"][ekey]
-        base = short_depth(cfg, timing) if opts.get("depth") == "short" else depth
+        short = opts.get("depth") == "short"
+        base = short_depth(cfg, timing) if short else depth
         tdepth = base + int(opts.get("depth_add", 0))
         if kind == "insn":
             insns = [i for i in isa_insns() if not only or only.search(f"insn_{i}")]
-            ngroups = min(len(insns), int(opts.get("groups", len(insns)))) if insns else 0
+            if opts.get("groups") == "class":
+                glist = [[i for i in g if i in insns] for g in CLASS_GROUPS]
+                glist = [g for g in glist if g]
+            else:
+                ngroups = min(len(insns), int(opts.get("groups", len(insns)))) if insns else 0
+                glist = [insns[g::ngroups] for g in range(ngroups)]   # round robin
             items = []
-            for g in range(ngroups):
-                members = insns[g::ngroups]   # round robin: mixes the instruction classes
+            for g, members in enumerate(glist):
                 tname = f"insn_{members[0]}" if len(members) == 1 else f"insn_group{g}"
                 req = [(f"insn_{i}", insn_reach(i)) for i in members]
-                items.append((tname, "bonetto_insn_check", members, req))
+                gdepth = short_depth(cfg, timing, members) if short else depth
+                items.append((tname, "bonetto_insn_check", members, req, gdepth))
         else:
             if only and not only.search(name):
                 continue
-            items = [(name, CHECKERS[name], None, [(name, REACH[name])])]
-        for tname, checker, model, req in items:
+            items = [(name, CHECKERS[name], None, [(name, REACH[name])], base)]
+        for tname, checker, model, req, ibase in items:
+            tdepth = ibase + int(opts.get("depth_add", 0))
             rf = (tname == "reset")
             p = write_sby(work, tname, checker, tdepth, eng, timeout, model=model, reset_free=rf)
             r = write_sby(work, tname + "_reach", checker, tdepth, reach_eng, timeout,
