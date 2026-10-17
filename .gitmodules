@@ -1,3 +1,6 @@
 [submodule "third_party/riscv-formal"]
 	path = third_party/riscv-formal
 	url = https://github.com/YosysHQ/riscv-formal.git
+[submodule "third_party/riscv-arch-test"]
+	path = third_party/riscv-arch-test
+	url = https://github.com/riscv-non-isa/riscv-arch-test.git
