@@ -114,6 +114,7 @@ module tt_um_fesens_r32v (
     // is not stored: no design logic reads it.
     // ------------------------------------------------------------------------------------
     wire [31:0] insn  = {irs[7:0], irs[15:8], irs[23:16], irs[30:25], 1'b1, irs[24]};
+    wire        _unused_insn1 = insn[1];
     wire [2:0]  f3    = insn[14:12];
     wire [3:0]  rd_f  = insn[10:7];
     wire [3:0]  rs1_f = insn[18:15];
