@@ -1,7 +1,11 @@
 # Cosim: reference ISS, test programs, pin-level harness
 
 These are contract gates (`verif/` is on the don't-touch list). They check a design in `src/`
-against `docs/contract.md` v2 (main 35b92b5) sections 2, 3, 4 and 6.
+against `docs/contract.md` v2 sections 2, 3, 4 and 6 (v2 at main 35b92b5, with the amendments
+8df46d8 (core-region transactions of a trapping instruction), e321614 (clarifications: trapping
+branch/JALR register reads are checked) and 78472fe (null READs; a partly clocked last byte counts
+as addressed)). The liveness fuzz (below) answers the formal review's C1: liveness on reserved
+encodings, per candidate.
 
 **Contract v2, the core region.** RAM bytes 0xFF80-0xFFFF, in every 64 KB alias, may hold the
 core's x1..x15, pc and scratch in a private layout. The checkers follow from that:
@@ -26,6 +30,7 @@ core's x1..x15, pc and scratch in a private layout. The checkers follow from tha
 | `run_cosim.py ... --dump-ram PATH` | writes the final 64 KB RAM image, raw bytes, as the design left it (the core region 0xFF80-0xFFFF included: the core's own bytes, random at reset) |
 | `run_cosim.py ... --trace out.fst` | separate traced build, FST waveform |
 | `run_cosim.py ... --src DIR` | runs another design directory (mutants) |
+| `run_cosim.py --fuzz-liveness --seed S [--src DIR]` | the liveness fuzz (below), rvfi mode; prints `{"prog","mode","seed","pass","liveness_checked","runs","walks","probes_retired","halted","capped","retired","cycles","max_cycles_per_insn","error"}`; exit 0 on a pass |
 | `pytest verif/cosim/test_iss.py` | ISS vs spike, ISS unit cases, program coverage |
 | `pytest verif/cosim/test_cosim_harness.py` | harness self-tests: stand-in driver, design passes, mutants fail |
 
@@ -79,9 +84,9 @@ Register-field convention (contract section 6, "the register index the core actu
 LUI, AUIPC, JAL report no sources; JALR reports rs1; branches rs1 and rs2; loads rs1; stores rs1
 and rs2; OP-IMM rs1; OP rs1 and rs2; FENCE, ECALL, EBREAK and the illegal words report nothing.
 On a trapping retirement the harness compares only trap, halt, insn and pc_rdata, plus
-rd_addr = 0 and mem_wmask = 0 (contract section 6). The register-read fields, rd_wdata, pc_wdata
-and the other memory fields are free there. (The ISS still reports the sources a trapping JALR or
-taken branch read.)
+rd_addr = 0 and mem_wmask = 0 (contract section 6), and on a trapping branch or JALR also the
+rs1/rs2 addr and rdata (e321614: the trap depends on those operands). The other register-read
+fields, rd_wdata, pc_wdata and the other memory fields are free there.
 
 Cross-check: `test_iss.py` runs selftest, gpio_demo and coremark (2,039 + 300 + 791,686 =
 794,025 retirements in their spike builds) on spike and on the ISS and compares pc, instruction,
@@ -121,8 +126,10 @@ The DUT runs with every power-up value randomized from the seed (`--x-initial un
 that leaves it zero), noise on MISO whenever SCK is low or no response bit is due, noise on every
 unused `uio_in` bit, and a reset of 1 to 9 edges depending on the seed (seed 1 uses one edge).
 
-A transaction's bytes, for classification: a READ's bytes with at least one bit clocked, a
-WRITE's complete bytes, or its start address when it has no data byte.
+A transaction's bytes, for classification: a READ's bytes with at least one bit clocked (a
+partly clocked last byte counts), a WRITE's complete bytes. A READ with no data bit (CS_n rises
+right after its 24-bit header) is a null READ: it addresses no byte and is free anywhere (contract
+section 6, 78472fe). A shorter header still fails rule 4.
 
 Both modes:
 
@@ -143,9 +150,9 @@ rvfi mode (design built with `RISCV_FORMAL`):
 
 | Check | Contract | Error text contains |
 |---|---|---|
-| every retirement: order, intr = 0, mode = 3, ixl = 1, insn, pc_rdata, trap, halt, rd_addr, mem_wmask; on a normal retirement also pc_wdata, rs1/rs2 addr and data, rd_wdata, mem_rmask, mem addr (when a mask is set), rdata/wdata on the masked lanes | 4, 6 | `RVFI mismatch at retirement #N (pc, insn): field = got, expected` |
-| every SPI transaction belongs to the instruction that retires next and ends before its rvfi_valid; region transactions are free (any number, READ or WRITE, any order; also for a trapping instruction, since section 6 allows them per instruction and the region isn't program memory, so the trap's "no memory write" covers program WRITEs, which the ISS never expects on a trap) | 4, 6 | |
-| program transactions of an instruction: exactly one fetch READ of exactly its 4 bytes (A = pc[15:0], 32 data bits; the first such READ is the fetch); for a RAM load, READs that read only its bytes; for a RAM store, WRITEs that write only its bytes, each byte once and with the store's value (a store may be split); nothing else (IO accesses never appear on SPI, a program READ without data bytes is nothing) | 3, 6 | `SPI READ/WRITE of byte ... is not part of retirement #N`, `the fetch READ of ... read beyond the instruction's 4 bytes`, `the fetch READ of ... read N data bits`, `a second fetch READ`, `a second time`, `the store writes 0x.. there`, `read no data byte` |
+| every retirement: order, intr = 0, mode = 3, ixl = 1, insn, pc_rdata, trap, halt, rd_addr, mem_wmask; on a normal retirement also pc_wdata, rs1/rs2 addr and data, rd_wdata, mem_rmask, mem addr (when a mask is set), rdata/wdata on the masked lanes; on a trapping branch or JALR also rs1/rs2 addr and data (e321614) | 4, 6 | `RVFI mismatch at retirement #N (pc, insn): field = got, expected` |
+| every SPI transaction belongs to the instruction that retires next and ends before its rvfi_valid; region transactions are free (any number, READ or WRITE, any order), also for a trapping instruction before it retires (contract section 4 as amended in 8df46d8: a trap makes no program-memory write, and nothing after the halt); null READs (CS_n rises right after the 24-bit header, no data bit) are free anywhere (section 6, 78472fe) | 4, 6 | |
+| program transactions of an instruction: exactly one fetch READ of exactly its 4 bytes (A = pc[15:0], 32 data bits; the first such READ is the fetch); for a RAM load, READs that read only its bytes; for a RAM store, WRITEs that write only its bytes, each byte once and with the store's value (a store may be split); nothing else (IO accesses never appear on SPI; a null READ is neither a region nor a program transaction) | 3, 6 | `SPI READ/WRITE of byte ... is not part of retirement #N`, `the fetch READ of ... read beyond the instruction's 4 bytes`, `the fetch READ of ... read N data bits`, `a second fetch READ`, `a second time`, `the store writes 0x.. there` |
 | CS_n is high in every rvfi_valid cycle | 6 | `SPI transaction still open at` |
 | completeness at retirement (checked before the RVFI fields, so a bus bug is named as one): the fetch was seen, the load READs read every load byte in full (a load of the instruction's own bytes needs a READ of its own), every store byte was written | 6 | `retired without its fetch`, `retired without reading load byte`, `without writing store byte` |
 | uo_out makes exactly the reference's changes, in order, each no later than one cycle after its IO store retires; any other change fails, including a glitch that returns to the old value before the store retires | 3 | `uo_out changed to`, `one cycle after the IO store retired` |
@@ -162,6 +169,74 @@ pins mode (the plain design):
 | an SPI transaction completes at least every 2,048 cycles while stores or GPIO writes remain (every instruction is fetched, and retires within 1,024 cycles) | 4, 6 | `no SPI transaction for` |
 | after the last store and GPIO change: (tail + 8) x 1,024 quiet cycles with no program WRITE (one whose address is outside the region; region WRITEs go on) and no uo_out change, where tail is the number of instructions after the reference's last observable effect | 4 | `SPI WRITE to 0x.... started after the reference program's last store` |
 | CoreMark (and any program whose expect file lists `log_contains`): the strings are in the RAM log ring at 0xF000 | | `RAM log ring lacks` |
+
+## Liveness fuzz (`--fuzz-liveness`)
+
+Contract section 4: a core must retire every instruction within 1,024 cycles of the previous one,
+or trap and halt, also on a reserved encoding (whatever effect it gives it). The programs contain
+no reserved encoding, so the program runs can't see a core that hangs on one (mutant
+`hang_reserved`, the formal agent's: custom-0 stays in EXEC forever). The fuzz runs random images
+with no reference and checks only liveness and the pin rules, since a random program wanders,
+writes RAM and touches the core region, all of it unspecified.
+
+```
+python3 verif/cosim/run_cosim.py --fuzz-liveness --seed S [--src DIR] [--mode rvfi|pins]
+                                 [--fuzz-runs K] [--fuzz-cap N]
+```
+
+Defaults: rvfi mode, K = 2,048 probe sub-runs plus K/256 = 8 walk sub-runs, N = 2,000
+retirements. Each sub-run starts from reset (1 to 9 edges, random power-up state, random core
+region) on its own image of RAM 0x0000-0xFF7F:
+
+- **probe sub-run k:** 0 to 8 valid, non-trapping, non-control instructions (random x0..x15
+  registers, so loads and stores hit random addresses, IO and region included; misaligned ones
+  don't trap), then one probe word, then random words to 0xFF7F (half arbitrary, half with
+  bits [1:0] = 11). The probe's bits [6:0] are entry k mod 128 of a per-seed shuffle of all 128
+  values (low bits other than 11 included). On visit v = k / 128 of that value, funct3 is
+  (v + a per-seed offset) mod 8, the register fields name x0..x15 when v mod 16 < 8 and are
+  random (x16-x31 included) otherwise, and funct7 is class (2 (v / 8) + S) mod 4 of {random,
+  0000000, 0100000, 0000001}; the other bits are random. So one seed probes every (bits [6:0],
+  funct3) pair twice, once with each register class, and seeds 1 to 4 together add every funct7
+  class. The probe is never 0x00000000, 0xFFFFFFFF, ECALL or EBREAK. A strict-decode core traps at
+  the probe; a spec-minimum decoder runs on into the random words.
+- **walk sub-run:** LUI x15, 0xC at 0, then valid, non-trapping words everywhere: the probe
+  prefix's mix plus branches and JALs with multiple-of-4 offsets, rd never x15, every store based
+  on x15 (bytes 0xB800-0xC7FF). The core wanders, loops included, until the retirement cap, or
+  until a jump lands on a word a store overwrote or in the region, where it may trap. These cover
+  the cap path and long runs.
+
+Checks, rvfi mode: the latency cap with contract section 4's count, at each retirement and by a
+watchdog (the error names the last retirement and the word at the next pc); no retirement and no
+SPI WRITE start (region included) in the 4,096 cycles after the halt; no rvfi_valid during reset.
+Both modes: the waveform and framing rules (spiram.h, null READs included), constant `uio_oe` and
+unused outputs, reset values, outputs that change only at rising clk edges. A sub-run ends at the
+halt (after the 4,096-cycle window) or at the cap; the first failing sub-run stops the run.
+
+**pins mode can't check liveness.** It sees no retirement and no halt, and a halted core and a
+hung one both go quiet, so it checks only the pin rules, for 32 x 1,024 cycles per sub-run, and
+reports `"liveness_checked": false` (`hang_reserved` passes it). The eval must run rvfi mode; the
+equivalence gate ties the plain build to the RVFI build.
+
+JSON keys: `prog` ("fuzz_liveness"), `mode`, `seed`, `pass`, `liveness_checked` (true in rvfi
+mode), `runs` (sub-runs started, probes and walks; fewer than K + K/256 after a failure),
+`walks`, `probes_retired` (probe sub-runs whose probe word retired, at its address; null in pins
+mode), `halted`, `capped` (sub-runs that reached the cap), `retired`, `cycles` (summed per
+sub-run up to its halt or cap), `max_cycles_per_insn` (null in pins mode), `error` (null on a
+pass; else `fuzz sub-run k (probe word 0x... at 0x..., opcode 0x.., funct3 f): cycle c: ...` or
+`fuzz sub-run k (walk w): ...`).
+
+Measured with seeds 1 to 5 (the CLI as above, one process per seed; wall clock for all five from
+`test_fuzz_liveness_passes`, cached builds, other jobs on the machine):
+
+| Design | probes retired per seed | capped walks per seed | worst gap | 5 seeds |
+|---|---|---|---|---|
+| seed (strict decode) | 2,047-2,048 of 2,048 | 1-3 of 8 | 230 | 4.0 s |
+| `legal_h002_rf` | 2,048 | 1-5 of 8 | 823 | 8.7 s |
+| `legal_h002_pcram` | 2,048 | 1-5 of 8 | 991-993 | 9.2 s |
+
+`hang_reserved` fails every seed (sub-runs 92, 105, 7, 30 and 107 for seeds 1 to 5, each at an
+opcode 0x0b probe) and `hang_funct3` (LOAD with funct3 011 and x0..x15 registers stays in EXEC)
+fails every seed too. One pins-mode seed on the seed core takes about 7 s (67 M cycles).
 
 ## Timing report (`--timing-json`, rvfi mode)
 
@@ -195,7 +270,9 @@ retirements are invisible, and `cycles` is the cycle of the last observable even
 per broken rule; `harness --spi-only N` runs it without an ISS. `verif/cosim/mutants/<name>/` are
 copies of the seed (or of the hyp/002 contract v2 designs) with one deliberate bug each, listed
 with their mode and expected error in `mutants/MANIFEST.json`. The legal variants must pass:
-`legal_trap_fields` (arbitrary register-read fields on trapping retirements), `legal_mosi_echo`
+`legal_trap_fields` (arbitrary rd_wdata and pc_wdata on trapping retirements, and arbitrary
+register-read fields on the traps that read no register), `legal_null_read` (a null READ at the
+IO address before every IO load), `legal_mosi_echo`
 (no header gate on the shift-in, so after a 56-bit transaction's last bit, while CS_n is still
 low, MOSI carries what MISO held during the header: noise in the cosim, X in the TT test; the
 contract constrains MOSI only at rising SCK edges), and for contract v2 `legal_split_store` (the
@@ -215,6 +292,15 @@ Contract v2 mutants, each failing with its own message:
 | `fetch_extra_byte` | the fetch READ reads a 5th byte | `read beyond the instruction's 4 bytes` | `no SPI transaction for` |
 | `load_skip_byte` | LW reads only 3 of its bytes | `retired without reading load byte` | `doesn't match the reference store` |
 | `region_zero_init` | hyp/002-rf-in-ram-pcram without its boot write: the pc comes from the region's reset contents | `retirement #0` | `no SPI transaction for` |
+| `null_read_short` | `legal_null_read` with a 23-bit header | `before its command and address were complete` | same |
+| `trap_rs_garbage` | arbitrary rs fields on every trap, a trapping branch or JALR included (e321614) | `RVFI mismatch` (`rvfi_rs1_addr`) | passes |
+| `hang_reserved` | custom-0 (0001011) stays in EXEC forever (setup/formal's mutant) | passes the programs; the fuzz fails it (`latency cap`, `opcode 0x0b`) | passes |
+| `hang_funct3` | LOAD with funct3 011 and x0..x15 registers stays in EXEC forever | passes the programs; the fuzz fails it (`latency cap`) | passes |
+
+MANIFEST entries with `"fuzz_fail"` must fail the rvfi-mode fuzz in seeds 1 to 5 with
+`latency cap` and that text. `test_fuzz_liveness_passes` runs the fuzz (seeds 1 to 5) on the seed
+and both hyp/002 designs, and `test_fuzz_pins_mode_cannot_check_liveness` shows pins mode passing
+`hang_reserved` with `"liveness_checked": false`.
 
 `test_region_starts_random` shows `region_zero_init` passes with `--region-zero` and fails with
 the random fill (seeds 1 to 3). `test_v2_designs_pass_the_full_matrix` runs `run_cosim.py --all`
@@ -236,6 +322,16 @@ model's rule, or the uo_out sequence). The TT test checks gpio_demo's uo_out seq
 rules; MOSI is left to the model's rising-edge checks. Bugs that only show against RVFI or
 the retirement timing (`uo_late`, `cs_open_at_retire`, `load_own_fetch`) pass it by design, and so
 does `rvfi_hidden` (gpio_demo runs no SLTU/SLTIU); the cosim catches them.
+
+The RAM model (`test/spiram_23lc512.v`) also checks the contract section 6 transaction classes
+that the pins alone show, so a wrap or a double write that synthesis introduces fails the
+gate-level test: every byte a transaction addresses (a READ's partly clocked last byte included;
+a null READ addresses none) is in the region or none is (`wraps out of the core region`,
+`runs from program RAM into the core region`); a program READ addresses at most 4 bytes
+(`addresses a fifth byte`); and between two program READs (each instruction starts with its
+fetch) program WRITEs write at most 4 bytes, none twice (`written a second time since the last
+program READ`, `a fifth program byte`). `region_wrap`, `region_straddle`, `store_twice`,
+`fetch_extra_byte` and `null_read_short` fail it with those messages; `legal_null_read` passes.
 
 ## Speed
 

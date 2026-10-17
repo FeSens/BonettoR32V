@@ -13,6 +13,15 @@ Everything (the `make cosim` gate):
 builds the programs, runs every program in both modes under seeds 1, 2 and 3, writes
 build/cosim.json and exits 0 only if every run passes.
 
+The liveness fuzz (contract section 4 on reserved encodings; docs/cosim.md):
+  run_cosim.py --fuzz-liveness --seed S [--mode rvfi|pins] [--fuzz-runs K] [--fuzz-cap N]
+               [--src DIR]
+runs K (default 2048) probe sub-runs and K/256 walk sub-runs from reset on random images, no
+reference, checking liveness and the pin rules (rvfi mode, the default; pins mode can only check
+the pin rules), and prints one JSON line {"prog": "fuzz_liveness", "mode", "seed", "pass",
+"liveness_checked", "runs", "walks", "probes_retired", "halted", "capped", "retired", "cycles",
+"max_cycles_per_insn", "error"}; exit 0 on a pass.
+
 --max-cycles defaults to the latency cap's bound, 1,024 * (reference retirements + 16).
 --timing-json (rvfi mode) writes {"pass", "first_retire_cycle", "max_cycles_per_insn",
 "per_class"} on every run; with "pass": false the numbers only cover the run up to the failure.
@@ -196,6 +205,48 @@ def _run(mode, hexfile, seed, max_cycles, dump_ram, src, vflags, trace):
     return summary, res
 
 
+FUZZ_RUNS = 2048  # probe sub-runs per seed: every (bits [6:0], funct3) pair twice
+FUZZ_CAP = 2000   # retirements per sub-run
+FUZZ_KEYS = ["prog", "mode", "seed", "pass", "liveness_checked", "runs", "walks",
+             "probes_retired", "halted", "capped", "retired", "cycles", "max_cycles_per_insn",
+             "error"]
+
+
+def run_fuzz(mode: str, seed: int, runs: int = FUZZ_RUNS, cap: int = FUZZ_CAP, src: Path = SRC,
+             vflags: str = "") -> dict:
+    """The liveness fuzz (harness --fuzz-liveness): `runs` probe sub-runs plus runs/256 walk
+    sub-runs from reset on random images (reserved encodings included), checking only liveness
+    (rvfi mode) and the pin rules. Returns the summary dict with FUZZ_KEYS ("runs" counts both
+    kinds)."""
+    s = {k: None for k in FUZZ_KEYS}
+    s.update(prog="fuzz_liveness", mode=mode, seed=seed, **{"pass": False})
+    try:
+        exe = ensure_built(mode, src, vflags)
+    except RuntimeError as e:
+        s["error"] = str(e)
+        return s
+    try:
+        p = subprocess.run([str(exe), "--fuzz-liveness", str(runs), "--fuzz-cap", str(cap),
+                            "--seed", str(seed)], capture_output=True, text=True, timeout=7200)
+    except subprocess.TimeoutExpired:
+        s["error"] = "harness wall-clock timeout (2 h)"
+        return s
+    lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
+    try:
+        res = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError:
+        res = {}
+    if not res or p.returncode not in (0, 1):
+        s["error"] = f"harness crashed (exit {p.returncode}): {(p.stderr or p.stdout)[-1500:]}"
+        return s
+    for k in FUZZ_KEYS[4:]:
+        s[k] = res.get(k)
+    s["pass"] = bool(res.get("pass")) and p.returncode == 0 and not res.get("error")
+    if res.get("pass") and p.returncode != 0:
+        s["error"] = f"harness exit {p.returncode} with pass=true"
+    return s
+
+
 def program_list():
     p = subprocess.run(["make", "-s", "-C", str(ROOT / "verif/programs"), "list"],
                        capture_output=True, text=True, check=True)
@@ -257,7 +308,21 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="every program x mode x seed {1,2,3}")
     ap.add_argument("--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 2)))
     ap.add_argument("--no-make", action="store_true", help="--all: don't rebuild the programs")
+    ap.add_argument("--fuzz-liveness", action="store_true",
+                    help="the liveness fuzz on random images (rvfi mode unless --mode pins)")
+    ap.add_argument("--fuzz-runs", type=int, default=FUZZ_RUNS,
+                    help=f"--fuzz-liveness: probe sub-runs (default {FUZZ_RUNS}; walks: 1/256)")
+    ap.add_argument("--fuzz-cap", type=int, default=FUZZ_CAP,
+                    help=f"--fuzz-liveness: retirements per sub-run (default {FUZZ_CAP})")
     a = ap.parse_args()
+    if a.fuzz_liveness:
+        if a.all or a.prog:
+            ap.error("--fuzz-liveness takes no --prog or --all (it makes its own images)")
+        if a.seed <= 0 or a.fuzz_runs <= 0 or a.fuzz_cap <= 0:
+            ap.error("--seed, --fuzz-runs and --fuzz-cap must be positive")
+        summary = run_fuzz(a.mode or "rvfi", a.seed, a.fuzz_runs, a.fuzz_cap, a.src, a.vflags)
+        print(json.dumps({k: summary[k] for k in FUZZ_KEYS}))
+        return 0 if summary["pass"] else 1
     if a.all:
         return run_all(a.src, a.jobs, make=not a.no_make)
     if not a.mode or not a.prog:

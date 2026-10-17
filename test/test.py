@@ -11,7 +11,10 @@ when the uo_out change sequence equals the expected one and nothing changes afte
 Contract v2 (docs/contract.md sections 3 and 6): the core may keep x1..x15, the pc and scratch in
 the RAM's core region 0xFF80-0xFFFF. The RAM model serves that traffic as plain memory and fills
 the region with random bytes at start (its reset contents are arbitrary); gpio_demo's stack starts
-at 0xFF80, below the region, and the program never touches it.
+at 0xFF80, below the region, and the program never touches it. The model also checks the section 6
+transaction classes the pins show: each transaction is all region or all program (a null READ,
+header only, touches nothing), a program READ addresses at most 4 bytes, and program WRITEs
+between two program READs write at most 4 bytes, none twice.
 """
 import json
 from pathlib import Path
