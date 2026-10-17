@@ -17,11 +17,15 @@
 //     --pwm CH:PER:Q:DUTY[,...]  after the program raises uo0 (GPIO marker) measure channel CH
 //                       (uo pin) period and high time; must be (PER+1)*2^Q and min(DUTY,PER+1)*2^Q
 //     --end-ebreak      (rvfi mode) a retired EBREAK ends the run (random streams)
+//     --expect-entries N (rvfi mode) exactly N retirements carry rvfi_intr = 1 (trap handler
+//                       entries, synchronous or interrupt; contract 8)
 //     --fuzz N          (rvfi mode) liveness fuzz: random flash bytes (from --seed) instead of
 //                       the program, N cycles, no ISS: only the Pmod rules and the 2,048 cap
 //     --quiet, --trace-retire, --vcd FILE (trace builds only)
 // rvfi build (-DRISCV_FORMAL): every retirement is compared with the ISS (all RVFI fields; IO
-// volatile bits from the DUT), interrupts must be allowed in the ISS, the 2,048-cycle cap holds,
+// volatile bits from the DUT), interrupts must be allowed in the ISS, rvfi_intr = 1 exactly on
+// the first instruction of a handler (after a synchronous trap's retirement, or an interrupt
+// entry: contract 8), the 2,048-cycle cap holds,
 // PSRAM writes outside the core region carry the ISS's data, the GPIO-mode uo pins follow the
 // ISS within a cycle, and the final PSRAM image matches. Both builds: the Pmod rules, and the
 // program's verdict on uo_out (0x5A pass, 0xEE fail), written with ALTFN = 0, then a self-loop.
@@ -97,6 +101,7 @@ int main(int argc, char** argv) {
   std::vector<PwmSpec> pwm;
   const char* vcd = nullptr;
   uint64_t fuzz = 0;
+  long long expect_entries = -1;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
@@ -122,6 +127,7 @@ int main(int argc, char** argv) {
       }
     }
     else if (a == "--end-ebreak") end_ebreak = true;
+    else if (a == "--expect-entries") expect_entries = strtoll(next().c_str(), nullptr, 0);
     else if (a == "--fuzz") fuzz = strtoull(next().c_str(), nullptr, 0);
     else if (a == "--quiet") quiet = true;
     else if (a == "--trace-retire") trace_ret = true;
@@ -238,8 +244,8 @@ int main(int argc, char** argv) {
   uint32_t last_pc = 0xFFFFFFFF, last_insn = 0;
   int selfloops = 0;
   uint64_t gpio_settle = 0;  // the GPIO compare skips this edge (one cycle after a store)
-  bool intr_seen = false;
-  uint64_t n_intr = 0, n_trap = 0;
+  bool intr_seen = false, prev_trap = false;
+  uint64_t n_intr = 0, n_trap = 0, n_entries = 0;
   // UART TX decoder
   std::vector<uint8_t> tx_bytes;
   int tx_state = 0;
@@ -283,7 +289,11 @@ int main(int argc, char** argv) {
         retired++;
         goto fuzz_next;
       }
-      if (top->rvfi_intr) {
+      // after a synchronous trap the handler's first instruction carries rvfi_intr = 1 (no
+      // interrupt can come between: the trap cleared MIE); otherwise rvfi_intr = 1 is an
+      // interrupt entry
+      if (top->rvfi_intr) n_entries++;
+      if (top->rvfi_intr && !prev_trap) {
         if (!iss.irq_allowed()) fail("interrupt while masked", t);
         iss.take_interrupt();
         n_intr++;
@@ -313,7 +323,7 @@ int main(int argc, char** argv) {
       else if (top->rvfi_insn != r.insn) mism("insn", top->rvfi_insn, r.insn);
       else if (top->rvfi_trap != r.trap) mism("trap", top->rvfi_trap, r.trap);
       else if (top->rvfi_halt) mism("halt", 1, 0);
-      else if (top->rvfi_intr != intr_seen) mism("intr", top->rvfi_intr, intr_seen);
+      else if (top->rvfi_intr != (intr_seen || prev_trap)) mism("intr", top->rvfi_intr, intr_seen || prev_trap);
       else if (top->rvfi_pc_wdata != r.npc) mism("pc_wdata", top->rvfi_pc_wdata, r.npc);
       else if (top->rvfi_rd_addr != r.rd) mism("rd_addr", top->rvfi_rd_addr, r.rd);
       else if (top->rvfi_rd_wdata != r.rdv) mism("rd_wdata", top->rvfi_rd_wdata, r.rdv);
@@ -331,6 +341,7 @@ int main(int argc, char** argv) {
       }
       if (r.trap) n_trap++;
       intr_seen = false;
+      prev_trap = r.trap;
       if (trace_ret)
         fprintf(stderr, "ret %llu t=%llu gap=%llu pc=%08x insn=%08x%s%s rd=%u:%08x\n",
                 (unsigned long long)retired, (unsigned long long)t, (unsigned long long)gap, r.pc, r.insn,
@@ -495,6 +506,13 @@ int main(int argc, char** argv) {
       }
     }
   }
+#ifdef RISCV_FORMAL
+  if (err.empty() && expect_entries >= 0 && n_entries != (uint64_t)expect_entries)
+    fail("handler entries (rvfi_intr) " + std::to_string(n_entries) + ", expected " +
+             std::to_string(expect_entries), t);
+#else
+  (void)expect_entries;
+#endif
   if (err.empty() && !ended) fail("no verdict", t);
   bool ok = err.empty() && passed;
   std::string txs;
@@ -504,11 +522,13 @@ int main(int argc, char** argv) {
     txs += h;
   }
   printf("{\"pass\":%s,\"seed\":%u,\"pmod\":%d,\"cycles\":%llu,\"retired\":%llu,\"first_retire\":%llu,"
-         "\"max_gap\":%llu,\"cpi\":%.1f,\"intr\":%llu,\"traps\":%llu,\"uart_tx\":\"%s\",\"error\":\"%s\"}\n",
+         "\"max_gap\":%llu,\"cpi\":%.1f,\"intr\":%llu,\"traps\":%llu,\"entries\":%llu,\"uart_tx\":\"%s\","
+         "\"error\":\"%s\"}\n",
          ok ? "true" : "false", seed, pmode, (unsigned long long)t, (unsigned long long)retired,
          (unsigned long long)first_ret_t, (unsigned long long)max_gap,
          retired > 1 ? (double)(last_ret_t - first_ret_t) / (double)(retired - 1) : 0.0,
-         (unsigned long long)n_intr, (unsigned long long)n_trap, txs.c_str(), err.c_str());
+         (unsigned long long)n_intr, (unsigned long long)n_trap, (unsigned long long)n_entries, txs.c_str(),
+         err.c_str());
   (void)quiet;
 #ifdef VCD_TRACE
   if (tfp) tfp->close();

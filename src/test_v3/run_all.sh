@@ -32,7 +32,9 @@ run() {
 run boot boot
 # csr_trap_irq
 run csr csr
-for t in ecall ebreak jal jalr branch zero ones; do run "trap_$t" "trap_$t"; done
+for t in ecall ebreak jal jalr branch zero ones; do run "trap_$t" "trap_$t" --expect-entries 1; done
+# rvfi_intr = 1 on every handler's first instruction: 7 synchronous traps + 1 interrupt
+run trap_chain trap_chain --expect-entries 8
 run irq_timer irq_timer
 run irq_gpio irq_gpio --loop
 run irq_latency irq_latency

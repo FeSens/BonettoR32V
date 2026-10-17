@@ -572,8 +572,11 @@ module tt_um_fesens_r32v (
             r_tr <= e_end & nret & tm;
             if (r_v)
                 r_order <= r_order + 64'd1;
-            if (e_end & sWP & tm & intr)
-                r_ipend <= 1'b1;                        // the next retirement enters the handler
+            // a trap or interrupt sequence ends: the next retirement is the handler's first
+            // instruction (rvfi_intr = 1 for both, contract 8). A synchronous trap's own
+            // retirement comes at this same END and still reports the old value.
+            if (e_end & sWP & tm)
+                r_ipend <= 1'b1;
             else if (e_end & nret)
                 r_ipend <= 1'b0;
             if (e_end & nret)
