@@ -1006,11 +1006,17 @@ def run_remote(args, host):
     timing JSON) are rsynced into a fresh ~/bonetto-formal/run-<id> on the host; the
     remote run holds the host's own lock (flock ~/bonetto-formal/formal.lock, so two
     formal runs don't stack); build/formal.json and the task logs come back; the remote
-    run dir is always deleted. Returns the remote exit code."""
+    run dir is deleted. Returns the remote exit code.
+
+    The remote run is detached from the ssh session (setsid nohup): this runner follows
+    its log, and a dropped connection only makes it follow again. If this runner dies
+    without cleaning up (the Mac crashes, SIGKILL), the remote run finishes on its own
+    and leaves out/formal.json; the next remote run from this machine, or
+    `--fetch-orphans`, fetches it (reap_remote)."""
     import tempfile
 
     # SIGTERM/SIGINT/SIGHUP at any point (staging, rsync, the run) unwind through the
-    # cleanup below, so the remote run dir never outlives an interrupted run.
+    # cleanup below: the remote run is stopped and its dir removed.
     def _stop(*_):
         raise KeyboardInterrupt
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -1018,17 +1024,27 @@ def run_remote(args, host):
     try:
         return _run_remote(args, host, tempfile)
     except KeyboardInterrupt:
-        log("remote: interrupted; the remote run dir was removed")
+        log("remote: interrupted; the remote run was stopped and its dir removed")
         return 130
 
 
-def reap_remote_stale(ssh, node):
-    """Delete this machine's earlier run dirs on the remote host whose local runner is
-    gone (a runner killed with SIGKILL cannot clean up; the host's disk is shared). Run
-    dirs of live runners, and other machines' run dirs, stay."""
+def _ssh(host):
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=4", host]
+
+
+def _node():
+    return os.uname().nodename.split('.')[0]
+
+
+def remote_orphans(ssh, node):
+    """[(run dir name, state)] for this machine's run dirs on the host whose local runner
+    is gone. state: "running" (the detached remote run is still alive), "done" (it
+    finished: `done` holds its exit code, out/formal.json its result) or "dead" (killed,
+    or never started)."""
     p = subprocess.run(ssh + [f"ls -1 {shlex.quote(REMOTE_BASE)} 2>/dev/null"],
                        capture_output=True, text=True)
-    stale = []
+    cands = []
     for d in p.stdout.split():
         m = re.fullmatch(rf"run-{re.escape(node)}-(\d+)-\d+", d)
         if not m:
@@ -1036,18 +1052,83 @@ def reap_remote_stale(ssh, node):
         try:
             os.kill(int(m.group(1)), 0)
         except ProcessLookupError:
-            stale.append(f"{REMOTE_BASE}/{d}")
+            cands.append(d)
         except PermissionError:
             pass
-    if stale:
-        subprocess.run(ssh + ["rm -rf " + " ".join(shlex.quote(s) for s in stale)])
-        log(f"remote: removed {len(stale)} stale run dir(s) of dead runners")
+    if not cands:
+        return []
+    # Alive: its session leader (remote.pid) runs, or (older runs without remote.pid) a
+    # process works inside the dir.
+    script = (f"cd {shlex.quote(REMOTE_BASE)} || exit 0\n"
+              "for d in " + " ".join(shlex.quote(c) for c in cands) + "; do\n"
+              "  if [ -f \"$d/remote.pid\" ] && kill -0 \"$(cat \"$d/remote.pid\")\" 2>/dev/null; then s=running\n"
+              "  elif ls -l /proc/[0-9]*/cwd 2>/dev/null | grep -qE \"/$d(/|\\$)\"; then s=running\n"
+              "  elif [ -f \"$d/done\" ]; then s=done\n"
+              "  else s=dead; fi\n"
+              "  echo \"$d $s\"\n"
+              "done\n")
+    p = subprocess.run(ssh + ["sh -s"], input=script, capture_output=True, text=True)
+    return [tuple(l.split()) for l in p.stdout.splitlines() if len(l.split()) == 2]
+
+
+def reap_remote(ssh, host, node, dest):
+    """Earlier remote runs of this machine whose local runner died: a finished one's
+    formal.json and task logs are fetched into <dest>/orphan-<run id>/ and its dir is
+    deleted; a dead one's dir is deleted; a running one is left alone (it holds the
+    host's lock until it finishes). Returns the fetched formal.json paths."""
+    fetched = []
+    for d, state in remote_orphans(ssh, node):
+        rdir = f"{REMOTE_BASE}/{d}"
+        if state == "running":
+            log(f"remote: orphan {host}:{rdir} is still running (its runner here is gone); "
+                "run with --fetch-orphans once it has finished")
+            continue
+        if state == "done":
+            out = os.path.join(dest, f"orphan-{d}", "formal.json")
+            if fetch_remote(host, rdir, out, os.path.dirname(out)):
+                fetched.append(out)
+                log(f"remote: fetched the result of orphan {host}:{rdir} -> "
+                    f"{os.path.relpath(out, ROOT)}")
+        subprocess.run(ssh + [f"rm -rf {shlex.quote(rdir)}"])
+    return fetched
+
+
+def fetch_remote(host, rdir, out, local_logs):
+    """Copy a remote run's out/formal.json to `out`, its task logs (and counterexample
+    traces, paths made local) into `local_logs`. True if a formal.json came back."""
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    os.makedirs(local_logs, exist_ok=True)
+    if os.path.isfile(out):
+        os.remove(out)
+    subprocess.run(["rsync", "-a", f"{host}:{rdir}/out/formal.json", out])
+    subprocess.run(["rsync", "-a", "--prune-empty-dirs", "--include=*/",
+                    "--include=logfile.txt", "--include=*.sby", "--exclude=*",
+                    f"{host}:{rdir}/build/formal/", local_logs + "/"])
+    subprocess.run(["rsync", "-a", f"{host}:{rdir}/run.log", local_logs + "/"])
+    if not os.path.isfile(out):
+        return False
+    with open(out) as f:
+        res = json.load(f)
+    for c, info in res.get("failures", {}).items():
+        tr = info.get("trace")
+        if tr and "/build/formal/" in tr:
+            rel = tr.split("/build/formal/", 1)[1]
+            dst = os.path.join(local_logs, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            subprocess.run(["rsync", "-a", f"{host}:{rdir}/build/formal/{rel}", dst])
+            info["trace"] = dst
+    res["host"] = host
+    res["work"] = local_logs
+    with open(out, "w") as f:
+        json.dump(res, f, indent=2, sort_keys=True)
+    return True
 
 
 def _run_remote(args, host, tempfile):
     reap_stale(os.path.join(ROOT, "build", "formal"))
-    run_id = f"run-{os.uname().nodename.split('.')[0]}-{os.getpid()}-{int(time.time())}"
+    run_id = f"run-{_node()}-{os.getpid()}-{int(time.time())}"
     rdir = f"{REMOTE_BASE}/{run_id}"
+    qd = shlex.quote(rdir)
     local_logs = os.path.join(ROOT, "build", "formal", f"remote-{run_id}")
     with tempfile.TemporaryDirectory(prefix="bonetto-formal-") as stg:
         # Timing (cosim or the Icarus fallback) runs here, where the cosim lives.
@@ -1081,10 +1162,11 @@ def _run_remote(args, host, tempfile):
         if args.config:
             shutil.copy(args.config, os.path.join(stg, "config.cfg"))
             cfg_arg = ["--config", "config.cfg"]
-        ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", host]
+        ssh = _ssh(host)
+        launched = finished = False
         try:
-            reap_remote_stale(ssh, os.uname().nodename.split('.')[0])
-            rc = subprocess.run(ssh + [f"mkdir -p {shlex.quote(rdir)}"]).returncode
+            reap_remote(ssh, host, _node(), os.path.join(ROOT, "build", "formal"))
+            rc = subprocess.run(ssh + [f"mkdir -p {qd}"]).returncode
             if rc != 0:
                 log(f"remote: cannot reach {host}")
                 return 1
@@ -1096,52 +1178,82 @@ def _run_remote(args, host, tempfile):
             fwd += ["--only", args.only] if args.only else []
             fwd += ["--keep-going"] if args.keep_going else []
             jobs = args.jobs or REMOTE_JOBS
-            rcmd = (f"cd {shlex.quote(rdir)} && flock ../formal.lock env "
-                    f"BONETTO_OSS_CAD={shlex.quote(REMOTE_OSS)} "
-                    f"BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
-                    f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
-                    f"--out out/formal.json --jobs {jobs} --keep "
-                    + " ".join(shlex.quote(a) for a in cfg_arg + fwd))
-            log(f"remote: {host}:{rdir} (jobs={jobs})")
-            # -tt: closing this ssh hangs up the remote run, which then stops its SBY tasks
-            # (SIGHUP handler). On SIGTERM/SIGINT/SIGHUP here: close it, then clean up.
-            sshp = subprocess.Popen(ssh[:1] + ["-tt"] + ssh[1:] + [rcmd])
-            try:
-                rc = sshp.wait()
-            except KeyboardInterrupt:
-                sshp.terminate()
-                sshp.wait()
-                log("remote: interrupted; the remote run was hung up")
-                return 130
-            os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-            os.makedirs(local_logs, exist_ok=True)
-            subprocess.run(["rsync", "-a", f"{host}:{rdir}/out/formal.json", args.out])
-            subprocess.run(["rsync", "-a", "--prune-empty-dirs", "--include=*/",
-                            "--include=logfile.txt", "--include=*.sby", "--exclude=*",
-                            f"{host}:{rdir}/build/formal/", local_logs + "/"])
-            if os.path.isfile(args.out):
-                with open(args.out) as f:
-                    res = json.load(f)
-                # Counterexample traces of failed checks come back too; paths made local.
-                for c, info in res.get("failures", {}).items():
-                    tr = info.get("trace")
-                    if tr and "/build/formal/" in tr:
-                        rel = tr.split("/build/formal/", 1)[1]
-                        dst = os.path.join(local_logs, rel)
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        subprocess.run(["rsync", "-a", f"{host}:{rdir}/build/formal/{rel}", dst])
-                        info["trace"] = dst
-                res["host"] = host
-                res["work"] = local_logs
-                with open(args.out, "w") as f:
-                    json.dump(res, f, indent=2, sort_keys=True)
-                log(f"remote: {args.out} (logs in {os.path.relpath(local_logs, ROOT)})")
-            else:
-                log("remote: no formal.json came back")
-                rc = rc or 1
+            inner = (f"flock ../formal.lock env BONETTO_OSS_CAD={shlex.quote(REMOTE_OSS)} "
+                     f"BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
+                     f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
+                     f"--out out/formal.json --jobs {jobs} --keep "
+                     + " ".join(shlex.quote(a) for a in cfg_arg + fwd))
+            # Detached: its own session (remote.pid = the session leader, whose process
+            # group the stop below signals), no tie to this ssh connection. `done` gets
+            # the exit code.
+            body = f"echo $$ > remote.pid; {inner}; echo $? > done"
+            launch = (f"cd {qd} && setsid nohup sh -c {shlex.quote(body)} "
+                      f"> run.log 2>&1 < /dev/null &")
+            log(f"remote: {host}:{rdir} (jobs={jobs}, detached)")
+            if subprocess.run(ssh + [launch]).returncode != 0:
+                log("remote: launch failed")
+                return 1
+            launched = True
+            # Follow the log until the run ends; a dropped connection follows again.
+            follow = (f"cd {qd} && n=0; while [ ! -f remote.pid ] && [ $n -lt 60 ]; do "
+                      f"sleep 1; n=$((n+1)); done; "
+                      f"tail -n +1 --pid=\"$(cat remote.pid)\" -f run.log")
+            shown = 0
+            while True:
+                p = subprocess.Popen(ssh + [follow], stdout=subprocess.PIPE, text=True)
+                n = 0
+                try:
+                    for line in p.stdout:
+                        n += 1
+                        if n > shown:   # after a reconnect, skip what was already shown
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                            shown = n
+                    p.wait()
+                except KeyboardInterrupt:
+                    p.terminate()
+                    raise
+                st = subprocess.run(
+                    ssh + [f"cd {qd} && if [ -f done ]; then cat done; "
+                           f"elif kill -0 \"$(cat remote.pid 2>/dev/null)\" 2>/dev/null; "
+                           f"then echo running; else echo dead; fi"],
+                    capture_output=True, text=True)
+                state = st.stdout.strip()
+                if st.returncode == 0 and state not in ("", "running"):
+                    break
+                log("remote: lost the run's log; following it again in 30 s")
+                time.sleep(30)
+            finished = True
+            rc = int(state) if state.isdigit() else 1
+            if not fetch_remote(host, rdir, args.out, local_logs):
+                log(f"remote: no formal.json came back ({state})")
+                return rc or 1
+            log(f"remote: {args.out} (logs in {os.path.relpath(local_logs, ROOT)})")
             return rc
         finally:
-            subprocess.run(ssh + [f"rm -rf {shlex.quote(rdir)}"])
+            if launched and not finished:
+                # Interrupted here: stop the remote run (its runner stops its SBY tasks
+                # on SIGTERM), wait for it, then remove the dir.
+                subprocess.run(ssh + [f"cd {qd} && p=$(cat remote.pid 2>/dev/null) && "
+                                      f"kill -TERM -- -$p 2>/dev/null; n=0; while kill -0 $p "
+                                      f"2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n+1)); "
+                                      f"done; true"])
+            subprocess.run(ssh + [f"rm -rf {qd}"])
+
+
+def fetch_orphans(host):
+    """--fetch-orphans: fetch the results of this machine's finished orphaned remote runs
+    (reap_remote) and list the running ones."""
+    got = reap_remote(_ssh(host), host, _node(), os.path.join(ROOT, "build", "formal"))
+    for out in got:
+        with open(out) as f:
+            res = json.load(f)
+        n = sum(1 for v in res.get("checks", {}).values() if v == "PASS")
+        log(f"{os.path.relpath(out, ROOT)}: pass={res.get('pass')} "
+            f"({n}/{len(res.get('checks', {}))} checks PASS)")
+    if not got:
+        log("no finished orphaned remote run to fetch")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1165,10 +1277,17 @@ def main():
     ap.add_argument("--timing", help="timing JSON (cosim --timing-json format)")
     ap.add_argument("--only", help="regex: run only matching checks (result is marked partial)")
     ap.add_argument("--keep", action="store_true", help="keep the work dir")
+    ap.add_argument("--fetch-orphans", action="store_true",
+                    help="with --host: fetch the results of this machine's remote runs whose "
+                    "local runner died (into build/formal/orphan-<run id>/), then exit")
     ap.add_argument("--timing-only", metavar="JSON",
                     help="measure the candidate's timing, write it to JSON and exit")
     args = ap.parse_args()
 
+    if args.fetch_orphans:
+        if not args.host:
+            sys.exit("--fetch-orphans needs --host or BONETTO_FORMAL_HOST")
+        sys.exit(fetch_orphans(args.host))
     if args.host and not args.timing_only:
         sys.exit(run_remote(args, args.host))
     setup_path()

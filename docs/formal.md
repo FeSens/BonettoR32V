@@ -519,19 +519,36 @@ the gate on another machine. The verdict is the same on any host:
 3. The remote run holds the host's own lock (`flock ~/bonetto-formal/formal.lock`), not the Mac's
    heavy lock, with `BONETTO_FORMAL_REMOTE_JOBS` jobs (default 18). It uses the oss-cad-suite at
    `BONETTO_FORMAL_REMOTE_OSS` (default `/opt/hwe-toolchain/oss-cad-suite/bin`).
-4. `formal.json`, the task logs and any counterexample traces come back to
-   `build/formal/remote-<run id>/`.
-5. The remote run dir is always deleted afterwards. During a run, each task's model files and
-   each reach task's traces are deleted as soon as the task finishes. A runner killed with
-   SIGKILL cannot clean up, so each remote run first deletes this machine's remote run dirs
-   whose local runner is gone (`reap_remote_stale`), and each run deletes the local work dirs
-   and `build/formal/remote-*` logs of dead runs (`reap_stale`). Any other exception in the
-   runner stops every SBY task before it exits.
+4. **The remote run is detached** from the ssh session (`setsid nohup`, its session leader's pid
+   in `remote.pid`, its exit code in `done`, its log in `run.log`). The local runner follows the
+   log over ssh; a dropped connection only makes it follow again 30 s later.
+5. `formal.json`, the task logs and any counterexample traces come back to
+   `build/formal/remote-<run id>/`, and the remote run dir is deleted. During a run, each task's
+   model files and each reach task's traces are deleted as soon as the task finishes.
 
-SIGTERM, SIGINT or SIGHUP on the local runner hangs up the ssh session, which stops the remote SBY
-runs, and then cleans up. `BONETTO_FORMAL_REMOTE_DIR` changes the remote base dir (and so the
-lock). With the host set, `test_formal.py` sends every formal run there and skips the local heavy
-lock.
+SIGTERM, SIGINT or SIGHUP on the local runner stops the remote run (SIGTERM to its process group;
+its runner stops every SBY task) and deletes its dir. Any other exception in a runner stops every
+SBY task before it exits.
+
+**Orphans.** A local runner that dies without cleaning up (the Mac crashes or runs out of
+memory, SIGKILL) leaves its remote run alive: it finishes on its own, holding the host's lock,
+and leaves `out/formal.json` and `done` in its dir. (Before the detached mode, such a run was
+hung up whenever sshd noticed the dead connection, possibly hours later, and its finished work
+was lost: that is what happened to the first 7-job V2 run below.) Recovery:
+
+- `run_formal.py --host <host> --fetch-orphans` fetches the result of every finished orphan of
+  this machine (run dirs `run-<this machine>-<pid>-<time>` whose local pid is gone) into
+  `build/formal/orphan-<run id>/formal.json` with its logs, deletes those dirs and dirs of dead
+  orphans, and lists the orphans still running (left alone);
+- every remote run does the same first (`reap_remote`), so orphans never pile up on the host's
+  shared disk;
+- each run also deletes the local work dirs and `build/formal/remote-*` logs of dead runs
+  (`reap_stale`).
+
+`test_formal.py::test_reap_remote_orphans` checks the classification (finished, dead, running,
+live runner, other machine); the SIGKILL, `--fetch-orphans` and SIGTERM paths were exercised on
+hwe-bench. `BONETTO_FORMAL_REMOTE_DIR` changes the remote base dir (and so the lock). With the
+host set, `test_formal.py` sends every formal run there and skips the local heavy lock.
 
 ## What is and is not proven
 

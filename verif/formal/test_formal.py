@@ -195,18 +195,36 @@ def test_aggregate_skipped():
     assert sorted(skipped) == ["gpio", "reg"]
 
 
-def test_reap_remote_stale(tmp_path, monkeypatch):
-    """Remote run dirs of this machine's dead runners are deleted; a live runner's dirs
-    and other machines' dirs stay. The 'ssh' here runs the commands locally."""
+def test_reap_remote_orphans(tmp_path, monkeypatch):
+    """Orphaned remote runs (this machine's run dirs whose local runner is dead): a
+    finished one's result is fetched and its dir deleted, a dead one's dir is deleted, a
+    running one stays. A live runner's dirs and other machines' dirs are never touched.
+    The 'ssh' here runs the commands locally."""
     dead = subprocess.Popen(["true"])
     dead.wait()
-    names = [f"run-mac-{dead.pid}-1", f"run-mac-{os.getpid()}-2", f"run-other-{dead.pid}-3",
-             "formal.lock"]
-    for n in names:
-        (tmp_path / n).mkdir()
-    monkeypatch.setattr(run_formal, "REMOTE_BASE", str(tmp_path))
-    run_formal.reap_remote_stale(["sh", "-c"], "mac")
-    assert sorted(os.listdir(tmp_path)) == sorted(names[1:])
+    base = tmp_path / "remote"
+    done, gone, running = (f"run-mac-{dead.pid}-{i}" for i in (1, 4, 5))
+    keep = [f"run-mac-{os.getpid()}-2", f"run-other-{dead.pid}-3", "formal.lock", running]
+    for n in [done, gone] + keep:
+        (base / n).mkdir(parents=True)
+    (base / done / "done").write_text("0\n")
+    (base / running / "remote.pid").write_text(f"{os.getpid()}\n")
+    monkeypatch.setattr(run_formal, "REMOTE_BASE", str(base))
+    ssh = ["sh", "-c"]
+    assert sorted(run_formal.remote_orphans(ssh, "mac")) == sorted(
+        [(done, "done"), (gone, "dead"), (running, "running")])
+    calls = []
+
+    def fake_fetch(host, rdir, out, logs):
+        calls.append(rdir)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        open(out, "w").write("{}")
+        return True
+    monkeypatch.setattr(run_formal, "fetch_remote", fake_fetch)
+    got = run_formal.reap_remote(ssh, "host", "mac", str(tmp_path / "local"))
+    assert calls == [f"{base}/{done}"]
+    assert got == [str(tmp_path / "local" / f"orphan-{done}" / "formal.json")]
+    assert sorted(os.listdir(base)) == sorted(keep)
 
 
 def test_stage_takes_every_top_level_v(tmp_path):
