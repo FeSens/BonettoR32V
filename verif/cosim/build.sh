@@ -2,6 +2,11 @@
 # Build the cosim harness against a design.
 #
 #   verif/cosim/build.sh MODE [SRC_DIR] [OUT_DIR]
+#   verif/cosim/build.sh
+#
+# With no arguments it builds the standalone C++ pieces instead (no design involved):
+#   build/cosim/test_pmod    unit tests of the QSPI Pmod chip models (pmod.h; test_pmod.py runs it)
+#   build/cosim/libpmod.so   the Pmod models behind a C API (pmod_capi.cpp), for ctypes
 #
 # MODE is rvfi (design built with RISCV_FORMAL, RVFI compared every retirement) or pins (the plain
 # design). SRC_DIR defaults to src/. Every SRC_DIR/*.v file is part of the design (contract
@@ -15,9 +20,21 @@
 # fails.
 set -euo pipefail
 
-MODE="${1:?usage: build.sh rvfi|pins [SRC_DIR] [OUT_DIR]}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COSIM="$ROOT/verif/cosim"
+
+if [ $# -eq 0 ]; then
+  OUT="$ROOT/build/cosim"
+  mkdir -p "$OUT"
+  CXX="${CXX:-c++}"
+  CXXFLAGS=(-O2 -std=c++17 -Wall -Wextra -I"$COSIM")
+  "$CXX" "${CXXFLAGS[@]}" "$COSIM/test_pmod.cpp" -o "$OUT/test_pmod"
+  "$CXX" "${CXXFLAGS[@]}" -fPIC -shared "$COSIM/pmod_capi.cpp" -o "$OUT/libpmod.so"
+  echo "built $OUT/test_pmod $OUT/libpmod.so"
+  exit 0
+fi
+
+MODE="$1"
 SRC="$(cd "${2:-$ROOT/src}" && pwd)"
 OUT="${3:-$ROOT/build/cosim/$MODE}"
 mkdir -p "$OUT"
