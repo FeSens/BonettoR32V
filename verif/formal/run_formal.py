@@ -456,6 +456,16 @@ def pick_depth(cfg, timing):
     return depth, d_min
 
 
+def short_depth(cfg, timing):
+    """Per-check option depth=short: reset + first_retire + max_cycles_per_insn + margin.
+    Covers any instruction as the first retirement (pc 0, free registers and memory) and
+    any instruction as the second retirement after a first one that is no slower than the
+    measured first retirement (an ALU op, or a JALR that sets an arbitrary pc). Not
+    covered: two slow (memory) instructions in a row."""
+    return (cfg["reset_steps"] + int(timing["first_retire_cycle"]) +
+            int(timing["max_cycles_per_insn"]) + cfg["depth_margin"])
+
+
 # ---------------------------------------------------------------------------
 # SBY task generation
 # ---------------------------------------------------------------------------
@@ -769,6 +779,16 @@ def run_task(name, path, timeout):
     RUNNING.pop(pr.pid, None)
     dt = time.time() - t0
     status, detail = parse_task(tdir, name)
+    # Disk: drop the task's model files (large, never read back), and the traces of a
+    # reach task (only its failed labels matter). A proof's counterexample trace stays.
+    d = os.path.join(tdir, name)
+    shutil.rmtree(os.path.join(d, "model"), ignore_errors=True)
+    if name.endswith("_reach"):
+        eng = os.path.join(d, "engine_0")
+        for f in os.listdir(eng) if os.path.isdir(eng) else []:
+            if f.startswith("trace"):
+                os.remove(os.path.join(eng, f))
+        detail["traces"] = {}
     return name, status, dt, detail
 
 
@@ -990,8 +1010,14 @@ def main():
                               "timing_source": tsrc, "timing": timing}
     log(f"timing ({tsrc}): first_retire={timing['first_retire_cycle']} "
         f"max_cycles_per_insn={timing['max_cycles_per_insn']} -> D_min={d_min}, D={depth}")
-    if depth > cfg["depth_cap"]:
-        result["error"] = f"D={depth} exceeds depth_cap={cfg['depth_cap']}: too slow for the formal policy"
+    d_short = short_depth(cfg, timing)
+    result["depth_policy"]["d_short"] = d_short
+    deepest = max((d_short if o.get("depth") == "short" else depth) + int(o.get("depth_add", 0))
+                  for _, _, o in cfg["checks"])
+    log(f"short depth (depth=short checks) = {d_short}; deepest task = {deepest}")
+    if deepest > cfg["depth_cap"]:
+        result["error"] = (f"deepest task depth {deepest} exceeds depth_cap={cfg['depth_cap']}: "
+                           f"too slow for the formal policy")
         log(result["error"])
         finish(1)
 
@@ -1006,7 +1032,8 @@ def main():
         timeout = int(opts.get("timeout", cfg["timeout_s"]))
         ekey = opts.get("engine", kind if kind in cfg["engines"] else "bmc")
         eng = cfg["engines"][ekey]
-        tdepth = depth + int(opts.get("depth_add", 0))
+        base = short_depth(cfg, timing) if opts.get("depth") == "short" else depth
+        tdepth = base + int(opts.get("depth_add", 0))
         if kind == "insn":
             insns = [i for i in isa_insns() if not only or only.search(f"insn_{i}")]
             ngroups = min(len(insns), int(opts.get("groups", len(insns)))) if insns else 0

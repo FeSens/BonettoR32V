@@ -172,14 +172,22 @@ module bonetto_unique_check (
 	end
 endmodule
 
-// liveness (fork). Contract section 4 latency cap: the first instruction retires
-// within 1,024 cycles of reset release and every later one within 1,024 cycles of
-// the previous retirement; a halted core is exempt (the halting retirement starts
-// no window). gap counts cycles since the last retirement or reset step, and the
-// assertion fires on the step where the 1,024-cycle window closes without a
-// retirement. This is a safety property: with `abc pdr` it is proven for all time;
-// with BMC it covers only windows that close within the depth (see docs/formal.md).
-// Stock liveness fires `check` right after `trig` in unbounded mode.
+// liveness (fork). Contract section 4 latency cap, with its edge count: edge 0 is
+// the last rising edge at which rst_n is sampled low; the first retirement (rvfi_valid
+// sampled high) comes at an edge <= 1,024, and each later one at most 1,024 edges
+// after the previous; a halted core is exempt (the halting retirement starts no
+// window).
+// Step/edge map (contract notation: X(t) is the value after edge t): BMC step s holds
+// X(s-1), so a signal is sampled at edge e in step e. Reset is step 0, so edge 0 is the
+// transition out of step 0, and "rvfi_valid sampled high at edge e" is rvfi_valid = 1
+// in step e. gap is 1 in step 1 and counts up by one per step without a retirement
+// (after a retirement in step r it is 1 in step r + 1), so gap = e - (edge of the last
+// retirement, or 0) in step e. The assertion fires in step e when gap reaches 1,024
+// without rvfi_valid: a retirement at edge 1,024 (or 1,024 edges after the previous)
+// passes, one edge later fails. The stall_* mutant pairs pin this boundary.
+// This is a safety property; BMC covers only windows that close within the depth
+// (see docs/formal.md). Stock liveness fires `check` right after `trig` in unbounded
+// mode.
 module bonetto_liveness_check (
 	`BONETTO_CHECKER_PORTS
 );
