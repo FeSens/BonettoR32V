@@ -1,6 +1,7 @@
 // LEGAL VARIANT legal_trap_fields (harness self-test): a copy of the seed core (97153ff)
-// that reports arbitrary register-read fields, rd_wdata and pc_wdata on a trapping
-// retirement. Contract section 6 doesn't compare those on a trap, so it must PASS.
+// that reports arbitrary rd_wdata and pc_wdata on every trapping retirement, and arbitrary
+// register-read fields on a trap that reads no register (ECALL, EBREAK, the illegal words,
+// JAL). Contract section 6 (e321614) doesn't compare those, so it must PASS.
 /*
  * BonettoR32V seed core (champion zero).
  *
@@ -382,10 +383,11 @@ module tt_um_fesens_r32v (
     assign rvfi_intr      = 1'b0;
     assign rvfi_mode      = 2'd3;
     assign rvfi_ixl       = 2'd1;
-    assign rvfi_rs1_addr  = trap ? 5'd7 : r_rs1 ? rs1 : 5'd0;             // VARIANT
-    assign rvfi_rs2_addr  = trap ? 5'd9 : r_rs2 ? rs2 : 5'd0;             // VARIANT
-    assign rvfi_rs1_rdata = trap ? 32'hdeadbeef : r_rs1 ? rs1_val : 32'd0; // VARIANT
-    assign rvfi_rs2_rdata = trap ? 32'h0badf00d : r_rs2 ? rs2_val : 32'd0; // VARIANT
+    wire   free_rs        = trap & ~is_branch & ~is_jalr;  // VARIANT: e321614
+    assign rvfi_rs1_addr  = free_rs ? 5'd7 : r_rs1 ? rs1 : 5'd0;             // VARIANT
+    assign rvfi_rs2_addr  = free_rs ? 5'd9 : r_rs2 ? rs2 : 5'd0;             // VARIANT
+    assign rvfi_rs1_rdata = free_rs ? 32'hdeadbeef : r_rs1 ? rs1_val : 32'd0; // VARIANT
+    assign rvfi_rs2_rdata = free_rs ? 32'h0badf00d : r_rs2 ? rs2_val : 32'd0; // VARIANT
     assign rvfi_rd_addr   = rd_we ? rd : 5'd0;
     assign rvfi_rd_wdata  = trap ? 32'h00001234 : rd_we ? rd_wdata : 32'd0; // VARIANT
     assign rvfi_pc_rdata  = pc;

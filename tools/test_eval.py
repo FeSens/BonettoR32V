@@ -493,9 +493,20 @@ PROGRAMS_MAKEFILE = (
 FAKE_COSIM = """
 import argparse, json, os, sys
 ap = argparse.ArgumentParser()
-for a in ("--mode", "--prog", "--seed"):
-    ap.add_argument(a, required=True)
+ap.add_argument("--fuzz-liveness", action="store_true")
+ap.add_argument("--seed", required=True)
+ap.add_argument("--mode")
+ap.add_argument("--prog")
 a = ap.parse_args()   # an unexpected --max-cycles is an argparse error (exit 2)
+if a.fuzz_liveness:
+    assert a.mode is None and a.prog is None
+    bad = os.environ.get("FAKE_FUZZ")
+    print(json.dumps({"prog": "fuzz_liveness", "mode": "rvfi", "seed": int(a.seed),
+                      "pass": bad != "fail", "liveness_checked": bad != "unchecked",
+                      "runs": 3 if bad == "short" else 2056,
+                      "error": "latency cap: no retirement" if bad == "fail" else None}))
+    sys.exit(1 if bad == "fail" else 0)
+assert a.mode and a.prog
 retired = 10 if "selftest" in a.prog else 1000
 fail = os.environ.get("FAKE_COSIM_FAIL") == a.mode
 gap = int(os.environ.get("FAKE_COSIM_GAP", "100"))
@@ -528,6 +539,9 @@ def test_cosim_adapter_passes(cosim_repo):
 @pytest.mark.parametrize("env,msg", [
     ({"FAKE_COSIM_FAIL": "pins"}, "rd mismatch"),
     ({"FAKE_COSIM_GAP": "1025"}, "exceeds the latency cap"),
+    ({"FAKE_FUZZ": "fail"}, "liveness fuzz --seed 1: latency cap"),
+    ({"FAKE_FUZZ": "unchecked"}, "liveness was not checked"),
+    ({"FAKE_FUZZ": "short"}, "only 3 fuzz runs"),
 ])
 def test_cosim_adapter_fails(cosim_repo, monkeypatch, env, msg):
     for k, v in env.items():

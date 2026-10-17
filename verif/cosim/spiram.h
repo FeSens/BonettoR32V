@@ -123,7 +123,6 @@ class SpiRam {
   // clears it. It tells a region WRITE from a program WRITE before the transaction ends.
   bool write_addr_seen = false;
   uint16_t write_addr = 0;
-  uint64_t write_addr_at = 0;
 
   std::vector<SpiTxn>& done() { return done_; }
   const std::string& error() const { return err_; }
@@ -177,7 +176,6 @@ class SpiRam {
       if (n == 23 && cur_.write) {
         write_addr_seen = true;
         write_addr = cur_.addr;
-        write_addr_at = t;
       }
       return true;
     }

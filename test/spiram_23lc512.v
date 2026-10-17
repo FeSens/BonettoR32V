@@ -15,6 +15,15 @@
  *   5. a WRITE ends on a byte boundary with at least one data byte;
  *   also: CS_n = 1 and SCK = 0 after every clk edge with rst_n low, and no X/Z on CS_n or SCK
  *   once reset is released.
+ * and the transaction classes of contract section 6, as far as the pins alone show them (the
+ * cosim checks each transaction against its instruction; this catches what synthesis might
+ * break in a design that passed it):
+ *   - every byte a transaction addresses (a READ's partly clocked last byte included) is in the
+ *     core region 0xFF80-0xFFFF, or none is: a transaction doesn't wrap out of the region or run
+ *     into it. A READ with no data bit (a null READ) addresses nothing;
+ *   - a program READ addresses at most 4 bytes (a fetch is exactly 4, a load at most 4);
+ *   - between two program READs (each instruction starts with its fetch, a program READ in the
+ *     test program), program WRITEs (one store's) write at most 4 bytes, none of them twice.
  * MISO (rule 3) carries the response bit from the moment SCK rises until it falls, and is X while
  * SCK is low, outside a READ's data phase and while CS_n is high. The model computes the next bit
  * one clk after the previous rising SCK edge, which is before the next one (SCK phases last at
@@ -51,6 +60,12 @@ module spiram_23lc512 #(
     reg [15:0] addr;
     reg [7:0]  wbyte;
     reg        next_bit;   // MISO value for the next rising SCK edge (X when none)
+    // contract section 6 classes
+    reg        t_region, t_prog;   // this transaction addressed a region / a program byte
+    reg [15:0] wa [0:3];           // program bytes written since the last program READ
+    integer    wcount;
+    reg [15:0] ba;                 // the byte a data bit addresses
+    integer    j;
 
     integer i;
     integer seed;
@@ -69,6 +84,7 @@ module spiram_23lc512 #(
         in_txn   = 1'b0;
         started  = 1'b0;
         nbits    = 0;
+        wcount   = 0;
     end
 
     // rule 3: MISO is valid only while SCK is high
@@ -82,6 +98,7 @@ module spiram_23lc512 #(
             if (cs_n !== 1'b1 || sck !== 1'b0)
                 $fatal(1, "spiram: during reset CS_n = %b, SCK = %b (must be 1, 0)", cs_n, sck);
             in_txn <= 1'b0;
+            wcount = 0;
         end else if (started) begin
             if ((cs_n !== 1'b0 && cs_n !== 1'b1) || (sck !== 1'b0 && sck !== 1'b1))
                 $fatal(1, "spiram: CS_n = %b, SCK = %b after reset (X or Z)", cs_n, sck);
@@ -92,6 +109,8 @@ module spiram_23lc512 #(
                 in_txn   <= 1'b1;
                 nbits    <= 0;
                 next_bit <= 1'bx;
+                t_region <= 1'b0;
+                t_prog   <= 1'b0;
             end
             if (c_q === 1'b0 && cs_n === 1'b1 && in_txn) begin
                 // rules 4 and 5 at the end of a transaction
@@ -118,6 +137,32 @@ module spiram_23lc512 #(
                     wbyte <= {wbyte[6:0], mosi};
                     if ((nbits - 24) % 8 == 7)
                         mem[(addr + (nbits - 24) / 8) & 16'hFFFF] <= {wbyte[6:0], mosi};
+                end
+                if (nbits >= 24 && (nbits - 24) % 8 == 0) begin
+                    // the first bit of byte k = (nbits - 24) / 8: it is addressed from now on
+                    ba = (addr + (nbits - 24) / 8) & 16'hFFFF;
+                    if (ba >= 16'hFF80) begin
+                        if (t_prog)
+                            $fatal(1, "spiram: transaction at 0x%04x runs from program RAM into the core region 0xFF80-0xFFFF (byte 0x%04x; contract section 6)", addr, ba);
+                        t_region <= 1'b1;
+                    end else begin
+                        if (t_region)
+                            $fatal(1, "spiram: transaction at 0x%04x wraps out of the core region 0xFF80-0xFFFF (byte 0x%04x; contract section 6)", addr, ba);
+                        t_prog <= 1'b1;
+                        if (cmd == 8'h03) begin
+                            if (nbits >= 24 + 32)
+                                $fatal(1, "spiram: program READ at 0x%04x addresses a fifth byte (0x%04x): a fetch reads exactly 4, a load at most 4 (contract section 6)", addr, ba);
+                            wcount = 0;   // a program READ: the previous store is over
+                        end else begin
+                            for (j = 0; j < wcount; j = j + 1)
+                                if (wa[j] == ba)
+                                    $fatal(1, "spiram: program byte 0x%04x written a second time since the last program READ (a store writes each byte once; contract section 6)", ba);
+                            if (wcount == 4)
+                                $fatal(1, "spiram: a fifth program byte (0x%04x) written since the last program READ (a store writes at most 4; contract section 6)", ba);
+                            wa[wcount] = ba;
+                            wcount = wcount + 1;
+                        end
+                    end
                 end
                 // the bit for the next rising SCK edge: READ data bit j = nbits + 1 - 24
                 if (cmd == 8'h03 && nbits == 23)            // this edge completed the address
