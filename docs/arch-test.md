@@ -82,6 +82,13 @@ with bits 16..20 set (the sign included) are covered instead by `verif/programs/
 section 7: a JAL by +0xF0010 and one by -0xFFFF0, whose targets alias to code a few bytes ahead
 while AUIPC sees the full 32-bit pc.
 
+This exclusion is the lead's ruling R10, and `run_arch.py` locks it: `EXCLUDED = {"jal-01":
+inst_1..inst_15}`. A test whose planned exclusions differ from that set (one case more or fewer, or
+an exclusion in any other test), or that is left with no runnable piece, fails, and so does the
+whole run when the union of the exclusions differs from the ruled set. A suite update that changes
+which cases don't fit must come back to the lead, not shrink the suite silently. The reference
+ISS's RAM dump is deleted before each ISS run, so a stale dump can't stand in for a crashed run.
+
 ## Skipped tests
 
 Only tests that need CSRs or a trap handler are skipped:

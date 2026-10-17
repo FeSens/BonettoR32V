@@ -78,6 +78,9 @@ def discover():
     missing = sorted(set(SKIP) - set(skipped))
     if missing:
         raise SystemExit(f"run_arch.py: SKIP lists tests the suite doesn't have: {missing}")
+    missing = sorted(set(EXCLUDED) - set(tests))
+    if missing:
+        raise SystemExit(f"run_arch.py: EXCLUDED lists tests the suite doesn't run: {missing}")
     return tests, skipped
 
 
@@ -132,6 +135,9 @@ def reference(name: str, elf: Path) -> list:
 # in 64 KB at all (jal-01's 512 KB and 1 MB jumps alias onto the jump itself): it is excluded and
 # listed in build/arch/report.json and docs/arch-test.md.
 CODE_BUDGET = 0xB000  # case bytes per piece; leaves room for boot, epilog, data, 4 KB alignment
+# The lead's ruling R10: exactly these cases are excluded, nothing else. Any other exclusion (a
+# suite update, a planning bug) fails the test instead of silently shrinking the suite.
+EXCLUDED = {"jal-01": set(range(1, 16))}
 CASE_RE = re.compile(r"^inst_(\d+):")
 SIGBASE_RE = re.compile(r"^\s*RVTEST_SIGBASE\(")
 
@@ -210,6 +216,11 @@ def one(name: str, src: Path, design: Path, seeds) -> tuple:
     except (RuntimeError, KeyError, StopIteration) as ex:
         return False, f"planning failed: {ex}", {}
     info = {"pieces": len(pieces), "excluded_cases": excluded}
+    if set(excluded) != EXCLUDED.get(name, set()):
+        return False, (f"excluded cases {sorted(excluded)} differ from the ruled set "
+                       f"{sorted(EXCLUDED.get(name, set()))} (ruling R10)"), info
+    if not pieces or any(keep is not None and not keep for keep in pieces):
+        return False, f"no runnable piece (pieces {pieces})", info
     for k, keep in enumerate(pieces):
         tag = name if keep is None else f"{name}.p{k}"
         psrc = src if keep is None else piece_source(src, keep, d / f"{tag}.S")
@@ -243,6 +254,7 @@ def one_piece(name: str, src: Path, d: Path, design: Path, seeds) -> tuple:
         return False, f"spike's signature has {len(ref)} words, expected {(e - b) // 4}"
     # the reference ISS: EBREAK, no unwritten register read, no unspecified instruction
     iss_ram = d / f"{name}.iss.bin"
+    iss_ram.unlink(missing_ok=True)
     p = run([ISS, hexf, "--check-init", "--ui", "pins", "--seed", "1", "--dump-ram", iss_ram])
     if p.returncode != 0:
         tail = p.stdout.strip().splitlines()[-1:] or [p.stderr[-300:]]
@@ -317,13 +329,26 @@ def main() -> int:
                   flush=True)
     ordered = {n: results[n] for n in sorted(results)}
     ok = bool(ordered) and all(ordered.values()) and len(ordered) == len(tests)
+    # ruling R10 for the whole run: the excluded cases are exactly EXCLUDED (for the tests run)
+    ruled = {n: {f"inst_{c}" for c in cs} for n, cs in EXCLUDED.items() if n in tests}
+    got = {n: set(cs) for n, cs in excluded.items()}
+    if got != ruled:
+        ok = False
+
+        def show(d):
+            return sorted((n, sorted(c, key=lambda s: int(s.split("_")[1]))) for n, c in d.items())
+
+        errors["(excluded cases)"] = f"excluded {show(got)}, ruled {show(ruled)}"
+        print(f"FAIL excluded cases differ from ruling R10: {errors['(excluded cases)']}",
+              flush=True)
     # a partial run (--only) never writes build/arch.json, so it can't pass for the full suite
     out = OUT / "only.json" if a.only else summary
     out.write_text(json.dumps({"pass": ok, "tests": ordered}, indent=1) + "\n")
     (OUT / "report.json").write_text(json.dumps(
         {"pass": ok, "seeds": seeds, "src": str(a.src), "only": a.only, "errors": errors,
          "skipped": skipped, "split": split, "excluded_cases": excluded}, indent=1) + "\n")
-    print(json.dumps({"pass": ok, "tests": len(ordered), "failed": len(errors),
+    print(json.dumps({"pass": ok, "tests": len(ordered),
+                      "failed": sum(not v for v in ordered.values()),
                       "skipped": len(skipped), "split": split,
                       "excluded_cases": {n: len(c) for n, c in excluded.items()}}))
     return 0 if ok else 1
