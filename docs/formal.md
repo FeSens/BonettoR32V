@@ -278,9 +278,13 @@ cycle c is BMC step c + 1, and margin covers it.
 A short-depth trace therefore covers the first retirement, plus one more retirement of the
 class under check after the fastest first retirement. The full depth D also covers a retirement
 of the slowest class after the slowest first retirement (on the seed: a load after a load).
-Slower instances than the timing program measures (none in the seed, whose shifter is a barrel
-shifter) are left to cosim and the architecture tests. Each check's reach task still demands
-that its triggers occur within the depth.
+Slower instances than the timing programs measure are left to cosim and the architecture tests.
+The seed has none (its shifter is a barrel shifter). hyp/002-rf-in-ram-pcram (b9a5211) has one:
+its commit message measures 993 cycles for a SW or JALR as the very first instruction after
+reset (its own directed tests), and no cosim program starts with one, so the measured first
+retirement is 729. A trace still reaches such a first retirement within the depth (994 < 1,623),
+but not a slow second retirement after it. Each check's reach task still demands that its
+triggers occur within the depth.
 
 | | seed (`src/`) | bit-serial (hyp/001, 9a39f1d) |
 |---|---|---|
@@ -458,9 +462,9 @@ Results, on hwe-bench unless marked Mac:
 | trap_program_write | seed | a program WRITE (0x0100) before a trap retires | bus_dmem | FAIL: `bus_dmem_write_claimed` |
 | trap_region_wrap | seed | a READ at 0xFFFE before a trap: 0xFFFE-0x0001 | bus_dmem | FAIL: `bus_region_mixed` |
 | trap_region_straddle | seed | a READ at 0xFF7E before a trap: 0xFF7E-0xFF81 | bus_dmem | FAIL: `bus_region_mixed` |
-| region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | REGION_WRAP_RESULT |
-| region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | REGION_STRADDLE_RESULT |
-| region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | REGION_ZERO_INIT_RESULT |
+| region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
+| region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
+| region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | FAIL (Mac): `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
 | reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1`, `reg_rs2` |
 | rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
 | sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
@@ -550,8 +554,9 @@ Not proven:
   ISA, bus or liveness properties. A bug that needs three or more retirements of a slow class, or
   internal state built up over many instructions, is cosim's and the architecture tests' to
   find.
-- Instruction instances slower than the timing program measured (for example, a
-  shift-amount-dependent shifter shifting further than the program does).
+- Instruction instances slower than the timing programs measured (for example, a
+  shift-amount-dependent shifter shifting further than the programs do, or b9a5211's
+  993-cycle first-instruction SW or JALR followed by a slow second retirement).
 - A reset after the start: `rst_n` goes low only at the beginning (the `reset` check varies its
   length from 1 to 8 edges).
 - Encodings with register fields x16-x31 and other UNSPECIFIED behaviour: the E filter drops them
