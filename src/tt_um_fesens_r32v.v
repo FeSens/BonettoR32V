@@ -94,9 +94,8 @@ module tt_um_fesens_r32v (
     reg  [5:0]  j;      // bit counter (40..63 command/address, 0.. data), shift pre-roll
     reg         sck, mosi;
     reg         mem;    // load/store goes to RAM (address bit 31 = 0); 1 until the first retirement
-    reg         cy;     // ALU carry; sign latch in W
+    reg         cy;     // ALU carry; sign latch in W; carry of the + 4 (WP, WP4, W4) and + 2 (BH2)
     reg         cmp;    // compare; address[1:0] == 0; JALR target[1]; shift fill state
-    reg         c4;     // carry of the on-the-fly + 4 (W family) and + 2 (BH2)
     reg  [32:0] bfr;    // operand/result buffer ring
     reg  [30:0] irs;    // instruction register, in SPI order, without insn[1]
     reg  [7:0]  gpo;
@@ -255,12 +254,12 @@ module tt_um_fesens_r32v (
                   c_slt ? ((j[4:0] == 5'd0) & cmp) :
                   c_sh  ? (shfill ? (insn[30] & cy) : wtap) :
                           wtap;
-    wire wpl    = wtap ^ (c4 & winc);             // WP, WP4, W4
+    wire wpl    = wtap ^ (cy & winc);             // WP, WP4, W4
     wire wdo    = sW ? wd : wpl;
 
     // BH2: address + 2 on the even phases, in the SCK-low clocks between the data strobes
     wire inc2   = (ep == E_DATA) & ~sck & hi & fO;
-    wire cin2   = (ph == 6'd2) | c4;
+    wire cin2   = (ph == 6'd2) | cy;
 
     // ------------------------------------------------------------------------------------
     // MOSI
@@ -386,10 +385,16 @@ module tt_um_fesens_r32v (
     // Datapath flags (no reset)
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
-        if (sW) begin
+        if ((ep == E_CMD) & j[5])
+            cy <= 1'b0;
+        else if (sW) begin
             if (wem & ~wfill)
                 cy <= c_ld ? bfm : wtap;
-        end else if (stb)
+        end else if (wem)
+            cy <= (j[4:0] == 5'd1) | (cy & wtap);
+        else if (inc2)
+            cy <= bfr[1] & cin2;
+        else if (stb & fR)
             cy <= cout;
 
         if (stb & sA) begin
@@ -408,12 +413,6 @@ module tt_um_fesens_r32v (
                 cmp <= 1'b1;
         end
 
-        if (wem)
-            c4 <= (j[4:0] == 5'd1) | (c4 & wtap);
-        else if (inc2)
-            c4 <= bfr[1] & cin2;
-        else if (ep == E_CMD)
-            c4 <= 1'b0;
 
         // bit counter
         if (((ep == E_IDLE) & (ph == 6'd16)) | ((ep == E_PC) & (j == 6'd63)))
