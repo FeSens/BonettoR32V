@@ -474,9 +474,10 @@ Levers if a candidate is slower than 9a39f1d (none is in the gate today):
       one call.
 
     A single call has to find a trace of the full depth even when the violation is at step
-    1,026, so a liveness counterexample can take longer than a proof. At depth 1,487 (see
-    "Mutants"), the counterexamples took 296 to 1,832 s and the proofs 87 to 309 s (658 s for
-    the seed's own).
+    1,026, so a liveness counterexample can take longer than a proof. At depth 1,487 on
+    hwe-bench, the counterexamples took 296 to 1,832 s and the proofs 87 to 309 s (658 s for
+    the seed's own) with the v1 checks, and 221 to 2,530 s against 113 and 353 s at 5d23efc
+    (see "Mutants").
 - **yices** stalls on the bus checks.
 - **abc bmc3**: see above.
 - **abc pdr**:
@@ -506,8 +507,11 @@ legal variants (`"expect": "pass"`, `"checks": "all"`) must pass the whole fast 
 `_1024` stall mutants must PASS their check. Mutants marked `"slow"` (the hyp/002 cores, hours
 each) run only with `BONETTO_FORMAL_SLOW=1`.
 
-Results, on hwe-bench unless marked Mac. The fast mutants and the legal variants were re-run at
-5d23efc, after fix round 3 (region stop from the spec only); the hyp/002 rows are noted.
+Results, all on hwe-bench (shared with other runs at the time). Every FAIL mutant on the seed's
+timing was re-run at 7b2aba3, the final checks (3 jobs); the liveness mutants ran at 5d23efc
+(2 jobs); the hyp/002 and legal rows say where they ran. Which assertions fail first can differ
+between runs of the same mutant; the table gives the 7b2aba3 run and notes an earlier run's extra
+ones.
 
 | mutant | RTL | bug | checks | result: failed assertions |
 |---|---|---|---|---|
@@ -516,12 +520,12 @@ Results, on hwe-bench unless marked Mac. The fast mutants and the legal variants
 | cs_open_at_retire | cosim | CS_n still low in the retirement cycle | spi | FAIL: `spi_cs_at_valid` |
 | write_midbyte | seed | store WRITE one bit short | spi, bus_dmem | FAIL: `spi_rule5_write`; `bus_dmem_store_once`, `bus_dmem_store_value` |
 | miso_low | seed | samples MISO while SCK is low | bus_imem | FAIL: `bus_imem_value` |
-| refetch | seed | every instruction fetched twice | bus_imem | FAIL (Mac): `bus_imem_refetch` |
+| refetch | seed | every instruction fetched twice | bus_imem | FAIL: `bus_imem_refetch` |
 | fetch_extra_byte | cosim | the fetch READ clocks a fifth byte | bus_imem, bus_dmem | FAIL: `bus_imem_fetch`; `bus_dmem_read_claimed` |
 | zero_init | cosim | pc not reset (relies on power-up 0) | rvfi, bus_imem | FAIL: `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
 | load_half_swap | seed | LH/LHU bytes swapped | bus_dmem | FAIL: `bus_dmem_load_value` |
 | load_own_fetch | cosim | an LW at its own pc reuses the fetch, no READ | bus_dmem | FAIL: `bus_dmem_load_read` |
-| load_skip_byte | cosim | LW reads 3 bytes, takes the 4th from the shift register | bus_dmem | FAIL: `bus_dmem_load_value` |
+| load_skip_byte | cosim | LW reads 3 bytes, takes the 4th from the shift register | bus_dmem | FAIL: `bus_dmem_load_read`, `bus_dmem_load_value` |
 | store_twice | cosim | every store WRITE sent twice | bus_dmem | FAIL: `bus_dmem_store_once` |
 | store_extra_byte | cosim | SB writes a second byte | bus_dmem | FAIL: `bus_dmem_write_claimed` |
 | trap_program_write | seed | a program WRITE (0x0100) before a trap retires | bus_dmem | FAIL: `bus_dmem_write_claimed` |
@@ -530,24 +534,24 @@ Results, on hwe-bench unless marked Mac. The fast mutants and the legal variants
 | region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
 | region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
 | region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | FAIL (Mac): `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
-| reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1` (`reg_rs2` too in another run) |
+| reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1`, `reg_rs2` |
 | rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
 | sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
 | trap_fields_brj | seed | junk rs fields on every trap | insn_jalr | FAIL: `insn_trap_rs1_addr`, `insn_trap_rs2_addr` |
-| claim_region_stop | seed | an OP with rs1 = rs2 flips result bit 0 and claims a 1-byte read at 0xFF80 | insn_add | FAIL: `insn_rmask` (it PASSed the 282f6d8 checks, which also stopped on a claimed region access) |
+| claim_region_stop | seed | an OP with rs1 = rs2 flips result bit 0 and claims a 1-byte read at 0xFF80 | insn_add | FAIL: `insn_rmask`, 46 s (it PASSed the 282f6d8 checks, which also stopped on a claimed region access) |
 | trap_writes_rd | cosim | a trapping JAL writes rd | insn_jal, rvfi | FAIL: `insn_trap_rd_addr`; `conv_trap_rd_addr` |
 | trap_continues | seed | fetches again after a misaligned-target trap | silent | FAIL: `silent_retire` (and `silent_write` in another run) |
 | no_halt | cosim | EBREAK traps but the core keeps running | silent | FAIL: `silent_retire` |
 | region_write_after_halt | seed | a region WRITE (0xFF80) after the halt | silent | FAIL: `silent_write` |
-| gpio_any_byte | seed | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold`, `gpio_uo_cause`, `gpio_uo_value` |
+| gpio_any_byte | seed | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold` (`gpio_uo_cause`, `gpio_uo_value` too at 5d23efc) |
 | uo_glitch | cosim | uo_out shows the value, restores the old one, then sets it again | gpio | FAIL: `gpio_uo_once` |
 | uo_late | cosim | uo_out set two cycles after the store retires | gpio | FAIL: `gpio_uo_hold` |
 | norvfi_diff | seed | uo_out inverted in the plain build only | equiv | FAIL (pre-pass) |
-| hang_reserved | seed | custom-0 opcode hangs | liveness (deep) | FAIL (Mac): `liveness` (the first instruction hangs, no retirement) |
-| stall_first_1024 | seed | first retirement at edge 1,024 | liveness (deep) | PASS (Mac) |
-| stall_first_1025 | seed | first retirement at edge 1,025 | liveness (deep) | FAIL (Mac): `liveness` |
-| stall_later_1024 | seed | a gap of 1,024 edges | liveness (deep) | PASS (Mac) |
-| stall_later_1025 | seed | a gap of 1,025 edges | liveness (deep) | FAIL (Mac): `liveness` |
+| hang_reserved | seed | custom-0 opcode hangs | liveness (deep) | FAIL: `liveness`, 221 s (the first instruction hangs, no retirement) |
+| stall_first_1024 | seed | first retirement at edge 1,024 | liveness (deep) | PASS, 113 s |
+| stall_first_1025 | seed | first retirement at edge 1,025 | liveness (deep) | FAIL: `liveness`, 519 s |
+| stall_later_1024 | seed | a gap of 1,024 edges | liveness (deep) | PASS, 353 s |
+| stall_later_1025 | seed | a gap of 1,025 edges | liveness (deep) | FAIL: `liveness`, 2,530 s |
 | legal_mosi_echo | cosim | MOSI carries noise after the last bit (CS_n still low) | all (fast) | PASS, 56 checks |
 | legal_split_store | cosim | SW as two 2-byte WRITEs | all (fast) | PASS, 56 checks |
 | legal_trap_fields_nb | seed | junk rs fields, rd_wdata and pc_wdata on non-branch traps | all (fast) | PASS, 56 checks |
@@ -557,9 +561,11 @@ Results, on hwe-bench unless marked Mac. The fast mutants and the legal variants
 | legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | running at the time of writing (detached, hwe-bench) |
 | legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | running at the time of writing (detached, hwe-bench); the first attempt PASSed every proof that finished (see "Measured runtimes") |
 
-On the seed's timing, every FAIL above came within 210 s of proof time (the slowest: the
-`stall_first_1025` liveness counterexample, 208 s on the Mac; on hwe-bench `write_midbyte`'s
-`bus_dmem`, 181 s, with other runs sharing the host). A legal variant's whole fast run took
+On the seed's timing, every fast-config FAIL above came within 227 s of proof time at 7b2aba3
+(the slowest: `load_half_swap`'s `bus_dmem`, 226.5 s, with the V2 and fc07cc3 runs sharing the
+host). The liveness counterexamples (deep, depth 1,487) are slower: 221 to 2,530 s on hwe-bench
+at 5d23efc, against 208 s for `stall_first_1025` on the Mac in an earlier run (see "Engines
+tried" on why a single-call liveness counterexample can take longer than a proof). A legal variant's whole fast run took
 215 to 253 s with 10 jobs. The hyp/002 region mutants FAILed within 317 s of proof time on the Mac (2 jobs).
 
 ## Fail fast, scheduling, remote runs
