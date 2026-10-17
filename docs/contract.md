@@ -153,9 +153,10 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   - JAL, JALR or a taken branch whose target has `target[1] = 1` (JALR clears bit 0 first);
   - the all-zeros word `0x00000000` and the all-ones word `0xFFFFFFFF`.
   A trapping instruction retires with `rvfi_trap = 1` and `rvfi_halt = 1`. It has no
-  architectural effect: no register write and no memory write, on the pins or in RVFI. Then the
-  core never retires again and never starts another SPI WRITE. Its `rvfi_pc_wdata` is
-  unspecified.
+  architectural effect: no register write in RVFI and no program-memory write on the pins (it may
+  still make core-region transactions before it retires, since the region is core-private and
+  nothing observes it after the halt). Then the core never retires again and never starts another
+  SPI WRITE. Its `rvfi_pc_wdata` is unspecified.
 - **Reserved encodings are UNSPECIFIED.** That covers every other encoding that isn't one of the
   instructions above, including RV32E encodings whose register fields name x16-x31. The core may
   give them any effect, but two rules hold:
