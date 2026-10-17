@@ -29,7 +29,8 @@ A trial passes when harden_tt.sh exits 0 (completed flow, magic DRC, route DRC, 
 the precheck decks, LVS, antenna, setup and hold at every corner, power grid, disconnected
 pins, overlap, TT's precheck). Exit 1 there is a design failure at that fraction. Exit 3 is a
 trial stopped by --trial-timeout: it counts as not signing off at that fraction (the search
-moves up), is listed under "timeouts" in tilefit.json and is printed as a WARNING. Exit 2 (tool
+moves up), is listed under "timeouts" in tilefit.json and is printed as a WARNING. The limit
+applies per harden stage (LibreLane, then the precheck), so one trial can take up to twice it. Exit 2 (tool
 error) or anything else aborts the whole search, so a broken tool never reads as a failing
 fraction.
 
@@ -51,7 +52,9 @@ Usage:
                       [--out build/tilefit.json]
 Output: build/tilefit.json {"min_fraction", "placeable_um2", "density", "timeouts",
                             "runs": [...], ...}
-Exit status: 0 with a min_fraction, 1 when nothing signs off (not even the full tile), 2 on a
+Exit status: 0 with a min_fraction and no timed-out trial; 1 when nothing signs off (not even
+the full tile) and no trial timed out; 3 when any trial timed out (min_fraction may be inflated,
+or null if the full tile timed out: "min_fraction_tainted": true, never a clean score); 2 on a
 tool error or any crash. Each harden_tt.sh run takes the heavy lock itself, so do not wrap
 this in lockf. --runs-dir must be inside this repo's build/ (harden_tt.sh's --out rule).
 """
@@ -370,6 +373,7 @@ def main():
         "highest_failing_fraction": max((r["fraction"] for r in s.runs if not r["pass"]),
                                         default=None),
         "timeouts": timeouts,
+        "min_fraction_tainted": bool(timeouts),
         "warning": (f"{len(timeouts)} trial(s) hit the {a.trial_timeout} min timeout and were "
                     f"counted as not signing off: {timeouts}") if timeouts else None,
         "lower_bound_fraction": round(lo, 5),
@@ -391,6 +395,8 @@ def main():
     if timeouts:
         print(f"[tilefit] WARNING: {res['warning']}", file=sys.stderr)
     print(f"wrote {out}")
+    if timeouts:
+        sys.exit(3)         # a timeout may have moved the bisection up: never a clean score
     sys.exit(0 if best is not None else 1)
 
 

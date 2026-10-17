@@ -753,13 +753,25 @@ class TilefitSearchTest(unittest.TestCase):
                 return 3, self.summary("timeout"), None
             return 0, self.summary("pass"), "auto"
         code, res = self.main(verdict, "--trial-timeout", "5")
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 3)                   # tainted: never a clean exit 0
+        self.assertIs(res["min_fraction_tainted"], True)
         self.assertEqual(self.calls[0]["timeout"], "300")
         self.assertTrue(res["timeouts"])
         self.assertIn("timeout", res["warning"])
         self.assertTrue(all(r["status"] == "timeout" for r in res["runs"]
                             if r["tag"] in res["timeouts"]))
         self.assertGreaterEqual(res["min_fraction"], (120.0 - 2.76) / 155.48 - 1e-4)
+
+    def test_full_tile_timeout_exits_3_not_1(self):
+        code, res = self.main(lambda x, o: (3, self.summary("timeout"), None))
+        self.assertEqual(code, 3)
+        self.assertIsNone(res["min_fraction"])
+        self.assertIs(res["min_fraction_tainted"], True)
+
+    def test_clean_search_is_not_tainted(self):
+        code, res = self.main(lambda x, o: (0, self.summary("pass"), "auto"))
+        self.assertEqual(code, 0)
+        self.assertIs(res["min_fraction_tainted"], False)
 
     def test_tool_error_aborts_search(self):
         for rc in (2, 137):

@@ -117,7 +117,11 @@ in sequence, not in parallel.
 1. Run `make formal-deep`. A failure means the champion goes back to its parent in the ledger,
    with the counterexample logged.
 2. Run `make harden` (TT 1x1 via LibreLane), then `make tilefit` (the physical score). Record both
-   in the ledger notes.
+   in the ledger notes, together with harden's `repair_um2` and `hold_buffers`, which `area_um2`
+   doesn't see.
+   - A tilefit result counts only on exit 0 with `min_fraction_tainted: false`.
+   - Exit 3 means a trial timed out, and the min_fraction may be inflated. Find out why
+     (Docker hang or routing), then rerun.
 3. Update `info.yaml` (`tiles` = the smallest config that fits, and `source_files` = `src/*.v`),
    then push main. The TT gds, precheck and gl_test workflows run on main pushes only. Check them
    with `gh run list -R FeSens/BonettoR32V`.
