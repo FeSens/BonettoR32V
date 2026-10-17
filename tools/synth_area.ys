@@ -1,0 +1,129 @@
+# BonettoR32V: fallback area synthesis, a hand mirror of LibreLane 3.0.14's Yosys.Synthesis
+# (librelane/scripts/pyosys/synthesize.py) with the values TT's config resolves to for
+# sky130A / sky130_fd_sc_hd: SYNTH_STRATEGY "AREA 0", SYNTH_HIERARCHY_MODE flatten,
+# SYNTH_TIE_UNDEFINED low, SYNTH_SPLITNETS, SYNTH_DIRECT_WIRE_BUFFERING (buf_2), the
+# tt_025C_1v80 liberty with no_synth.cells and drc_exclude.cells removed.
+#
+# The real score comes from LibreLane itself (tools/area.py --engine librelane, the default).
+# This file is used only by `tools/area.py --engine yosys`, which fills in the @NAME@ fields
+# and writes the AREA 0 ABC script and the ABC SDC next to the rendered copy.
+# Known differences from LibreLane: its opt loops run to a fixed point (the opt_share loop
+# below is unrolled six times), it sorts the design between passes (pyosys Design.sort), and
+# the yosys version may differ (LibreLane 3.0.14 ships 0.62).
+
+# blackbox models of the standard cells
+read_liberty -lib -ignore_miss_dir -setattr blackbox -setattr keep_hierarchy @LIB_FULL@
+@READ_VERILOG@
+@CHPARAM@
+hierarchy -check -top @TOP@ -nokeep_prints -nokeep_asserts
+rename -top @TOP@
+attrmap -remove single_bit_vector
+tribuf
+
+# librelane_synth()
+hierarchy -check -top @TOP@ -nokeep_prints -nokeep_asserts
+proc_clean
+proc_rmdead
+proc_prune
+proc_init
+proc_arst
+proc_rom
+proc_mux
+tee -o @REPORTS@/latch.rpt proc_dlatch
+proc_dff
+proc_memwr
+proc_clean
+tee -o @REPORTS@/pre_synth_chk.rpt check
+opt_expr
+@FLATTEN@
+opt_expr
+opt_clean
+opt -nodffe -nosdff
+fsm
+opt
+wreduce
+peepopt
+opt_clean
+alumacc
+share
+opt
+memory -nomap
+opt_clean
+opt -fast -mux_undef -mux_bool -undriven -fine
+memory_map
+# librelane_opt(opt_share, mux_undef, mux_bool, undriven, fine): yosys' opt only enables
+# opt_share together with -sat (-full), so the loop is spelled out and unrolled.
+opt_expr -mux_undef -mux_bool -undriven -fine
+opt_merge -nomux
+opt_muxtree
+opt_reduce -fine
+opt_merge
+opt_share
+opt_dff
+opt_clean
+opt_expr -mux_undef -mux_bool -undriven -fine
+opt_muxtree
+opt_reduce -fine
+opt_merge
+opt_share
+opt_dff
+opt_clean
+opt_expr -mux_undef -mux_bool -undriven -fine
+opt_muxtree
+opt_reduce -fine
+opt_merge
+opt_share
+opt_dff
+opt_clean
+opt_expr -mux_undef -mux_bool -undriven -fine
+opt_muxtree
+opt_reduce -fine
+opt_merge
+opt_share
+opt_dff
+opt_clean
+opt_expr -mux_undef -mux_bool -undriven -fine
+opt_muxtree
+opt_reduce -fine
+opt_merge
+opt_share
+opt_dff
+opt_clean
+opt_expr -mux_undef -mux_bool -undriven -fine
+opt_muxtree
+opt_reduce -fine
+opt_merge
+opt_share
+opt_dff
+opt_clean
+opt_expr -mux_undef -mux_bool -undriven -fine
+techmap
+opt -fast
+opt -fast
+abc -fast
+opt -fast
+hierarchy -check -top @TOP@ -nokeep_prints -nokeep_asserts
+check
+stat
+
+delete t:$print
+delete t:$assert
+opt
+opt_clean -purge
+
+# SYNTH_TRISTATE_MAP, SYNTH_LATCH_MAP (SYNTH_ADDER_TYPE is YOSYS: no FA map)
+techmap -map @TRIBUF_MAP@
+simplemap
+techmap -map @LATCH_MAP@
+simplemap
+dfflibmap -liberty @LIB@
+abc -script @ABC_SCRIPT@ -D @CLOCK_PS@ -constr @ABC_SDC@ -showtmp -liberty @LIB@
+setundef -zero
+hilomap -hicell sky130_fd_sc_hd__conb_1 HI -locell sky130_fd_sc_hd__conb_1 LO
+splitnets
+opt_clean -purge
+insbuf -buf sky130_fd_sc_hd__buf_2 A X
+tee -o @REPORTS@/chk.rpt check
+tee -q -o @REPORTS@/stat.json stat -json -liberty @LIB@
+tee -o @REPORTS@/stat.rpt stat -liberty @LIB@
+write_verilog -noattr -noexpr -nohex -nodec -defparam @OUT@
