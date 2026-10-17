@@ -198,11 +198,15 @@ module tt_um_fesens_r32v (
     wire sub    = sA ? c_slt : (sB & ((c_op & insn[30] & (f3 == 3'b000)) | c_slt | c_br));
     wire b_x    = b_raw ^ sub;
     wire cin    = k0 ? sub : cy;
-    wire sum    = a_bit ^ b_x ^ cin;
-    wire cout   = (a_bit & b_x) | (cin & (a_bit ^ b_x));
-    wire boolr  = ((a_bit ^ b_raw) & ~f3[0]) | (f3[1] & a_bit & b_raw);
+    // propagate and generate, shared by the sum, the carry, the logic ops (sub = 0) and the
+    // compares (sub = 1)
+    wire pp     = a_bit ^ b_x;
+    wire gg     = a_bit & b_x;
+    wire sum    = pp ^ cin;
+    wire cout   = gg | (cin & pp);
+    wire boolr  = (pp & ~f3[0]) | (f3[1] & gg);
     wire sgnd   = c_br ? ~f3[1] : ~f3[0];
-    wire lt     = (a_bit & sgnd) ^ ~(b_raw & sgnd) ^ cout;
+    wire lt     = cout ^ (pp | ~sgnd);
     wire eqacc  = ~sum & (cmp | k0);
     wire ocmp   = (c_br & ~f3[2]) ? eqacc : lt;
     wire trap   = trap_dec | (c_br & taken & insn[8]) | (c_jalr & cmp);
