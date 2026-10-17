@@ -9,8 +9,9 @@ between a prologue and an epilogue:
     x1..x15 (and x0 as a source or destination);
   - loads and stores of every width, misaligned included. Effective addresses carry random alias
     bits (addr[30:16]); RAM stores go to the data window 0x8000-0x8FFF (which starts with random
-    bytes) or to 0xFFF0-0xFFFF, where wider stores wrap around to 0x0000 (the prologue, which
-    never runs again); RAM loads may read anywhere in the 64 KB;
+    bytes) or to 0xFF70-0xFF7F, up to the last byte below the core region; RAM loads may read
+    anywhere in 0x0000-0xFF7F. No access touches the core region 0xFF80-0xFFFF (contract v2
+    section 3: programs never do), so none wraps at 64 KB either;
   - GPIO loads and stores anywhere in the addr[31] = 1 space, on every byte lane (accesses wider
     than a byte only at addr[1:0] = 0: other IO accesses wider than a byte are unspecified);
   - the base register is either loaded just before the access (li) or a register whose value the
@@ -28,7 +29,8 @@ import random
 import sys
 
 WIN_LO, WIN_HI = 0x8000, 0x8FFF
-TOP_LO = 0xFFF0  # RAM stores here may wrap around to 0x0000..0x0002
+REGION_LO = 0xFF80  # contract v2 section 3: the core region 0xFF80-0xFFFF
+TOP_LO = 0xFF70     # RAM stores here end at or below 0xFF7F
 GPIO = 0x80000000
 M32 = 0xFFFFFFFF
 
@@ -155,6 +157,8 @@ class Gen:
         if ea >> 31:
             return False
         lo = ea & 0xFFFF
+        if lo + n > REGION_LO:  # touches the region (or wraps at 64 KB through it)
+            return False
         return not store or WIN_LO <= lo <= WIN_HI - (n - 1) or lo >= TOP_LO
 
     def pick_ea(self, n: int, io: bool, store: bool) -> int:
@@ -168,10 +172,10 @@ class Gen:
         alias = 0 if r.random() < 0.4 else r.getrandbits(15)
         if r.random() < 0.85:
             lo = r.randint(WIN_LO, WIN_HI - (n - 1))
-        elif n > 1 and r.random() < 0.7:
-            lo = 0x10000 - r.randint(1, n - 1)  # crosses the 64 KB wrap
+        elif r.random() < 0.5:
+            lo = REGION_LO - n  # ends at 0xFF7F, the last byte below the core region
         else:
-            lo = r.randint(TOP_LO, 0xFFFF)
+            lo = r.randint(TOP_LO, REGION_LO - n)
         return alias << 16 | lo
 
     def mem_base(self, n: int, io: bool, store: bool) -> tuple[list[str], str, int]:

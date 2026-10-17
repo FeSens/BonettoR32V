@@ -5,7 +5,8 @@ Usage: mkexpect.py --iss ISS_MAIN --hex PROG.hex --out PROG.expect.json
 
 Checks (any failure exits 1, so `make -C verif/programs` fails):
   - the program never reads a register before writing it (the core's registers start unknown);
-  - it never executes a reserved or unspecified instruction;
+  - it never executes a reserved or unspecified instruction, and never touches the core region
+    0xFF80-0xFFFF (contract v2 section 3; the ISS reports such an access as unspecified);
   - it halts: on EBREAK, or for trap_<kind> programs on exactly that fatal trap;
   - selftest leaves uo_out = 0xA5 under both GPIO input schedules;
   - gpio_demo retires fewer than 2,000 instructions;

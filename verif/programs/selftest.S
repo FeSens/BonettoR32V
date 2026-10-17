@@ -2,8 +2,8 @@
 #
 # Executes every RV32E instruction (ECALL is in the trap_* programs, since it halts), every branch
 # taken and not taken, x0 writes, JALR with bit 0 set, a not-taken branch to a misaligned target,
-# misaligned LW/LH/LHU/SW/SH including the 64 KB wraps at 0xFFFD..0xFFFF, data and fetch aliasing,
-# every shift amount, FENCE variants, and GPIO reads and writes on every byte lane.
+# misaligned LW/LH/LHU/SW/SH up to 0xFF7F (the last byte below the core region), data and fetch
+# aliasing, every shift amount, FENCE variants, and GPIO reads and writes on every byte lane.
 #
 # Results also go to a signature area in RAM, so the pins-mode cosim (final RAM image) sees every
 # computed value. The verdict is written to GPIO: 0xA5 pass, 0xEE fail; then EBREAK.
@@ -12,7 +12,7 @@
 # a2 (x12) GPIO base in the GPIO section. x1..x11 are scratch.
 #
 # Built with -DSPIKE_XCHECK for the spike cross-check of the ISS: that build skips the sections
-# spike can't model (64 KB wrap and aliasing, GPIO).
+# spike can't model (aliasing, GPIO).
 
     .macro TEST id
     li   a5, \id
@@ -392,59 +392,54 @@ auipc1:
 
 #ifndef SPIKE_XCHECK
 # ---------------------------------------------------------------------------------------------
-# 6. Misaligned accesses that wrap at 64 KB. They overwrite RAM 0x0000..0x0003, the reset
-#    code, which never runs again.
+# 6. Misaligned accesses that end at 0xFF7F, the last RAM byte below the core region
+#    0xFF80-0xFFFF (contract v2 section 3). Contract v1's 64 KB data wrap (0xFFFD..0x0002) and
+#    the LW at 0x7FFFFFFE that crosses into bit 31 both touch the region, so they are
+#    unspecified now and no longer tested. 0xFF78..0xFF7F is the top of the stack, which
+#    selftest never uses.
     TEST 6
-    li   x1, 0xfffc
+    li   x1, 0xff7c
     li   x2, 0x44332211
-    sw   x2, 0(x1)             # 0xfffc..0xffff = 11 22 33 44
+    sw   x2, 0(x1)             # 0xff7c..0xff7f = 11 22 33 44
     li   x2, 0x88776655
-    sw   x2, 0(x0)             # 0x0000..0x0003 = 55 66 77 88
-    lw   x3, 2(x1)             # 0xfffe
-    EXPECT x3, 0x66554433
-    lw   x3, 3(x1)             # 0xffff
-    EXPECT x3, 0x77665544
-    lw   x3, 1(x1)             # 0xfffd
-    EXPECT x3, 0x55443322
-    lh   x3, 3(x1)             # 0xffff
-    EXPECT x3, 0x5544
-    lhu  x3, 3(x1)
-    EXPECT x3, 0x5544
+    sw   x2, -4(x1)            # 0xff78..0xff7b = 55 66 77 88
+    lw   x3, -1(x1)            # 0xff7b
+    EXPECT x3, 0x33221188
+    lw   x3, -3(x1)            # 0xff79
+    EXPECT x3, 0x11887766
+    lh   x3, 1(x1)             # 0xff7d
+    EXPECT x3, 0x3322
+    lhu  x3, -1(x1)            # 0xff7b
+    EXPECT x3, 0x1188
+    lb   x3, 3(x1)             # 0xff7f
+    EXPECT x3, 0x44
     li   x2, 0xddccbbaa
-    sw   x2, 2(x1)             # 0xfffe: aa bb | cc dd at 0x0000
-    lbu  x3, 2(x1)
-    EXPECT x3, 0xaa
-    lbu  x3, 3(x1)
-    EXPECT x3, 0xbb
-    lbu  x3, 0(x0)
-    EXPECT x3, 0xcc
-    lbu  x3, 1(x0)
-    EXPECT x3, 0xdd
-    lbu  x3, 2(x0)
-    EXPECT x3, 0x77
+    sw   x2, -2(x1)            # 0xff7a..0xff7d = aa bb cc dd
+    lw   x3, 0(x1)
+    EXPECT x3, 0x4433ddcc
+    lw   x3, -4(x1)
+    EXPECT x3, 0xbbaa6655
     li   x2, 0xf234
-    sh   x2, 3(x1)             # 0xffff = 34, 0x0000 = f2
-    lh   x3, 3(x1)
+    sh   x2, -1(x1)            # 0xff7b = 34, 0xff7c = f2
+    lh   x3, -1(x1)
     EXPECT x3, 0xfffff234
-    lhu  x3, 3(x1)
-    EXPECT x3, 0xf234
-    li   x2, 0x0badf00d
-    sw   x2, 3(x1)             # 0xffff, 0x0000, 0x0001, 0x0002
-    lw   x3, 3(x1)
-    EXPECT x3, 0x0badf00d
-    lw   x3, 0(x0)
-    EXPECT x3, 0x880badf0
+    lhu  x3, 1(x1)             # 0xff7d..0xff7e = dd 33
+    EXPECT x3, 0x33dd
+    li   x2, 0x8001
+    sh   x2, 2(x1)             # 0xff7e..0xff7f = 01 80
+    lh   x3, 2(x1)
+    EXPECT x3, 0xffff8001
     SIG  x3
-    # addr[31] = 0 selects RAM for the whole access, even when addr + k reaches bit 31
-    li   x4, 0x7ffffffe
-    lw   x3, 0(x4)             # RAM 0xfffe, 0xffff, 0x0000, 0x0001
-    EXPECT x3, 0xadf00daa
+    # the same bytes through alias bits addr[30:16], addr[31] = 0
+    li   x4, 0x7fffff7c
+    lw   x3, 0(x4)             # RAM 0xff7c..0xff7f = f2 dd 01 80
+    EXPECT x3, 0x8001ddf2
     li   x2, 0x13579bdf
-    sw   x2, 0(x4)
-    lw   x3, 2(x1)
-    EXPECT x3, 0x13579bdf
-    lhu  x3, 0(x0)
-    EXPECT x3, 0x1357
+    sw   x2, -3(x4)            # 0xff79..0xff7c = df 9b 57 13
+    lw   x3, -4(x1)
+    EXPECT x3, 0x579bdf55
+    lw   x3, 0(x1)
+    EXPECT x3, 0x8001dd13
     SIG  x3
 
 # ---------------------------------------------------------------------------------------------
