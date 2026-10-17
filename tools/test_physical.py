@@ -193,7 +193,11 @@ class SummaryTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def make(self, steps=("01-verilator-lint", "06-yosys-synthesis", "30-openroad-gpl"),
-             final=None, errlog="", lllog="", rows=None, match=True):
+             final=None, errlog="", lllog="", rows=None, match=True, xml=None, prelog="",
+             magic_txt=None):
+        """rows: results.md; xml: {row: (message, exception type)} for results.xml, by
+        default a PrecheckFailure with the row's message for every failing row ("none": no
+        results.xml at all)."""
         for s in steps:
             (self.run / s).mkdir(parents=True, exist_ok=True)
         if steps:
@@ -217,11 +221,31 @@ class SummaryTest(unittest.TestCase):
             (rep / "results.md").write_text(
                 "# Tiny Tapeout Precheck Results\n\n| Check | Result |\n|-----------|--------|\n"
                 + "".join(f"| {k} | {v} |\n" for k, v in rows.items()))
+            if xml != "none":
+                errs = xml if xml is not None else {
+                    k: (v.split("Fail: ", 1)[-1], "precheck_failure.PrecheckFailure")
+                    for k, v in rows.items() if "\u2705" not in v}
+                cases = ""
+                for k in rows:
+                    if k in errs:
+                        msg, etype = errs[k]
+                        tb = ("Traceback (most recent call last):\n  File \"precheck.py\", "
+                              f"line 575, in main\n    check[\"check\"]()\n{etype}: {msg}")
+                        cases += (f'    <testcase name="{k}" time="1.0">\n      <error '
+                                  f'message="{msg}">{tb}</error>\n    </testcase>\n')
+                    else:
+                        cases += f'    <testcase name="{k}" time="1.0" />\n'
+                (rep / "results.xml").write_text(
+                    '<testsuites>\n  <testsuite name="Tiny Tapeout Prechecks">\n'
+                    f"{cases}  </testsuite>\n</testsuites>\n")
+            if magic_txt is not None:
+                (rep / "magic_drc.txt").write_text(magic_txt)
+        (self.out / "precheck.log").write_text(prelog)
 
-    def summarize(self, ll, sub=-1, pre=-1, out=None, proj=None):
+    def summarize(self, ll, sub=-1, pre=-1, out=None, proj=None, timed_out=""):
         out, proj = out or self.out, proj or self.proj
         r = subprocess.run([sys.executable, "-I", str(SUMMARY), str(out), str(proj), "tt_um_t",
-                            str(ll), str(sub), str(pre), "10", "5", str(self.lib)],
+                            str(ll), str(sub), str(pre), "10", "5", str(self.lib), timed_out],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return json.loads((out / "summary.json").read_text())
@@ -244,15 +268,64 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(s["status"], "fail")
         self.assertIn("GPL-0301", s["failure"])
 
-    def test_routing_overflow_is_design_failure(self):
-        self.make(errlog="[ERROR GRT-0116] Global routing finished with congestion.\n")
-        self.assertEqual(self.summarize(2)["status"], "fail")
+    def test_grt0116_is_not_evidence(self):  # never emitted under GRT_ALLOW_CONGESTION
+        self.make(errlog="[GRT-0116] Global routing finished with congestion.\n")
+        self.assertEqual(self.summarize(2)["status"], "tool_error")
+
+    def test_design_caused_openroad_and_checker_errors(self):
+        cases = [
+            "[GPL-0307] Divergence detected between consecutive iterations",
+            "[DPL-0036] Detailed placement failed.",
+            "[RSZ-0060] Max buffer count reached.",
+            "[RSZ-0064] Unable to repair all hold violations.",
+            "Timing constructs found in the RTL. Please remove them or wrap them around an "
+            "ifdef.",
+            "Setup violations found in the following corners:\n* max_ss_100C_1v60",
+            "2 Lint errors found.",
+            "7 power grid violations (as reported by OpenROAD PSM- you may ignore these if LVS "
+            "passes) found. - deferred",
+        ]
+        for msg in cases:
+            shutil.rmtree(self.out)
+            self.out.mkdir()
+            self.make(errlog=msg + "\n")
+            s = self.summarize(2)
+            self.assertEqual(s["status"], "fail", (msg, s["tool_error"]))
+
+    def test_evidence_only_from_error_level_text(self):
+        # design identifiers and INFO lines in the console log are never evidence
+        lllog = ("[INFO GPL-0019] Utilization: 104.491 %\n"
+                 "module Detailed_placement_failed; // Max buffer count reached\n"
+                 "[05:16:52] INFO     2 Lint errors found in a comment        flow.py:1\n"
+                 "Utilization 104.491 % exceeds 100%.\n")
+        self.make(lllog=lllog)
+        self.assertEqual(self.summarize(1)["status"], "tool_error")
+
+    def test_console_error_entry_counts_without_error_log(self):
+        lllog = ("[05:16:52] ERROR    [GPL-0301] Utilization 104.491 % exceeds     "
+                 "openroad.py:312\n                    100%.                \n"
+                 "Error: gpl.tcl, 82 GPL-0301\n")
+        self.make(lllog=lllog)
+        s = self.summarize(2)
+        self.assertEqual(s["status"], "fail", s["tool_error"])
+        self.assertIn("GPL-0301", s["failure"])
+
+    def test_timeout(self):
+        self.make()
+        s = self.summarize(124, timed_out="librelane")
+        self.assertEqual(s["status"], "timeout")
+        self.assertIn("librelane", s["timeout"])
+        # a precheck timeout after a flow that already shows a violation is still a failure
+        shutil.rmtree(self.out)
+        self.out.mkdir()
+        self.make(final={**SIGNOFF_OK, "route__drc_errors": 4})
+        self.assertEqual(self.summarize(0, 0, 124, timed_out="precheck")["status"], "fail")
 
     def test_unknown_librelane_failure_is_tool_error(self):
         self.make(errlog="Traceback (most recent call last):\nKeyError: 'x'\n")
         s = self.summarize(1)
         self.assertEqual(s["status"], "tool_error")
-        self.assertIn("without signoff evidence", s["tool_error"])
+        self.assertIn("without evidence of a design failure", s["tool_error"])
 
     def test_deferred_magic_drc_is_design_failure(self):
         self.make(final={**SIGNOFF_OK, "magic__drc_error__count": 3},
@@ -294,13 +367,51 @@ class SummaryTest(unittest.TestCase):
             self.assertEqual(s["status"], "tool_error", pre)
             self.assertIn("precheck wrote no results", s["tool_error"])
 
-    def test_precheck_failing_row_is_design_failure(self):
-        rows = {k: "✅" for k in PRECHECK_OK}
-        rows["KLayout BEOL"] = "❌ Fail"
-        self.make(final=SIGNOFF_OK, rows=rows)
-        s = self.summarize(0, 0, 1)
+    def precheck_case(self, row, text, **kw):
+        shutil.rmtree(self.out, ignore_errors=True)
+        self.out.mkdir()
+        rows = {k: "\u2705" for k in PRECHECK_OK}
+        rows[row] = f"\u274c Fail: {text}"
+        self.make(final=kw.pop("final", SIGNOFF_OK), rows=rows, **kw)
+        return self.summarize(0, 0, 1)
+
+    def test_precheck_violation_rows_are_design_failures(self):
+        s = self.precheck_case("KLayout BEOL", "Klayout beol failed with 3 DRC violations")
         self.assertEqual(s["status"], "fail")
-        self.assertIn("precheck: KLayout BEOL", s["evidence"])
+        self.assertIn("precheck: KLayout BEOL: Klayout beol failed with 3 DRC violations",
+                      s["evidence"])
+        s = self.precheck_case("Pin check", "Some ports are missing or have wrong dimensions, "
+                                            "see uo_out[0] above")
+        self.assertEqual(s["status"], "fail")
+
+    def test_precheck_tool_failures_are_tool_errors(self):
+        """The re-review's repro (scratchpad/rr8/repro_precheck.py), plus variants."""
+        cases = [
+            ("Magic DRC", "Magic DRC failed", {}),  # dead magic shim, no count anywhere
+            ("KLayout FEOL", "Klayout feol failed", {}),  # klayout returned non-zero
+            ("KLayout BEOL", "[Errno 2] No such file or directory: 'reports/drc_beol.xml'",
+             {"xml": {"KLayout BEOL": ("[Errno 2] No such file or directory: "
+                                       "'reports/drc_beol.xml'", "FileNotFoundError")}}),
+            ("Verilog syntax check", "Verilog syntax check failed", {}),
+            ("KLayout BEOL", "Klayout beol failed with 3 DRC violations", {"xml": "none"}),
+            ("Pin check", "Duplicate pin in template DEF", {}),
+        ]
+        for row, text, kw in cases:
+            s = self.precheck_case(row, text, **kw)
+            self.assertEqual(s["status"], "tool_error", (row, text, s["failure"]))
+            self.assertIn(row, s["precheck"]["tool_failures"])
+
+    def test_magic_drc_failed_needs_corroboration(self):
+        s = self.precheck_case("Magic DRC", "Magic DRC failed",
+                               prelog="[INFO]: DRC Checking DONE\n[ERROR]: 12 DRC errors found\n")
+        self.assertEqual(s["status"], "fail")
+        self.assertIn("12 DRC errors found", s["failure"])
+        s = self.precheck_case("Magic DRC", "Magic DRC failed",
+                               magic_txt="top\n[INFO]: COUNT: 8\n[INFO]: Should be divided by 3 or 4\n")
+        self.assertEqual(s["status"], "fail")
+        s = self.precheck_case("Magic DRC", "Magic DRC failed",
+                               magic_txt="top\n[INFO]: COUNT: 0\n")
+        self.assertEqual(s["status"], "tool_error")
 
     def test_precheck_nonzero_exit_with_all_rows_passing_is_tool_error(self):
         self.make(final=SIGNOFF_OK, rows={k: "✅" for k in PRECHECK_OK})
@@ -354,9 +465,12 @@ class SummaryTest(unittest.TestCase):
 class HardenArgsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="harden-args-"))
+        (REPO / "build").mkdir(exist_ok=True)
+        self.btmp = Path(tempfile.mkdtemp(prefix="test-harden-args-", dir=REPO / "build"))
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.btmp, ignore_errors=True)
 
     def harden(self, *args, env=None):
         # BONETTO_HEAVY_LOCKED=1: these calls all stop before LibreLane, so no lock is needed
@@ -371,7 +485,8 @@ class HardenArgsTest(unittest.TestCase):
     def test_out_guard(self):
         home = Path.home()
         for out in ["/", str(home), str(REPO), str(REPO.parent), str(REPO / "docs"),
-                    str(REPO / "src" / "x"), str(REPO / "build" / ".." / "src")]:
+                    str(REPO / "src" / "x"), str(REPO / "build" / ".." / "src"),
+                    str(REPO / "build"), str(self.tmp / "out")]:
             self.assertRefused(self.harden("--out", out))
             self.assertRefused(self.harden(f"--out={out}"))
         self.assertTrue((REPO / "src").is_dir() and (REPO / "docs").is_dir())
@@ -383,11 +498,29 @@ class HardenArgsTest(unittest.TestCase):
         self.assertRefused(self.harden("--out", str(link)))
 
     def test_out_guard_unrelated_nonempty_dir(self):
-        d = self.tmp / "mine"
+        d = self.btmp / "mine"
         d.mkdir()
         (d / "keep.txt").write_text("precious\n")
         self.assertRefused(self.harden("--out", str(d)), "not a harden_tt.sh output")
         self.assertEqual((d / "keep.txt").read_text(), "precious\n")
+        (d / "summary.json").write_text("{}\n")  # summary.json alone is not enough
+        self.assertRefused(self.harden("--out", str(d)), "not a harden_tt.sh output")
+        self.assertEqual((d / "keep.txt").read_text(), "precious\n")
+
+    @unittest.skipUnless((TT_ENV / "tt-support-tools").is_dir(),
+                         "needs tools/harden_tt.sh --setup-only done")
+    def test_out_guard_accepts_legacy_output(self):
+        d = self.btmp / "legacy"
+        (d / "proj").mkdir(parents=True)
+        (d / "summary.json").write_text("{}\n")
+        r = self.harden("--out", str(d), env={"PDK_ROOT": "/nonexistent/pdk"})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("refusing", r.stderr)
+        self.assertEqual(sorted(p.name for p in d.iterdir()), [".harden_tt_out"])
+
+    def test_timeout_value_checked(self):
+        self.assertRefused(self.harden("--timeout", "10m", "--setup-only"), "bad --timeout")
+        self.assertRefused(self.harden("--timeout=-1", "--setup-only"), "bad --timeout")
 
     def test_tiles_forms(self):
         self.assertRefused(self.harden("--tiles=3x2x", "--setup-only"), "bad --tiles")
@@ -405,7 +538,7 @@ class HardenArgsTest(unittest.TestCase):
     @unittest.skipUnless((TT_ENV / "tt-support-tools").is_dir(),
                          "needs tools/harden_tt.sh --setup-only done")
     def test_stale_summary_wiped_before_setup_and_setup_failure_is_tool_error(self):
-        out = self.tmp / "out"
+        out = self.btmp / "out"
         out.mkdir()
         (out / ".harden_tt_out").touch()
         (out / "summary.json").write_text('{"status": "pass"}\n')
@@ -433,9 +566,12 @@ END sky130_fd_sc_hd__tapvpwrvgnd_1
 """
 
 
-def def_text(comps):
+def def_text(comps, rows=()):
+    """rows: [(x_dbu, y_dbu, sites)] as horizontal unithd ROWs."""
+    rowtext = "".join(f"ROW ROW_{i} unithd {x} {y} N DO {n} BY 1 STEP 460 0 ;\n"
+                      for i, (x, y, n) in enumerate(rows))
     lines = "".join(f"    - {n} {m} + PLACED ( {x} {y} ) {o} ;\n" for n, m, x, y, o in comps)
-    return (f"VERSION 5.8 ;\nDESIGN t ;\nUNITS DISTANCE MICRONS 1000 ;\n"
+    return (f"VERSION 5.8 ;\nDESIGN t ;\nUNITS DISTANCE MICRONS 1000 ;\n{rowtext}"
             f"COMPONENTS {len(comps)} ;\n{lines}END COMPONENTS\nEND DESIGN\n")
 
 
@@ -480,12 +616,22 @@ class TilefitScanTest(unittest.TestCase):
         text = defs[0].read_text()
         self.assertEqual(self.tf.def_overreach(text, sizes, 120.52), [])
         self.assertGreater(len(self.tf.def_overreach(text, sizes, 60.0)), 100)
+        # 1x2 template core (2.76, 2.72)-(158.24, 223.04), rows cut at x_cut
+        self.assertEqual(self.tf.def_row_extent(text), [2.76, 2.72, 120.52, 223.04])
+
+    def test_row_extent(self):
+        rows = [(2760, 2720 + 2720 * i, 100) for i in range(3)]
+        self.assertEqual(self.tf.def_row_extent(def_text([], rows)), [2.76, 2.72, 48.76, 10.88])
+        with self.assertRaises(ValueError):
+            self.tf.def_row_extent(def_text([]))
 
 
 @unittest.skipUnless(HAVE_PDK and (TT_ENV / "tt-support-tools").is_dir(),
                      "needs the local PDK and tools/harden_tt.sh --setup-only done")
 class TilefitSearchTest(unittest.TestCase):
-    """tilefit with a stub in place of harden_tt.sh (subprocess.run patched)."""
+    """tilefit with a stub in place of harden_tt.sh (subprocess.run patched). The 1x1 TT
+    template core is (2.76, 2.72) to (158.24, 108.80): 338 sites by 39 rows."""
+    CORE = (2.76, 2.72, 158.24, 108.80)
 
     def setUp(self):
         self.tf = load_tilefit()
@@ -496,77 +642,124 @@ class TilefitSearchTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def stub(self, verdict):
-        """verdict(fraction, overlay) -> (rc, summary dict or None, def instances or None)."""
+        """verdict(x_cut or None, overlay) -> (rc, summary or None, def or None), where def
+        is "auto" (rows of the template core cut at x_cut, one cell flush against it) or
+        (rows, comps) for def_text."""
         tf = self.tf
 
         def run(cmd, **kw):
             out = Path(cmd[cmd.index("--out") + 1])
             overlay = json.loads(Path(cmd[cmd.index("--overlay") + 1]).read_text())
-            self.calls.append(overlay)
-            obs = overlay.get("FP_OBSTRUCTIONS")
+            self.calls.append({"overlay": overlay, "timeout": cmd[cmd.index("--timeout") + 1]})
+            obs = [o for o in overlay.get("FP_OBSTRUCTIONS") or [] if o[1] == 0.0]
             x_cut = obs[-1][0] if obs else None
-            rc, summary, comps = verdict(x_cut, overlay)
+            rc, summary, d = verdict(x_cut, overlay)
             if summary is not None:
                 out.mkdir(parents=True, exist_ok=True)
                 (out / "summary.json").write_text(json.dumps(summary))
-            if comps is not None:
-                d = out / "proj" / "runs" / "wokwi" / "final" / "def"
-                d.mkdir(parents=True, exist_ok=True)
-                (d / "tt_um_t.def").write_text(def_text(comps))
+            if d is not None:
+                if d == "auto":
+                    d = (self.rows(x_cut), self.inside(x_cut or self.CORE[2]))
+                p = out / "proj" / "runs" / "wokwi" / "final" / "def"
+                p.mkdir(parents=True, exist_ok=True)
+                (p / "tt_um_t.def").write_text(def_text(d[1], d[0]))
             return subprocess.CompletedProcess(cmd, rc)
         return mock.patch.object(tf.subprocess, "run", side_effect=run)
+
+    def rows(self, x_cut, dx=0.0, dy=0.0):
+        x0, y0, x1, _ = self.CORE
+        n = round(((x_cut or x1) - x0) / 0.46)
+        return [(round((x0 + dx) * 1000), round((y0 + dy + 2.72 * i) * 1000), n)
+                for i in range(39)]
 
     def args(self, *extra):
         return ["tilefit.py", "--project", str(REPO), "--runs-dir", str(self.tmp / "runs"),
                 "--out", str(self.tmp / "tilefit.json"), "--tiles", "1x1", "--lo", "0.3", *extra]
 
-    def summary(self, ok, core=16493.3):
-        return {"status": "pass" if ok else "fail", "checks": {}, "core_um2": core,
-                "failure": None if ok else "GPL-0301", "stdcell_area_um2": 5000.0}
+    def summary(self, status, core=16493.3):
+        return {"status": status, "checks": {}, "core_um2": core if status != "timeout" else None,
+                "failure": "GPL-0301" if status == "fail" else None,
+                "timeout": "librelane stopped" if status == "timeout" else None,
+                "stdcell_area_um2": 5000.0}
 
-    def main(self, verdict, *extra):
+    def main(self, verdict, *extra, entry=False):
         (self.tmp / "tilefit.json").write_text('{"stale": true}\n')
         with self.stub(verdict), mock.patch.object(sys, "argv", self.args(*extra)):
             with self.assertRaises(SystemExit) as cm:
-                self.tf.main()
+                (self.tf.entry if entry else self.tf.main)()
         res = self.tmp / "tilefit.json"
         return cm.exception.code, json.loads(res.read_text()) if res.exists() else None
 
     def inside(self, x_cut):  # one cell flush against x_cut
         return [("a", "sky130_fd_sc_hd__inv_2", round(x_cut * 1000) - 1380, 2720, "N")]
 
-    def test_obstruction_spans_die_edge_and_search_converges(self):
+    def passing_above(self, threshold):
         def verdict(x_cut, overlay):
-            ok = x_cut is None or x_cut >= 110.0
-            return (0 if ok else 1), self.summary(ok), (self.inside(x_cut) if ok and x_cut else None)
-        code, res = self.main(verdict)
+            ok = x_cut is None or x_cut >= threshold
+            return (0, self.summary("pass"), "auto") if ok else (1, self.summary("fail"), None)
+        return verdict
+
+    def test_obstruction_spans_die_edge_and_search_converges(self):
+        code, res = self.main(self.passing_above(110.0))
         self.assertEqual(code, 0)
-        self.assertIsNone(self.calls[0].get("FP_OBSTRUCTIONS"))  # full tile first
+        self.assertIsNone(self.calls[0]["overlay"].get("FP_OBSTRUCTIONS"))  # full tile first
+        self.assertEqual(self.calls[0]["timeout"], "3600")  # --trial-timeout 60 min default
         die = [0.0, 0.0, 161.0, 111.52]
-        for ov in self.calls[1:]:
-            x0, y0, x1, y1 = ov["FP_OBSTRUCTIONS"][-1]
+        for c in self.calls[1:]:
+            x0, y0, x1, y1 = c["overlay"]["FP_OBSTRUCTIONS"][-1]
             self.assertEqual([y0, x1, y1], die[1:], "blockage must reach the die edge")
             sites = (x0 - 2.76) / 0.46
             self.assertAlmostEqual(sites, round(sites), places=4)  # on the site grid
         self.assertGreaterEqual(res["min_fraction"], (110.0 - 2.76) / 155.48 - 1e-4)
         self.assertLess(res["min_fraction"], 0.72)
+        self.assertEqual(res["timeouts"], [])
+
+    def test_core_is_the_template_whatever_the_overlay(self):
+        ov = self.tmp / "ov.json"
+        ov.write_text(json.dumps({"LEFT_MARGIN_MULT": 12, "TOP_MARGIN_MULT": 4}))
+        code, res = self.main(self.passing_above(110.0), "--overlay", str(ov))
+        self.assertEqual(code, 0)
+        self.assertEqual(res["core_box_um"], list(self.CORE))
+        # a real run with those margins reports a smaller core and aborts on the area check
+        code, _ = self.main(lambda x, o: (0, self.summary("pass", core=15000.0), "auto"),
+                            "--overlay", str(ov))
+        self.assertEqual(code, 2)
+
+    def test_shifted_core_of_equal_area_aborts(self):
+        def verdict(x_cut, overlay):  # same area, rows shifted 0.46 um right (CORE_AREA)
+            return 0, self.summary("pass"), (self.rows(x_cut, dx=0.46),
+                                             self.inside((x_cut or self.CORE[2]) - 1.0))
+        code, res = self.main(verdict)
+        self.assertEqual((code, res), (2, None))
+        self.assertEqual(len(self.calls), 1)  # caught on the full tile already
 
     def test_user_obstructions_kept(self):
         ov = self.tmp / "ov.json"
         ov.write_text(json.dumps({"FP_OBSTRUCTIONS": [[10, 10, 20, 20]]}))
-
-        def verdict(x_cut, overlay):
-            return 0, self.summary(True), self.inside(x_cut) if x_cut else None
-        code, _ = self.main(verdict, "--overlay", str(ov), "--steps", "1")
+        code, _ = self.main(self.passing_above(0.0), "--overlay", str(ov), "--steps", "1")
         self.assertEqual(code, 0)
-        self.assertEqual(self.calls[1]["FP_OBSTRUCTIONS"][0], [10, 10, 20, 20])
-        self.assertEqual(len(self.calls[1]["FP_OBSTRUCTIONS"]), 2)
+        self.assertEqual(self.calls[1]["overlay"]["FP_OBSTRUCTIONS"][0], [10, 10, 20, 20])
+        self.assertEqual(len(self.calls[1]["overlay"]["FP_OBSTRUCTIONS"]), 2)
 
     def test_nothing_signs_off_exits_1(self):
-        code, res = self.main(lambda x, o: (1, self.summary(False), None))
+        code, res = self.main(lambda x, o: (1, self.summary("fail"), None))
         self.assertEqual(code, 1)
         self.assertIsNone(res["min_fraction"])
         self.assertEqual(len(self.calls), 1)
+
+    def test_timeout_counts_as_not_signing_off_and_is_listed(self):
+        def verdict(x_cut, overlay):
+            if x_cut is not None and x_cut < 120.0:
+                return 3, self.summary("timeout"), None
+            return 0, self.summary("pass"), "auto"
+        code, res = self.main(verdict, "--trial-timeout", "5")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls[0]["timeout"], "300")
+        self.assertTrue(res["timeouts"])
+        self.assertIn("timeout", res["warning"])
+        self.assertTrue(all(r["status"] == "timeout" for r in res["runs"]
+                            if r["tag"] in res["timeouts"]))
+        self.assertGreaterEqual(res["min_fraction"], (120.0 - 2.76) / 155.48 - 1e-4)
 
     def test_tool_error_aborts_search(self):
         for rc in (2, 137):
@@ -581,22 +774,29 @@ class TilefitSearchTest(unittest.TestCase):
         self.assertEqual((code, res), (2, None))
 
     def test_status_disagreeing_with_exit_aborts(self):
-        code, _ = self.main(lambda x, o: (1, self.summary(True), None))
-        self.assertEqual(code, 2)
+        for rc, status in ((1, "pass"), (0, "timeout"), (3, "fail")):
+            code, _ = self.main(lambda x, o: (rc, self.summary(status), "auto"))
+            self.assertEqual(code, 2, (rc, status))
 
     def test_core_area_mismatch_aborts(self):
-        code, _ = self.main(lambda x, o: (0, self.summary(True, core=17000.0), None))
+        code, _ = self.main(lambda x, o: (0, self.summary("pass", core=17000.0), "auto"))
         self.assertEqual(code, 2)
 
     def test_instance_past_cut_aborts(self):
         def verdict(x_cut, overlay):
-            comps = None
-            if x_cut:
-                comps = [("z", "sky130_fd_sc_hd__inv_2", round(x_cut * 1000) - 920, 2720, "N")]
-            return 0, self.summary(True), comps
+            comps = [("z", "sky130_fd_sc_hd__inv_2",
+                      round((x_cut or self.CORE[2]) * 1000) - (920 if x_cut else 1380), 2720,
+                      "N")]
+            return 0, self.summary("pass"), (self.rows(x_cut), comps)
         code, res = self.main(verdict)
         self.assertEqual((code, res), (2, None))
         self.assertEqual(len(self.calls), 2)
+
+    def test_crash_is_a_tool_error(self):
+        def verdict(x_cut, overlay):
+            raise RuntimeError("boom")
+        code, res = self.main(verdict, entry=True)
+        self.assertEqual((code, res), (2, None))
 
 
 if __name__ == "__main__":

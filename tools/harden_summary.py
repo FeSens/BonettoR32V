@@ -2,20 +2,29 @@
 """BonettoR32V: classify one tools/harden_tt.sh run and write OUT/summary.json.
 
 Called by tools/harden_tt.sh; kept as its own file so tools/test_physical.py can run it on
-fixture run directories. Arguments: OUT PROJ TOP LL_RC SUB_RC PRE_RC T_LIBRELANE T_PRECHECK LIB
-  LL_RC   LibreLane exit code
-  SUB_RC  tt_tool --create-tt-submission exit code (-1: not attempted)
-  PRE_RC  precheck exit code (-1: not attempted, -2: --no-precheck)
-  LIB     the tt corner liberty file (cell areas for the timing-repair count)
-summary.json "status" is "pass", "fail" (evidence that the design does not sign off) or
-"tool_error"; harden_tt.sh maps them to exit 0, 1 and 2 by reading the file back, so a crash
-here reads as a tool error.
+fixture run directories.
+Arguments: OUT PROJ TOP LL_RC SUB_RC PRE_RC T_LIBRELANE T_PRECHECK LIB [TIMED_OUT]
+  LL_RC      LibreLane exit code
+  SUB_RC     tt_tool --create-tt-submission exit code (-1: not attempted)
+  PRE_RC     precheck exit code (-1: not attempted, -2: --no-precheck)
+  LIB        the tt corner liberty file (cell areas for the timing-repair count)
+  TIMED_OUT  "", "librelane" or "precheck": the stage harden_tt.sh's --timeout stopped
+summary.json "status" is one of
+  pass        every check holds
+  fail        evidence that the design does not sign off: a signoff metric violation, a
+              precheck row that reports a violation, or a design-caused flow error
+  tool_error  anything else that went wrong (the tools, not the design)
+  timeout     a stage hit --timeout and there is no evidence of a design failure
+harden_tt.sh maps them to exit 0, 1, 2 and 3 by reading the file back, so a crash here reads
+as a tool error.
 """
 import glob, json, re, sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 out, proj, top = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 ll_rc, sub_rc, pre_rc, t_ll, t_pre = (int(x) for x in sys.argv[4:9])
 lib = Path(sys.argv[9])
+timed_out = sys.argv[10] if len(sys.argv) > 10 else ""
 run = proj / "runs" / "wokwi"
 final = run / "final" / "metrics.json"
 flow_finished = final.exists()   # all steps ran (deferred checker errors still write final/)
@@ -39,24 +48,34 @@ def count(k):
     v = g(k)
     return None if v is None else int(v)
 
-errlog = (run / "error.log").read_text(errors="replace") if (run / "error.log").exists() else ""
-lllog = (out / "librelane.log").read_text(errors="replace") if (out / "librelane.log").exists() else ""
-logs = errlog + "\n" + lllog
+def read(path):
+    return path.read_text(errors="replace") if path.exists() else ""
 
-# --- precheck results
-precheck = {"ran": pre_rc >= 0, "skipped": pre_rc == -2, "exit_code": pre_rc}
-res_md = proj / "tt" / "precheck" / "reports" / "results.md"
-if pre_rc >= 0 and res_md.exists():
-    rows = {}
-    for line in res_md.read_text().splitlines():
-        mm = re.match(r"^\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|$", line)
-        if mm and mm.group(1) not in ("Check", "-----------"):
-            rows[mm.group(1)] = "pass" if "\u2705" in mm.group(2) else mm.group(2)
-    precheck["checks"] = rows
-rows = precheck.get("checks", {})
-precheck["pass"] = pre_rc == 0 and bool(rows) and all(v == "pass" for v in rows.values())
-kl = {k: v for k, v in rows.items() if k.startswith("KLayout")}
-klayout_ok = (bool(kl) and all(v == "pass" for v in kl.values())) if rows else None
+# --- ERROR-level messages only: LibreLane's per-level error.log/critical.log in the run dir
+# (flow.py:661) plus ERROR/CRITICAL entries of the console log, so that design identifiers in
+# tool output (yosys, OpenROAD info lines) can never look like evidence.
+def console_errors(text):
+    entries, cur = [], None
+    for line in text.splitlines():
+        mm = re.match(r"^(?:\[\d\d:\d\d:\d\d\]| {10})\s+(DEBUG|VERBOSE|INFO|WARNING|ERROR|"
+                      r"CRITICAL|SUBPROCESS)\s+(.*)$", line)
+        if mm:
+            if cur is not None:
+                entries.append(cur)
+            cur = re.sub(r"\s+\S+\.py:\d+\s*$", "", mm.group(2)) \
+                if mm.group(1) in ("ERROR", "CRITICAL") else None
+        elif cur is not None and line.startswith(" " * 10):
+            cur += " " + line.strip()
+        else:
+            if cur is not None:
+                entries.append(cur)
+            cur = None
+    if cur is not None:
+        entries.append(cur)
+    return "\n".join(entries)
+
+errlog = read(run / "error.log") + "\n" + read(run / "critical.log")
+error_text = errlog + "\n" + console_errors(read(out / "librelane.log"))
 
 # --- signoff metrics (from final/ only)
 fin = (lambda v: v) if flow_finished else (lambda v: None)
@@ -85,6 +104,83 @@ signoff = {  # name: (metric values, violation?)
     "disconnected_pins": ([disc], disc is not None and disc > 0),
     "illegal_overlap": ([overlap], overlap is not None and overlap > 0),
 }
+
+# --- precheck results. A failed row is design evidence only when it shows a violation: TT's
+# precheck.py turns ANY exception into "Fail: <message>" (precheck.py:580-583), and some
+# messages are the same for a violation and a dead tool.
+precheck = {"ran": pre_rc >= 0, "skipped": pre_rc == -2, "exit_code": pre_rc}
+reports = proj / "tt" / "precheck" / "reports"
+res_md = reports / "results.md"
+rows = {}
+if pre_rc >= 0 and res_md.exists():
+    for line in res_md.read_text().splitlines():
+        mm = re.match(r"^\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|$", line)
+        if mm and mm.group(1) not in ("Check", "-----------"):
+            rows[mm.group(1)] = "pass" if "\u2705" in mm.group(2) else mm.group(2)
+    precheck["checks"] = rows
+
+def xml_errors(path):
+    """{check name: (message, exception type)} from precheck's results.xml."""
+    errs = {}
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    for tc in root.iter("testcase"):
+        e = tc.find("error")
+        if e is None:
+            continue
+        lines = [l for l in (e.text or "").strip().splitlines() if l.strip()]
+        mm = re.match(r"^([A-Za-z_][\w.]*)(?::|$)", lines[-1]) if lines else None
+        errs[tc.get("name")] = (e.get("message", ""), mm.group(1) if mm else "unknown")
+    return errs
+
+def runs_external_tool(name):  # checks whose failure can be a crashed magic/klayout/yosys
+    return name in ("Magic DRC", "Verilog syntax check", "urpm/nwell check", "Antenna check") or \
+        (name.startswith("KLayout ") and name != "KLayout Checks")
+
+def magic_corroborated():
+    hits = []
+    mm = re.search(r"\[ERROR\]: (\d+) DRC errors found", read(out / "precheck.log"))
+    if mm and int(mm.group(1)) > 0:
+        hits.append(f"precheck.log: {mm.group(0)}")
+    mm = re.search(r"\[INFO\]: COUNT: (\d+)", read(reports / "magic_drc.txt"))
+    if mm and int(mm.group(1)) > 0:
+        hits.append(f"magic_drc.txt: {mm.group(0)}")
+    if magic is not None and magic > 0:
+        hits.append(f"LibreLane magic__drc_error__count = {magic}")
+    return hits
+
+design_rows, tool_rows = {}, {}
+failed = {k: v for k, v in rows.items() if v != "pass"}
+xerrs = xml_errors(reports / "results.xml") if failed else {}
+for name, text in failed.items():
+    if xerrs is None or name not in xerrs:
+        tool_rows[name] = f"{text} (no results.xml entry to confirm it)"
+        continue
+    msg, etype = xerrs[name]
+    if etype.split(".")[-1] != "PrecheckFailure":
+        tool_rows[name] = f"{etype}: {msg}"  # an exception, not a check verdict
+        continue
+    mm = re.search(r"failed with (\d+) DRC violations", msg)
+    if mm and int(mm.group(1)) > 0:
+        design_rows[name] = msg
+    elif name == "Magic DRC" and msg == "Magic DRC failed":
+        hits = magic_corroborated()
+        if hits:
+            design_rows[name] = f"{msg} ({'; '.join(hits)})"
+        else:
+            tool_rows[name] = f"{msg}, with no DRC count anywhere (magic did not run?)"
+    elif not runs_external_tool(name) and "template DEF" not in msg:
+        design_rows[name] = msg  # in-process GDS/LEF/netlist content checks
+    else:
+        tool_rows[name] = msg  # e.g. bare "Klayout feol failed": klayout returned non-zero
+precheck["design_failures"] = design_rows
+precheck["tool_failures"] = tool_rows
+precheck["pass"] = pre_rc == 0 and bool(rows) and not failed
+kl = {k: v for k, v in rows.items() if k.startswith("KLayout")}
+klayout_ok = (bool(kl) and all(v == "pass" for v in kl.values())) if rows else None
+
 checks = {"librelane_flow": flow_finished and ll_rc == 0}
 for k, (vals, vio) in signoff.items():
     checks[k] = flow_finished and all(v is not None for v in vals) and not vio
@@ -96,30 +192,43 @@ if precheck["skipped"]:  # --no-precheck: KLayout DRC comes only from the preche
 
 # --- evidence that the DESIGN fails (exit 1) versus a tool error (exit 2)
 evidence = [k for k, (vals, vio) in signoff.items() if vio]
-if rows and not precheck["pass"]:
-    evidence += [f"precheck: {k}" for k, v in rows.items() if v != "pass"]
-patterns = [
-    (r"GPL-0301", "global placement: utilization above 100 %"),
-    (r"DPL-0036|DPL-0044|[Dd]etailed placement failed", "detailed placement failed"),
-    (r"ERROR\s+GRT-0116|\[GRT-0116\]", "global routing overflow"),
-    (r"\d+(?:\.\d+)? (?:Routing DRC errors|Magic DRC errors|Magic Illegal Overlap errors|"
-     r"critical disconnected pins|LVS errors|power grid violations[^\n]*|Lint errors|"
-     r"Lint Timing Errors|KLayout DRC errors|Unmapped Yosys instances|Yosys check errors) found",
+evidence += [f"precheck: {k}: {v}" for k, v in design_rows.items()]
+CHECKERS = ["Unmapped Yosys instances", "Yosys check errors", "Routing DRC errors",
+            "Magic DRC errors", "Magic Illegal Overlap errors", "critical disconnected pins",
+            "Threshold-surpassing long wires", "XOR differences", "LVS errors",
+            "power grid violations", "Lint errors", "Lint warnings", "KLayout DRC errors",
+            "KLayout density errors", "KLayout antenna errors"]  # steps/checker.py descriptions
+patterns = [  # OpenROAD and LibreLane messages a design causes, matched in ERROR text only
+    (r"Utilization [0-9.]+ % exceeds 100%", "global placement: utilization above 100 % (GPL-0301)"),
+    (r"\[GPL-\d+\][^\n]*Divergence detected", "global placement diverged"),
+    (r"Detailed placement failed", "detailed placement failed"),
+    (r"Max buffer count reached", "resizer: max buffer count reached"),
+    (r"Unable to repair all hold (?:violations|checks within margin)", "resizer: hold repair failed"),
+    (r"\b\d+(?:\.\d+)? (?:" + "|".join(map(re.escape, CHECKERS)) + r")[^\n]*? found",
      "LibreLane checker"),
+    (r"(?:Setup|Hold|Max Cap|Max Slew) violations found in the following corners",
+     "LibreLane timing checker"),
+    (r"Timing constructs found in the RTL", "LibreLane lint: timing constructs"),
+    (r"assign statements? found in the netlist", "LibreLane: assign statements in the netlist"),
 ]
 if ll_rc != 0:
     for rx, what in patterns:
-        hit = re.search(rx, errlog) or re.search(rx, lllog)
+        hit = re.search(rx, error_text)
         if hit:
             evidence.append(f"{what}: {hit.group(0)[:200]}")
 
+timeout = None
+if timed_out and not evidence:
+    timeout = f"{timed_out} stopped by harden_tt.sh --timeout"
 tool_error = None
-if ll_rc in (125, 126, 127) or ll_rc > 128:
+if timeout:
+    pass
+elif ll_rc in (125, 126, 127) or ll_rc > 128:
     tool_error = f"docker/LibreLane did not run or was killed (exit {ll_rc})"
 elif not steps:
     tool_error = f"LibreLane produced no flow steps (exit {ll_rc})"
 elif ll_rc != 0 and not evidence:
-    tool_error = (f"LibreLane exit {ll_rc} without signoff evidence; last step "
+    tool_error = (f"LibreLane exit {ll_rc} without evidence of a design failure; last step "
                   f"{steps[-1]}: {errlog.strip()[-600:] or 'see librelane.log'}")
 elif ll_rc == 0 and not flow_finished:
     tool_error = "LibreLane exited 0 but wrote no final/metrics.json"
@@ -131,11 +240,15 @@ elif flow_finished and not evidence:
         tool_error = f"tt_tool --create-tt-submission failed (exit {sub_rc})"
     elif pre_rc >= 0 and not rows:
         tool_error = f"precheck wrote no results (exit {pre_rc}); see precheck.log"
-    elif pre_rc > 0 and rows and all(v == "pass" for v in rows.values()):
+    elif tool_rows:
+        tool_error = f"precheck checks failed without showing a violation: {tool_rows}"
+    elif pre_rc > 0:
         tool_error = f"precheck exit {pre_rc} although every results row passed"
 
 failure = None
-if tool_error:
+if timeout:
+    status = "timeout"
+elif tool_error:
     status = "tool_error"
 elif evidence:
     status = "fail"
@@ -183,6 +296,7 @@ summary = {
     "status": status,
     "pass": status == "pass",
     "tool_error": tool_error,
+    "timeout": timeout,
     "failure": failure,
     "evidence": evidence,
     "flow_finished": flow_finished,
@@ -232,3 +346,5 @@ if failure:
     print("failure:", failure[-600:])
 if tool_error:
     print("TOOL ERROR:", tool_error[-800:], file=sys.stderr)
+if timeout:
+    print("TIMEOUT:", timeout, file=sys.stderr)

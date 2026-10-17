@@ -14,33 +14,36 @@
 #
 # Usage:
 #   tools/harden_tt.sh [--project DIR] [--out DIR] [--overlay FILE.json] [--tiles 1x2]
-#                      [--keep-info-sources] [--no-precheck] [--setup-only]
+#                      [--keep-info-sources] [--no-precheck] [--timeout SEC] [--setup-only]
 #   (every option also accepts the --option=value form)
 #     --project DIR        TT project root with info.yaml and src/ (default: this repo)
-#     --out DIR            output directory (default: build/harden); it is wiped first, so it
-#                          must not be /, $HOME, the project or this repo or any ancestor of
-#                          them, nor inside a checkout outside its build/, nor a non-empty
-#                          directory that is not a previous harden_tt.sh output
+#     --out DIR            output directory (default: build/harden). It is wiped first, so it
+#                          must be strictly inside this repo's build/, must not hold the
+#                          project, and must be empty, a harden_tt.sh output (marker
+#                          .harden_tt_out) or an older one (summary.json and proj/)
 #     --overlay FILE.json  extra LibreLane config keys merged into the staged src/config.json
 #                          (tilefit uses this for FP_OBSTRUCTIONS; never edits the real one)
 #     --tiles NxM          override info.yaml's tile count in the staged copy
 #     --keep-info-sources  use info.yaml's source_files verbatim (default: regenerate the list
 #                          from src/*.v, like tools/area.py does)
 #     --no-precheck        skip TT's precheck
+#     --timeout SEC        stop LibreLane plus the precheck after SEC seconds, counted after
+#                          the lock is taken (default 0: no limit); exit 3, status "timeout"
 #     --setup-only         only fetch tools, venvs and PDKs
 #
 # Output: OUT/summary.json
 #   {"status", "pass", "drc", "lvs", "antenna", "setup_wns", "hold_wns", "utilization",
 #    "die_um2", "repair_um2", "repair_cells", "hold_buffers", "info_sources_match", ...}
-# Exit status, decided from evidence:
+# Exit status, decided from evidence by tools/harden_summary.py:
 #   0  every signoff check passed
-#   1  the design does not sign off: a named signoff check reports a violation (DRC, LVS,
-#      antenna, timing, power grid, disconnected pins, overlap, a LibreLane checker, a failing
-#      precheck row) or the flow stopped on GPL-0301, a detailed-placement failure or a
-#      routing overflow
-#   2  tool error: Docker or LibreLane did not run or was killed (rc 125/126/127, >128), no
-#      flow steps, a failure with none of the evidence above, a missing signoff metric, a
-#      failed --create-tt-submission, or a precheck that wrote no results
+#   1  the design does not sign off: a signoff metric reports a violation (DRC, LVS, antenna,
+#      timing, power grid, disconnected pins, overlap), a precheck row shows a violation, or
+#      an ERROR-level message is a design-caused one (GPL-0301, GPL divergence, detailed
+#      placement failure, resizer buffer limit or hold repair failure, a LibreLane checker)
+#   2  tool error: everything else (Docker or LibreLane did not run or was killed, no flow
+#      steps, a failure without evidence, a missing metric, a failed --create-tt-submission,
+#      a precheck without results or with rows that failed without showing a violation)
+#   3  --timeout stopped a stage and there is no evidence of a design failure
 #
 # Load: this is a heavy job. The script takes the heavy lock itself (lockf -k on
 # $BONETTO_HEAVY_LOCK, default /tmp/bonetto-heavy.lock). Do NOT wrap it in lockf yourself
@@ -75,12 +78,13 @@ TILES=""
 KEEP_INFO=0
 PRECHECK=1
 SETUP_ONLY=0
+TIMEOUT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --*=*) a="$1"; shift; set -- "${a%%=*}" "${a#*=}" "$@"; continue ;;
   esac
   case "$1" in
-    --project|--out|--overlay|--tiles)
+    --project|--out|--overlay|--tiles|--timeout)
       [ $# -ge 2 ] || { echo "harden_tt.sh: $1 needs a value" >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -88,16 +92,53 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2 ;;
     --overlay) OVERLAY="$2"; shift 2 ;;
     --tiles) TILES="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
     --keep-info-sources) KEEP_INFO=1; shift ;;
     --no-precheck) PRECHECK=0; shift ;;
     --setup-only) SETUP_ONLY=1; shift ;;
-    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) echo "harden_tt.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 case "$TILES" in ""|[0-9]x[0-9]) ;; *) echo "harden_tt.sh: bad --tiles $TILES" >&2; exit 2 ;; esac
+case "$TIMEOUT" in ""|*[!0-9]*) echo "harden_tt.sh: bad --timeout $TIMEOUT" >&2; exit 2 ;; esac
 
 log() { echo "[harden_tt $(date +%H:%M:%S)] $*" >&2; }
+# run_limited SECONDS CMD...: CMD's exit code, or 124 after killing it at the deadline
+# (SECONDS <= 0: no limit). Containers started for this OUT carry a label, so a stopped
+# docker CLI cannot leave its container running past the lock.
+run_limited() {
+  python3 -I -c '
+import os, signal, subprocess, sys
+limit, cmd = int(sys.argv[1]), sys.argv[2:]
+p = subprocess.Popen(cmd, start_new_session=True)
+try:
+    sys.exit(p.wait(timeout=limit if limit > 0 else None))
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid, signal.SIGTERM)
+    try:
+        p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+    sys.exit(124)
+' "$@"
+}
+kill_labelled_containers() {
+  local ids
+  ids="$(docker ps -q --filter "label=bonetto.harden.out=$OUT" 2>/dev/null || true)"
+  if [ -n "$ids" ]; then
+    log "killing leftover containers: $ids"
+    # shellcheck disable=SC2086
+    docker kill $ids >/dev/null 2>&1 || true
+  fi
+}
+remaining() {  # seconds left before the deadline (0 means no limit; at least 1 otherwise)
+  if [ "$TIMEOUT" = 0 ]; then echo 0; return; fi
+  local left=$(( DEADLINE - $(date +%s) ))
+  if [ "$left" -lt 1 ]; then left=1; fi
+  echo "$left"
+}
 abspath() { (cd "$(dirname "$1")" && echo "$(pwd)/$(basename "$1")"); }
 
 # ---------------------------------------------------------------- resolve and wipe OUT first
@@ -111,14 +152,14 @@ import os, sys
 proj, out, home, repo = (os.path.realpath(os.path.abspath(p)) for p in sys.argv[1:5])
 def covers(a, b):  # a is b or an ancestor of b
     return b == a or b.startswith(a.rstrip("/") + "/")
-for root in (proj, repo):  # inside a checkout, only under its build/
-    if covers(root, out) and not covers(os.path.join(root, "build"), out):
-        sys.exit(f"harden_tt.sh: refusing --out {out}: inside {root} it must be under build/")
-if out == "/" or covers(out, proj) or covers(out, repo) or covers(out, home):
+build = os.path.realpath(os.path.join(repo, "build"))
+if out == build or not covers(build, out):
+    sys.exit(f"harden_tt.sh: refusing --out {out}: it must be strictly inside {build}")
+if covers(out, proj) or covers(out, home) or covers(os.path.join(proj, "src"), out):
     sys.exit(f"harden_tt.sh: refusing --out {out} (project {proj}, home {home})")
-names = os.listdir(out) if os.path.isdir(out) else []
-if names and not ({".harden_tt_out", "summary.json"} & set(names)
-                  or os.path.isfile(os.path.join(out, "proj", "info.yaml"))):
+names = set(os.listdir(out)) if os.path.isdir(out) else set()
+legacy = {"summary.json", "proj"} <= names  # outputs written before the marker existed
+if names and ".harden_tt_out" not in names and not legacy:
     sys.exit(f"harden_tt.sh: refusing to wipe --out {out}: not empty and not a harden_tt.sh "
              f"output directory")
 PY
@@ -181,7 +222,9 @@ setup() {
 #!/usr/bin/env bash
 mounts=()
 for d in \$BONETTO_DOCKER_MOUNTS; do mounts+=(-v "\$d:\$d"); done
-exec docker run --rm -i --user "\$(id -u):\$(id -g)" "\${mounts[@]}" -e HOME=/tmp \\
+labels=()
+[ -n "\${BONETTO_DOCKER_LABEL:-}" ] && labels=(--label "bonetto.harden.out=\$BONETTO_DOCKER_LABEL")
+exec docker run --rm -i --user "\$(id -u):\$(id -g)" "\${mounts[@]}" "\${labels[@]}" -e HOME=/tmp \\
   -e PDK_ROOT="\$PDK_ROOT" -e PDK="\$PDK" -w "\$PWD" "$LIBRELANE_IMAGE" $tool "\$@"
 EOF
     chmod +x "$ENV_DIR/shims/$tool"
@@ -270,14 +313,22 @@ T0=$(date +%s)
 
 # ---------------------------------------------------------------- 2. LibreLane (tt_tool --harden)
 mkdir -p "$PROJ/runs/wokwi"
+DEADLINE=$(( T0 + TIMEOUT ))
+TIMED_OUT=""
 log "LibreLane 3.0.14 Classic flow (log: $OUT/librelane.log)"
 set +e; errtrap_off
-docker run --rm --user "$(id -u):$(id -g)" -v "$OUT:$OUT" -v "$CIEL_ROOT:$CIEL_ROOT" \
+run_limited "$(remaining)" docker run --rm --label "bonetto.harden.out=$OUT" \
+  --user "$(id -u):$(id -g)" -v "$OUT:$OUT" -v "$CIEL_ROOT:$CIEL_ROOT" \
   -e PDK_ROOT="$CIEL_ROOT" -e HOME="$OUT/.home" -w "$PROJ" "$LIBRELANE_IMAGE" \
   librelane --pdk-root "$CIEL_ROOT" --run-tag wokwi --force-run-dir runs/wokwi \
   --hide-progress-bar src/config_merged.json > "$OUT/librelane.log" 2>&1
 LL_RC=$?
 set -e; errtrap_on
+if [ "$LL_RC" = 124 ] && [ "$TIMEOUT" != 0 ]; then
+  TIMED_OUT=librelane
+  log "LibreLane stopped after the ${TIMEOUT} s timeout"
+  kill_labelled_containers
+fi
 T1=$(date +%s)
 log "LibreLane exit $LL_RC after $((T1 - T0)) s"
 
@@ -317,13 +368,20 @@ PY
     log "TT precheck (log: $OUT/precheck.log)"
     rm -rf "$PROJ/tt/precheck/reports"
     set +e; errtrap_off
-    (cd "$PROJ/tt/precheck" && mkdir -p reports && \
-      PATH="$ENV_DIR/shims:$ENV_DIR/precheck-venv/bin:$PATH" \
-      PDK_ROOT="$CIEL_ROOT/ciel/sky130/versions/$PRECHECK_PDK_HASH" PDK=sky130A \
-      BONETTO_DOCKER_MOUNTS="$OUT $CIEL_ROOT" \
-      python precheck.py --gds "$PROJ/tt_submission/$TOP.gds") > "$OUT/precheck.log" 2>&1
+    mkdir -p "$PROJ/tt/precheck/reports"
+    (cd "$PROJ/tt/precheck" && \
+      export PATH="$ENV_DIR/shims:$ENV_DIR/precheck-venv/bin:$PATH" \
+        PDK_ROOT="$CIEL_ROOT/ciel/sky130/versions/$PRECHECK_PDK_HASH" PDK=sky130A \
+        BONETTO_DOCKER_MOUNTS="$OUT $CIEL_ROOT" BONETTO_DOCKER_LABEL="$OUT" && \
+      run_limited "$(remaining)" python precheck.py --gds "$PROJ/tt_submission/$TOP.gds") \
+      > "$OUT/precheck.log" 2>&1
     PRE_RC=$?
     set -e; errtrap_on
+    if [ "$PRE_RC" = 124 ] && [ "$TIMEOUT" != 0 ]; then
+      TIMED_OUT=precheck
+      log "precheck stopped at the ${TIMEOUT} s timeout"
+      kill_labelled_containers
+    fi
     log "precheck exit $PRE_RC after $(( $(date +%s) - T1 )) s"
   fi
 fi
@@ -333,7 +391,7 @@ T2=$(date +%s)
 LIB="$CIEL_ROOT/ciel/sky130/versions/$PDK_HASH/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
 set +e; errtrap_off
 python3 -I "$REPO/tools/harden_summary.py" "$OUT" "$PROJ" "$TOP" "$LL_RC" "$SUB_RC" "$PRE_RC" \
-  "$((T1 - T0))" "$((T2 - T1))" "$LIB"
+  "$((T1 - T0))" "$((T2 - T1))" "$LIB" "$TIMED_OUT"
 set -e; errtrap_on
 # The exit status comes from the summary's status, never from the summarizer's own exit code:
 # a crash there must read as a tool error (2), not as a design failure (1).
@@ -341,5 +399,6 @@ STATUS="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["st
 case "$STATUS" in
   pass) exit 0 ;;
   fail) exit 1 ;;
+  timeout) echo "harden_tt.sh: TIMEOUT, see $OUT/summary.json" >&2; exit 3 ;;
   *) echo "harden_tt.sh: tool error (status: $STATUS), see $OUT/summary.json" >&2; exit 2 ;;
 esac

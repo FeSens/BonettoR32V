@@ -124,14 +124,20 @@ never touched). Then it does what the action does:
 - `commit_id.json` and `pdk.json` are written locally, as `tt_tool --harden` would, so that
   `--create-tt-submission` works.
 
-**Options.** Every option also takes the `--option=value` form (`--tiles=3x2`). `--out` is
-wiped before anything else runs, so it refuses `/`, `$HOME`, the project, this repo and any
-ancestor of them, any path inside a checkout outside its `build/`, and a non-empty directory
-that isn't a previous `harden_tt.sh` output (marker `.harden_tt_out`). Paths are compared as
-real paths, so a symlink doesn't get around it.
+**Options.** Every option also takes the `--option=value` form (`--tiles=3x2`).
+
+- `--out` is wiped before anything else runs, so it must be strictly inside this repo's
+  `build/`, must not hold the project (or sit in its `src/`), and must be empty, a
+  `harden_tt.sh` output (marker `.harden_tt_out`) or an older one (both `summary.json` and
+  `proj/`). Paths are compared as real paths, so a symlink doesn't get around it.
+- `--timeout SEC` stops LibreLane and then the precheck once SEC seconds have passed since the
+  lock was taken (0, the default, means no limit). The stopped process group gets SIGTERM, then
+  SIGKILL after 30 s, and every container labelled `bonetto.harden.out=<OUT>` (LibreLane's and
+  the precheck's magic and klayout shims) is killed, so nothing keeps running once the lock is
+  released.
 
 **`build/harden/summary.json`.** The summary is written by `tools/harden_summary.py`. `status`
-is `pass`, `fail` or `tool_error`, and `pass` is true only when all of these hold:
+is `pass`, `fail`, `tool_error` or `timeout`, and `pass` is true only when all of these hold:
 
 - the flow completed;
 - magic DRC = 0 and TritonRoute DRC = 0;
@@ -173,8 +179,29 @@ Definitions:
 | Exit | Status | When |
 |---|---|---|
 | 0 | `pass` | every check above holds |
-| 1 | `fail` | a named signoff check reports a violation (from `final/metrics.json`), a precheck row fails, or a failed flow's logs show GPL-0301, a detailed-placement failure, GRT-0116 (routing overflow) or a LibreLane checker's "N ... found" |
-| 2 | `tool_error` | LibreLane exits 125, 126, 127 or above 128 (Docker could not run it, or it was killed); no flow step directory exists; a non-zero LibreLane exit has none of the evidence above; a signoff metric is missing; `--create-tt-submission` fails; the precheck writes no `results.md`, or exits non-zero with every row passing |
+| 1 | `fail` | a signoff metric in `final/metrics.json` reports a violation; a precheck row shows a violation (see below); or, when LibreLane failed, an ERROR-level message is design-caused: utilization above 100 % (GPL-0301), GPL divergence, a detailed-placement failure, the resizer's buffer limit or a failed hold repair, a LibreLane checker's "N ... found", its timing-violation, timing-construct or netlist-assign errors |
+| 2 | `tool_error` | LibreLane exits 125, 126, 127 or above 128 (Docker could not run it, or it was killed); no flow step directory exists; a non-zero LibreLane exit has none of the evidence above; a signoff metric is missing; `--create-tt-submission` fails; the precheck writes no `results.md`, has a failed row that doesn't show a violation, or exits non-zero with every row passing |
+| 3 | `timeout` | `--timeout` stopped LibreLane or the precheck, and there's no evidence of a design failure |
+
+- **Where evidence comes from.** Log patterns are matched only against ERROR-level text:
+  LibreLane's `error.log` and `critical.log` in the run directory (it writes one file per
+  level, `flows/flow.py:661`) and the ERROR entries of the console log. Yosys or OpenROAD info
+  lines that mention a design identifier can't match. GRT-0116 isn't evidence: under TT's
+  `GRT_ALLOW_CONGESTION` global routing only warns (GRT-0115), and real overflow shows up as
+  route DRC errors in `final/metrics.json`.
+- **Precheck rows.** TT's `precheck.py:580-583` turns any exception into a "Fail" row, and
+  some messages read the same for a violation and for a dead tool. So a failed row is design
+  evidence only when `results.xml` shows a `PrecheckFailure` (any other exception is a tool
+  error) and one of these holds:
+  - KLayout: "failed with N DRC violations", N > 0. A bare "Klayout X failed" (klayout
+    returned non-zero) is a tool error.
+  - "Magic DRC failed", corroborated by `[ERROR]: N DRC errors found` in `precheck.log`, a
+    non-zero `[INFO]: COUNT` in `magic_drc.txt`, or LibreLane's own magic count. Otherwise it's
+    a tool error (for example a magic shim that never ran).
+  - The in-process content checks (KLayout Checks, Pin, Boundary, Power pin, Layer, Cell name
+    and Analog pin checks), unless the message is about TT's template DEF.
+  The summary lists both kinds under `precheck.design_failures` and `precheck.tool_failures`.
+  "Verilog syntax check failed" counts as a tool error.
 
 **Locking.** The script takes the heavy lock itself (`lockf -k` on `$BONETTO_HEAVY_LOCK`,
 default `/tmp/bonetto-heavy.lock`). Don't wrap it in `lockf` yourself: the second lock waits on
@@ -204,17 +231,26 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
   aren't obstructed. An `--overlay` that sets its own `FP_OBSTRUCTIONS` keeps them; the tilefit
   box is appended.
 - **Fraction.** The placeable fraction is `(x_cut - core_x0) / core_width`, with `x_cut` on the
-  0.46 um site grid. The 1x1 core is (2.76, 2.72) to (158.24, 108.80), which is 16,493.3 um2.
+  0.46 um site grid. The core is always the TT template's for the tile: the die from
+  tt-support-tools' `tile_sizes.yaml` minus TT's fixed margins (6 sites left and right, 1 row
+  top and bottom). The project's config and `--overlay` never change it. The 1x1 core is
+  (2.76, 2.72) to (158.24, 108.80), which is 16,493.3 um2.
 - **Pass.** A trial passes when `harden_tt.sh` exits 0: every check above, the precheck
-  included. Exit 1 is a failing fraction. Exit 2, any other exit code, a missing `summary.json`
-  or a summary status that disagrees with the exit code aborts the whole search with exit 2, so
+  included. Exit 1 is a failing fraction.
+- **Timeouts.** `--trial-timeout MIN` (default 60) is handed to `harden_tt.sh --timeout`, so it
+  counts from when the trial holds the lock. A timed-out trial (exit 3) counts as not signing
+  off at that fraction, so the bisection moves up. It's recorded with status `timeout`, listed
+  under `timeouts` and `warning` in `tilefit.json`, and printed as a WARNING: a Docker hang
+  shows up as a timeout, not as a design failure.
+- **Aborts.** Exit 2 or any other exit code, a missing `summary.json`, a summary status that
+  disagrees with the exit code, or a crash of tilefit itself all end the search with exit 2, so
   a broken tool never reads as a failing fraction.
 - **Cross-checks.** Each also aborts the search as a tool error:
-  - the run's `core_um2` must equal the core tilefit computed (within 0.5 um2), so a config or
-    overlay that moves the core can't open an uncounted strip;
-  - after every passing trial below the full tile, no instance in the final DEF may reach past
-    `x_cut`. Bounding boxes come from the PDK's LEF `SIZE`s (rotated for E, W, FE and FW); an
-    instance of an unknown macro also aborts.
+  - the run's `core_um2` must equal the template core's area (within 0.5 um2);
+  - after every passing trial, the final DEF's ROWs must span exactly `[core_x0, x_cut]` by
+    `[core_y0, core_y1]`, so a core shifted by `CORE_AREA` fails even when its area is equal;
+  - and no instance in that DEF may reach past `x_cut`. Bounding boxes come from the PDK's LEF
+    `SIZE`s (rotated for E, W, FE and FW); an instance of an unknown macro also aborts.
 - **Density.** Trials keep the config's `PL_TARGET_DENSITY_PCT` (60 in TT's template).
   LibreLane 3.0.14's OpenROAD raises the target itself when the free area is too small for it.
   It logs warning GPL-0302, "Automatically adjusting to uniform density". The seed in 2x2, for
@@ -223,23 +259,28 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
     placement actually used (`gpl_target_density`).
   - GPL-0301 means the cells don't fit at all: utilization above 100 %, counting OpenROAD's
     pin-density area adjustment.
-  - If a future OpenROAD turns GPL-0302 back into an error, the trial reruns once at the
-    suggested density plus 1.
+  - If a future OpenROAD turned GPL-0302 back into an error, `harden_tt.sh` would report a
+    tool error and the search would stop; there's no density retry.
 - **Search.**
   1. The full tile first. If it fails, `min_fraction` is null.
   2. The lower bound is the synthesized cell area over the core area, a fraction that can't pass.
-  3. Then `--steps` (default 6) bisection steps, so 7 runs, or a few more when density retries
-     happen.
+  3. Then `--steps` (default 6) bisection steps, so 7 runs.
   The search assumes pass and fail are monotonic in the fraction. PnR noise can break that near
   the edge.
 - **Output.** `build/tilefit.json` (deleted at start, so an aborted search leaves none):
   `min_fraction`, `placeable_um2`, `density` (the passing run's standard-cell area over
   `placeable_um2`), `target_density_pct`, `repair_um2`, `hold_buffers`,
-  `highest_failing_fraction`, and every run with its checks, evidence and failure reason.
+  `highest_failing_fraction`, `timeouts`, `warning`, and every run with its status, checks,
+  evidence and failure reason.
 - **Exit status.** 0 with a `min_fraction`; 1 when nothing signs off, not even the full tile
-  (`min_fraction` null); 2 on a tool error.
+  (`min_fraction` null); 2 on a tool error or a crash.
 - **Physical hypotheses** pass `--overlay FILE.json` (extra LibreLane keys for every trial),
-  kept under `physical/`.
+  kept under `physical/`. `--runs-dir` must stay inside this repo's `build/`, because each
+  trial's directory is a `harden_tt.sh --out`.
+- **Validated end to end** (NanoV, `--tiles 1x2 --steps 1 --lo 0.6`): the full tile and
+  fraction 0.7988 (`x_cut` 126.96) both passed signoff and the precheck. LibreLane logged
+  "Created floorplan obstruction at 126.96 0.0 161.0 225.76", every ROW ends at 126.96, and no
+  instance reaches past it, while 81 reach past 126.5.
 
 ## Findings
 
@@ -338,14 +379,25 @@ Fixture tests for all three tools; none takes the heavy lock or runs LibreLane's
 - `area.py`: injected and `.sv` file names, a bad `--top` or `--param`, and a missing or wrong
   PDK version all exit 2 and leave no `area.json`. A combinational loop dies under both engines
   (the LibreLane one needs Docker). A clean design scores with zero check counts.
-- `harden_summary.py` on synthetic run directories: exits 137 and 125 to 127, no steps,
-  GPL-0301, GRT-0116, an unknown LibreLane failure, deferred magic DRC, a clean pass with the
-  repair fields, `--no-precheck`, a failed submission, a precheck with no results, a failing
-  precheck row, and a missing overlap metric. It also reclassifies the runs kept under `build/`
-  when present.
-- `harden_tt.sh`: the `--out` guard (including a symlink to the repo), `--tiles` forms, and a
-  stale `summary.json` wiped before a failing setup, which exits 2.
-- `tilefit.py`: the LEF and DEF scan (also on a kept real run) and the search with a stub in
-  place of `harden_tt.sh` (die-edge blockage on the site grid, convergence, user obstructions
-  kept, exit 1 when nothing passes, aborts on tool errors, status mismatch, core mismatch and
-  an instance past `x_cut`).
+- `harden_summary.py` on synthetic run directories:
+  - exits 137 and 125 to 127, no steps, and an unknown LibreLane failure;
+  - design-caused errors: GPL-0301, GPL divergence, DPL, RSZ, checker and timing-checker
+    messages. GRT-0116 isn't evidence;
+  - evidence only from ERROR-level text, including a console ERROR entry with no `error.log`;
+  - timeouts;
+  - deferred magic DRC, a clean pass with the repair fields, `--no-precheck`, a failed
+    submission, a precheck with no results, and a missing overlap metric;
+  - precheck rows: violations count; the re-review's tool-failure repro and its variants are
+    tool errors; "Magic DRC failed" needs corroboration.
+
+  It also reclassifies the runs kept under `build/` when present.
+- `harden_tt.sh`: the `--out` guard (strictly inside `build/`, including a symlink to the
+  repo, marker and legacy rules), `--tiles` and `--timeout` forms, and a stale `summary.json`
+  wiped before a failing setup, which exits 2.
+- `tilefit.py`:
+  - the LEF, DEF and ROW scans (also on a kept real run);
+  - the search with a stub in place of `harden_tt.sh`: die-edge blockage on the site grid,
+    convergence, template core whatever the overlay, a shifted core of equal area, user
+    obstructions kept, timeouts listed and counted as not signing off, exit 1 when nothing
+    passes, and aborts on tool errors, status mismatch, core mismatch, an instance past
+    `x_cut` and a crash.
