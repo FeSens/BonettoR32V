@@ -676,13 +676,14 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
     files = [os.path.join(HERE, f) for f in CHECKER_FILES]
     files.append(os.path.join(RVF, "checks", "rvfi_macros.vh"))
     read = [os.path.basename(f) for f in CHECKER_FILES if not f.endswith(".vh")]
-    insns = []
     if model is not None:
         # model: the list of instructions this insn check covers (one group model).
         files.append(os.path.join(HERE, "checks", "bonetto_insn_check.sv"))
         read.append("bonetto_insn_check.sv")
         read.append("group.v")
-        insns = [i for i in model if i not in NEW_INSNS]
+    # Every stock model, in every task: the wrapper decodes RV32E (rvfi_isa_rv32e) to
+    # tell an instruction from a reserved encoding for the region stop.
+    insns = [i for i in isa_insns() if i not in NEW_INSNS]
     for i in insns:
         files.append(os.path.join(RVF, "insns", f"insn_{i}.v"))
         read.append(f"insn_{i}.v")
@@ -854,13 +855,45 @@ RUNNING = {}   # pid -> Popen of the SBY runs in flight (own process groups)
 STOP = threading.Event()   # set on fail-fast: tasks not yet started are skipped
 
 
+def descendants(pid):
+    """Every process below `pid` (children first in breadth order), from ps."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True,
+                             text=True).stdout
+    except OSError:
+        return []
+    kids = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            kids.setdefault(int(f[1]), []).append(int(f[0]))
+    res, todo = [], [pid]
+    while todo:
+        for c in kids.get(todo.pop(0), []):
+            res.append(c)
+            todo.append(c)
+    return res
+
+
+def kill_tree(pid):
+    """SIGTERM an SBY run and everything below it. Its solvers (bitwuzla) can sit in
+    other process groups and outlive a killpg (seen on hwe-bench), so every descendant
+    is signalled by pid, the deepest first, then the group."""
+    for p in reversed(descendants(pid)):
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def stop_all():
     STOP.set()
     for pr in list(RUNNING.values()):
-        try:
-            os.killpg(pr.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        kill_tree(pr.pid)
 
 
 def kill_running(*_):
@@ -936,10 +969,7 @@ def run_task(name, path, timeout):
     try:
         pr.wait(timeout=timeout + 300)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(pr.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        kill_tree(pr.pid)
         pr.wait()
     RUNNING.pop(pr.pid, None)
     dt = time.time() - t0

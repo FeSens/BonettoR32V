@@ -144,15 +144,28 @@ module rvfi_wrapper (
 			rmem[ev_byte_addr[6:0]] <= ev_byte_data;
 	end
 
-	// Region-touching retirements (contract section 3), from the spec-model address
-	// only, never from what the core claims (rvfi_mem_*), so a core cannot stop the
-	// checks by misreporting. Fetch: bytes pc16 + k, k < 4, reach 0xFF80 (or wrap
-	// through 0xFFFF) iff pc16 >= 0xFF7D. Data: an RV32E load/store at rs1 + imm (rs1 = x0
-	// reads 0), RAM (addr[31] = 0), n bytes touch the region iff
-	// addr16 >= 0xFF80 - (n - 1). Its inputs are checked at that retirement: rvfi_insn
-	// by bus_imem (the fetched bytes), rs1_addr by the insn check, rs1_rdata by reg. A
-	// reserved encoding (a used register field x16-x31) has no spec address and never
-	// stops the checks (its rs1_rdata is unconstrained).
+	// Region-touching retirements (contract section 3). Fetch: bytes pc16 + k, k < 4,
+	// reach 0xFF80 (or wrap through 0xFFFF) iff pc16 >= 0xFF7D. Data:
+	//   - an RV32E instruction (spec_insn: one of the 40 models' spec_valid, E filter
+	//     included, or a fatal-trap word): only its spec address counts, an RV32E
+	//     load/store at rs1 + imm (rs1 = x0 reads 0), RAM (addr[31] = 0), n bytes touch
+	//     the region iff addr16 >= 0xFF80 - (n - 1). What the core claims never stops
+	//     one, so it cannot hide a bug by claiming a region access. The inputs of the
+	//     spec address are checked at that retirement: rvfi_insn by bus_imem (the
+	//     fetched bytes), rs1_addr by the insn check, rs1_rdata by reg.
+	//   - a reserved encoding has no spec access: the access it claims (rvfi_mem_*,
+	//     non-trapping) decides. Formal picks the instruction stream, so a core cannot
+	//     place a reserved encoding in a trace to end the checks.
+	wire isa_valid;
+	rvfi_isa_rv32e isa_decode (
+		.rvfi_valid(1'b1), .rvfi_insn(rvfi_insn), .rvfi_pc_rdata(rvfi_pc_rdata),
+		.rvfi_rs1_rdata(rvfi_rs1_rdata), .rvfi_rs2_rdata(rvfi_rs2_rdata),
+		.rvfi_mem_rdata(rvfi_mem_rdata), .spec_valid(isa_valid),
+		.spec_trap(), .spec_rs1_addr(), .spec_rs2_addr(), .spec_rd_addr(), .spec_rd_wdata(),
+		.spec_pc_wdata(), .spec_mem_addr(), .spec_mem_rmask(), .spec_mem_wmask(),
+		.spec_mem_wdata()
+	);
+	wire spec_insn = isa_valid || rvfi_insn == 32'h00000000 || rvfi_insn == 32'hffffffff;
 	wire [6:0] r_op = rvfi_insn[6:0];
 	wire [2:0] r_f3 = rvfi_insn[14:12];
 	wire r_ld = r_op == 7'b0000011 && (r_f3 == 3'd0 || r_f3 == 3'd1 || r_f3 == 3'd2 ||
@@ -163,12 +176,15 @@ module rvfi_wrapper (
 	wire [31:0] r_imm = r_st ? {{20{rvfi_insn[31]}}, rvfi_insn[31:25], rvfi_insn[11:7]}
 	                         : {{20{rvfi_insn[31]}}, rvfi_insn[31:20]};
 	wire [31:0] r_addr = r_rs1 + r_imm;
-	wire r_e = !rvfi_insn[19] && (r_ld ? !rvfi_insn[11] : !rvfi_insn[24]);   // E filter
-	wire spec_touch = (r_ld || r_st) && r_e && !r_addr[31] &&
+	wire spec_touch = isa_valid && (r_ld || r_st) && !r_addr[31] &&
 	                  r_addr[15:0] >= 16'hff80 - r_nm1;
+	wire [3:0] c_mask = rvfi_mem_rmask | rvfi_mem_wmask;
+	wire [15:0] c_nm1 = (c_mask == 4'b0001) ? 16'd0 : (c_mask == 4'b0011) ? 16'd1 : 16'd3;
+	wire claim_touch = !spec_insn && !rvfi_trap && c_mask != 4'b0 && !rvfi_mem_addr[31] &&
+	                   rvfi_mem_addr[15:0] >= 16'hff80 - c_nm1;
 	wire fetch_touch = rvfi_pc_rdata[15:0] >= 16'hff7d;
 	assign bon_fetch_touch = fetch_touch;
-	assign bon_region_ret = fetch_touch || spec_touch;
+	assign bon_region_ret = fetch_touch || spec_touch || claim_touch;
 	reg stopped_r = 1'b0;
 	always @(posedge clock) begin
 		if (reset) stopped_r <= 1'b0;

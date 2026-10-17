@@ -128,6 +128,31 @@ def test_check_verdicts():
     assert run_formal.insn_reach("add") == ["reach_insn_add"]
 
 
+def test_kill_tree():
+    """stop_all/kill_tree reach every process below an SBY run, also those in other
+    process groups (solvers that outlived a killpg on hwe-bench)."""
+    import time
+    pr = subprocess.Popen(["sh", "-c", "sleep 60 & (setsid sleep 61 || perl -e 'setpgrp; sleep 61') & wait"],
+                          start_new_session=True)
+    time.sleep(1)
+    below = run_formal.descendants(pr.pid)
+    assert len(below) >= 2
+    run_formal.kill_tree(pr.pid)
+    pr.wait(timeout=10)
+    time.sleep(0.5)
+    alive = []
+    for p in below:
+        try:
+            os.kill(p, 0)
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(p)], capture_output=True,
+                                text=True).stdout.strip()
+            if st and not st.startswith("Z"):
+                alive.append(p)
+        except ProcessLookupError:
+            pass
+    assert alive == []
+
+
 def test_mem_jobs(monkeypatch):
     """Jobs are capped by memory at the deepest task's depth: the seed (348) fits 18 jobs
     in 50 GB, V2 (1,623, about 6.4 GB per task) only 7, the Mac's 16 GB 2; at least 1."""

@@ -395,7 +395,7 @@ clock for the whole runner, with `--keep-going` (a passing run is the same eithe
 
 | run | Mac, 8 jobs | hwe-bench |
 |---|---|---|
-| seed, fast | 486.5 s, cosim timing included (reg 419 s, bus_dmem 358 s; load ~11 from other agents) | 253 s with 18 jobs (reg 220 s, bus_dmem 210 s; measured before bb05e68); 215 to 253 s with 10 jobs for each seed-based legal variant at bb05e68 |
+| seed, fast | 486.5 s at 4c03d59, cosim timing included (reg 419 s, bus_dmem 358 s; load ~11 from other agents) | 208 s at 38551e4 with 18 jobs (the memory cap allowed 18: 1.7 GB per task, 53.7 GB budget), 251 s with staging and transfer; reg 206 s, bus_dmem 201 s |
 | V2 = hyp/002-rf-in-ram-pcram b9a5211, fast (depths 1,461 to 1,623) | not run (memory) | first 7-job attempt hung up after 2 h 20 min when the Mac crashed (see "Orphans"); a detached 6-job rerun was still running at the time of writing |
 | fc07cc3 (hyp/002-rf-in-ram), fast (depths up to 1,222) | not run (memory) | a detached 3-job run was still running at the time of writing |
 
@@ -490,7 +490,8 @@ legal variants (`"expect": "pass"`, `"checks": "all"`) must pass the whole fast 
 `_1024` stall mutants must PASS their check. Mutants marked `"slow"` (the hyp/002 cores, hours
 each) run only with `BONETTO_FORMAL_SLOW=1`.
 
-Results, on hwe-bench unless marked Mac:
+Results, on hwe-bench unless marked Mac. The fast mutants and the legal variants were re-run at
+5d23efc, after fix round 3 (region stop from the spec only); the hyp/002 rows are noted.
 
 | mutant | RTL | bug | checks | result: failed assertions |
 |---|---|---|---|---|
@@ -513,13 +514,13 @@ Results, on hwe-bench unless marked Mac:
 | region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
 | region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
 | region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | FAIL (Mac): `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
-| reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1`, `reg_rs2` |
+| reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1` (`reg_rs2` too in another run) |
 | rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
 | sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
 | trap_fields_brj | seed | junk rs fields on every trap | insn_jalr | FAIL: `insn_trap_rs1_addr`, `insn_trap_rs2_addr` |
 | claim_region_stop | seed | an OP with rs1 = rs2 flips result bit 0 and claims a 1-byte read at 0xFF80 | insn_add | FAIL: `insn_rmask` (it PASSed the 282f6d8 checks, which also stopped on a claimed region access) |
 | trap_writes_rd | cosim | a trapping JAL writes rd | insn_jal, rvfi | FAIL: `insn_trap_rd_addr`; `conv_trap_rd_addr` |
-| trap_continues | seed | fetches again after a misaligned-target trap | silent | FAIL: `silent_retire` |
+| trap_continues | seed | fetches again after a misaligned-target trap | silent | FAIL: `silent_retire` (and `silent_write` in another run) |
 | no_halt | cosim | EBREAK traps but the core keeps running | silent | FAIL: `silent_retire` |
 | region_write_after_halt | seed | a region WRITE (0xFF80) after the halt | silent | FAIL: `silent_write` |
 | gpio_any_byte | seed | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold`, `gpio_uo_cause`, `gpio_uo_value` |
