@@ -173,18 +173,19 @@ module bonetto_unique_check (
 endmodule
 
 // liveness (fork). Contract section 4 latency cap, with its edge count: edge 0 is
-// the last rising edge at which rst_n is sampled low; the first retirement (rvfi_valid
-// sampled high) comes at an edge <= 1,024, and each later one at most 1,024 edges
-// after the previous; a halted core is exempt (the halting retirement starts no
-// window).
-// Step/edge map (contract notation: X(t) is the value after edge t): BMC step s holds
-// X(s-1), so a signal is sampled at edge e in step e. Reset is step 0, so edge 0 is the
-// transition out of step 0, and "rvfi_valid sampled high at edge e" is rvfi_valid = 1
-// in step e. gap is 1 in step 1 and counts up by one per step without a retirement
-// (after a retirement in step r it is 1 in step r + 1), so gap = e - (edge of the last
-// retirement, or 0) in step e. The assertion fires in step e when gap reaches 1,024
-// without rvfi_valid: a retirement at edge 1,024 (or 1,024 edges after the previous)
-// passes, one edge later fails. The stall_* mutant pairs pin this boundary.
+// the last rising edge at which rst_n is sampled low; the first retirement comes at an
+// edge <= 1,024 and each later one at most 1,024 edges after the previous; a halted
+// core is exempt (the halting retirement starts no window). A retirement "at edge e"
+// is rvfi_valid high after edge e (X(e) = 1 in the contract notation), as the cosim
+// harness counts it (it reads the outputs right after evaluating edge e).
+// Step/edge map: BMC step s holds X(s-1). Reset is step 0, so edge 0 is the transition
+// out of step 0, and a retirement at edge e is rvfi_valid = 1 in step e + 1. gap is 0
+// in step 1 and counts up by one per step without a retirement; after a retirement in
+// step r it is 1 in step r + 1. So in step s, gap = (s - 1) - (edge of the last
+// retirement, or 0) = the edge count since edge 0 or since the last retirement. The
+// assertion fires when gap reaches 1,024 without rvfi_valid: a first retirement at
+// edge 1,024 (step 1,025), or one 1,024 edges after the previous, passes; one edge
+// later fails. The stall_* mutant pairs pin both boundaries.
 // This is a safety property; BMC covers only windows that close within the depth
 // (see docs/formal.md). Stock liveness fires `check` right after `trig` in unbounded
 // mode.
@@ -196,7 +197,7 @@ module bonetto_liveness_check (
 
 	always @(posedge clock) begin
 		if (reset) begin
-			gap <= 11'd1;
+			gap <= 11'd0;
 			halted <= 1'b0;
 		end else begin
 			if (rvfi_valid) gap <= 11'd1;

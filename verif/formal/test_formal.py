@@ -91,6 +91,14 @@ def test_depth_policy():
     assert run_formal.short_depth(cfg, t, ["beq", "lw"]) == 1 + 319 + 736 + 2
     assert run_formal.short_depth(cfg, t, ["jal"]) == 1 + 319 + 736 + 2   # class not measured
     assert sorted(sum(run_formal.CLASS_GROUPS, [])) == sorted(run_formal.isa_insns())
+    # The cosim's per_class format ({class: cycles}, its own class names).
+    t = {"first_retire_cycle": 116, "max_cycles_per_insn": 230,
+         "per_class": {"alu": 116, "shift": 116, "load": 230, "io_load": 118, "trap": 116,
+                       "branch_taken": 116, "branch_not_taken": 116}}
+    assert run_formal.short_depth(cfg, t, ["add", "sll"]) == 1 + 116 + 116 + 2
+    assert run_formal.short_depth(cfg, t, ["lw"]) == 1 + 116 + 230 + 2
+    assert run_formal.short_depth(cfg, t, ["beq"]) == 1 + 116 + 116 + 2
+    assert run_formal.short_depth(cfg, t, ["sw"]) == 1 + 116 + 230 + 2   # store not measured
 
 
 def test_check_verdicts():

@@ -152,17 +152,43 @@ for _i in ("add", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and")
     INSN_CLASS[_i] = "alu_reg"
 
 
+# The cosim's per_class ({class: max cycles}, verif/cosim/iss.h iss_class) uses other
+# class names; an instruction's latency there is the max over these classes ("trap"
+# covers ECALL/EBREAK and the misaligned-target traps of jumps and branches).
+COSIM_CLASSES = {"lui": ["lui_auipc"], "auipc": ["lui_auipc"], "jal": ["jal", "trap"],
+                 "jalr": ["jalr", "trap"], "fence": ["fence"], "ecall": ["trap"],
+                 "ebreak": ["trap"]}
+for _i in ("beq", "bne", "blt", "bge", "bltu", "bgeu"):
+    COSIM_CLASSES[_i] = ["branch_taken", "branch_not_taken", "trap"]
+for _i in ("lb", "lh", "lw", "lbu", "lhu"):
+    COSIM_CLASSES[_i] = ["load", "io_load"]
+for _i in ("sb", "sh", "sw"):
+    COSIM_CLASSES[_i] = ["store", "io_store"]
+for _i in ("addi", "slti", "sltiu", "xori", "ori", "andi"):
+    COSIM_CLASSES[_i] = ["alu_imm"]
+for _i in ("add", "sub", "slt", "sltu", "xor", "or", "and"):
+    COSIM_CLASSES[_i] = ["alu"]
+for _i in ("sll", "srl", "sra", "slli", "srli", "srai"):
+    COSIM_CLASSES[_i] = ["shift"]
+
+
 def class_max_cycles(timing, insns):
-    """Slowest measured class among `insns` (falls back to max_cycles_per_insn when the
-    timing has no per-class data or misses a class)."""
+    """Slowest measured class among `insns`, from either per_class format (timing_tb.v:
+    {class: {"max_cycles": n}}; cosim: {class: n}). Any class not measured falls back to
+    max_cycles_per_insn, so a missing measurement never shortens the depth."""
     pc = timing.get("per_class") or {}
+    fallback = int(timing["max_cycles_per_insn"])
     vals = []
     for i in insns:
-        c = pc.get(INSN_CLASS.get(i, ""))
-        if not c or c.get("max_cycles") is None:
-            return int(timing["max_cycles_per_insn"])
-        vals.append(int(c["max_cycles"]))
-    return max(vals)
+        if pc and all(isinstance(v, dict) for v in pc.values()):
+            c = pc.get(INSN_CLASS.get(i, ""))
+            v = c.get("max_cycles") if c else None
+            vals.append(int(v) if v is not None else fallback)
+        else:
+            names = COSIM_CLASSES.get(i, [])
+            got = [pc[n] for n in names if isinstance(pc.get(n), int)]
+            vals.append(max(got) if names and len(got) == len(names) else fallback)
+    return max(vals) if vals else fallback
 
 
 def is_reach_label(lbl):

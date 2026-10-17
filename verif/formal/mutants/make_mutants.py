@@ -115,12 +115,14 @@ MUTANTS = {
     ),
 }
 
-# Liveness boundary (contract section 4). Measured on the seed: the latest first
-# retirement is a 4-byte RAM access at edge 230, and the longest gap between
-# retirements is 230 edges (a 4-byte RAM access). A fetch stall of N cycles moves the
-# first retirement to edge 230 + N (stall_first) or the gap after the first retirement
-# to 230 + N (stall_later); N = 794 gives exactly 1,024, N = 795 gives 1,025. Each pair
-# also pins formal's count: the PASS/FAIL flip is at exactly one cycle.
+# Liveness boundary (contract section 4 edge count, as the cosim counts it). Measured
+# on the seed (cosim --timing-json: first retirement at edge 115, a 4-byte RAM access
+# takes 230 edges, everything else 116): the latest first retirement is a 4-byte RAM
+# access at edge 229, and the longest gap between retirements is 230 edges. A fetch
+# stall of N cycles moves the latest first retirement to edge 229 + N (stall_first;
+# N = 795 gives 1,024, N = 796 gives 1,025) or the longest gap after the first
+# retirement to 230 + N (stall_later; N = 794 gives 1,024, N = 795 gives 1,025). Each
+# pair also pins formal's count: the PASS/FAIL flip is at exactly one cycle.
 _DECL = ("    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n",
          "    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n"
          "    reg  [10:0] stall_n;     // MUTANT: fetch stall counter\n"
@@ -156,15 +158,16 @@ def _wb(later_n):
             "                    end\n")
 
 
-for _n, _exp in ((794, "pass"), (795, "fail")):
-    MUTANTS[f"stall_first_{230 + _n}"] = (
-        f"first retirement at edge {230 + _n} at the latest",
+for _n, _exp in ((795, "pass"), (796, "fail")):
+    MUTANTS[f"stall_first_{229 + _n}"] = (
+        f"first retirement at edge {229 + _n} at the latest",
         ["liveness"],
         f"The first fetch waits {_n} extra cycles after reset: the latest first retirement "
-        f"(a 4-byte RAM access) is sampled at edge {230 + _n}. Expect {_exp.upper()}.",
+        f"(a 4-byte RAM access) is at edge {229 + _n}. Expect {_exp.upper()}.",
         [_DECL, _reset(_n), _FETCH],
         {"expect": _exp, "deep": True},
     )
+for _n, _exp in ((794, "pass"), (795, "fail")):
     MUTANTS[f"stall_later_{230 + _n}"] = (
         f"second retirement {230 + _n} edges after the first at the latest",
         ["liveness"],
