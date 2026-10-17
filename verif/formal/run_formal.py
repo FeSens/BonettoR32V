@@ -1041,7 +1041,7 @@ def main():
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
 
-    result = {"pass": False, "checks": {}, "depth": None, "runtime_s": None,
+    result = {"pass": False, "checks": {}, "depth": None, "runtime_s": None, "failures": {},
               "config": os.path.relpath(cfg_path, ROOT), "suite": cfg["name"],
               "complete": not args.only, "work": work}
 
@@ -1064,6 +1064,7 @@ def main():
     if not ok:
         log(msg)
         result["error"] = msg
+        result["failures"]["structure"] = {"why": msg}
         finish(1)
     log(f"pre-pass: {msg}")
     ok, msg = pins_equiv(work, sdir, rtl)
@@ -1072,6 +1073,7 @@ def main():
     log(f"pins equivalence: {msg}")
     if not ok:
         result["error"] = msg
+        result["failures"]["equiv"] = {"why": msg}
         finish(1)
 
     timing, tsrc = get_timing(args, work, sdir, rtl)
