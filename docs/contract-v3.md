@@ -325,8 +325,9 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 ### 5.5 UART (8N1, LSB first)
 
 - **Transmit.**
-  - A write to UART_DATA while TX_BUSY = 0 sets TX_BUSY = 1, and the next instruction reads it
-    as 1.
+  - A write to UART_DATA while TX_BUSY = 0 sets TX_BUSY = 1. TX_BUSY reads 1 from that write
+    until the stop bit ends, so a read during the frame returns 1 even if the frame is shorter
+    than an instruction.
   - The start bit begins within `DIV+2` cycles. Then come the start bit, 8 data bits and the
     stop bit, each exactly DIV+1 cycles.
   - TX_BUSY clears when the stop bit ends.
@@ -347,7 +348,8 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 - **Each bit:**
   1. MOSI (`uo[6]`) is set while SCK (`uo[5]`) is low.
   2. SCK stays low for `2^D` cycles, then high for `2^D` cycles.
-  3. MISO (`ui[3]`, synchronized) is sampled at the rising SCK edge, or up to 3 cycles later.
+  3. The bit shifted in is the MISO pin value (`ui[3]`) at the rising SCK edge, or up to 3 cycles
+     after it (synchronizer delay allowed).
 - BUSY clears after the eighth high phase ends with SCK low. SPI_DATA then reads the received
   byte.
 - A write while BUSY is ignored.
