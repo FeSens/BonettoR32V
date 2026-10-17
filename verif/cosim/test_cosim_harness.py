@@ -5,7 +5,9 @@
 2. The design in src/ must pass the cosim (both modes, several seeds), and --timing-json and
    --dump-ram must produce what Tasks 5 and 6 consume.
 3. Mutants of the seed (mutants/<name>/, listed in mutants/MANIFEST.json) must each fail with
-   their specific error.
+   their specific error; the legal variants (legal_*) must pass.
+4. The TT test (test/, RTL) passes on the seed and the legal variants and fails on pin-visible
+   mutants.
 
 Run: pytest verif/cosim/test_cosim_harness.py -v
 """
@@ -231,8 +233,8 @@ def test_latency_cap_boundary(programs, tmp_path):
     assert tj["pass"] and tj["first_retire_cycle"] == 1024 and tj["max_cycles_per_insn"] == 1024
     assert set(tj["per_class"].values()) == {1024}
     assert run("pins", "+define+STALL_GAP=1024")["pass"]
-    # tools/eval.py passes --max-cycles 1024 x (retired + 1): a core at the cap must fit in it
-    # (the budget covers the program; the windows after the halt don't count)
+    # An explicit --max-cycles of 1024 x (retired + 1) fits a core at the cap: the budget covers
+    # the program, the windows after the halt don't count
     tight = 1024 * (json.loads((PROGS / "selftest.expect.json").read_text())["retired"] + 1)
     for mode in ("rvfi", "pins"):
         s = run_cosim.run_one(mode, prog, 1, max_cycles=tight, src=src,
@@ -255,6 +257,26 @@ def test_latency_cap_boundary(programs, tmp_path):
     assert not s["pass"]
     assert s["error"].startswith("cycle 1025: latency cap: no retirement within 1024 cycles of "
                                  "reset release"), s["error"]
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_core_at_the_cap_passes_as_eval_runs_it(programs, mode):
+    """A legal core retiring every instruction exactly 1,024 cycles after the previous one passes
+    a ui_in-dependent program, run the way tools/eval.py runs the cosim (no --max-cycles, so the
+    harness budget is 1,024 x (its own ISS count for this mode's ui_in schedule + 16)). random_4
+    retires a different number of instructions in rvfi mode than its expect file's pins count."""
+    exp = json.loads((PROGS / "random_4.expect.json").read_text())
+    assert exp["rvfi"]["retired"] != exp["retired"], "random_4 is no longer ui_in-dependent"
+    src = COSIM / "mutants" / "stall_gap"
+    for seed in (1, 2, 3):
+        p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--mode", mode, "--prog",
+                            str(PROGS / "random_4.hex"), "--seed", str(seed), "--src", str(src),
+                            "--vflags", "+define+STALL_GAP=1024 +define+STALL_SKIP_FIRST"],
+                           capture_output=True, text=True)
+        s = json.loads(p.stdout.strip().splitlines()[-1])
+        assert p.returncode == 0 and s["pass"], f"{mode} seed {seed}: {s['error']}"
+        if mode == "rvfi":
+            assert s["max_cycles_per_insn"] == 1024
 
 
 def test_coremark_log_ring_is_checked(programs, tmp_path):
@@ -299,6 +321,22 @@ def test_mutant_fails(programs, name):
                 assert s["error"] and err in s["error"], f"{name} {mode} seed {seed}: {s['error']}"
 
 
+def test_fetch_reading_its_load_bytes_is_named(tmp_path):
+    """Contract section 6: a fetch may only read its instruction's bytes. lw x1, 4(x0) at pc 0
+    loads the next word; fetch_extra_byte's fetch READ continues into byte 4, one of the load's own
+    bytes, so the error names the fetch overrun (not a missing load byte). The seed passes."""
+    img = bytearray(65536)
+    img[0:8] = (0x00402083).to_bytes(4, "little") + (0x00100073).to_bytes(4, "little")  # ebreak
+    hexf = tmp_path / "lw_next.hex"
+    hexf.write_text("".join(f"{b:02x}\n" for b in img))
+    s, _ = run_cosim.run_one("rvfi", hexf, 1)
+    assert s["pass"] and s["retired"] == 2, s["error"]
+    s, _ = run_cosim.run_one("rvfi", hexf, 1, src=COSIM / "mutants" / "fetch_extra_byte")
+    assert not s["pass"]
+    assert ("the fetch READ of retirement #0" in s["error"]
+            and "read beyond the instruction's 4 bytes (byte 0x0004)" in s["error"]), s["error"]
+
+
 def test_trap_retirement_compares_only_the_contract_fields():
     """Contract section 6: on a trapping retirement only trap, halt, insn, pc_rdata, rd_addr = 0
     and no memory write are compared. legal_trap_fields reports arbitrary rs fields, rd_wdata and
@@ -316,3 +354,43 @@ def test_every_required_mutant_class_is_present():
                 "load_own_fetch"}
     assert required <= set(m), required - set(m)
     assert m["rvfi_hidden"]["pass"] == ["rvfi"] and "pins" in m["rvfi_hidden"]["fail"]
+
+
+# ------------------------------------------------------------------------------------------------
+# 4. the TT test (test/test.py with the 23LC512 model) on legal variants and on mutants
+# It sees only the pins: gpio_demo's uo_out sequence and the RAM model's waveform rules. Mutants
+# whose bug only shows against RVFI or the retirement timing (rvfi_hidden, uo_late,
+# cs_open_at_retire, load_own_fetch) pass it by design; the cosim catches those.
+TT_CASES = {
+    "(seed)": None,
+    "legal_mosi_echo": None,    # MOSI = X when no bit is due: legal
+    "legal_trap_fields": None,
+    "mosi_on_rise": "spiram: MOSI changed on a rising SCK edge",
+    "cs_sck_high": "spiram: CS_n changed while SCK was high",
+    "write_midbyte": "spiram: WRITE ended mid-byte",  # needs gpio_demo's RAM stores
+    "zero_init": "spiram: MOSI = x on a rising SCK edge",
+    "uo_glitch": "uo_out change #1 is 0x00",
+}
+
+
+@pytest.mark.parametrize("name", sorted(TT_CASES))
+def test_tt_test_on_variants(name):
+    """make -C test (RTL) passes on the seed and the legal variants and fails on the mutants with
+    their specific message. legal_mosi_echo drives MOSI = X when no bit is due, which the contract
+    allows (MOSI matters only at rising SCK edges): the TT test must not X-check MOSI."""
+    if name == "legal_mosi_echo":
+        m = manifest()[name]
+        assert m["pass"] == ["rvfi", "pins"] and not m["fail"]
+    src = SRC if name == "(seed)" else COSIM / "mutants" / name
+    tag = "tt_" + name.strip("()")
+    p = subprocess.run(["make", "-C", str(ROOT / "test"), f"SRC_DIR={src}",
+                        f"SIM_BUILD=sim_build/{tag}",
+                        f"COCOTB_RESULTS_FILE=sim_build/{tag}/results.xml"],
+                       capture_output=True, text=True)
+    out = p.stdout + p.stderr
+    want = TT_CASES[name]
+    if want is None:
+        assert p.returncode == 0 and "TESTS=1 PASS=1 FAIL=0" in out, out[-3000:]
+    else:
+        assert p.returncode != 0 and "FAIL=1" in out, f"{name} passed the TT test"
+        assert want in out, out[-3000:]

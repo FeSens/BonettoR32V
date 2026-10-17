@@ -120,11 +120,14 @@ struct Expect {
     return false;
   }
   // One completed READ transaction. Returns the index of its first byte that is neither a fetch
-  // nor a load byte of this instruction, or -1. Completeness is tracked per transaction
-  // (contract section 6): the first READ that carries all 4 instruction bytes in full is the
-  // fetch, and load bytes count only when another READ carries them, so a load of the
-  // instruction's own bytes still needs its own READ.
-  int read_txn(const SpiTxn& x) {
+  // nor a load byte of this instruction, or -1; *overrun is set when the fetch READ also carried
+  // bytes other than the instruction's 4. Completeness is tracked per transaction (contract
+  // section 6): the first READ that carries all 4 instruction bytes in full is the fetch, it may
+  // carry nothing else ("a fetch may only read that instruction's bytes"), and load bytes count
+  // only when another READ carries them, so a load of the instruction's own bytes, or of the
+  // bytes right after them, still needs its own READ.
+  int read_txn(const SpiTxn& x, bool* overrun) {
+    *overrun = false;
     for (size_t k = 0; k < x.bytes.size(); k++)
       if (!read_allowed(x.at(k))) return (int)k;
     const size_t full = x.full_bytes();
@@ -134,6 +137,14 @@ struct Expect {
         if (x.at(k) == fetch[j]) has[j] = true;
     if (!fetch_done && has[0] && has[1] && has[2] && has[3]) {
       fetch_done = true;
+      for (size_t k = 0; k < x.bytes.size(); k++) {
+        bool own = false;
+        for (int j = 0; j < 4; j++) own = own || x.at(k) == fetch[j];
+        if (!own) {
+          *overrun = true;
+          return (int)k;
+        }
+      }
       return -1;
     }
     for (size_t k = 0; k < full; k++)
@@ -407,13 +418,22 @@ int Harness::run(const uint8_t* img) {
           continue;
         }
         int bad = -1;
+        bool overrun = false;
         if (x.write) {
           for (size_t k = 0; k < x.bytes.size() && bad < 0; k++)
             if (!pend.write_ok(x.at(k), x.bytes[k])) bad = (int)k;
         } else {
-          bad = pend.read_txn(x);
+          bad = pend.read_txn(x, &overrun);
         }
-        if (bad >= 0) {
+        if (overrun) {
+          fail(fmt("the fetch READ of %s (transaction at 0x%04x, cycles %llu..%llu) read beyond "
+                   "the instruction's 4 bytes (byte 0x%04x): a fetch may only read that "
+                   "instruction's bytes, and a load reads its bytes with a READ of its own "
+                   "(contract section 6)",
+                   describe(retired_, pend.e).c_str(), x.addr,
+                   (unsigned long long)since_release(x.start),
+                   (unsigned long long)since_release(x.end), x.at(bad)));
+        } else if (bad >= 0) {
           fail(fmt("SPI %s of byte 0x%04x%s (transaction at 0x%04x, cycles %llu..%llu) is not "
                    "part of %s; allowed: %s",
                    x.write ? "WRITE" : "READ", x.at(bad),

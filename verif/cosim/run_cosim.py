@@ -3,7 +3,7 @@
 
 One run:
   run_cosim.py --mode {rvfi,pins} --prog build/programs/<name>.hex [--seed S] [--max-cycles C]
-               [--timing-json PATH] [--dump-ram PATH] [--src DIR] [--trace PATH]
+               [--timing-json PATH] [--dump-ram PATH] [--src DIR] [--vflags ARGS] [--trace PATH]
 prints one JSON line
   {"prog","mode","seed","pass","retired","cycles","cpi","max_cycles_per_insn","error"}
 and exits 0 on a pass.
@@ -251,6 +251,8 @@ def main() -> int:
     ap.add_argument("--timing-json", type=Path)
     ap.add_argument("--dump-ram", type=Path)
     ap.add_argument("--src", type=Path, default=SRC)
+    ap.add_argument("--vflags", default="",
+                    help="extra Verilator arguments (harness self-tests on mutant copies)")
     ap.add_argument("--trace", type=Path, help="write an FST waveform (separate traced build)")
     ap.add_argument("--all", action="store_true", help="every program x mode x seed {1,2,3}")
     ap.add_argument("--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 2)))
@@ -265,7 +267,7 @@ def main() -> int:
     if a.timing_json and a.mode != "rvfi":
         ap.error("--timing-json needs --mode rvfi (pins mode can't see retirements)")
     summary, _ = run_one(a.mode, a.prog, a.seed, a.max_cycles, a.timing_json, a.dump_ram, a.src,
-                         trace=a.trace)
+                         vflags=a.vflags, trace=a.trace)
     print(json.dumps({k: summary[k] for k in KEYS}))
     return 0 if summary["pass"] else 1
 
