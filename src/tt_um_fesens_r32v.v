@@ -98,7 +98,7 @@ module tt_um_fesens_r32v (
     reg         cmp;    // compare; address[1:0] == 0; JALR target[1]; shift fill state
     reg         c4;     // carry of the on-the-fly + 4 (W family) and + 2 (BH2)
     reg  [32:0] bfr;    // operand/result buffer ring
-    reg  [31:0] irs;    // instruction register, in SPI order
+    reg  [30:0] irs;    // instruction register, in SPI order, without insn[1]
     reg  [7:0]  gpo;
 
     assign uo_out  = gpo;
@@ -108,33 +108,18 @@ module tt_um_fesens_r32v (
     wire _unused = &{ena, uio_in[7:3], uio_in[1:0], 1'b0};
 
     // ------------------------------------------------------------------------------------
-    // Decode. Only the contract's fatal traps trap (contract section 4): SYSTEM (ECALL, EBREAK),
-    // the all-zeros and all-ones words, and misaligned JAL. Every other reserved encoding is
-    // unspecified and executes as the class its opcode bits select; register fields use 4 bits.
+    // Decode, spec-minimum (contract section 4). It traps on insn[0] = 0 (the all-zeros word),
+    // opcode[6:4] = 111 (SYSTEM: ECALL, EBREAK; the all-ones word) and misaligned JAL. Every other
+    // encoding executes as the class its opcode bits select; register fields use 4 bits. insn[1]
+    // is not stored: no design logic reads it.
     // ------------------------------------------------------------------------------------
-    wire [31:0] insn  = {irs[7:0], irs[15:8], irs[23:16], irs[31:24]};
+    wire [31:0] insn  = {irs[7:0], irs[15:8], irs[23:16], irs[30:25], 1'b1, irs[24]};
     wire [2:0]  f3    = insn[14:12];
     wire [3:0]  rd_f  = insn[10:7];
     wire [3:0]  rs1_f = insn[18:15];
     wire [3:0]  rs2_f = insn[23:20];
 
-    wire [6:0] opcode   = insn[6:0];
-    wire is_lui    = (opcode == 7'b0110111);
-    wire is_auipc  = (opcode == 7'b0010111);
-    wire is_jal    = (opcode == 7'b1101111);
-    wire is_jalr   = (opcode == 7'b1100111);
-    wire is_branch = (opcode == 7'b1100011);
-    wire is_load   = (opcode == 7'b0000011);
-    wire is_store  = (opcode == 7'b0100011);
-    wire is_opimm  = (opcode == 7'b0010011);
-    wire is_op     = (opcode == 7'b0110011);
-    wire is_fence  = (opcode == 7'b0001111);
-    wire uses_rd   = is_lui | is_auipc | is_jal | is_jalr | is_load | is_opimm | is_op;
-    wire uses_rs1  = is_jalr | is_branch | is_load | is_store | is_opimm | is_op;
-    wire legal     = uses_rd | uses_rs1 | is_fence;   // a known opcode
-    wire trap_dec  = ~legal | (is_jal & insn[21]);
-
-    // Datapath classes (legal instructions only)
+    // Datapath classes, from the opcode bits that tell the RV32E classes apart
     wire c_br    = insn[6] & ~insn[2];
     wire c_jalr  = insn[6] & insn[2] & ~insn[3];
     wire c_jal   = insn[6] & insn[3];
@@ -150,6 +135,7 @@ module tt_um_fesens_r32v (
     wire c_slt   = c_alu & (f3[2:1] == 2'b01);
     wire sh_left = ~f3[2];
     wire [1:0] nm1 = {f3[1], f3[1] | f3[0]};   // access bytes - 1
+    wire trap_dec  = ~insn[0] | (insn[6] & insn[5] & insn[4]) | (c_jal & insn[21]);
 
     wire fR   = ~sl[3] & ~sl[2];
     wire fO   = ~sl[3] &  sl[2];
@@ -297,7 +283,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // the slot starts (CS_n falls) after the IDLE clock at this phase: 15, 16, 1, 4 (W), 17
     wire [5:0] tgt = {1'b0, fO | wpln, fR, fR | sW, fR, fR | fM | wpln};
-    wire mask = (sA & (~uses_rs1 | (rs1_f == 4'd0))) |
+    wire mask = (sA & (c_u | c_jal | (rs1_f == 4'd0))) |
                 (sB & ~(c_op | c_br)) |
                 ((sB | fO) & (rs2_f == 4'd0)) |
                 (fW & sl[1] & (rd_f == 4'd0));
@@ -375,8 +361,12 @@ module tt_um_fesens_r32v (
 
     always @(posedge clk) begin
         bfr <= {bfr_we ? bfr_w : bfr[0], bfr[32:1]};
-        if (sF & stb)
-            irs <= {irs[30:0], uio_in[2]};
+        // the tail (insn[7:2]) skips the last strobe, so insn[1] (the strobe before) drops out
+        if (sF & stb) begin
+            irs[24:0] <= {irs[23:0], uio_in[2]};
+            if (~j[5])
+                irs[30:25] <= irs[29:24];
+        end
     end
 
     // ------------------------------------------------------------------------------------
@@ -483,8 +473,8 @@ module tt_um_fesens_r32v (
     // RVFI (formal and cosim builds only; observes, never drives the pins)
     // ------------------------------------------------------------------------------------
 `ifdef RISCV_FORMAL
-    wire        uses_rs2 = is_branch | is_store | is_op;
     wire        sP       = fR & ~sl[1] & ~sl[0];
+    reg         r_i1;                                   // insn[1], not stored by the design
 
     reg [63:0] r_order;
     reg        r_halt;
@@ -502,6 +492,8 @@ module tt_um_fesens_r32v (
         end
         if (stb & sP)
             r_pc <= {miso_m, r_pc[31:1]};
+        if (stb & sF & (j == 6'd7))
+            r_i1 <= uio_in[2];
         if (wem & ~sl[1])
             r_npc <= {wdo, r_npc[31:1]};                    // WP, WP4
         if (stb & sA)
@@ -520,21 +512,23 @@ module tt_um_fesens_r32v (
     wire [31:0] imm_b = {{20{insn[31]}}, insn[7], insn[30:25], insn[11:8], 1'b0};
     wire [31:0] imm_j = {{12{insn[31]}}, insn[19:12], insn[20], insn[30:21], 1'b0};
     wire [31:0] jalr_t = (r_rs1 + imm_i) & 32'hFFFF_FFFE;
-    wire [31:0] npc_t  = is_jal ? r_pc + imm_j : is_jalr ? jalr_t :
-                         (is_branch & taken) ? r_pc + imm_b : r_pc + 32'd4;
+    // a decode trap reports pc + 4 (a misaligned JAL its target), as the reference ISS does
+    wire        r_jal  = ({insn[6:2], r_i1, insn[0]} == 7'b1101111);
+    wire [31:0] npc_t  = (trap_dec & ~r_jal) ? r_pc + 32'd4 : c_jal ? r_pc + imm_j : c_jalr ? jalr_t :
+                         (c_br & taken) ? r_pc + imm_b : r_pc + 32'd4;
 
-    wire        r_rs1e = legal & uses_rs1;
-    wire        r_rs2e = legal & uses_rs2;
-    wire        r_rde  = legal & uses_rd & (rd_f != 4'd0) & ~trap;
-    wire        r_mem  = ~trap & (is_load | is_store);
-    wire [31:0] maddr  = r_rs1 + (is_store ? imm_s : imm_i);
+    wire        r_rs1e = ~trap_dec & (c_alu | c_mem | c_br | c_jalr);
+    wire        r_rs2e = ~trap_dec & (c_br | c_st | c_op);
+    wire        r_rde  = ~trap & (c_alu | c_u | c_jal | c_jalr | c_ld) & (rd_f != 4'd0);
+    wire        r_mem  = ~trap & c_mem;
+    wire [31:0] maddr  = r_rs1 + (c_st ? imm_s : imm_i);
     wire [3:0]  r_mask = (f3[1:0] == 2'b00) ? 4'b0001 : (f3[1:0] == 2'b01) ? 4'b0011 : 4'b1111;
     wire [31:0] lmask  = {{8{r_mask[3]}}, {8{r_mask[2]}}, {8{r_mask[1]}}, {8{r_mask[0]}}};
     wire [31:0] mrd    = maddr[31] ? {24'd0, cmp ? ui_in : 8'd0} : r_mrd;
 
     assign rvfi_valid     = r_ret;
     assign rvfi_order     = r_order;
-    assign rvfi_insn      = insn;
+    assign rvfi_insn      = {insn[31:2], r_i1, insn[0]};
     assign rvfi_trap      = trap;
     assign rvfi_halt      = trap;
     assign rvfi_intr      = 1'b0;
@@ -549,10 +543,10 @@ module tt_um_fesens_r32v (
     assign rvfi_pc_rdata  = r_pc;
     assign rvfi_pc_wdata  = trap ? npc_t : r_npc;
     assign rvfi_mem_addr  = r_mem ? maddr : 32'd0;
-    assign rvfi_mem_rmask = (r_mem & is_load) ? r_mask : 4'd0;
-    assign rvfi_mem_wmask = (r_mem & is_store) ? r_mask : 4'd0;
-    assign rvfi_mem_rdata = (r_mem & is_load) ? (mrd & lmask) : 32'd0;
-    assign rvfi_mem_wdata = (r_mem & is_store) ? (r_rs2 & lmask) : 32'd0;
+    assign rvfi_mem_rmask = (r_mem & c_ld) ? r_mask : 4'd0;
+    assign rvfi_mem_wmask = (r_mem & c_st) ? r_mask : 4'd0;
+    assign rvfi_mem_rdata = (r_mem & c_ld) ? (mrd & lmask) : 32'd0;
+    assign rvfi_mem_wdata = (r_mem & c_st) ? (r_rs2 & lmask) : 32'd0;
 `endif
 
 endmodule
