@@ -9,14 +9,15 @@
 #   third_party/ unless --third-party (774 MB; needed by make arch), and build/ except
 #   build/programs/) to hwe-bench:~/bonetto-work/<tag>/. <tag> defaults to the checkout's directory
 #   name, so each worktree gets its own mirror and its own remote build/ cache.
-# - Runs <command...> there with the oss-cad-suite (Verilator, iverilog, yosys) and
-#   ~/bonetto-venv (pytest, cocotb) on PATH.
+# - Runs <command...> there with ~/bonetto-venv (pytest, cocotb, the vvp/iverilog shims for
+#   cocotb and the LibreLane docker shim), ~/bonetto-tools (spike, dtc), the oss-cad-suite
+#   (Verilator, iverilog, yosys, sby, eqy) and /opt/hwe-toolchain (xPack riscv32-unknown-elf-gcc
+#   15.2.0, the Mac's release) on PATH.
 # - Copies each --pull PATH (relative to the checkout, e.g. build/cosim.json) back into the local
 #   checkout, then exits with the remote command's status.
 #
-# hwe-bench has no RISC-V GCC: build programs locally first (make -C verif/programs), then run the
-# cosim remotely with --no-make. Only one-off commands belong here; long formal runs use
-# verif/formal's own remote runner.
+# Programs can be built on either host (same xPack GCC release). Only one-off commands belong
+# here; long formal runs use verif/formal's own remote runner.
 set -euo pipefail
 
 HOST="${BONETTO_HWE_HOST:-hwe-bench}"
@@ -49,7 +50,7 @@ rsync -a --delete \
 cmd="$(printf '%q ' "$@")"
 set +e
 ssh -o ConnectTimeout=15 "$HOST" \
-  "cd ~/$remote && export PATH=\$HOME/bonetto-venv/bin:/opt/hwe-toolchain/oss-cad-suite/bin:\$PATH && $cmd"
+  "cd ~/$remote && export PATH=\$HOME/bonetto-venv/bin:\$HOME/bonetto-tools/bin:/opt/hwe-toolchain/oss-cad-suite/bin:/opt/hwe-toolchain/bin:\$PATH && $cmd"
 status=$?
 set -e
 
