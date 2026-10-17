@@ -517,6 +517,7 @@ Results, on hwe-bench unless marked Mac:
 | rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
 | sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
 | trap_fields_brj | seed | junk rs fields on every trap | insn_jalr | FAIL: `insn_trap_rs1_addr`, `insn_trap_rs2_addr` |
+| claim_region_stop | seed | an OP with rs1 = rs2 flips result bit 0 and claims a 1-byte read at 0xFF80 | insn_add | FAIL: `insn_rmask` (it PASSed the 282f6d8 checks, which also stopped on a claimed region access) |
 | trap_writes_rd | cosim | a trapping JAL writes rd | insn_jal, rvfi | FAIL: `insn_trap_rd_addr`; `conv_trap_rd_addr` |
 | trap_continues | seed | fetches again after a misaligned-target trap | silent | FAIL: `silent_retire` |
 | no_halt | cosim | EBREAK traps but the core keeps running | silent | FAIL: `silent_retire` |
