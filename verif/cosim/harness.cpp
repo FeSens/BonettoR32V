@@ -1,17 +1,26 @@
 // Pin-level cosim harness for tt_um_fesens_r32v (Verilator main). See docs/cosim.md.
 //
 //   harness <prog.hex> [--seed S] [--max-cycles C] [--dump-ram PATH] [--trace PATH] [-v]
+//           [--region-zero]   (self-test hook: the core region starts zero instead of random)
 //   harness --spi-only N [--seed S] [--dump-ram PATH]       (harness self-test, no ISS)
+//
+// Contract v2: RAM bytes 0xFF80-0xFFFF are the core region (the core's private state). Every SPI
+// transaction is a region transaction or a program transaction (contract section 6); region
+// transactions are free, persist in the RAM model (they are the core's registers), start from
+// random bytes, and are left out of the final-RAM comparison.
 //
 // Built twice by build.sh:
 //   rvfi mode (RVFI_MODE, design built with RISCV_FORMAL): every retirement is compared field by
-//     field with the reference ISS, every SPI transaction is attributed to the instruction that
-//     retires next and checked against it, uo_out timing and the latency cap are enforced.
-//   pins mode (plain design): the SPI write stream, the uo_out change sequence and the final RAM
-//     image are compared with the ISS; no RVFI ports exist.
-// Both modes: the contract section 2 waveform rules (spiram.h), constant uio_oe / unused outputs,
-// reset values, outputs that only change at rising clk edges, noise on MISO while SCK is low and
-// on every unused input, random power-up state (+verilator seed), and no SPI WRITE after the halt.
+//     field with the reference ISS, every program SPI transaction is attributed to the instruction
+//     that retires next and checked against it (one exact fetch, load READs, store WRITEs),
+//     uo_out timing and the latency cap are enforced.
+//   pins mode (plain design): the program SPI write stream, the uo_out change sequence and the
+//     final RAM image outside the region are compared with the ISS; no RVFI ports exist.
+// Both modes: the contract section 2 waveform rules (spiram.h), region/program classification,
+// constant uio_oe / unused outputs, reset values, outputs that only change at rising clk edges,
+// noise on MISO while SCK is low and on every unused input, random power-up state (+verilator
+// seed) and region contents, and no SPI WRITE after the halt (rvfi) or program WRITE after the
+// last store (pins).
 //
 // The last stdout line is a JSON summary. Exit 0 = pass, 1 = fail, 2 = usage or setup error.
 #include <verilated.h>
@@ -46,6 +55,7 @@ struct Opts {
   const char* trace = nullptr;
   uint64_t spi_only = 0;
   int verbose = 0;
+  bool region_zero = false;  // test hook: leave the region as the image has it (zeros)
 };
 
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
@@ -80,11 +90,53 @@ std::string describe(uint64_t n, const Retire& e) {
              iss_disasm(e.insn).c_str());
 }
 
-// Per-instruction SPI bookkeeping (rvfi mode).
+// What made the ISS step unspecified (Retire::reserved).
+const char* unspecified(const Retire& r) {
+  return r.region ? "a fetch or RAM access touching the core region 0xFF80-0xFFFF"
+                  : "an unspecified instruction";
+}
+
+// Contract v2 section 6: every SPI transaction is a region transaction (every byte it addresses
+// is in 0xFF80-0xFFFF, no wrap out) or a program transaction (no region byte). The bytes it
+// addresses: READ, every byte with at least one bit clocked; WRITE, every complete byte; a
+// transaction with no data byte addresses its start address A.
+enum class TxnKind { Region, Program, Mixed };
+
+TxnKind classify(const SpiTxn& x) {
+  const size_t n = x.bytes.size();
+  if (n == 0) return in_region(x.addr) ? TxnKind::Region : TxnKind::Program;
+  bool in = false, out = false;
+  for (size_t k = 0; k < n; k++) (in_region(x.at(k)) ? in : out) = true;
+  return in && out ? TxnKind::Mixed : in ? TxnKind::Region : TxnKind::Program;
+}
+
+std::string txn_where(const SpiTxn& x, uint64_t release_edge) {
+  return fmt("transaction at 0x%04x, %zu data byte%s, cycles %llu..%llu", x.addr, x.bytes.size(),
+             x.bytes.size() == 1 ? "" : "s", (unsigned long long)(x.start - release_edge),
+             (unsigned long long)(x.end - release_edge));
+}
+
+// A transaction that is neither kind, as an error message.
+std::string mixed_error(const SpiTxn& x, uint64_t release_edge) {
+  size_t k = 0;
+  const bool first_in = in_region(x.at(0));
+  while (k < x.bytes.size() && in_region(x.at(k)) == first_in) k++;
+  const char* how = first_in ? "wraps out of the core region 0xFF80-0xFFFF"
+                             : "runs from program RAM into the core region 0xFF80-0xFFFF";
+  return fmt("SPI %s (%s) %s at byte 0x%04x: a transaction is either a region transaction (every "
+             "byte in 0xFF80-0xFFFF, no wrap out) or a program transaction (no region byte) "
+             "(contract section 6)",
+             x.write ? "WRITE" : "READ", txn_where(x, release_edge).c_str(), how, x.at(k));
+}
+
+// Per-instruction SPI bookkeeping (rvfi mode): the program transactions of the instruction that
+// retires next (contract section 6). Exactly one fetch READ of exactly its 4 bytes; for a RAM
+// load, READs of only its bytes that together read all of them; for a RAM store, WRITEs of only
+// its bytes, each byte exactly once and with the store's value; nothing else.
 struct Expect {
   Retire e;
-  uint16_t fetch[4];
-  bool fetch_done = false;  // one READ carried all 4 instruction bytes in full
+  uint16_t pc16 = 0;
+  bool fetched = false;  // its fetch READ was seen
   int nload = 0;
   uint16_t load[4];
   bool load_read[4];
@@ -95,8 +147,8 @@ struct Expect {
 
   void set(const Retire& r) {
     e = r;
-    for (int k = 0; k < 4; k++) fetch[k] = (uint16_t)(r.pc + k);
-    fetch_done = false;
+    pc16 = (uint16_t)r.pc;
+    fetched = false;
     nload = nstore = 0;
     bool io = r.maddr >> 31;
     if (r.rmask && !io) {
@@ -112,59 +164,83 @@ struct Expect {
       }
     }
   }
-  bool read_allowed(uint16_t a) const {
-    for (int k = 0; k < 4; k++)
-      if (fetch[k] == a) return true;
+  int load_index(uint16_t a) const {
     for (int k = 0; k < nload; k++)
-      if (load[k] == a) return true;
-    return false;
-  }
-  // One completed READ transaction. Returns the index of its first byte that is neither a fetch
-  // nor a load byte of this instruction, or -1; *overrun is set when the fetch READ also carried
-  // bytes other than the instruction's 4. Completeness is tracked per transaction (contract
-  // section 6): the first READ that carries all 4 instruction bytes in full is the fetch, it may
-  // carry nothing else ("a fetch may only read that instruction's bytes"), and load bytes count
-  // only when another READ carries them, so a load of the instruction's own bytes, or of the
-  // bytes right after them, still needs its own READ.
-  int read_txn(const SpiTxn& x, bool* overrun) {
-    *overrun = false;
-    for (size_t k = 0; k < x.bytes.size(); k++)
-      if (!read_allowed(x.at(k))) return (int)k;
-    const size_t full = x.full_bytes();
-    bool has[4] = {false, false, false, false};
-    for (size_t k = 0; k < full; k++)
-      for (int j = 0; j < 4; j++)
-        if (x.at(k) == fetch[j]) has[j] = true;
-    if (!fetch_done && has[0] && has[1] && has[2] && has[3]) {
-      fetch_done = true;
-      for (size_t k = 0; k < x.bytes.size(); k++) {
-        bool own = false;
-        for (int j = 0; j < 4; j++) own = own || x.at(k) == fetch[j];
-        if (!own) {
-          *overrun = true;
-          return (int)k;
-        }
-      }
-      return -1;
-    }
-    for (size_t k = 0; k < full; k++)
-      for (int j = 0; j < nload; j++)
-        if (x.at(k) == load[j]) load_read[j] = true;
+      if (load[k] == a) return k;
     return -1;
   }
-  bool write_ok(uint16_t a, uint8_t v) {
+  int store_index(uint16_t a) const {
     for (int k = 0; k < nstore; k++)
-      if (store[k] == a && store_val[k] == v) return store_written[k] = true;
-    return false;
+      if (store[k] == a) return k;
+    return -1;
   }
   std::string allowed() const {
-    std::string s = fmt("fetch 0x%04x..0x%04x", fetch[0], fetch[3]);
+    std::string s = fmt("fetch 0x%04x..0x%04x%s", pc16, (uint16_t)(pc16 + 3),
+                        fetched ? " (done)" : "");
     if (nload) s += fmt(", load 0x%04x+%d", load[0], nload);
     if (nstore) {
       s += ", store";
       for (int k = 0; k < nstore; k++) s += fmt(" 0x%04x=0x%02x", store[k], store_val[k]);
     }
-    return s;
+    return s + ", and region transactions";
+  }
+  // One completed program READ. Returns "" or what is wrong with it (who: the instruction,
+  // where: the transaction). The first READ of exactly pc[15:0] + k (k < 4) is the fetch; a READ
+  // whose every byte is a load byte is a load READ (its complete bytes count for the load), so a
+  // load of the instruction's own bytes still needs a READ of its own.
+  std::string read_txn(const SpiTxn& x, const std::string& who, const std::string& where) {
+    const size_t n = x.bytes.size(), full = x.full_bytes();
+    const bool exact_fetch = x.addr == pc16 && n == 4 && full == 4;
+    if (exact_fetch && !fetched) {
+      fetched = true;
+      return "";
+    }
+    bool only_load = n > 0;
+    for (size_t k = 0; k < n; k++) only_load = only_load && load_index(x.at(k)) >= 0;
+    if (only_load) {
+      for (size_t k = 0; k < full; k++) load_read[load_index(x.at(k))] = true;
+      return "";
+    }
+    if (n == 0)
+      return fmt("a program SPI READ (%s) read no data byte: it is neither %s's fetch nor a load "
+                 "READ (contract section 6)",
+                 where.c_str(), who.c_str());
+    if (!fetched && x.addr == pc16) {
+      if (n > 4)
+        return fmt("the fetch READ of %s (%s) read beyond the instruction's 4 bytes (byte "
+                   "0x%04x): a fetch reads exactly that instruction's bytes, and a load reads its "
+                   "bytes with a READ of its own (contract section 6)",
+                   who.c_str(), where.c_str(), x.at(4));
+      return fmt("the fetch READ of %s (%s) read %u data bits: a fetch reads exactly the "
+                 "instruction's 4 bytes, 32 bits (contract section 6)",
+                 who.c_str(), where.c_str(), x.data_bits);
+    }
+    if (exact_fetch)
+      return fmt("a second fetch READ of %s (%s): exactly one fetch per instruction (contract "
+                 "section 6)",
+                 who.c_str(), where.c_str());
+    size_t k = 0;
+    while (load_index(x.at(k)) >= 0) k++;
+    return fmt("SPI READ of byte 0x%04x (%s) is not part of %s; allowed: %s", x.at(k),
+               where.c_str(), who.c_str(), allowed().c_str());
+  }
+  // One completed program WRITE: only the store's bytes, each exactly once, with its value.
+  std::string write_txn(const SpiTxn& x, const std::string& who, const std::string& where) {
+    for (size_t k = 0; k < x.bytes.size(); k++) {
+      const int j = store_index(x.at(k));
+      if (j < 0)
+        return fmt("SPI WRITE of byte 0x%04x = 0x%02x (%s) is not part of %s; allowed: %s",
+                   x.at(k), x.bytes[k], where.c_str(), who.c_str(), allowed().c_str());
+      if (store_written[j])
+        return fmt("SPI WRITE of store byte 0x%04x (%s) a second time for %s: a store writes "
+                   "each of its bytes exactly once (contract section 6)",
+                   x.at(k), where.c_str(), who.c_str());
+      if (x.bytes[k] != store_val[j])
+        return fmt("SPI WRITE of byte 0x%04x = 0x%02x (%s) for %s: the store writes 0x%02x there",
+                   x.at(k), x.bytes[k], where.c_str(), who.c_str(), store_val[j]);
+      store_written[j] = true;
+    }
+    return "";
   }
 };
 
@@ -261,6 +337,10 @@ int Harness::run(const uint8_t* img) {
   // Reset length depends on the seed; seed 1 uses the minimum of one edge.
   reset_edges_ = 1 + ((o_.seed + 8) * 5) % 9;
   const bool spi_only = o_.spi_only != 0;
+  // Contract section 3: the core region's contents at reset are arbitrary, like on-die registers.
+  if (!spi_only && !o_.region_zero)
+    for (uint32_t a = REGION_LO; a < SpiRam::SIZE; a++)
+      spi_.poke((uint16_t)a, ui_value(o_.seed * 0x2545F491u + 0x5EED, a));
 
   // ---- reference -----------------------------------------------------------------------------
   Iss iss;
@@ -294,7 +374,8 @@ int Harness::run(const uint8_t* img) {
     ui_ = ui_value(o_.seed, 0);
     Retire r = iss.step(ui_);
     if (r.reserved) {
-      fail("test program bug: the ISS hit an unspecified instruction at " + describe(0, r));
+      fail(std::string("test program bug: the ISS hit ") + unspecified(r) + " at " +
+           describe(0, r));
     }
     note_iss_uo();
     pend.set(r);
@@ -312,7 +393,7 @@ int Harness::run(const uint8_t* img) {
     while (!iss.halted()) {
       Retire r = iss.step(ui_value(o_.seed, changes));
       if (r.reserved) {
-        fail("test program bug: the ISS hit an unspecified instruction at " +
+        fail(std::string("test program bug: the ISS hit ") + unspecified(r) + " at " +
              describe(ref_retired, r));
         break;
       }
@@ -411,36 +492,23 @@ int Harness::run(const uint8_t* img) {
       }
     } else if (!in_reset) {
 #ifdef RVFI_MODE
-      // SPI transactions completed so far belong to the instruction that retires next.
+      // SPI transactions completed so far belong to the instruction that retires next. Region
+      // transactions are free (any number, READ or WRITE, any order); program transactions must
+      // be that instruction's fetch, load READs or store WRITEs (contract section 6).
       for (const SpiTxn& x : spi_.done()) {
-        if (halted_) {
+        const TxnKind kind = classify(x);
+        if (kind == TxnKind::Mixed) {
+          fail(mixed_error(x, reset_edges_ - 1));
+        } else if (halted_) {
           if (x.write) fail("SPI WRITE after the halt");
-          continue;
-        }
-        int bad = -1;
-        bool overrun = false;
-        if (x.write) {
-          for (size_t k = 0; k < x.bytes.size() && bad < 0; k++)
-            if (!pend.write_ok(x.at(k), x.bytes[k])) bad = (int)k;
+        } else if (kind == TxnKind::Region) {
+          // the core's own state: any number, READ or WRITE, in any order
         } else {
-          bad = pend.read_txn(x, &overrun);
-        }
-        if (overrun) {
-          fail(fmt("the fetch READ of %s (transaction at 0x%04x, cycles %llu..%llu) read beyond "
-                   "the instruction's 4 bytes (byte 0x%04x): a fetch may only read that "
-                   "instruction's bytes, and a load reads its bytes with a READ of its own "
-                   "(contract section 6)",
-                   describe(retired_, pend.e).c_str(), x.addr,
-                   (unsigned long long)since_release(x.start),
-                   (unsigned long long)since_release(x.end), x.at(bad)));
-        } else if (bad >= 0) {
-          fail(fmt("SPI %s of byte 0x%04x%s (transaction at 0x%04x, cycles %llu..%llu) is not "
-                   "part of %s; allowed: %s",
-                   x.write ? "WRITE" : "READ", x.at(bad),
-                   x.write ? fmt(" = 0x%02x", x.bytes[bad]).c_str() : "", x.addr,
-                   (unsigned long long)since_release(x.start),
-                   (unsigned long long)since_release(x.end), describe(retired_, pend.e).c_str(),
-                   pend.allowed().c_str()));
+          const std::string who = describe(retired_, pend.e);
+          const std::string where = txn_where(x, reset_edges_ - 1);
+          const std::string err = x.write ? pend.write_txn(x, who, where)
+                                          : pend.read_txn(x, who, where);
+          if (!err.empty()) fail(err);
         }
         if (!error_.empty()) break;
       }
@@ -474,6 +542,26 @@ int Harness::run(const uint8_t* img) {
                " (all of an instruction's SPI traffic must finish before its rvfi_valid cycle)");
           break;
         }
+        // The instruction's own program SPI traffic must be complete (checked before the RVFI
+        // fields, so a bus bug is named as one even when it also corrupts a value).
+        if (!pend.fetched)
+          fail(fmt("%s retired without its fetch: an SPI READ of exactly its 4 bytes "
+                   "0x%04x..0x%04x",
+                   who.c_str(), pend.pc16, (uint16_t)(pend.pc16 + 3)));
+        for (int k = 0; k < pend.nload && error_.empty(); k++)
+          if (!pend.load_read[k])
+            fail(fmt("%s retired without reading load byte 0x%04x over SPI", who.c_str(),
+                     pend.load[k]));
+        for (int k = 0; k < pend.nstore && error_.empty(); k++)
+          if (!pend.store_written[k])
+            fail(fmt("%s retired without writing store byte 0x%04x over SPI", who.c_str(),
+                     pend.store[k]));
+        // A fatal trap has no memory write on the pins (contract section 4): the ISS reports no
+        // store for it, so any program WRITE already failed above. Region WRITEs of the trapping
+        // instruction are allowed (section 6: any number per instruction; the region is the
+        // core's private state, not program memory). After its retirement no WRITE at all may
+        // start (checked above).
+        if (!error_.empty()) break;
         // field-by-field comparison
         struct F {
           const char* name;
@@ -526,20 +614,6 @@ int Harness::run(const uint8_t* img) {
                    who.c_str(), top_->rvfi_mem_wdata, e.mwdata, wl));
           break;
         }
-        // the instruction's own SPI traffic must be complete
-        if (!pend.fetch_done)
-          fail(fmt("%s retired without an SPI READ carrying all 4 instruction bytes "
-                   "0x%04x..0x%04x (its own fetch)",
-                   who.c_str(), pend.fetch[0], pend.fetch[3]));
-        for (int k = 0; k < pend.nload && error_.empty(); k++)
-          if (!pend.load_read[k])
-            fail(fmt("%s retired without reading load byte 0x%04x over SPI", who.c_str(),
-                     pend.load[k]));
-        for (int k = 0; k < pend.nstore && error_.empty(); k++)
-          if (!pend.store_written[k])
-            fail(fmt("%s retired without writing store byte 0x%04x over SPI", who.c_str(),
-                     pend.store[k]));
-        if (!error_.empty()) break;
         // latency statistics
         if (retired_ == 0) first_gap_ = gap;
         if (gap > max_gap_) max_gap_ = gap;
@@ -562,7 +636,7 @@ int Harness::run(const uint8_t* img) {
           schedule_ui(nu, retired_);
           Retire r = iss.step(nu);
           if (r.reserved) {
-            fail("test program bug: the ISS hit an unspecified instruction at " +
+            fail(std::string("test program bug: the ISS hit ") + unspecified(r) + " at " +
                  describe(retired_, r));
             break;
           }
@@ -617,17 +691,34 @@ int Harness::run(const uint8_t* img) {
                  (unsigned long long)(t_ - last_txn_end)));
         break;
       }
-      // WRITE bytes must follow the reference run's stores, in order.
+      // Program WRITE bytes must follow the reference run's stores, in order: only a store's
+      // bytes, each exactly once, with its value (a store may be split over several WRITEs).
+      // Region transactions are the core's own (contract section 6).
       for (const SpiTxn& x : spi_.done()) {
-        if (!x.write) continue;
+        const TxnKind kind = classify(x);
+        if (kind == TxnKind::Mixed) {
+          fail(mixed_error(x, reset_edges_ - 1));
+          break;
+        }
+        if (!x.write || kind == TxnKind::Region) continue;
         for (size_t k = 0; k < x.bytes.size() && error_.empty(); k++) {
           uint16_t a = x.at(k);
           uint8_t v = x.bytes[k];
-          auto in = [&](size_t i) -> int {
+          auto in = [&](size_t i) -> int {  // index of address a in store i, or -1
             if (i >= stores.size()) return -1;
             for (int j = 0; j < stores[i].n; j++)
-              if (stores[i].addr[j] == a && stores[i].val[j] == v) return j;
+              if (stores[i].addr[j] == a) return j;
             return -1;
+          };
+          auto mismatch = [&](size_t i, bool cur_full) {
+            const StoreGroup& g = stores[i];
+            std::string want;
+            for (int q = 0; q < g.n; q++) want += fmt(" 0x%04x=0x%02x", g.addr[q], g.val[q]);
+            fail(fmt("SPI WRITE of 0x%02x to 0x%04x (transaction at cycle %llu) doesn't match the "
+                     "reference store #%zu of %zu (retirement #%llu):%s%s",
+                     v, a, (unsigned long long)since_release(x.start), i, stores.size(),
+                     (unsigned long long)g.index, want.c_str(),
+                     cur_full ? " (complete; the next store didn't match either)" : ""));
           };
           int j = in(st_idx);
           bool cur_full = st_started;
@@ -635,22 +726,25 @@ int Harness::run(const uint8_t* img) {
             cur_full = cur_full && st_marks[q];
           int jn = cur_full ? in(st_idx + 1) : -1;
           if (jn >= 0) {  // the next store starts (preferred once the current one is complete)
-            st_idx++;
-            for (bool& m : st_marks) m = false;
-            st_marks[jn] = true;
-            st_started = true;
-          } else if (j >= 0) {
+            if (stores[st_idx + 1].val[jn] != v) {
+              mismatch(st_idx + 1, false);
+            } else {
+              st_idx++;
+              for (bool& m : st_marks) m = false;
+              st_marks[jn] = true;
+              st_started = true;
+            }
+          } else if (j >= 0 && st_marks[j]) {
+            fail(fmt("SPI WRITE of store byte 0x%04x (transaction at cycle %llu) a second time for "
+                     "reference store #%zu (retirement #%llu): a store writes each of its bytes "
+                     "exactly once (contract section 6)",
+                     a, (unsigned long long)since_release(x.start), st_idx,
+                     (unsigned long long)stores[st_idx].index));
+          } else if (j >= 0 && stores[st_idx].val[j] == v) {
             st_marks[j] = true;
             st_started = true;
           } else if (st_idx < stores.size()) {
-            const StoreGroup& g = stores[st_idx];
-            std::string want;
-            for (int q = 0; q < g.n; q++) want += fmt(" 0x%04x=0x%02x", g.addr[q], g.val[q]);
-            fail(fmt("SPI WRITE of 0x%02x to 0x%04x (transaction at cycle %llu) doesn't match the "
-                     "reference store #%zu of %zu (retirement #%llu):%s%s",
-                     v, a, (unsigned long long)since_release(x.start), st_idx, stores.size(),
-                     (unsigned long long)g.index, want.c_str(),
-                     cur_full ? " (complete; the next store didn't match either)" : ""));
+            mismatch(st_idx, cur_full);
           } else {
             fail(fmt("SPI WRITE of 0x%02x to 0x%04x after the reference program's last store", v,
                      a));
@@ -682,12 +776,14 @@ int Harness::run(const uint8_t* img) {
           all_seen = true;
           all_seen_edge = t_;
           quiet_until = t_ + (tail + 8) * LAT_CAP;
-          spi_.write_started = false;
+          spi_.write_addr_seen = false;
           cycles_ = since_release(t_);
         }
       }
-      if (all_seen && spi_.write_started) {
-        fail("SPI WRITE started after the reference program's last store");
+      // Region WRITEs go on (the core's registers); a program WRITE may not start.
+      if (all_seen && spi_.write_addr_seen && !in_region(spi_.write_addr)) {
+        fail(fmt("SPI WRITE to 0x%04x started after the reference program's last store",
+                 spi_.write_addr));
         break;
       }
       if (all_seen && t_ >= quiet_until) {
@@ -728,10 +824,11 @@ int Harness::run(const uint8_t* img) {
   }
   double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
+  // The final RAM compare leaves out the core region (contract section 3).
 #ifndef RVFI_MODE
   if (passed && !spi_only) {
     const uint8_t* m = spi_.mem();
-    for (uint32_t a = 0; a < Iss::RAM_SIZE; a++)
+    for (uint32_t a = 0; a < REGION_LO; a++)
       if (m[a] != ref_ram[a]) {
         passed = false;
         fail(fmt("final RAM differs from the reference at 0x%04x: 0x%02x, expected 0x%02x", a, m[a],
@@ -744,7 +841,7 @@ int Harness::run(const uint8_t* img) {
 #else
   if (passed && !spi_only) {
     const uint8_t* m = spi_.mem();
-    for (uint32_t a = 0; a < Iss::RAM_SIZE; a++)
+    for (uint32_t a = 0; a < REGION_LO; a++)
       if (m[a] != iss.ram()[a]) {
         passed = false;
         fail(fmt("final RAM differs from the ISS at 0x%04x: 0x%02x, expected 0x%02x", a, m[a],
@@ -796,7 +893,7 @@ int Harness::run(const uint8_t* img) {
 int usage() {
   std::fprintf(stderr,
                "usage: harness <prog.hex> [--seed S] [--max-cycles C] [--dump-ram PATH] "
-               "[--trace PATH] [-v]\n"
+               "[--trace PATH] [-v] [--region-zero]\n"
                "       harness --spi-only N [--seed S] [--dump-ram PATH]\n");
   return 2;
 }
@@ -817,6 +914,7 @@ int main(int argc, char** argv) {
     else if (a == "--trace") o.trace = next();
     else if (a == "--spi-only") o.spi_only = std::strtoull(next(), nullptr, 0);
     else if (a == "-v") o.verbose++;
+    else if (a == "--region-zero") o.region_zero = true;
     else if (a.rfind("+verilator", 0) == 0) continue;
     else if (a[0] == '-') return usage();
     else o.hex = argv[i];

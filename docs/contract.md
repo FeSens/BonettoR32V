@@ -85,8 +85,10 @@ module tt_um_fesens_r32v (
     - no gate primitives;
     - no special net types (only `wire`, `reg`, `integer`, `genvar`, `parameter`, `localparam`);
     - functions must assign every local before reading it, on every path.
-  - Every `src/*.v` file is part of the design. The gates read them in sorted order, and the lead
-    keeps `info.yaml` `source_files` equal to that list.
+  - Every top-level `src/*.v` file is part of the design, whatever its name (`test_*.v`
+    included). Unit tests live in subdirectories (`src/test_*/`) or in non-`.v` files. The gates
+    read the design files in sorted order, and the lead keeps `info.yaml` `source_files` equal to
+    that list.
 
 ## 2. SPI memory protocol (23LC512-compatible, mode 0)
 
@@ -121,8 +123,10 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   the core's architectural state: x1..x15, the pc and core scratch, in any layout and bit order the
   core likes. The core may also keep any of that state on the die instead.
   - A program fetch or data access that touches a region byte is UNSPECIFIED: the core may return
-    or change its own state, but it must still retire or trap and halt (liveness applies), and its
-    RVFI trace must stay consistent. Test programs never touch the region (stack top 0xFF80).
+    or change its own state, but it must still retire or trap and halt (liveness applies). Checkers
+    stop comparing a run at the first retirement whose fetch or data access touches the region
+    (only liveness and the SPI waveform rules still apply after it). Test programs never touch the
+    region (stack top 0xFF80).
   - The region's contents at reset are arbitrary, like on-die registers (section 1). The pc still
     starts at 0 (section 1), so a core keeping the pc in the region must write it before use.
   - Checkers exclude the region from final-RAM comparisons.
@@ -153,9 +157,10 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   - JAL, JALR or a taken branch whose target has `target[1] = 1` (JALR clears bit 0 first);
   - the all-zeros word `0x00000000` and the all-ones word `0xFFFFFFFF`.
   A trapping instruction retires with `rvfi_trap = 1` and `rvfi_halt = 1`. It has no
-  architectural effect: no register write and no memory write, on the pins or in RVFI. Then the
-  core never retires again and never starts another SPI WRITE. Its `rvfi_pc_wdata` is
-  unspecified.
+  architectural effect: no register write in RVFI and no program-memory write on the pins (it may
+  still make core-region transactions before it retires, since the region is core-private and
+  nothing observes it after the halt). Then the core never retires again and never starts another
+  SPI WRITE. Its `rvfi_pc_wdata` is unspecified.
 - **Reserved encodings are UNSPECIFIED.** That covers every other encoding that isn't one of the
   instructions above, including RV32E encodings whose register fields name x16-x31. The core may
   give them any effect, but two rules hold:
@@ -167,8 +172,8 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   later one within 1,024 cycles of the previous retirement. A halted core is exempt.
   - **Counting:** number the rising clock edges so that edge 0 is the last edge at which `rst_n`
     is sampled low.
-  - The first retirement (rvfi_valid sampled high) must happen at an edge numbered 1,024 or
-    lower.
+  - A retirement happens at edge e when `rvfi_valid(e) = 1` (the header's notation: the value
+    right after edge e). The first retirement must happen at an edge numbered 1,024 or lower.
   - Each later retirement must come at most 1,024 edges after the previous one.
   - Every checker (cosim watchdog, formal liveness) uses this count.
 - **FENCE** is a no-op that retires normally. That covers every MISC-MEM encoding with
@@ -205,8 +210,9 @@ rvfi_mem_rdata[31:0], rvfi_mem_wdata[31:0]`.
 Conventions:
 - **One instruction per pulse.** `rvfi_valid` pulses for one cycle per retired instruction, and
   `rvfi_order` counts retirements from 0. `rvfi_intr = 0`, `rvfi_mode = 3`, `rvfi_ixl = 1`.
-- **Register fields** report the register index the core actually read or wrote. Unused fields
-  report 0 with rdata 0, and a write to x0 reports `rd_addr = 0, rd_wdata = 0`.
+- **Register fields** report the register index the core actually read or wrote. A field the
+  instruction's specification doesn't use reports 0 with rdata 0, even if the core read a
+  register for it, and a write to x0 reports `rd_addr = 0, rd_wdata = 0`.
 - **Memory fields** use riscv-formal's misaligned convention: `rvfi_mem_addr` is the exact address
   of the first byte, the masks are LSB-aligned (`4'b0001`, `4'b0011` or `4'b1111`), and byte lane
   `k` is the byte at `mem_addr + k`. IO accesses use the same fields.
@@ -223,6 +229,10 @@ Conventions:
     - for a RAM store, WRITEs that write only that store's bytes, each byte exactly once (a store
       may be split into several WRITEs);
     - nothing else (IO accesses never appear on the pins).
+  - or a **null READ**: a READ whose CS_n rises after its full 24-bit header with no data bit
+    clocked. It touches no byte; any number are allowed, anywhere.
+  - A READ's partly clocked last byte counts as addressed (so a fetch with one extra bit fails,
+    and a region READ that clocks a bit past 0xFFFF is not a region transaction).
 - **Fetch and load completeness.** Every retired instruction is fetched by its own SPI READ
   covering all 4 of its bytes: no caching or reuse of earlier fetches. Every RAM load reads all of
   its bytes over SPI.
@@ -231,8 +241,10 @@ Conventions:
   written) is checked on the core plus its RAM: the formal RAM model is a real memory for the
   region, with an arbitrary initial value.
 - **On a trapping retirement**, the checkers compare only `rvfi_trap`, `rvfi_halt`, `rvfi_insn`
-  and `rvfi_pc_rdata`, plus the absence of side effects (`rd_addr = 0`, no memory write). The
-  register-read fields aren't compared.
+  and `rvfi_pc_rdata`, plus the absence of side effects (`rd_addr = 0`, no program-memory write).
+  The register-read fields aren't compared, except on a trapping branch or JALR: there the trap
+  depends on the operands, so `rs1`/`rs2` addr and rdata must be truthful and are checked (the
+  register-consistency check covers those reads too).
 
 ## 7. What a hypothesis may change
 

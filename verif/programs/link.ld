@@ -2,7 +2,9 @@
  *
  *   0x0000 .. _end     code, rodata, data, bss
  *   0xF000 .. 0xF7FF   RAM log ring (CoreMark output; NUL-terminated text)
- *   0xF800 .. 0xFFFF   stack (grows down from 0x10000)
+ *   0xF800 .. 0xFF7F   stack (grows down from 0xFF80)
+ *   0xFF80 .. 0xFFFF   core region (contract v2 section 3): the core's private state; programs
+ *                      never touch it
  *   0x80000000         GPIO (bonetto.h)
  *
  * RAM_BASE (default 0) relocates the whole layout. Only the spike cross-check uses it
@@ -36,7 +38,7 @@ SECTIONS
 
   _log_ring = RAM_BASE + 0xF000;
   _log_ring_end = RAM_BASE + 0xF800;
-  _stack_top = RAM_BASE + 0x10000;
+  _stack_top = RAM_BASE + 0xFF80;  /* the core region starts here (contract v2 section 3) */
 
   ASSERT(_end <= _log_ring, "program too large: it must end below 0xF000 (log ring)")
 

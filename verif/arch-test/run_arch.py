@@ -7,12 +7,13 @@ For every RV32E test of third_party/riscv-arch-test (rv32e_m/E and rv32e_m/privi
 skips listed in SKIP and docs/arch-test.md):
   1. build one ELF (verif/arch-test/model_test.h, linked at 0x10000) and its 64 KB RAM image;
   2. reference signature from spike (cached in build/arch/ref/, keyed on the ELF and spike);
-  3. the reference ISS must run the image to EBREAK without reading an unwritten register or
-     hitting an unspecified instruction, and leave the same signature as spike;
+  3. the reference ISS must run the image to EBREAK without reading an unwritten register,
+     hitting an unspecified instruction or touching the core region 0xFF80-0xFFFF (contract v2
+     section 3), and leave the same signature as spike;
   4. the DUT runs it through run_cosim.run_one("pins", ..., dump_ram=...) (what
      `run_cosim.py --mode pins --dump-ram` does) for each seed: the cosim must pass (SPI writes,
-     uo_out and the final RAM equal the ISS) and the signature in the dumped RAM must equal
-     spike's.
+     uo_out and the final RAM outside the region equal the ISS) and the signature in the dumped
+     RAM must equal spike's. The signature must lie below the region.
 Writes build/arch.json as {"pass": bool, "tests": {name: bool}} (removed first, so it is always
 fresh; --only writes build/arch/only.json instead) and build/arch/report.json with the errors and
 the skips. Exit 0 only if every test passes.
@@ -42,7 +43,8 @@ sys.path.insert(0, str(ROOT / "verif" / "cosim"))
 import run_cosim  # noqa: E402
 
 BASE = 0x10000
-CROSS = os.environ.get("CROSS", "riscv32-unknown-elf-")
+REGION_LO = 0xFF80  # contract v2 section 3: RAM 0xFF80-0xFFFF is the core's; tests stay below
+CROSS =os.environ.get("CROSS", "riscv32-unknown-elf-")
 DIRS = ["rv32e_m/E/src", "rv32e_m/privilege/src"]
 TRAP = "needs a trap handler (mtvec, mcause, mepc: CSRs), which the core doesn't have"
 SKIP = {
@@ -244,15 +246,17 @@ def one_piece(name: str, src: Path, d: Path, design: Path, seeds) -> tuple:
     if "begin_signature" not in syms or "end_signature" not in syms:
         return False, "no begin_signature/end_signature symbols"
     b, e = syms["begin_signature"], syms["end_signature"]
-    if not (BASE <= b < e <= BASE + 0x10000) or (e - b) % 4:
-        return False, f"signature {b:#x}..{e:#x} is not inside the 64 KB RAM"
+    if not (BASE <= b < e <= BASE + REGION_LO) or (e - b) % 4:
+        return False, (f"signature {b:#x}..{e:#x} is not inside program RAM {BASE:#x}.."
+                       f"{BASE + REGION_LO - 1:#x} (below the core region, contract section 3)")
     try:
         ref = reference(name, elf)
     except (RuntimeError, subprocess.TimeoutExpired) as ex:
         return False, f"reference: {ex}"
     if len(ref) != (e - b) // 4:
         return False, f"spike's signature has {len(ref)} words, expected {(e - b) // 4}"
-    # the reference ISS: EBREAK, no unwritten register read, no unspecified instruction
+    # the reference ISS: EBREAK, no unwritten register read, no unspecified instruction, no access
+    # to the core region (iss_main exits 2 with "region": true)
     iss_ram = d / f"{name}.iss.bin"
     iss_ram.unlink(missing_ok=True)
     p = run([ISS, hexf, "--check-init", "--ui", "pins", "--seed", "1", "--dump-ram", iss_ram])

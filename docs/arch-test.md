@@ -21,12 +21,21 @@ Options: `--src DIR` (another design), `--seeds 1,2,3` (the default), `--jobs N`
    +signature=... +signature-granularity=4`, cached in `build/arch/ref/<name>.sig`, keyed on the
    ELF's bytes and the spike binary.
 3. The reference ISS (`build/cosim/iss_main --check-init`) must run the image to EBREAK without an
-   unspecified instruction or a read of an unwritten register, and leave the same signature as
-   spike. This cross-checks the ISS and the image before the DUT is involved.
+   unspecified instruction, a read of an unwritten register or an access to the core region
+   (contract v2 section 3), and leave the same signature as spike. This cross-checks the ISS and
+   the image before the DUT is involved.
 4. The DUT runs the image through `run_cosim.run_one("pins", ..., dump_ram=...)`, which is what
-   `run_cosim.py --mode pins --dump-ram` does, once per seed. The cosim must pass (its SPI writes,
-   uo_out and final RAM equal the ISS's), and the signature words in the dumped RAM must equal
-   spike's.
+   `run_cosim.py --mode pins --dump-ram` does, once per seed. The cosim must pass (its program SPI
+   writes, uo_out and final RAM outside the core region equal the ISS's), and the signature words
+   in the dumped RAM must equal spike's.
+
+**Contract v2 (main 35b92b5): the core region.** RAM 0xFF80-0xFFFF, in every 64 KB alias, may
+hold the core's registers, pc and scratch, so no test code, data or signature may land there.
+`link.ld` puts code and data below 0xF000 (its `ASSERT`) and the stack top at 0xFF80; the tests
+use no stack. `run_arch.py` checks that the signature lies inside 0x10000-0x1FF7F (the
+relocated 0x0000-0xFF7F), and the ISS run fails on any access to the region. The DUT's region
+contents are its own: the cosim starts them random, never compares them, and the signature
+compare reads only signature words.
 
 ## The model (`verif/arch-test/model_test.h`)
 
@@ -109,3 +118,8 @@ Not part of RV32E, so not run: `rv32e_m/M`, `rv32e_m/C`, `rv32e_m/B` and `rv32e_
 `python3 verif/arch-test/run_arch.py` on the seed (src/ as merged from 97153ff): 43 of 43 tests
 pass with seeds 1, 2 and 3, 10 skipped, 6 split, 15 cases of `jal-01` excluded; 2.97 s wall clock
 (12.3 s user) with the Verilator model already built.
+
+With the contract v2 checkers, the seed and both real v2 designs pass the same 43 tests with the
+same skips, splits and exclusions: `run_arch.py --src verif/cosim/mutants/legal_h002_rf`
+(hyp/002-rf-in-ram fc07cc3) and `--src verif/cosim/mutants/legal_h002_pcram`
+(hyp/002-rf-in-ram-pcram b9a5211).
