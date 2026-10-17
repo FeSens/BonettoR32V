@@ -254,7 +254,8 @@ The sequence counts toward the first instruction's latency (section 4).
   - Reading byte 0 of UART_DATA clears RX_FULL and RX_OVR.
   - A W1C (write-1-to-clear) bit clears when 1 is written to it.
   - Writing byte 0 of UART_DATA or SPI_DATA starts a transfer.
-- Misaligned IO accesses are UNSPECIFIED.
+- IO accesses that aren't naturally aligned (`addr % n != 0`) are UNSPECIFIED. A halfword at slot byte
+  2 is legal and covers bytes 2-3.
 
 **Timing:**
 - Peripheral inputs pass through synchronizers. An input change becomes visible to the logic
