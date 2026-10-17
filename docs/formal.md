@@ -508,8 +508,9 @@ legal variants (`"expect": "pass"`, `"checks": "all"`) must pass the whole fast 
 each) run only with `BONETTO_FORMAL_SLOW=1`.
 
 Results, all on hwe-bench (shared with other runs at the time). Every FAIL mutant on the seed's
-timing was re-run at 7b2aba3, the final checks (3 jobs); the liveness mutants ran at 5d23efc
-(2 jobs); the hyp/002 and legal rows say where they ran. Which assertions fail first can differ
+timing was re-run at 7b2aba3, the final checks (3 jobs), and so were the three hyp/002 region
+mutants (2 jobs, times are proof seconds); the liveness mutants ran at 5d23efc (2 jobs); the
+legal rows say where they ran. Which assertions fail first can differ
 between runs of the same mutant; the table gives the 7b2aba3 run and notes an earlier run's extra
 ones.
 
@@ -531,9 +532,9 @@ ones.
 | trap_program_write | seed | a program WRITE (0x0100) before a trap retires | bus_dmem | FAIL: `bus_dmem_write_claimed` |
 | trap_region_wrap | seed | a READ at 0xFFFE before a trap: 0xFFFE-0x0001 | bus_dmem | FAIL: `bus_region_mixed` |
 | trap_region_straddle | seed | a READ at 0xFF7E before a trap: 0xFF7E-0xFF81 | bus_dmem | FAIL: `bus_region_mixed` |
-| region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
-| region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | FAIL (Mac): `bus_region_mixed` |
-| region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | FAIL (Mac): `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
+| region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | FAIL: `bus_region_mixed`, 598 s |
+| region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | FAIL: `bus_region_mixed`, 943 s |
+| region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | FAIL: `conv_first_pc`, 462 s; `bus_imem_fetch`, `bus_imem_pc`, 866 s |
 | reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1`, `reg_rs2` |
 | rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
 | sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
@@ -566,7 +567,8 @@ On the seed's timing, every fast-config FAIL above came within 227 s of proof ti
 host). The liveness counterexamples (deep, depth 1,487) are slower: 221 to 2,530 s on hwe-bench
 at 5d23efc, against 208 s for `stall_first_1025` on the Mac in an earlier run (see "Engines
 tried" on why a single-call liveness counterexample can take longer than a proof). A legal variant's whole fast run took
-215 to 253 s with 10 jobs. The hyp/002 region mutants FAILed within 317 s of proof time on the Mac (2 jobs).
+215 to 253 s with 10 jobs. The hyp/002 region mutants FAILed within 943 s of proof time at 7b2aba3 (hwe-bench, 2 jobs, host
+shared), against 317 s on the Mac (2 jobs) in an earlier run.
 
 ## Fail fast, scheduling, remote runs
 
