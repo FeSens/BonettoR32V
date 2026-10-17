@@ -82,6 +82,15 @@ def test_depth_policy():
     t = run_formal.timing_from_retires([(114, 0x00000013, 0), (344, 0x00002083, 0), (460, 0x00100073, 1)])
     assert t["first_retire_cycle"] == 114 and t["max_cycles_per_insn"] == 230
     assert t["per_class"]["load"]["max_cycles"] == 230
+    # depth=short: reset + first retirement + the group's slowest class + margin.
+    t = {"first_retire_cycle": 319, "max_cycles_per_insn": 736,
+         "per_class": {"alu_reg": {"max_cycles": 416}, "load": {"max_cycles": 736},
+                       "branch": {"max_cycles": 320}}}
+    assert run_formal.short_depth(cfg, t) == 1 + 319 + 736 + 2
+    assert run_formal.short_depth(cfg, t, ["add", "sub"]) == 1 + 319 + 416 + 2
+    assert run_formal.short_depth(cfg, t, ["beq", "lw"]) == 1 + 319 + 736 + 2
+    assert run_formal.short_depth(cfg, t, ["jal"]) == 1 + 319 + 736 + 2   # class not measured
+    assert sorted(sum(run_formal.CLASS_GROUPS, [])) == sorted(run_formal.isa_insns())
 
 
 def test_check_verdicts():
