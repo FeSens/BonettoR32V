@@ -7,6 +7,7 @@
 # With no arguments it builds the standalone C++ pieces instead (no design involved):
 #   build/cosim/test_pmod    unit tests of the QSPI Pmod chip models (pmod.h; test_pmod.py runs it)
 #   build/cosim/libpmod.so   the Pmod models behind a C API (pmod_capi.cpp), for ctypes
+#   build/cosim/iss_main     the reference ISS runner (v2 by default, contract v3 with --v3)
 #
 # MODE is rvfi (design built with RISCV_FORMAL, RVFI compared every retirement) or pins (the plain
 # design). SRC_DIR defaults to src/. Every SRC_DIR/*.v file is part of the design (contract
@@ -30,11 +31,12 @@ if [ $# -eq 0 ]; then
   CXXFLAGS=(-O2 -std=c++17 -Wall -Wextra -I"$COSIM")
   "$CXX" "${CXXFLAGS[@]}" "$COSIM/test_pmod.cpp" -o "$OUT/test_pmod"
   "$CXX" "${CXXFLAGS[@]}" -fPIC -shared "$COSIM/pmod_capi.cpp" -o "$OUT/libpmod.so"
-  echo "built $OUT/test_pmod $OUT/libpmod.so"
+  "$CXX" "${CXXFLAGS[@]}" "$COSIM/iss_main.cpp" -o "$OUT/iss_main"
+  echo "built $OUT/test_pmod $OUT/libpmod.so $OUT/iss_main"
   exit 0
 fi
 
-MODE="$1"
+MODE="${1:?usage: build.sh rvfi|pins [SRC_DIR] [OUT_DIR]}"
 SRC="$(cd "${2:-$ROOT/src}" && pwd)"
 OUT="${3:-$ROOT/build/cosim/$MODE}"
 mkdir -p "$OUT"
