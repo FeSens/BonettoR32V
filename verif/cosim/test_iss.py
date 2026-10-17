@@ -1157,6 +1157,36 @@ def test_selfloop_end(built3):
     assert s["retired"] == first_j + 2 and log[-1]["intr"] == 1 and events[-2].get("irq_entry")
 
 
+def psram_seed_byte(a: int) -> int:
+    """iss3.h psram_seed_byte: the model's initial PSRAM content."""
+    m = 0xFFFFFFFF
+    x = ((a & 0x7FFFFF) * 0x9E3779B1 + 0x7F4A7C15) & m
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & m
+    x ^= x >> 15
+    x = (x * 0x846CA68B) & m
+    x ^= x >> 16
+    return x & 0xFF
+
+
+def test_dump_psram_v3(built3, tmp_path):
+    # --dump-psram (run_arch.py --v3 reads signatures from it): the final 8 MiB PSRAM image, stored
+    # bytes at their PSRAM offsets (through any alias), the seed pattern elsewhere, whatever the
+    # end reason
+    h, _ = asm3("dump_psram3", "li t0, 0x01000100\n li t1, 0x11223344\n sw t1, 0(t0)\n"
+                "li t0, 0x037FFF7E\n li t1, 0xA5\n sb t1, 0(t0)\n j .")
+    out = tmp_path / "psram.bin"
+    rc, _, _, s = run3(h, "--dump-psram", str(out))
+    m = out.read_bytes()
+    assert rc == 0 and s["end"] == "selfloop" and len(m) == 1 << 23
+    assert m[0x100:0x104] == bytes([0x44, 0x33, 0x22, 0x11]) and m[0x7FFF7E] == 0xA5
+    assert all(m[a] == psram_seed_byte(a) for a in (0, 0xFF, 0x104, 0x7FFF7D, 0x7FFF7F, 0x7FFFFF))
+    rc, _, _, s = run3(h, "--dump-psram", str(out), "--max", "5")  # 2 li (2 each), the sw
+    m = out.read_bytes()
+    assert rc == 4 and s["end"] == "max" and m[0x100:0x104] == bytes([0x44, 0x33, 0x22, 0x11])
+    assert m[0x7FFF7E] == psram_seed_byte(0x7FFF7E), "the sb hadn't run yet"
+
+
 REGION3 = {
     "lw_017fff80": "li t0, 0x017fff80\n lw a0, 0(t0)",
     "sb_017fffff": "li t0, 0x017fffff\n sb zero, 0(t0)",
