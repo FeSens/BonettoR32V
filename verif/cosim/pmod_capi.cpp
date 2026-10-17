@@ -1,10 +1,13 @@
 // C API over PmodBus (pmod.h) for ctypes: built by build.sh (no arguments) as
 // build/cosim/libpmod.so.
 //
-//   flash_mode: 0 Standard, 1 Continuous.  psram_mode: 0 SpiUninit, 1 Spi, 2 Qpi.
-//   pmod_new returns NULL for an out-of-range mode. img is the 16 MiB flash image (copied; NULL
-//   means erased, all 0xFF). pmod_edge returns 1, or 0 on the first violation (pmod_error says why;
-//   it is "" until then).
+//   img: the flash image, exactly 16 MiB (copied at creation), or NULL for an erased flash (all
+//        0xFF).
+//   pmod_new: flash_mode 0 Standard, 1 Continuous; psram_mode 0 SpiUninit, 1 Spi, 2 Qpi. Returns
+//        NULL for an out-of-range mode.
+//   pmod_new_for_seed: the power-up modes of pmod_init_for_seed(seed) (contract 2.4), with seed
+//        also as the noise seed.
+//   pmod_edge returns 1, or 0 on the first violation (pmod_error says why; it is "" until then).
 #include "pmod.h"
 
 extern "C" {
@@ -13,6 +16,10 @@ void* pmod_new(uint32_t seed, const uint8_t* img, int flash_mode, int psram_mode
   if (flash_mode < 0 || flash_mode > 1 || psram_mode < 0 || psram_mode > 2) return nullptr;
   PmodInit init{(FlashMode)flash_mode, (PsramMode)psram_mode};
   return new PmodBus(seed, img, init, clk_ns);
+}
+
+void* pmod_new_for_seed(uint32_t seed, const uint8_t* img, double clk_ns) {
+  return new PmodBus(seed, img, pmod_init_for_seed(seed), clk_ns);
 }
 
 int pmod_edge(void* p, uint64_t t, uint8_t out, uint8_t oe) {

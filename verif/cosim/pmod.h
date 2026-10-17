@@ -88,6 +88,15 @@ struct Layout {
   Data data = Data::None;
   int max_mhz = 0;
 };
+inline Layout row(uint8_t addr, uint8_t mode, uint8_t dummy, Data data, int mhz) {
+  Layout l;
+  l.addr_edges = addr;
+  l.mode_edges = mode;
+  l.dummy_edges = dummy;
+  l.data = data;
+  l.max_mhz = mhz;
+  return l;
+}
 
 inline std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 inline std::string fmt(const char* f, ...) {
@@ -255,16 +264,6 @@ class QspiFlash : public pmod_detail::QspiChip {
   std::vector<uint8_t> mem_;
   bool continuous_;
 
-  static pmod_detail::Layout row(uint8_t a, uint8_t m, uint8_t d, pmod_detail::Data k, int mhz) {
-    pmod_detail::Layout l;
-    l.addr_edges = a;
-    l.mode_edges = m;
-    l.dummy_edges = d;
-    l.data = k;
-    l.max_mhz = mhz;
-    return l;
-  }
-
   const char* name() const override { return "flash"; }
   bool cmd_quad() const override { return false; }
   void start_txn() override {
@@ -273,10 +272,11 @@ class QspiFlash : public pmod_detail::QspiChip {
     x_.cmd_known = true;
     x_.cmd = 0xEB;
     x_.field0 = 0;
-    x_.lay = row(6, 2, 4, pmod_detail::Data::OutQuad, 133);
+    x_.lay = pmod_detail::row(6, 2, 4, pmod_detail::Data::OutQuad, 133);
   }
   bool decode() override {
     using pmod_detail::Data;
+    using pmod_detail::row;
     switch (x_.cmd) {
       case 0x03: x_.lay = row(24, 0, 0, Data::OutSingle, 50); return true;
       case 0x0B: x_.lay = row(24, 0, 8, Data::OutSingle, 133); return true;
@@ -332,39 +332,31 @@ class Psram : public pmod_detail::QspiChip {
   uint64_t reset_t_ = 0;
   std::vector<PsramWrite> writes_;
 
-  static pmod_detail::Layout row(uint8_t a, uint8_t d, pmod_detail::Data k, int mhz) {
-    pmod_detail::Layout l;
-    l.addr_edges = a;
-    l.dummy_edges = d;
-    l.data = k;
-    l.max_mhz = mhz;
-    return l;
-  }
-
   const char* name() const override { return "PSRAM"; }
   bool cmd_quad() const override { return qpi_; }
   void start_txn() override { reset_pending_ = false; }
   bool decode() override {
     using pmod_detail::Data;
     using pmod_detail::fmt;
+    using pmod_detail::row;
     const uint8_t c = x_.cmd;
     bool known = true, access = true;
     if (!qpi_) {
       switch (c) {
-        case 0x03: x_.lay = row(24, 0, Data::OutSingle, 33); break;
-        case 0x0B: x_.lay = row(24, 8, Data::OutSingle, 84); break;
-        case 0xEB: x_.lay = row(6, 6, Data::OutQuad, 84); break;
-        case 0x02: x_.lay = row(24, 0, Data::InSingle, 84); break;
-        case 0x38: x_.lay = row(6, 0, Data::InQuad, 84); break;
-        case 0x35: case 0x66: case 0x99: x_.lay = row(0, 0, Data::None, 84); access = false; break;
+        case 0x03: x_.lay = row(24, 0, 0, Data::OutSingle, 33); break;
+        case 0x0B: x_.lay = row(24, 0, 8, Data::OutSingle, 84); break;
+        case 0xEB: x_.lay = row(6, 0, 6, Data::OutQuad, 84); break;
+        case 0x02: x_.lay = row(24, 0, 0, Data::InSingle, 84); break;
+        case 0x38: x_.lay = row(6, 0, 0, Data::InQuad, 84); break;
+        case 0x35: case 0x66: case 0x99: x_.lay = row(0, 0, 0, Data::None, 84); access = false; break;
         default: known = false;
       }
     } else {
       switch (c) {
-        case 0x0B: x_.lay = row(6, 4, Data::OutQuad, 66); break;
-        case 0xEB: x_.lay = row(6, 6, Data::OutQuad, 84); break;
-        case 0x02: case 0x38: x_.lay = row(6, 0, Data::InQuad, 84); break;
-        case 0xF5: case 0x66: case 0x99: x_.lay = row(0, 0, Data::None, 84); access = false; break;
+        case 0x0B: x_.lay = row(6, 0, 4, Data::OutQuad, 66); break;
+        case 0xEB: x_.lay = row(6, 0, 6, Data::OutQuad, 84); break;
+        case 0x02: case 0x38: x_.lay = row(6, 0, 0, Data::InQuad, 84); break;
+        case 0xF5: case 0x66: case 0x99: x_.lay = row(0, 0, 0, Data::None, 84); access = false; break;
         default: known = false;
       }
     }

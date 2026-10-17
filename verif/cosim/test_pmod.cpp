@@ -307,6 +307,45 @@ std::string test_flash_continuous() {
   return "";
 }
 
+std::string test_flash_continuous_partial() {
+  // A transaction that ends before M is complete leaves the mode as it was (contract 2.2).
+  Drv d;
+  d.select(CSF);
+  d.send_single(0xEB, 8);
+  d.send_quad(0x002000, 6);
+  d.send_quad(0xA0, 2);  // enter continuous read
+  d.dummy(4);
+  d.read_quad(1);
+  d.end();
+  REQUIRE_OK(d);
+  d.select(CSF);
+  d.send_quad(0x0, 4);  // 4 of 6 address edges, no M
+  d.end();
+  REQUIRE_OK(d);
+  d.select(CSF);  // still continuous: no command
+  d.send_quad(0x345678, 6);
+  d.send_quad(0xA0, 2);
+  d.dummy(4);
+  Bytes got = d.read_quad(2);
+  d.end();
+  REQUIRE_OK(d);
+  REQUIRE_BYTES(got, img_at(0x345678, 2), "continuous read after a 4-edge transaction");
+  d.select(CSF);
+  d.send_quad(0xFFFFFF, 6);
+  d.send_quad(0xF, 1);  // only the first M nibble (M[5:4] would be 11)
+  d.end();
+  REQUIRE_OK(d);
+  d.select(CSF);  // still continuous
+  d.send_quad(0x0ABCDE, 6);
+  d.send_quad(0xA0, 2);
+  d.dummy(4);
+  got = d.read_quad(2);
+  d.end();
+  REQUIRE_OK(d);
+  REQUIRE_BYTES(got, img_at(0x0ABCDE, 2), "continuous read after half an M byte");
+  return "";
+}
+
 std::string test_flash_program_ignored() {
   Drv d;
   const uint32_t a = 0x004321;
@@ -385,6 +424,23 @@ std::string test_psram_spi_rw() {
   REQUIRE_BYTES(got, w, "0x03 read back with A[23] = 1");
   REQUIRE(d.bus->psram_reads() == 8, "psram_reads = %llu, want 8",
           (unsigned long long)d.bus->psram_reads());
+  return "";
+}
+
+std::string test_psram_spi_0b() {
+  // SPI 0x0B: address 24 single, 8 wait edges, data single on SD1
+  Drv d;
+  d.psram_reset_spi();
+  Bytes w{0x96, 0x3C, 0xE1, 0x0F, 0x5A};
+  d.psram_write02(0x012345, w);
+  d.select(CSR);
+  d.send_single(0x0B, 8);
+  d.send_single(0x012345, 24);
+  d.dummy(8);
+  Bytes got = d.read_single(5);
+  d.end();
+  REQUIRE_OK(d);
+  REQUIRE_BYTES(got, w, "SPI 0x02 then 0x0B");
   return "";
 }
 
@@ -840,9 +896,11 @@ int main() {
       {"test_flash_read03", test_flash_read03},
       {"test_flash_fastread_0b_6b_eb", test_flash_fastread_0b_6b_eb},
       {"test_flash_continuous", test_flash_continuous},
+      {"test_flash_continuous_partial", test_flash_continuous_partial},
       {"test_flash_program_ignored", test_flash_program_ignored},
       {"test_psram_requires_reset", test_psram_requires_reset},
       {"test_psram_spi_rw", test_psram_spi_rw},
+      {"test_psram_spi_0b", test_psram_spi_0b},
       {"test_psram_quad_and_qpi", test_psram_quad_and_qpi},
       {"test_reset_sequence_from_every_state", test_reset_sequence_from_every_state},
       {"test_trst", test_trst},
