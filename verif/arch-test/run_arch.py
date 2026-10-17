@@ -55,6 +55,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +63,7 @@ HERE = ROOT / "verif" / "arch-test"
 SUITE = ROOT / "third_party" / "riscv-arch-test" / "riscv-test-suite"
 ENV = SUITE / "env"
 OUT = ROOT / "build" / "arch"
+SUMMARY = ROOT / "build" / "arch.json"  # the gate's result (the v3 flow; v2 spells it out)
 REF = OUT / "ref"
 ISS = ROOT / "build" / "cosim" / "iss_main"
 LINK = ROOT / "verif" / "programs" / "link.ld"
@@ -142,8 +144,12 @@ CFLAGS_V3 = ["-march=rv32e_zicsr", "-mabi=ilp32e", "-mno-relax", "-static", "-mc
 # Memory: flash 0x1000-0xFFFFFF (its first 4 KiB is spike's debug module), PSRAM, and a scratch
 # page at 0x8000_0000 for RVMODEL_HALT's GPIO_OUT store. --priv=m: machine mode only (mstatus.MPP
 # reads 3, contract 4).
-SPIKE_V3 = ["spike", "--isa=rv32e_zicsr", "--priv=m", "--misaligned", "--disable-dtb",
+SPIKE_V3 = ["spike", "--priv=m", "--disable-dtb",
             "-m0x1000:0xfff000,0x1000000:0x800000,0x80000000:0x1000", "--instructions=50000000"]
+# The ISA, with hardware misaligned loads and stores (contract 3): the Zicclsm extension, which is
+# spike's only way since riscv-isa-sim d6a5e90c (Dec 2025) removed --misaligned; spike builds that
+# don't know Zicclsm (e.g. Homebrew's 1.1.1-dev) take --misaligned instead (spike_isa_v3 picks).
+SPIKE_ISA_V3 = (["--isa=rv32e_zicsr_zicclsm"], ["--isa=rv32e_zicsr", "--misaligned"])
 RVTEST_CASE_RE = re.compile(r'^\s*RVTEST_CASE\(\s*(\d+)\s*,\s*"([^"]*)"', re.M)
 
 
@@ -420,10 +426,61 @@ def flow_key_v3() -> str:
     h = hashlib.sha256()
     for p in (HERE / "model_test.h", LINK, ELF2HEX):
         h.update(p.name.encode() + b"\0" + p.read_bytes())
-    settings = json.dumps([SIG_LD, CFLAGS_V3, SPIKE_V3, ISA_V3, HW_MISALIGNED_V3, CODE_V3, STUB_V3,
-                           SIG_V3, RESULT_PASS_V3])
+    settings = json.dumps([SIG_LD, CFLAGS_V3, SPIKE_V3, SPIKE_ISA_V3, ISA_V3, HW_MISALIGNED_V3,
+                           CODE_V3, STUB_V3, SIG_V3, RESULT_PASS_V3])
     h.update(settings.replace(str(ROOT), "<root>").encode())  # the same key in any checkout
     return h.hexdigest()
+
+
+def suite_key_v3() -> str:
+    """A hash of the suite's content (the env headers and the test sources), so a suite bump is
+    caught on any checkout, including tools/hwe_run.sh mirrors, which carry no .git."""
+    h = hashlib.sha256()
+    for p in sorted(ENV.glob("*")) + [s for d in DIRS for s in sorted((SUITE / d).glob("*.S"))]:
+        if p.is_file():
+            h.update(str(p.relative_to(SUITE)).encode() + b"\0" + p.read_bytes())
+    return h.hexdigest()
+
+
+_spike_isa = None
+_spike_lock = threading.Lock()
+
+
+def spike_isa_v3(elf: Path) -> list:
+    """SPIKE_ISA_V3's Zicclsm form, unless this spike rejects the extension (probed once, on a
+    test's ELF): then its --misaligned form, if this spike has that option."""
+    global _spike_isa
+    with _spike_lock:
+        if _spike_isa is None:
+            p = run(["spike"] + SPIKE_ISA_V3[0] + SPIKE_V3[1:-1] + ["--instructions=1", elf],
+                    timeout=60)
+            if "bad --isa" not in p.stdout + p.stderr:
+                _spike_isa = SPIKE_ISA_V3[0]
+            else:
+                h = run(["spike", "--help"], timeout=60)
+                if "--misaligned" not in h.stdout + h.stderr:
+                    raise RuntimeError("this spike takes neither Zicclsm nor --misaligned: "
+                                       + (p.stdout + p.stderr).strip()[-300:])
+                _spike_isa = SPIKE_ISA_V3[1]
+        return _spike_isa
+
+
+def suite_commit_v3():
+    """The suite submodule's HEAD (for the record), or None where the checkout has no git data
+    (a tools/hwe_run.sh mirror): suite_key_v3 is what --phase dut checks."""
+    p = run(["git", "-C", SUITE.parent, "rev-parse", "--show-toplevel", "HEAD"])
+    lines = p.stdout.split()
+    if p.returncode != 0 or len(lines) != 2 or Path(lines[0]).resolve() != SUITE.parent.resolve():
+        return None
+    return lines[1]
+
+
+def tool_version(cmd: list) -> str:
+    try:
+        p = run(cmd + ["--version"], timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return f"unavailable: {ex}"
+    return ((p.stdout or p.stderr).strip().splitlines() or ["?"])[0]
 
 
 def sha256_file(p: Path) -> str:
@@ -457,15 +514,16 @@ def first_diff(got: list, ref: list) -> int:
 def reference_v3(name: str, elf: Path) -> list:
     """spike's signature words, cached in build/arch/ref-v3/<name>.sig (+ .key)."""
     sig, keyf = REF_V3 / f"{name}.sig", REF_V3 / f"{name}.key"
+    args = SPIKE_V3 + spike_isa_v3(elf)
     h = hashlib.sha256(elf.read_bytes())
     spike = shutil.which("spike") or "spike"
     st = os.stat(spike)
-    h.update(f"{' '.join(SPIKE_V3)}|{spike}|{st.st_size}|{st.st_mtime_ns}".encode())
+    h.update(f"{' '.join(args)}|{spike}|{st.st_size}|{st.st_mtime_ns}".encode())
     key = h.hexdigest()
     if not (sig.exists() and keyf.exists() and keyf.read_text() == key):
         tmp = REF_V3 / f"{name}.sig.tmp"
         tmp.unlink(missing_ok=True)
-        p = run(SPIKE_V3 + [f"+signature={tmp}", "+signature-granularity=4", elf], timeout=600)
+        p = run(args + [f"+signature={tmp}", "+signature-granularity=4", elf], timeout=600)
         if p.returncode != 0 or not tmp.exists():
             raise RuntimeError(f"spike failed (exit {p.returncode}; 1 = an unexpected trap reached "
                                f"rvmodel_trap): {(p.stderr or p.stdout)[-500:]}")
@@ -579,15 +637,16 @@ def prep_v3(only, jobs: int) -> bool:
             print(f"{'PREP' if not err else 'FAIL'} {n}" + (f": {err}" if err else
                   f" ({len(ent['ref'])} signature words, ISS {ent['iss_retired']} retired, "
                   f"{ent['iss_traps']} traps)"), flush=True)
-    suite = run(["git", "-C", SUITE.parent, "rev-parse", "HEAD"])
-    manifest = {"contract": "v3", "flow_key": flow_key_v3(), "isa": ISA_V3,
-                "suite_commit": suite.stdout.strip() if suite.returncode == 0 else None,
+    manifest = {"contract": "v3", "flow_key": flow_key_v3(), "suite_key": suite_key_v3(),
+                "suite_commit": suite_commit_v3(), "isa": ISA_V3,
+                "spike_isa": _spike_isa, "gcc": tool_version([CROSS + "gcc"]),
                 "only": only or None, "skipped": skipped,
                 "tests": {n: entries[n] for n in sorted(entries)}}
     (STAGE_V3 / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     bad = sorted(n for n, e in entries.items() if "error" in e)
     print(json.dumps({"phase": "prep", "pass": not bad, "tests": len(entries), "failed": len(bad),
-                      "skipped": len(skipped), "manifest": str(STAGE_V3 / "manifest.json")}))
+                      "skipped": len(skipped), "spike_isa": _spike_isa,
+                      "manifest": str(STAGE_V3 / "manifest.json")}))
     return not bad
 
 
@@ -619,11 +678,38 @@ def dut_one_v3(name: str, ent: dict, design: Path, seeds) -> tuple:
     return True, None, {"cycles": cycles}
 
 
+def manifest_problem_v3(man: dict, only):
+    """Why the staged manifest can't serve this --phase dut run, or None. Each image's sha256 is
+    checked later, per test (dut_one_v3)."""
+    if man.get("flow_key") != flow_key_v3():
+        return ("the staged images were made by another flow (model_test.h, link.ld, elf2hex.py "
+                "or run_arch.py's v3 settings differ)")
+    tests = man.get("tests", {})
+    if only:
+        unknown = sorted(set(only) - set(tests))
+        if unknown:
+            return f"tests not in the manifest: {unknown}"
+    elif man.get("only"):
+        return (f"the manifest covers only {man['only']} (prep ran with --only), so it can't serve "
+                "a full run")
+    if SUITE.exists():  # where the suite is checked out, the manifest must come from it
+        if man.get("suite_key") != suite_key_v3():
+            return (f"the suite changed since prep (manifest suite commit "
+                    f"{man.get('suite_commit')}, now {suite_commit_v3()})")
+        names, _ = discover_v3()
+        if not only and set(names) != set(tests):
+            return (f"the manifest's tests differ from the suite's: missing "
+                    f"{sorted(set(names) - set(tests))}, extra {sorted(set(tests) - set(names))}")
+    return None
+
+
 def dut_v3(only, design: Path, seeds, jobs: int) -> int:
-    """Step 4 for every test of the manifest; writes build/arch.json and build/arch/report.json."""
-    summary = ROOT / "build" / "arch.json"
-    out = OUT / "only.json" if only else summary
+    """Step 4 for every test of the manifest; writes build/arch.json and build/arch/report.json.
+    Refuses (exit 1, before any cosim) a manifest that doesn't match this checkout: see
+    manifest_problem_v3."""
+    out = OUT / "only.json" if only else SUMMARY
     report = OUT / "report.json"
+    OUT.mkdir(parents=True, exist_ok=True)
 
     def setup_fail(err):
         print(json.dumps({"pass": False, "error": err}))
@@ -634,26 +720,12 @@ def dut_v3(only, design: Path, seeds, jobs: int) -> int:
 
     mpath = STAGE_V3 / "manifest.json"
     if not mpath.exists():
-        return setup_fail(f"no {mpath.relative_to(ROOT)}: run --phase prep first")
+        return setup_fail(f"no {mpath}: run --phase prep first")
     man = json.loads(mpath.read_text())
-    if man.get("flow_key") != flow_key_v3():
-        return setup_fail("the staged images were made by another flow (model_test.h, link.ld, "
-                          "elf2hex.py or run_arch.py's v3 settings differ): rerun --phase prep")
-    tests = man["tests"]
-    if only:
-        unknown = sorted(set(only) - set(tests))
-        if unknown:
-            return setup_fail(f"tests not in the manifest: {unknown}")
-        tests = {n: tests[n] for n in only}
-    elif man.get("only"):
-        return setup_fail(f"the manifest covers only {man['only']} (prep ran with --only): rerun "
-                          "--phase prep without --only for a full run")
-    elif SUITE.exists():  # where the suite is checked out, the manifest must cover all of it
-        names, _ = discover_v3()
-        if set(names) != set(tests):
-            return setup_fail(f"the manifest's tests differ from the suite's: missing "
-                              f"{sorted(set(names) - set(tests))}, extra "
-                              f"{sorted(set(tests) - set(names))}: rerun --phase prep")
+    err = manifest_problem_v3(man, only)
+    if err:
+        return setup_fail(err + ": rerun --phase prep")
+    tests = {n: man["tests"][n] for n in only} if only else man["tests"]
     try:
         run_cosim.ensure_built("pins", design, v3=True)
     except RuntimeError as ex:
@@ -680,8 +752,9 @@ def dut_v3(only, design: Path, seeds, jobs: int) -> int:
     report.write_text(json.dumps(
         {"pass": ok, "contract": "v3", "seeds": seeds, "src": str(design), "only": only,
          "errors": errors, "skipped": man.get("skipped", {}), "isa": man.get("isa"),
-         "suite_commit": man.get("suite_commit"),
-         "cycles": {n: cycles[n] for n in sorted(cycles)}}, indent=1) + "\n")
+         "suite_commit": man.get("suite_commit"), "spike_isa": man.get("spike_isa"),
+         "gcc": man.get("gcc"), "cycles": {n: cycles[n] for n in sorted(cycles)}},
+        indent=1) + "\n")
     print(json.dumps({"pass": ok, "contract": "v3", "tests": len(ordered),
                       "failed": sum(not v for v in ordered.values()),
                       "skipped": len(man.get("skipped", {})), "seeds": seeds}))
@@ -692,7 +765,7 @@ def run_v3(a) -> int:
     seeds = [int(x) for x in a.seeds.split(",") if x] if a.seeds else list(run_cosim.SEEDS_V3)
     if not seeds or min(seeds) <= 0:
         raise SystemExit("run_arch.py --v3: --seeds must list positive seeds")
-    (ROOT / "build" / "arch.json").unlink(missing_ok=True)
+    SUMMARY.unlink(missing_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
     if a.phase in ("all", "prep"):
         ok = prep_v3(a.only, a.jobs)
