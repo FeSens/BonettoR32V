@@ -92,7 +92,7 @@ def fake_gates(monkeypatch, fail_at=None, boom_at=None):
 def test_all_gates_pass(repo, monkeypatch):
     calls = fake_gates(monkeypatch)
     assert ev.main(["--repo", str(repo)]) == 0
-    assert calls == ev.ORDER == ["lint", "cosim", "equiv", "formal", "arch", "area", "gl"]
+    assert calls == ev.ORDER == ["lint", "area", "cosim", "arch", "equiv", "gl", "formal"]
     doc = json.loads((repo / "build" / "eval.json").read_text())
     for key in ("sha", "pass", "gates", "area_um2", "cells", "cpi", "timestamp"):
         assert key in doc
@@ -105,16 +105,44 @@ def test_all_gates_pass(repo, monkeypatch):
 def test_stops_at_first_failure(repo, monkeypatch):
     calls = fake_gates(monkeypatch, fail_at="equiv")
     assert ev.main(["--repo", str(repo)]) == 1
-    assert calls == ["lint", "cosim", "equiv"]
+    assert calls == ["lint", "area", "cosim", "arch", "equiv"]
     doc = json.loads((repo / "build" / "eval.json").read_text())
     assert doc["pass"] is False and doc["stopped_at"] == "equiv"
     assert doc["gates"]["cosim"]["pass"] is True
     assert doc["gates"]["equiv"] == {"pass": False, "detail": "equiv broke",
                                      "runtime_s": doc["gates"]["equiv"]["runtime_s"]}
-    for g in ("formal", "arch", "area", "gl"):
+    for g in ("gl", "formal"):
         assert doc["gates"][g]["pass"] is None
         assert doc["gates"][g]["detail"] == "not run (stopped after equiv failed)"
-    assert doc["area_um2"] is None
+    assert doc["area_um2"] == 1234.5 and doc["no_gain"] is False
+
+
+@pytest.mark.parametrize("bar,rc,calls_after_area", [
+    (1234.5, 3, []),                     # equal area is no gain
+    (1000.0, 3, []),
+    (1234.6, 0, ["cosim", "arch", "equiv", "gl", "formal"]),
+])
+def test_max_area_retires_early(repo, monkeypatch, bar, rc, calls_after_area):
+    calls = fake_gates(monkeypatch)
+    assert ev.main(["--repo", str(repo), "--max-area", str(bar)]) == rc
+    assert calls == ["lint", "area"] + calls_after_area
+    doc = json.loads((repo / "build" / "eval.json").read_text())
+    assert doc["max_area"] == bar and doc["area_um2"] == 1234.5
+    if rc == 3:
+        assert doc["pass"] is False and doc["no_gain"] is True and doc["stopped_at"] == "area"
+        assert doc["gates"]["area"]["pass"] is True
+        for g in calls_after_area or ["cosim", "formal"]:
+            assert doc["gates"][g]["pass"] is None and "--max-area" in doc["gates"][g]["detail"]
+    else:
+        assert doc["pass"] is True and doc["no_gain"] is False
+
+
+def test_failing_area_gate_beats_bar_check(repo, monkeypatch):
+    calls = fake_gates(monkeypatch, fail_at="area")
+    assert ev.main(["--repo", str(repo), "--max-area", "99999"]) == 1
+    assert calls == ["lint", "area"]
+    doc = json.loads((repo / "build" / "eval.json").read_text())
+    assert doc["no_gain"] is False and doc["stopped_at"] == "area"
 
 
 def test_adapter_exception_fails_gate(repo, monkeypatch):

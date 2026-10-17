@@ -54,7 +54,7 @@ $(GATE_TARGETS):
 	$(EVAL) --gate $@
 
 eval gates:
-	$(EVAL) $(if $(V),-v)
+	$(EVAL) $(if $(V),-v) $(if $(MAX_AREA),--max-area $(MAX_AREA))
 
 harden:
 	@test -f tools/harden_tt.sh || { echo "harden: runner missing (tools/harden_tt.sh)"; exit 1; }

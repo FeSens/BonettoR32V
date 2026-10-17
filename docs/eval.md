@@ -7,7 +7,7 @@ Everything here is contract: hypothesis agents run it and never edit it (CLAUDE.
 | Command | Runs |
 |---|---|
 | `make lint` ... `make gl` | one gate: `python3 tools/eval.py --gate <name>`, result in `build/gates/<name>.json` |
-| `make eval` | every gate in order, stops at the first FAIL, writes `build/eval.json` (`V=1` streams runner output) |
+| `make eval` | every gate in order, cheapest first, stops at the first FAIL, writes `build/eval.json` (`V=1` streams runner output). `MAX_AREA=<champion um2>` retires a candidate right after the area gate unless it is smaller (`no_gain: true`, exit 3) |
 | `make gates` | exactly the same command as `make eval`, writing the same `build/eval.json` |
 | `make formal-deep` | the deep formal config (champions); not part of `make eval` |
 | `make harden`, `make tilefit` | `tools/harden_tt.sh $(HARDEN_ARGS)`, `physical/tilefit.py $(TILEFIT_ARGS)` |
@@ -24,6 +24,10 @@ Everything here is contract: hypothesis agents run it and never edit it (CLAUDE.
 
 ## Gates, in `make eval` order
 
+Cheapest first, so a bad candidate retires early: lint (~1 s), area (~10 s), cosim and arch
+(minutes), equiv, gl (minutes), formal (the longest). With `--max-area`, a candidate that is not
+smaller than the champion stops after the area gate, because it cannot win.
+
 Each gate is one adapter function in `tools/eval.py`. An adapter deletes the runner's output json,
 runs the runner from the repo root, and passes only if the exit code is 0 AND the fresh json says
 so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runner output goes to
@@ -32,12 +36,12 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 | # | Gate | Runner (as called) | PASS requires |
 |---|---|---|---|
 | 1 | lint | `tools/src_check.py` rules (below), then `verilator --lint-only -Wall --top-module tt_um_fesens_r32v src/*.v`, then again with the RVFI defines | src hygiene clean; Verilator exit 0 for both builds |
-| 2 | cosim | `make -C verif/programs`, then for every `build/programs/*.hex`, mode in {rvfi, pins}, seed in {1, 2, 3}: `run_cosim.py --mode M --prog P --seed S --max-cycles C` | every run exits 0 with a last-line JSON summary `pass: true`, `error` empty, `max_cycles_per_insn <= 1024` |
-| 3 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` | exit 0 and `pass: true` |
-| 4 | formal | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
-| 5 | arch | `verif/arch-test/run_arch.py` | exit 0, `pass: true`, at least one test, every test `true` |
-| 6 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract v1), the `netlist` file exists |
-| 7 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
+| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract v1), the `netlist` file exists |
+| 3 | cosim | `make -C verif/programs`, then for every `build/programs/*.hex`, mode in {rvfi, pins}, seed in {1, 2, 3}: `run_cosim.py --mode M --prog P --seed S --max-cycles C` | every run exits 0 with a last-line JSON summary `pass: true`, `error` empty, `max_cycles_per_insn <= 1024` |
+| 4 | arch | `verif/arch-test/run_arch.py` | exit 0, `pass: true`, at least one test, every test `true` |
+| 5 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` | exit 0 and `pass: true` |
+| 6 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
+| 7 | formal | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
 
 Details:
 - **RVFI build flags** (lint, equiv and the differential check): just `-DRISCV_FORMAL`.
@@ -220,7 +224,7 @@ Fixtures in `tools/test_fixtures/src_check/`:
   "cells": 987,
   "cpi": 92.4,
   "timestamp": "2026-10-16T19:43:49Z",
-  "order": ["lint", "cosim", "equiv", "formal", "arch", "area", "gl"],
+  "order": ["lint", "area", "cosim", "arch", "equiv", "gl", "formal"],
   "stopped_at": null,
   "tools": {"yosys": "...", "verilator": "...", "iverilog": "..."},
   "runtime_s": 2213.4
