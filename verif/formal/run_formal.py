@@ -13,19 +13,25 @@ Steps:
      every flip-flop on the rising edge of clk, no formal-only cells), strip any
      formal statements and initial values from the core, write core.il. The checkers are read separately, so the core's macros
      and modules cannot reach them (a module name clash is a yosys error).
-  3. Depth D (never set by an agent): D = max(depth_floor, D_min) with
-     D_min = reset_steps + max(first_retire_cycle, max_cycles_per_insn) +
-     max_cycles_per_insn + margin, from the cosim's --timing-json when available,
-     else from verif/formal/timing_tb.v run on the candidate (Icarus). D above
-     depth_cap is a FAIL (too slow for the formal policy).
+  3. Depth (never set by an agent), from the timing measured on the candidate (the
+     cosim's --timing-json when available, else verif/formal/timing_tb.v run with
+     Icarus). Full depth D = max(depth_floor, D_min), D_min = reset_steps +
+     max(first_retire_cycle, max_cycles_per_insn) + max_cycles_per_insn + margin.
+     Short depth (checks marked depth=short) = reset_steps + first_retire_cycle +
+     max_cycles(class) + margin, with the slowest class of the instructions under check
+     (all classes for a non-instruction check). A base depth above depth_cap is a FAIL
+     (too slow for the formal policy); liveness's fixed +1,024 is not counted.
   4. Two SBY tasks per check in the config (checks.cfg, or checks-deep.cfg with
      --deep), on the same design and depth: the proof task (the check's assertions)
      and the reach task (only the reach_* statements, each as assert(!trigger), BMC
      with --keep-going: a failed one is a reached trigger). A check PASSes iff its
      proof passes and every required trigger is reached. Tasks run in parallel
-     (jobs <= 8).
-  5. build/formal.json: {"pass", "checks": {name: PASS|FAIL|UNREACHED}, "depth",
-     "runtime_s", ...}. Exit 0 iff every check is PASS.
+     (jobs <= 8 on the Mac; BONETTO_FORMAL_MAX_JOBS raises the cap on a bigger host).
+  5. build/formal.json: {"pass", "checks": {name: PASS|FAIL|UNREACHED|SKIPPED},
+     "depth" (the deepest base depth used), "runtime_s", ...}. Exit 0 iff every check
+     is PASS. By default the run stops at the first FAIL or UNREACHED (the checks not
+     finished are SKIPPED); --keep-going runs everything. --host runs it on a remote
+     machine (default: env BONETTO_FORMAL_HOST).
 """
 import argparse
 import configparser
@@ -808,10 +814,9 @@ def kill_running(*_):
 
 
 # Relative cost of each task (measured on the seed, see docs/formal.md), for ordering.
-TASK_COST = {"liveness": 900, "bus_dmem": 500, "insn_group": 300, "bus_imem": 150,
-             "reg": 120, "pc_fwd": 120, "pc_bwd": 120, "causal": 120, "unique": 120,
-             "gpio": 100, "rvfi": 80, "silent": 60, "ill": 60, "reset": 60, "spi": 40,
-             "cover": 10}
+TASK_COST = {"liveness": 900, "bus_dmem": 500, "reg": 450, "insn_group": 300, "reset": 300,
+             "bus_imem": 180, "gpio": 100, "rvfi": 90, "pc_bwd": 80, "pc_fwd": 70,
+             "unique": 60, "causal": 60, "ill": 50, "silent": 50, "spi": 40, "cover": 20}
 
 
 def task_cost(tname):
@@ -1081,16 +1086,16 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
         sys.exit(0)
     depth, d_min = pick_depth(cfg, timing)
-    result["depth"] = depth
     result["depth_policy"] = {"d_min": d_min, "floor": cfg["depth_floor"], "cap": cfg["depth_cap"],
                               "formula": "reset_steps + max(first_retire, max_cpi) + max_cpi + margin",
-                              "timing_source": tsrc, "timing": timing}
+                              "d": depth, "timing_source": tsrc, "timing": timing}
     log(f"timing ({tsrc}): first_retire={timing['first_retire_cycle']} "
         f"max_cycles_per_insn={timing['max_cycles_per_insn']} -> D_min={d_min}, D={depth}")
     d_short = short_depth(cfg, timing)
     result["depth_policy"]["d_short"] = d_short
     # The cap bounds the candidate-derived depth (liveness's fixed +1,024 is not counted).
     deepest = max(d_short if o.get("depth") == "short" else depth for _, _, o in cfg["checks"])
+    result["depth"] = deepest
     log(f"short depth (depth=short checks) = {d_short}; deepest base depth = {deepest}")
     if deepest > cfg["depth_cap"]:
         result["error"] = (f"base depth {deepest} exceeds depth_cap={cfg['depth_cap']}: "
@@ -1142,10 +1147,17 @@ def main():
             for cname, _ in req:
                 task_depths[cname] = tdepth
 
-    # Longest first (makespan for the common, passing case). Reach tasks are short.
-    jobs_todo.sort(key=lambda t: -task_cost(t[0]))
+    # Order: the proofs longest first (the likeliest to fail, and the makespan of a passing
+    # run) interleaved with the reach tasks (cheap; a dead or stuck core shows up there as
+    # UNREACHED). A failing proof stops at its counterexample, so a long proof that fails
+    # still fails early.
+    proofs = sorted((t for t in jobs_todo if not t[0].endswith("_reach")),
+                    key=lambda t: -task_cost(t[0]))
+    reaches = [t for t in jobs_todo if t[0].endswith("_reach")]
+    jobs_todo = [t for pair in zip(proofs, reaches) for t in pair] + \
+        proofs[len(reaches):] + reaches[len(proofs):]
     log(f"running {len(jobs_todo)} SBY task(s) for {sum(len(r) for _, r in units)} check(s), "
-        f"jobs={jobs}, D={depth}" + ("" if args.keep_going else ", stop at the first FAIL"))
+        f"jobs={jobs}, base depth <= {deepest}" + ("" if args.keep_going else ", stop at the first FAIL"))
     unit_req = {}
     for tname, req in units:
         unit_req[tname] = [l for _, labels in req for l in labels]

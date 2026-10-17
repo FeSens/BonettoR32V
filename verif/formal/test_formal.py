@@ -8,7 +8,9 @@
 - The depth policy and timing summary.
 - Every mutant in mutants/ (the seed with one bug) FAILS the checks its expect.json
   names, at the seed's depth.
-- The seed (src/) PASSES the full suite (checks.cfg). Set BONETTO_SKIP_SEED=1 to skip.
+- The seed (src/) PASSES the fast suite (checks.cfg). Set BONETTO_SKIP_SEED=1 to skip.
+
+With BONETTO_FORMAL_HOST set, every formal run goes to that host (its own lock).
 
 The formal runs (mutants, seed) take the heavy-job lock /tmp/bonetto-heavy.lock once
 for the whole session (the same lock as `lockf -k /tmp/bonetto-heavy.lock`). If you
@@ -351,5 +353,6 @@ def test_seed_passes(tmp_path, heavy_lock):
     rc, text = formal(["--out", str(out)])
     res = json.load(open(out))
     assert rc == 0 and res["pass"], f"{res.get('checks')}\n{res.get('failures')}\n{text[-3000:]}"
-    assert res["depth"] >= res["depth_policy"]["d_min"]
+    # The fast config runs every check at the short depth, the deepest class group's.
+    assert res["depth"] == res["depth_policy"]["d_short"] == max(res["per_check_depth"].values())
     assert all(v == "PASS" for v in res["checks"].values())
