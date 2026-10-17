@@ -20,8 +20,9 @@ within the depth) counts as a failure. By default the run stops at the first `FA
 
 ## How it works
 
-1. **Staging.** `src/*.v` and `src/*.sv` are copied into `build/formal/work-<pid>/`. Stale work
-   dirs of dead processes are removed.
+1. **Staging.** Every top-level `src/*.v` and `src/*.sv`, `test_*.v` included (contract section
+   1: every top-level file is design; subdirectories are not), is copied into
+   `build/formal/work-<pid>/`. Stale work dirs of dead processes are removed.
 2. **Pre-pass.** yosys elaborates the `RISCV_FORMAL` build, reading `src/` with that one define
    and no other (contract section 6). It fails on latches, on flip-flops that are not on the
    rising edge of `clk`, and on formal-only cells (`$anyconst`, `$initstate`, ...) in the core.
@@ -57,28 +58,116 @@ within the depth) counts as a failure. By default the run stops at the first `FA
   it to the memory contents. A core that samples MISO while SCK is low reads noise and fails the
   bus checks (mutant `miso_low`).
 - `ena = 1`. All non-reset registers, the register file included, start at free values.
+- **The core region (0xFF80-0xFFFF) is a real 128-byte memory** in every task (`rmem` in
+  `wrapper.sv`), with free initial contents (contract section 3: arbitrary at reset, like on-die
+  registers). A READ data bit at a region byte is assumed equal to that byte's current bit, and a
+  complete WRITE byte to a region byte updates it. So a core that keeps x1..x15, the pc or
+  scratch in the region sees its own writes, and register consistency (`reg`, `causal`) covers
+  the core plus that memory. An uninitialized memory in SBY starts free (checked on a small
+  test design before relying on it). Program bytes (outside the region) are free noise, which
+  the bus checks constrain one symbolic byte at a time.
 
 ### The SPI monitor
 
 `bonetto_spi_monitor` (in `wrapper.sv`) decodes the pins into transactions: the 8-bit command,
 the 16-bit address, and data bytes at `(A + k) mod 2^16`. It emits an event for every READ data
 bit (byte address, bit index, MISO value) and every complete data byte (READ or WRITE, address,
-value), plus command and end-of-transaction events. `test_formal.py::test_monitor_decodes_stub`
-checks it against a hand-written waveform (stretched phases, a READ wrapping at 0xFFFF, a READ
-and a WRITE ending mid-byte, an incomplete header, MISO noise while SCK is low).
+value), plus command and end-of-transaction events.
+
+When CS_n rises it classifies the transaction (contract section 6), from the address `A`, the
+number of data bits clocked (`ev_end_nbits`, saturating at 1,023) and which bytes got at least
+one data bit. A partly clocked last byte counts as addressed.
+
+- **region**: every addressed byte is in 0xFF80-0xFFFF. A READ with no data bit (a null READ)
+  is a region READ if `A` is in the region. Region transactions are exempt from the bus checks.
+- **mixed**: it addresses both region and program bytes (a region READ running past 0xFFFF into
+  0x0000, a program READ running into 0xFF80, or one bit past the region). Always a failure
+  (`bus_region_mixed`).
+- **program**: everything else, null READs at a program address included. A null READ addresses
+  no byte, so the bus checks never count it against an instruction: it is legal anywhere. A
+  header shorter than 24 bits still fails `spi_rule4_header`.
+
+`test_formal.py::test_monitor_decodes_stub` checks the decoding and the classes against a
+hand-written waveform: stretched phases, a READ wrapping at 0xFFFF, a READ and a WRITE ending
+mid-byte, an incomplete header, MISO noise while SCK is low, a region READ, null READs in the
+region and in program memory, a READ clocking one bit past 0xFFFF (mixed), and a region WRITE.
+
+### The region stop
+
+Contract section 3: a fetch or data access that touches a region byte is UNSPECIFIED, and the
+checkers stop comparing at the first retirement that makes one. Only liveness and the SPI
+waveform rules apply after it. `wrapper.sv` computes, at each retirement:
+
+- `bon_fetch_touch`: the fetch touches the region, `pc_rdata[15:0] >= 0xFF7D` (one of
+  `pc[15:0] + k`, k < 4, is a region byte);
+- the data access touches the region, from the specification's address (contract ruling: the
+  spec-model address, so a core cannot dodge the stop by misreporting `mem_addr`). For a load or
+  store, `addr = rs1_rdata + imm` (`rs1 = x0` reads 0), with `n` bytes; it touches the region
+  iff `addr[31] = 0` and `addr[15:0] >= 0xFF80 - (n - 1)`. That covers an access inside the
+  region, one that straddles 0xFF7F/0xFF80, one that wraps at 64 KB (touching 0xFFFD-0xFFFF),
+  and one that crosses 0x7FFFFFFF into `addr[31] = 1` (its first bytes are 0xFFFD-0xFFFF of the
+  RAM). The claimed access (`rvfi_mem_*`, non-trapping) is OR'ed in, so a core whose claim
+  touches the region also stops;
+- `bon_region_ret`: either, at this retirement; `bon_stopped`: a region retirement has happened
+  before this step. `BONETTO_FULL` = neither.
+
+At a region retirement only two things are still compared: `insn_region_mem_addr` (the claimed
+`mem_addr` equals the spec's, unless the fetch itself touched the region), and the register reads
+in `reg` that happened before the touch (rs1, which the address came from, unless the fetch
+touched the region). Every other instruction, bus, gpio, causal, rvfi, ill and silent assertion
+is gated by `BONETTO_FULL`, and reg, pc_fwd, pc_bwd and unique by `!bon_stopped`. `spi` (minus
+`spi_cs_at_valid`, which is a retirement rule) and liveness never stop. Like the full checks,
+`insn_region_mem_addr` applies to the group's own instructions (`spec_valid`), so reserved
+encodings are not compared there either.
+
+The stop only removes traces from the comparison after a region-touching instruction. Formal
+picks the instruction stream, so every program that never touches the region (as every test
+program, contract section 3) is still checked in full: the touch is the trace's choice, not the
+core's.
+
+### The bus checks (transaction identity)
+
+`bus_imem` and `bus_dmem` follow one symbolic program byte `X` (a free constant outside the
+region, with a free initial value, updated by WRITE bytes at `X`; every READ data bit at `X` is
+assumed equal to its current bit). The window of an instruction is the SPI traffic between the
+previous retirement and its own. Transaction ends are classified by the monitor (above); region
+transactions are exempt. With `pc16` the expected fetch address (0 after reset, then the
+previous retirement's `pc_wdata[15:0]`) and the claimed bytes of the retiring instruction:
+
+- An **F READ** is a program READ with a full header, `A = pc16` and exactly 32 data bits. There
+  must be at least one (`bus_imem_fetch`), and `pc16 = pc_rdata[15:0]` (`bus_imem_pc`). A second
+  F READ is accepted only as a load READ of the same bytes (`bus_imem_refetch`: if there are two,
+  each fetch byte must be a load byte). So a re-fetch fails, and so does a fetch with one extra
+  bit or byte (it is not an F READ, and its bytes are not load bytes).
+- Every **other program READ** (a fetch split in two, a fetch running on, a load READ) may read
+  only the load's bytes: `ma + k` with `rmask[k]`, RAM, non-trapping (`bus_dmem_read_claimed`).
+  Each load byte must be read in full by a READ that is not the fetch, or by a second F READ
+  (`bus_dmem_load_read`). The fetch never counts toward a load, so a load of its own
+  instruction bytes needs its own READ (mutant `load_own_fetch`).
+- Every **program WRITE byte** must be a store byte (`bus_dmem_write_claimed`), each store byte
+  is written exactly once (`bus_dmem_store_once`; a store may be split over WRITEs), and with the
+  claimed value (`bus_dmem_store_value`).
+- Fetch and load bytes equal `X` at the start of the window (`bus_imem_value`,
+  `bus_dmem_load_value`).
+- No mixed transaction (`bus_region_mixed`).
+
+A trapping instruction claims no load and no store, whatever its fields say, so any program READ
+beyond its fetch and any program WRITE fail; its region transactions are allowed (contract
+section 4). Every assertion is checked at each `BONETTO_FULL` retirement for the window that
+retirement closes. Null READs address no byte, so they never trip a claim.
 
 ### Forks of riscv-formal (in `verif/formal/checks/`, the submodule is untouched)
 
 | Fork | Why |
 |---|---|
 | `rvfi_testbench.sv` | 16-bit cycle counter (stock: 8 bits, saturating at 255); free `check` (unbounded style); pins and monitor events for the checkers; free reset length for the `reset` check. |
-| `bonetto_insn_check` | Checks a group of instructions (model `bonetto_insn_group`). Stock semantics plus: halt equals the spec's trap; a trapping retirement is compared only on trap, halt, `rd_addr = 0` and `wmask = 0` (contract section 6); register fields of other retirements exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM. |
-| `bonetto_reg_check` | Stock (reads return the last write) plus: a register not yet written reads the same value every time. |
+| `bonetto_insn_check` | Checks a group of instructions (model `bonetto_insn_group`). Stock semantics plus: halt equals the spec's trap; a trapping retirement is compared only on trap, halt, `rd_addr = 0` and `wmask = 0`, plus the rs1/rs2 fields on a trapping branch or JALR (contract section 6); register fields of other retirements exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM; the region stop. |
+| `bonetto_reg_check` | Stock (reads return the last write) plus: a register not yet written reads the same value every time; the reads of a trapping branch or JALR are checked too; the region stop. |
 | `bonetto_pc_bwd_check` | Stock pc_bwd only fires when order N+1 retires before N, never true in order (unreachable). The fork checks the time-adjacent pair: order + 1 and pc chaining. |
 | `bonetto_unique_check` | Stock unique fails on any core with a free trig. The fork counts retirements per order. |
 | `bonetto_liveness_check` | Edge counter since edge 0 or the last retirement (contract section 4 count, see "Liveness"): a retirement by edge 1,024 unless halted. Stock fires check right after trig in unbounded mode. |
 | `bonetto_ill_check` | 0x00000000 and 0xFFFFFFFF. Stock only covers 0x00000000. |
-| `bonetto_bus_checks.sv` | Byte shadow at a 16-bit pin address, misaligned and wrap aware; GPIO is not RAM. Stock shadows aligned words at 32-bit addresses and only on `mem_addr == addr`. |
+| `bonetto_bus_checks.sv` | Byte shadow at a 16-bit pin address outside the region, misaligned and wrap aware; GPIO is not RAM; transaction identity per instruction (one fetch READ, load READs, store WRITEs, see "The bus checks"). Stock shadows aligned words at 32-bit addresses and only on `mem_addr == addr`. |
 | new: `fence`, `ecall`, `ebreak` models, `silent`, `rvfi`, `spi`, `gpio`, `reset`, reach | See the property table. |
 
 `isa_rv32e.txt` and `isa_rv32e.v` are generated by `gen_isa_rv32e.py` from the submodule's
@@ -120,11 +209,13 @@ reached (see "Non-vacuity").
 | equiv (pre-pass) | RVFI build with `rvfi_*` stripped is equivalent to the plain build | 6: RVFI logic drives no pin |
 | `insn_<name>` | `insn_trap`, `insn_halt` (trap and halt equal the spec's trap) | 4: fatal traps (ECALL, EBREAK, misaligned jump/branch target), trap = halt; nothing else traps |
 | | `insn_trap_rd_addr`, `insn_trap_wmask` (on a spec trap) | 4: no register write and no memory write; 6: only these are compared on a trapping retirement |
+| | `insn_trap_rs1_zero`, `insn_trap_rs2_zero`, `insn_trap_rs1_addr`, `insn_trap_rs2_addr` (trapping branch or JALR) | 6: there the trap depends on the operands, so the rs fields are truthful |
+| | `insn_region_mem_addr` (at the region retirement, unless the fetch touched the region) | 3: the stop uses the spec's address; the claimed `mem_addr` must still be right |
 | | `insn_rs1_zero`, `insn_rs2_zero`, `insn_rs1_addr`, `insn_rs2_addr` (non-trapping) | 6: register fields report the index read, unused fields 0 with rdata 0; 4: x0 reads 0 |
 | | `insn_rd_addr`, `insn_rd_wdata`, `insn_pc_wdata` (non-trapping) | 4: RV32E semantics (riscv-formal's rv32i model, E filter), FENCE a no-op; 6: a write to x0 reports rd 0, wdata 0 |
 | | `insn_rmask`, `insn_wmask`, `insn_mem_addr`, store data per lane | 6: exact first-byte address, LSB-aligned masks, lane k = byte at mem_addr + k; 3/4: misaligned accesses never trap |
 | | reach: `reach_insn_<name>`; also `reach_insn_<name>_trap` for JAL, JALR, branches, ECALL, EBREAK | non-vacuity |
-| reg | `reg_rs1`, `reg_rs2`, `reg_rs1_rs2` | 4: reads return the last value written (every encoding); 1: registers start unknown but do not change by themselves |
+| reg | `reg_rs1`, `reg_rs2`, `reg_rs1_rs2` | 4: reads return the last value written (every encoding, trapping branches and JALR included); 1: registers start unknown but do not change by themselves; 3/6: on the die or in the region, one real memory |
 | pc_fwd | `pc_fwd` | 4: PCs chain (order N's pc_rdata = order N-1's pc_wdata) |
 | pc_bwd | `pc_bwd_order`, `pc_bwd_pc` | 6: one instruction per pulse, order counts retirements; 4: PCs chain |
 | causal | `causal` | 6: in-order retirement; 4: register reads return the last write |
@@ -134,19 +225,20 @@ reached (see "Non-vacuity").
 | | `conv_trap_halt`, `conv_trap_rd_addr`, `conv_trap_wmask` | 4: a trap halts, no register or memory write; stricter reading: nothing halts without trapping |
 | | `conv_first_order`, `conv_first_pc`, `conv_order_next` | 6: order from 0; 1: execution starts at pc = 0 |
 | ill | `ill_trap`, `ill_halt`, `ill_rd_addr`, `ill_wmask` for `0x00000000` and `0xFFFFFFFF` | 4: fatal traps |
-| silent | `silent_retire`, `silent_write`, `silent_uo` (after a halting retirement) | 4: never retires again, never starts another SPI WRITE; 3: uo_out changes only on an IO store |
+| silent | `silent_retire`, `silent_write`, `silent_uo` (after a halting retirement) | 4: never retires again, never starts another SPI WRITE (a region WRITE included); 3: uo_out changes only on an IO store |
 | liveness (deep only) | `liveness` (first retirement by edge 1,024, then at most 1,024 edges apart, unless halted; see "Liveness") | 4: latency cap |
-| bus_imem | `bus_imem_read`, `bus_imem_value` | 6: fetch completeness (own READ of all 4 bytes, before retirement); 3: fetch reads RAM at pc[15:0] (64 KB alias); 2: memory semantics |
-| bus_dmem | `bus_dmem_load_read`, `bus_dmem_load_value` (non-trapping) | 6: load completeness; 3: RAM bytes (addr[15:0] + k) mod 2^16, misaligned and wrapping |
-| | `bus_dmem_store_once`, `bus_dmem_store_value` | 3: store bytes; 2 rule 5: every byte sent is written; 6: traffic finishes before retirement |
-| | `bus_dmem_write_claimed`, `bus_dmem_read_claimed` | 6: transaction order (a fetch reads only its bytes, a load or store moves only its data); 3: an IO access never appears on the pins |
+| bus_imem | `bus_imem_pc`, `bus_imem_fetch`, `bus_imem_refetch`, `bus_imem_value` | 6: exactly one fetch, a READ of exactly the 4 instruction bytes, before retirement, no caching; 3: fetch reads RAM at pc[15:0] (64 KB alias); 2: memory semantics |
+| bus_dmem | `bus_dmem_load_read`, `bus_dmem_load_value` (non-trapping) | 6: load completeness, the fetch never counts; 3: RAM bytes (addr[15:0] + k) mod 2^16, misaligned and wrapping |
+| | `bus_dmem_store_once`, `bus_dmem_store_value` | 3: store bytes; 2 rule 5: every byte sent is written; 6: each store byte exactly once, traffic finishes before retirement |
+| | `bus_dmem_write_claimed`, `bus_dmem_read_claimed` | 6: program transactions are the fetch, the load's READs and the store's WRITEs, nothing else (no program write on a trap); 3: an IO access never appears on the pins |
+| | `bus_region_mixed` | 6: a transaction is region, program or a null READ; a partial last byte counts as addressed |
 | gpio | IO load lanes (unnamed, one per byte lane) | 3: byte X with X[1:0] = 0 reads `ui_in`, other IO bytes read 0 (misaligned multi-byte IO unspecified) |
-| | `gpio_uo_hold`, `gpio_uo_once`, `gpio_uo_cause`, `gpio_uo_value` | 3: uo_out changes only from an IO store writing byte 0, holds the new value no later than one cycle after it retires; 1: 0 after reset |
+| | `gpio_uo_hold`, `gpio_uo_once`, `gpio_uo_cause`, `gpio_uo_value` | 3: uo_out changes only from an IO store writing byte 0, at most once per instruction (it may move early, within the store's own window), holds the new value no later than one cycle after it retires; 1: 0 after reset. Not compared from a misaligned IO store on (unspecified, its own retirement included) |
 | spi | `spi_uio_oe`, `spi_uio_out_hi`, `spi_uio_out_2` | 1: uio_oe constant, unused outputs 0 |
 | | `spi_reset_cs`, `spi_reset_sck`, `spi_reset_uo`, `spi_reset_valid` | 1: reset state of the pins; nothing retires in reset |
 | | `spi_rule1_prev`, `spi_rule1_now`, `spi_rule2` | 2: rules 1 and 2 |
 | | `spi_rule4_cmd`, `spi_rule4_header`, `spi_rule5_write` | 2: rules 4 and 5 |
-| | `spi_cs_at_valid` | 6: CS_n high at the retirement cycle |
+| | `spi_cs_at_valid` (compared retirements) | 6: CS_n high at the retirement cycle |
 | reset | spi and rvfi checks with rst_n low for 1 to 8 edges | 1: rst_n low for at least one edge |
 | cover | reach only: a non-trapping retirement, a trapping one, a second retirement | riscv-formal's cover check |
 
@@ -172,12 +264,15 @@ group uses its members' classes (`INSN_CLASS`, `COSIM_CLASSES` in `run_formal.py
 check, or a class the timing does not measure, uses `max_cpi`. reset_steps = 1 and margin = 2 in
 both configs.
 
-The timing comes from the cosim (`run_cosim.py --mode rvfi --prog build/programs/selftest.hex
---src <dir> --timing-json <file>`, per class `{class: cycles}`) when it runs. Otherwise the runner
-measures it itself: `timing_tb.v` runs the candidate in Icarus against a behavioural 23LC512 (noise
-on MISO while SCK is low) on the selftest, or on `timing_prog.S` when the selftest isn't built
-(per class `{class: {max_cycles, ...}}`). The cosim counts cycle c as the outputs right after
-edge c. BMC step s holds the state after edge s - 1, with step 0 the reset cycle. So cosim
+The timing comes from the cosim when it runs: `run_cosim.py --mode rvfi --prog <p>.hex --src
+<dir> --timing-json <file>` for every built program in `build/programs/` except CoreMark (too
+long for a timing run), the selftest first, then the rest four at a time. The timing is the
+maximum over the programs, per class too (`merge_timings`); `depth_policy` lists the programs.
+On the v2 cores this matters: the slowest class differs between programs. Otherwise the runner
+measures it itself: `timing_tb.v` runs the candidate in Icarus against a behavioural 23LC512
+(noise on MISO while SCK is low) on the selftest, or on `timing_prog.S` when the selftest isn't
+built (per class `{class: {max_cycles, ...}}`). The cosim counts cycle c as the outputs right
+after edge c. BMC step s holds the state after edge s - 1, with step 0 the reset cycle. So cosim
 cycle c is BMC step c + 1, and margin covers it.
 
 A short-depth trace therefore covers the first retirement, plus one more retirement of the
@@ -246,6 +341,14 @@ not cover:
    slow (on the seed, a load or store first, then a load or store), and every third or later
    retirement. Deep adds the slow-then-slow pair. Neither config covers a third retirement of
    the slowest class.
+3. **Liveness on any candidate.** The lead ruled that formal fast needs no liveness (cosim's
+   1,024-cycle watchdog covers it on every candidate); deep keeps it.
+
+**Ruling R9 (the lead's).** The fast depth policy is accepted as it stands. It is below the
+original brief's floor of 2 x max_cpi: an instruction group runs at reset + first + the slowest
+member class + margin, which on the seed is 234 for the ALU groups against 2 x 230 = 460, and
+every other check at reset + first + max_cpi + margin (348 on the seed). Deep keeps the full
+depth D, which is at least 2 x max_cpi + 3.
 
 Neither config is an unbounded proof (see "What is and is not proven").
 
@@ -390,7 +493,8 @@ Proven, for the candidate as built with `-DRISCV_FORMAL`, under the environment 
   That means:
   - every free MISO bit, `uio_in` value and `ui_in` constant;
   - free power-up values of every register, the register file included;
-  - a free memory image, through the SPI monitor's byte shadow.
+  - free initial contents of the core region (a real memory);
+  - a free program memory image, through the bus checks' byte shadow.
 - **Non-vacuity of each check.** Its triggers occur within that same depth (the reach tasks).
 - **Liveness, in deep only.** Every 1,024-edge window that closes within D + 1,024.
 
@@ -407,6 +511,14 @@ Not proven:
 - Encodings with register fields x16-x31 and other UNSPECIFIED behaviour: the E filter drops them
   from the instruction checks; the consistency checks still apply.
 - What a trapping retirement claims on top of trap, halt, `rd_addr = 0` and `wmask = 0` (its
-  `rmask` and read data are not checked).
+  `rmask` and read data are not checked), and its rs fields unless it is a branch or JALR.
+- Anything at or after the first retirement whose fetch or data access touches the core region
+  (contract section 3), except `insn_region_mem_addr` and the reads before the touch at that
+  retirement, the SPI waveform rules and (deep) liveness. Region transactions themselves are
+  only checked for staying inside the region (no wrap, no mixing), for not starting after a
+  halt (a WRITE) and, through the region memory, for register consistency. Their number, order
+  and what they write are not compared.
+- The rs2 read of a load or store that touches the region in its data access (it may come after
+  the touch).
 - The plain build, other than through the pins equivalence. Gate-level behaviour, X propagation
   and timing belong to `make gl` and hardening.
