@@ -8,6 +8,12 @@
 #   build/cosim/test_pmod    unit tests of the QSPI Pmod chip models (pmod.h; test_pmod.py runs it)
 #   build/cosim/libpmod.so   the Pmod models behind a C API (pmod_capi.cpp), for ctypes
 #   build/cosim/iss_main     the reference ISS runner (v2 by default, contract v3 with --v3)
+#   build/cosim/test_periph  unit tests of the peripheral pin models (periph_models.h;
+#                            test_cosim_harness.py runs it)
+#
+# HARNESS selects the harness source for MODE builds: v3 (default) is harness.cpp, contract v3
+# (pmod.h, iss3.h, periph_models.h); v2 is harness_v2.cpp, contract v2 (spiram.h, iss.h), which
+# run_cosim.py uses until the integration swap.
 #
 # MODE is rvfi (design built with RISCV_FORMAL, RVFI compared every retirement) or pins (the plain
 # design). SRC_DIR defaults to src/. Every SRC_DIR/*.v file is part of the design (contract
@@ -32,7 +38,8 @@ if [ $# -eq 0 ]; then
   "$CXX" "${CXXFLAGS[@]}" "$COSIM/test_pmod.cpp" -o "$OUT/test_pmod"
   "$CXX" "${CXXFLAGS[@]}" -fPIC -shared "$COSIM/pmod_capi.cpp" -o "$OUT/libpmod.so"
   "$CXX" "${CXXFLAGS[@]}" "$COSIM/iss_main.cpp" -o "$OUT/iss_main"
-  echo "built $OUT/test_pmod $OUT/libpmod.so $OUT/iss_main"
+  "$CXX" "${CXXFLAGS[@]}" "$COSIM/test_periph.cpp" -o "$OUT/test_periph"
+  echo "built $OUT/test_pmod $OUT/libpmod.so $OUT/iss_main $OUT/test_periph"
   exit 0
 fi
 
@@ -67,6 +74,12 @@ esac
 read -r -a EXTRA <<<"${VFLAGS:-}"
 DEFS+=(${EXTRA[@]+"${EXTRA[@]}"})
 
+case "${HARNESS:-v3}" in
+  v3) HSRC="$COSIM/harness.cpp" ;;
+  v2) HSRC="$COSIM/harness_v2.cpp" ;;
+  *) echo "build.sh: HARNESS must be v2 or v3" >&2; exit 1 ;;
+esac
+
 TRACE_ARGS=()
 if [ "${TRACE:-0}" = "1" ]; then
   TRACE_ARGS=(--trace-fst)
@@ -80,7 +93,7 @@ ARGS=(--cc --exe --build -j 0 -O3
   ${DEFS[@]+"${DEFS[@]}"}
   ${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"}
   "${FILES[@]}"
-  "$COSIM/harness.cpp"
+  "$HSRC"
   -CFLAGS "-O2 -std=c++17 -I$COSIM $CDEFS"
   -Mdir "$OUT/obj" -o "$OUT/harness")
 # the exact command, one argument per line (test_cosim_harness.py checks the design inputs)
@@ -89,4 +102,4 @@ verilator "${ARGS[@]}" >"$OUT/build.log" 2>&1 || {
   tail -40 "$OUT/build.log" >&2
   exit 1
 }
-echo "built $OUT/harness ($MODE, ${#FILES[@]} source files)"
+echo "built $OUT/harness ($MODE, harness ${HARNESS:-v3}, ${#FILES[@]} source files)"
