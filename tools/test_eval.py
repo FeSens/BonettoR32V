@@ -67,7 +67,10 @@ def with_src(repo, fixture="pass_observer"):
 
 # --- orchestration -----------------------------------------------------------------------------
 
-def fake_gates(monkeypatch, fail_at=None, boom_at=None):
+V3_ORDER = ["lint", "area", "cosim", "arch", "equiv", "gl"]
+
+
+def fake_gates(monkeypatch, fail_at=None, boom_at=None, ips=2.5):
     calls = []
 
     def make(name):
@@ -81,68 +84,139 @@ def fake_gates(monkeypatch, fail_at=None, boom_at=None):
                 ctx.notes.update({"area_um2": 1234.5, "cells": 321})
             if name == "cosim":
                 ctx.notes["cpi"] = 88.0
+                if ips is not None:
+                    ctx.notes.update({"coremark_ips": ips, "coremark_cycles_per_iter": 16e6,
+                                      "clock_period_ns": 25})
             return f"{name} ok", {}
         return gate
 
-    for name in ev.ORDER:
+    for name in ev.ORDER + [ev.FORMAL_GATE]:
         monkeypatch.setitem(ev.GATES, name, make(name))
     return calls
+
+
+def eval_doc(repo):
+    return json.loads((repo / "build" / "eval.json").read_text())
 
 
 def test_all_gates_pass(repo, monkeypatch):
     calls = fake_gates(monkeypatch)
     assert ev.main(["--repo", str(repo)]) == 0
-    assert calls == ev.ORDER == ["lint", "area", "cosim", "arch", "equiv", "gl", "formal"]
-    doc = json.loads((repo / "build" / "eval.json").read_text())
-    for key in ("sha", "pass", "gates", "area_um2", "cells", "cpi", "timestamp"):
+    assert calls == ev.ORDER == V3_ORDER
+    doc = eval_doc(repo)
+    for key in ("sha", "dirty", "pass", "gates", "area_um2", "cells", "coremark_ips", "cpi",
+                "formal", "timestamp"):
         assert key in doc
     assert doc["pass"] is True and doc["stopped_at"] is None
     assert (doc["area_um2"], doc["cells"], doc["cpi"]) == (1234.5, 321, 88.0)
+    assert (doc["coremark_ips"], doc["coremark_cycles_per_iter"], doc["clock_period_ns"]) \
+        == (2.5, 16e6, 25)
     assert all(doc["gates"][g]["pass"] is True for g in ev.ORDER)
     assert doc["sha"] == "unknown" and doc["dirty"] is None   # not a git repo
+
+
+def test_v3_order_and_formal_skipped(repo, monkeypatch):
+    calls = fake_gates(monkeypatch)
+    assert ev.main(["--repo", str(repo)]) == 0
+    assert "formal" not in calls and calls == V3_ORDER
+    doc = eval_doc(repo)
+    assert doc["formal"] == "skipped"
+    assert "formal" not in doc["gates"] and doc["order"] == V3_ORDER
+    assert doc["pass"] is True                       # a skipped formal does not block a pass
+
+
+def test_formal_flag_runs_formal_last(repo, monkeypatch):
+    calls = fake_gates(monkeypatch)
+    assert ev.main(["--repo", str(repo), "--formal"]) == 0
+    assert calls == V3_ORDER + ["formal"]
+    doc = eval_doc(repo)
+    assert doc["formal"] == "pass" and doc["gates"]["formal"]["pass"] is True
+    assert doc["order"] == V3_ORDER + ["formal"] and doc["pass"] is True
+
+
+def test_formal_flag_failure_fails_eval(repo, monkeypatch):
+    fake_gates(monkeypatch, fail_at="formal")
+    assert ev.main(["--repo", str(repo), "--formal"]) == 1
+    doc = eval_doc(repo)
+    assert doc["formal"] == "fail" and doc["pass"] is False and doc["stopped_at"] == "formal"
+
+
+def test_formal_flag_not_reached_is_skipped(repo, monkeypatch):
+    calls = fake_gates(monkeypatch, fail_at="cosim")
+    assert ev.main(["--repo", str(repo), "--formal"]) == 1
+    assert calls == ["lint", "area", "cosim"]
+    doc = eval_doc(repo)
+    assert doc["formal"] == "skipped"
+    assert doc["gates"]["formal"] == {"pass": None, "detail": "not run (stopped after cosim failed)"}
 
 
 def test_stops_at_first_failure(repo, monkeypatch):
     calls = fake_gates(monkeypatch, fail_at="equiv")
     assert ev.main(["--repo", str(repo)]) == 1
     assert calls == ["lint", "area", "cosim", "arch", "equiv"]
-    doc = json.loads((repo / "build" / "eval.json").read_text())
+    doc = eval_doc(repo)
     assert doc["pass"] is False and doc["stopped_at"] == "equiv"
     assert doc["gates"]["cosim"]["pass"] is True
     assert doc["gates"]["equiv"] == {"pass": False, "detail": "equiv broke",
                                      "runtime_s": doc["gates"]["equiv"]["runtime_s"]}
-    for g in ("gl", "formal"):
-        assert doc["gates"][g]["pass"] is None
-        assert doc["gates"][g]["detail"] == "not run (stopped after equiv failed)"
+    assert doc["gates"]["gl"]["pass"] is None
+    assert doc["gates"]["gl"]["detail"] == "not run (stopped after equiv failed)"
+    assert "formal" not in doc["gates"] and doc["formal"] == "skipped"
     assert doc["area_um2"] == 1234.5 and doc["no_gain"] is False
 
 
-@pytest.mark.parametrize("bar,rc,calls_after_area", [
-    (1234.5, 3, []),                     # equal area is no gain
-    (1000.0, 3, []),
-    (1234.6, 0, ["cosim", "arch", "equiv", "gl", "formal"]),
+@pytest.mark.parametrize("bar,ips,rc,calls_after_cosim", [
+    (2.5, 2.5, 0, ["arch", "equiv", "gl"]),   # a tie continues: the area tiebreak may win (R17)
+    (2.5000001, 2.5, 3, []),
+    (3.0, 2.5, 3, []),
+    (0.0, None, 3, []),                  # no CoreMark score: cannot be shown at least as fast
+    (2.4, 2.5, 0, ["arch", "equiv", "gl"]),
 ])
-def test_max_area_retires_early(repo, monkeypatch, bar, rc, calls_after_area):
-    calls = fake_gates(monkeypatch)
-    assert ev.main(["--repo", str(repo), "--max-area", str(bar)]) == rc
-    assert calls == ["lint", "area"] + calls_after_area
-    doc = json.loads((repo / "build" / "eval.json").read_text())
-    assert doc["max_area"] == bar and doc["area_um2"] == 1234.5
+def test_min_ips_stops_after_cosim(repo, monkeypatch, bar, ips, rc, calls_after_cosim):
+    calls = fake_gates(monkeypatch, ips=ips)
+    assert ev.main(["--repo", str(repo), "--min-ips", str(bar)]) == rc
+    assert calls == ["lint", "area", "cosim"] + calls_after_cosim
+    doc = eval_doc(repo)
+    assert doc["min_ips"] == bar and doc["coremark_ips"] == ips
+    assert doc["area_um2"] == 1234.5 and doc["cpi"] == 88.0
     if rc == 3:
-        assert doc["pass"] is False and doc["no_gain"] is True and doc["stopped_at"] == "area"
-        assert doc["gates"]["area"]["pass"] is True
-        for g in calls_after_area or ["cosim", "formal"]:
-            assert doc["gates"][g]["pass"] is None and "--max-area" in doc["gates"][g]["detail"]
+        assert doc["pass"] is False and doc["no_gain"] is True and doc["stopped_at"] == "cosim"
+        assert doc["gates"]["cosim"]["pass"] is True and doc["formal"] == "skipped"
+        for g in ("arch", "equiv", "gl"):
+            assert doc["gates"][g]["pass"] is None and "--min-ips" in doc["gates"][g]["detail"]
     else:
         assert doc["pass"] is True and doc["no_gain"] is False
 
 
-def test_failing_area_gate_beats_bar_check(repo, monkeypatch):
-    calls = fake_gates(monkeypatch, fail_at="area")
-    assert ev.main(["--repo", str(repo), "--max-area", "99999"]) == 1
-    assert calls == ["lint", "area"]
-    doc = json.loads((repo / "build" / "eval.json").read_text())
-    assert doc["no_gain"] is False and doc["stopped_at"] == "area"
+def test_min_ips_with_formal_stops_before_formal(repo, monkeypatch):
+    calls = fake_gates(monkeypatch, ips=1.0)
+    assert ev.main(["--repo", str(repo), "--formal", "--min-ips", "1.5"]) == 3
+    assert calls == ["lint", "area", "cosim"]
+    doc = eval_doc(repo)
+    assert doc["formal"] == "skipped" and "--min-ips" in doc["gates"]["formal"]["detail"]
+    assert "coremark_ips 1.0 is below --min-ips 1.5" in doc["gates"]["formal"]["detail"]
+
+
+def test_min_ips_tie_runs_every_gate_including_formal(repo, monkeypatch):
+    calls = fake_gates(monkeypatch, ips=1.0)
+    assert ev.main(["--repo", str(repo), "--formal", "--min-ips", "1.0"]) == 0
+    assert calls == V3_ORDER + ["formal"]
+    doc = eval_doc(repo)
+    assert doc["pass"] is True and doc["no_gain"] is False and doc["formal"] == "pass"
+
+
+def test_failing_cosim_gate_beats_bar_check(repo, monkeypatch):
+    calls = fake_gates(monkeypatch, fail_at="cosim")
+    assert ev.main(["--repo", str(repo), "--min-ips", "0"]) == 1
+    assert calls == ["lint", "area", "cosim"]
+    doc = eval_doc(repo)
+    assert doc["no_gain"] is False and doc["stopped_at"] == "cosim"
+
+
+def test_max_area_is_replaced_by_min_ips(repo, monkeypatch):
+    fake_gates(monkeypatch)
+    with pytest.raises(SystemExit):
+        ev.main(["--repo", str(repo), "--max-area", "5000"])
 
 
 def test_adapter_exception_fails_gate(repo, monkeypatch):
@@ -205,6 +279,35 @@ def test_make_gates_alias_runs_the_same_command():
     assert dry("gates") == dry("eval")
     assert dry("gates").endswith("tools/eval.py")
     assert "lockf" not in dry("gates")              # the full run never takes the heavy lock
+
+
+def test_make_eval_formal_and_min_ips_flags():
+    import subprocess
+
+    def dry(*args):
+        return subprocess.run(["make", "-n", "-C", REPO, *args], capture_output=True, text=True)
+
+    for target in ("eval", "gates"):
+        p = dry(target, "FORMAL=1", "MIN_IPS=1.25")
+        assert p.returncode == 0, p.stderr
+        assert " ".join(p.stdout.split()).endswith("tools/eval.py --formal --min-ips 1.25")
+        assert "lockf" not in p.stdout
+        bare = " ".join(dry(target).stdout.split())
+        assert bare.endswith("tools/eval.py") and "--formal" not in bare
+    p = dry("eval", "MAX_AREA=4000")                 # replaced by MIN_IPS: refuse, don't ignore
+    assert p.returncode != 0 and "MIN_IPS" in p.stderr
+
+
+@pytest.mark.parametrize("value,formal", [("1", True), ("0", False), ("", False),
+                                          ("yes", False), ("no", False)])
+def test_make_formal_only_when_formal_is_1(value, formal):
+    import subprocess
+    for target in ("eval", "gates"):
+        p = subprocess.run(["make", "-n", "-C", REPO, target, f"FORMAL={value}"],
+                           capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        cmd = " ".join(p.stdout.split())
+        assert cmd.endswith("tools/eval.py --formal" if formal else "tools/eval.py"), cmd
 
 
 # --- missing runners fail loudly ---------------------------------------------------------------
@@ -417,12 +520,12 @@ def test_arch_adapter(repo, doc, ok):
 # --- area adapter ------------------------------------------------------------------------------
 
 def good_area(netlist="build/synth/netlist.v"):
-    return {"area_um2": 15432.1, "cells": 987, "by_type": {}, "by_module": {}, "flops": 120,
+    return {"area_um2": 10432.1, "cells": 987, "by_type": {}, "by_module": {}, "flops": 120,
             "latches": 0, "netlist": netlist, "engine": "librelane"}
 
 
 @pytest.mark.parametrize("change,ok,msg", [
-    ({}, True, "15432.1 um2, 987 cells, 120 flops"),
+    ({}, True, "10432.1 um2, 987 cells, 120 flops"),
     ({"latches": 3}, False, "no latches"),
     ({"engine": "yosys"}, False, "librelane engine"),
     ({"engine": None}, False, "librelane engine"),
@@ -437,6 +540,31 @@ def test_area_adapter(repo, change, ok, msg):
                 extra="assert sys.argv[1:] == ['--top', 'tt_um_fesens_r32v', '--src', 'src/']")
     res = run_gate(repo, "area")
     assert res["pass"] is ok and msg in res["detail"], res["detail"]
+
+
+@pytest.mark.parametrize("area,ok", [(11501, False), (11500.01, False), (11500, True),
+                                     (4780.0, True)])
+def test_fits_prefilter(repo, area, ok):
+    put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
+    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": area}, 0)
+    res = run_gate(repo, "area")
+    assert res["pass"] is ok, res["detail"]
+    if ok:
+        assert "fits (<= 11,500 um2)" in res["detail"] and res["data"]["fits"] is True
+    else:
+        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 11,500 um2")
+
+
+def test_fits_failure_stops_eval_at_area(repo, monkeypatch):
+    put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
+    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": 11501}, 0)
+    calls = fake_gates(monkeypatch)
+    monkeypatch.setitem(ev.GATES, "area", ev.gate_area)
+    assert ev.main(["--repo", str(repo)]) == 1
+    doc = eval_doc(repo)
+    assert calls == ["lint"] and doc["stopped_at"] == "area" and "fits FAIL" in \
+        doc["gates"]["area"]["detail"]
+    assert doc["area_um2"] == 11501                 # the measured area is still reported
 
 
 # --- gl adapter --------------------------------------------------------------------------------
@@ -472,6 +600,16 @@ def test_gl_rejects_netlist_older_than_area_step(repo):
     put(repo, "test/Makefile", gl_makefile("<testsuites/>"))
     res = run_gate(repo, "gl")
     assert res["pass"] is False and "older than this run's area step" in res["detail"]
+
+
+def test_gl_alone_does_not_need_the_fits_prefilter(repo):
+    # `make gl` synthesizes for its netlist; whether the design fits is the area gate's verdict.
+    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": 20000.0},
+                0, extra=WRITE_NETLIST)
+    put(repo, "test/Makefile",
+        gl_makefile('<testsuites><testsuite><testcase name="gpio"/></testsuite></testsuites>'))
+    res = run_gate(repo, "gl")
+    assert res["pass"] is True, res["detail"]
 
 
 def test_gl_fails_when_area_fails(repo):
@@ -510,10 +648,17 @@ assert a.mode and a.prog
 retired = 10 if "selftest" in a.prog else 1000
 fail = os.environ.get("FAKE_COSIM_FAIL") == a.mode
 gap = int(os.environ.get("FAKE_COSIM_GAP", "100"))
+summary = {"prog": a.prog, "mode": a.mode, "seed": int(a.seed), "pass": not fail,
+           "retired": retired, "cycles": retired * 90, "cpi": 90.0,
+           "max_cycles_per_insn": gap, "error": "rd mismatch" if fail else None}
+cm = os.environ.get("FAKE_CM_CYCLES")    # unset: a v2 runner, which has no such key
+if cm is not None:
+    vals = json.loads(cm)                  # one value, or one per seed
+    summary["coremark_cycles_per_iter"] = (
+        None if "coremark" not in a.prog else vals[int(a.seed) - 1] if isinstance(vals, list)
+        else vals)
 print("building...")
-print(json.dumps({"prog": a.prog, "mode": a.mode, "seed": int(a.seed), "pass": not fail,
-                  "retired": retired, "cycles": retired * 90, "cpi": 90.0,
-                  "max_cycles_per_insn": gap, "error": "rd mismatch" if fail else None}))
+print(json.dumps(summary))
 sys.exit(1 if fail else 0)
 """
 
@@ -554,3 +699,74 @@ def test_cosim_needs_expect_count(cosim_repo):
     put(cosim_repo, "verif/programs/Makefile", PROGRAMS_MAKEFILE.replace('"retired": 10, ', ""))
     res = run_gate(cosim_repo, "cosim")
     assert "no retired-instruction count in selftest.expect.json" in res["detail"]
+
+
+# --- the score: coremark_ips -------------------------------------------------------------------
+
+def config_json(clock_period):
+    # TT's src/config.json repeats the "//" comment key; json keeps the last one.
+    return ('{\n  "//": "comment",\n  "//": "another",\n  "CLOCK_PERIOD": %s,\n'
+            '  "CLOCK_PORT": "clk"\n}\n' % json.dumps(clock_period))
+
+
+def test_coremark_ips_from_cycles(cosim_repo, monkeypatch):
+    assert ev.coremark_ips(1_000_000, 25) == 40.0
+    assert ev.coremark_ips(1_000_000, 50) == 20.0
+    put(cosim_repo, "src/config.json", config_json(25))
+    monkeypatch.setenv("FAKE_CM_CYCLES", "1000000")
+    res = run_gate(cosim_repo, "cosim")
+    assert res["pass"] is True, res["detail"]
+    d = res["data"]
+    assert (d["coremark_ips"], d["coremark_cycles_per_iter"], d["clock_period_ns"]) \
+        == (40.0, 1000000, 25)
+    assert "coremark_ips 40.0" in res["detail"]
+    cm = [r for r in d["runs"] if r["prog"] == "coremark"]
+    assert cm and all(r["coremark_cycles_per_iter"] == 1000000 for r in cm)
+
+
+def test_coremark_ips_reaches_eval_json(cosim_repo, monkeypatch):
+    put(cosim_repo, "src/config.json", config_json(25))
+    monkeypatch.setenv("FAKE_CM_CYCLES", "1000000")
+    fake_gates(monkeypatch)
+    monkeypatch.setitem(ev.GATES, "cosim", ev.gate_cosim)
+    assert ev.main(["--repo", str(cosim_repo), "--min-ips", "39.99"]) == 0
+    doc = eval_doc(cosim_repo)
+    assert doc["coremark_ips"] == 40.0 and doc["cpi"] == 90.0 and doc["pass"] is True
+    assert ev.main(["--repo", str(cosim_repo), "--min-ips", "40"]) == 0     # a tie continues
+    assert ev.main(["--repo", str(cosim_repo), "--min-ips", "40.000001"]) == 3
+
+
+def test_coremark_ips_uses_the_slowest_seed(cosim_repo, monkeypatch):
+    put(cosim_repo, "src/config.json", config_json(25))
+    monkeypatch.setenv("FAKE_CM_CYCLES", "[1000000, 1250000, 1000000]")
+    d = run_gate(cosim_repo, "cosim")["data"]
+    assert d["coremark_cycles_per_iter"] == 1250000 and d["coremark_ips"] == 32.0
+
+
+def test_coremark_ips_null_without_cycles(cosim_repo, monkeypatch):
+    # A runner that reports no CoreMark cycles (v2, or a program without iteration marks):
+    # the gate still judges correctness; the score is null (and --min-ips treats it as no gain).
+    res = run_gate(cosim_repo, "cosim")
+    assert res["pass"] is True and res["data"]["coremark_ips"] is None
+    monkeypatch.setenv("FAKE_CM_CYCLES", "null")
+    res = run_gate(cosim_repo, "cosim")
+    assert res["pass"] is True and res["data"]["coremark_ips"] is None
+
+
+@pytest.mark.parametrize("cycles,config,msg", [
+    ("0", config_json(25), "bad coremark_cycles_per_iter 0"),
+    ('"many"', config_json(25), "bad coremark_cycles_per_iter 'many'"),
+    ("true", config_json(25), "bad coremark_cycles_per_iter True"),
+    ("1000000", None, "src/config.json"),
+    ("1000000", config_json(0), "CLOCK_PERIOD"),
+    ("1000000", config_json("25"), "CLOCK_PERIOD"),
+    ("1000000", '{"CLOCK_PORT": "clk"}', "CLOCK_PERIOD"),
+    ("1000000", "not json", "src/config.json"),
+], ids=["zero", "string", "bool", "no-config", "period-0", "period-string", "no-period",
+        "config-not-json"])
+def test_coremark_ips_bad_inputs_fail(cosim_repo, monkeypatch, cycles, config, msg):
+    if config is not None:
+        put(cosim_repo, "src/config.json", config)
+    monkeypatch.setenv("FAKE_CM_CYCLES", cycles)
+    res = run_gate(cosim_repo, "cosim")
+    assert res["pass"] is False and msg in res["detail"], res["detail"]

@@ -2,9 +2,15 @@
 """BonettoR32V evaluation: run every gate in order, stop at the first failure, write build/eval.json.
 
 Gate order (docs/eval.md): cheapest first, so a bad candidate retires early.
-  lint (~1 s), area (~10 s), cosim (minutes), arch (minutes), equiv, gl (minutes), formal (longest).
-With --max-area X, a candidate whose area_um2 is not below X stops right after the area gate
-("NO_GAIN", exit 3): it cannot win, so its correctness is not worth the formal run.
+  lint (~1 s), area (~10 s), cosim (minutes), arch (minutes), equiv, gl (minutes), and formal (the
+  longest) only with --formal (contract v3 section 7: formal runs at final signoff and on every
+  tenth merged improvement). eval.json says "formal": "pass", "fail" or "skipped".
+The score is coremark_ips = f_clk / CoreMark cycles per iteration (contract v3 section 7): the
+cosim gate reads the cycles from the CoreMark runs and f_clk from src/config.json CLOCK_PERIOD.
+The area gate includes the `fits` pre-filter: synth area above 11,500 um2 fails (harden confirms).
+With --min-ips X, a candidate whose coremark_ips is below X (or null) stops right after the cosim
+gate ("NO_GAIN", exit 3): it cannot win, so the rest of its gates are not worth running. A tie
+continues through every gate: the contract's tiebreak (smaller synth area) may still make it win.
 
 Each gate is one adapter function below (gate_<name>). An adapter runs the gate's runner and
 judges the result from the runner's exit code AND its output json, which it deletes before the run
@@ -12,10 +18,12 @@ so a stale file can never pass. A gate whose runner is missing FAILS ("gate X: r
 Changing a runner's interface means changing one adapter.
 
 Usage:
-  eval.py                 every gate in order; writes build/eval.json; exit 0 iff all pass
+  eval.py                 every gate but formal in order; writes build/eval.json; exit 0 iff all
+                          pass
+  eval.py --formal        the same, then formal last
   eval.py --gate NAME     one gate (lint cosim equiv formal formal-deep arch area gl);
                           writes build/gates/NAME.json; exit 0 iff it passes
-  eval.py --max-area X    stop after the area gate unless area_um2 < X (the champion's area)
+  eval.py --min-ips X     stop after the cosim gate if coremark_ips < X (the champion's) or null
   eval.py -v              also stream runner output to the console (always on with --gate)
 
 Runner output goes to build/logs/<gate>*.log. Formal runs under `lockf -k /tmp/bonetto-heavy.lock`.
@@ -24,6 +32,7 @@ import argparse
 import datetime
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -39,7 +48,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9_./+-]+$")
 TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
 TOP = "tt_um_fesens_r32v"
-ORDER = ["lint", "area", "cosim", "arch", "equiv", "gl", "formal"]
+ORDER = ["lint", "area", "cosim", "arch", "equiv", "gl"]
+FORMAL_GATE = "formal"                  # appended to ORDER only with --formal
+FIT_AREA_UM2 = 11500.0                  # `fits` pre-filter for one 1x1 tile (harden confirms)
+COREMARK_PROG = "coremark"              # the program whose runs carry the score
 # One heavy job at a time on the Mac. The path is overridable only so tests don't queue behind a
 # real formal run; it changes scheduling, never a verdict.
 HEAVY_LOCK = ["lockf", "-k", os.environ.get("BONETTO_HEAVY_LOCK", "/tmp/bonetto-heavy.lock")]
@@ -157,6 +169,28 @@ def last_json_line(lines):
     return None
 
 
+def positive_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+
+
+def coremark_ips(cycles_per_iter, clock_period_ns):
+    """CoreMark iterations per second: f_clk / cycles per iteration (contract v3 section 7)."""
+    return 1e9 / clock_period_ns / cycles_per_iter
+
+
+def clock_period_ns(ctx, gate):
+    """CLOCK_PERIOD (ns) from src/config.json, the signoff clock (contract v3 section 7)."""
+    rel = "src/config.json"
+    try:
+        with open(ctx.path(rel)) as f:
+            period = json.load(f).get("CLOCK_PERIOD")
+    except (OSError, ValueError, AttributeError) as e:
+        raise GateFail(f"gate {gate}: cannot score CoreMark: {rel} unreadable ({e})")
+    if not positive_number(period):
+        raise GateFail(f"gate {gate}: cannot score CoreMark: bad CLOCK_PERIOD {period!r} in {rel}")
+    return period
+
+
 # ---------------------------------------------------------------------------------------------
 # Gate adapters. Each returns (detail, data) on PASS and raises GateFail on FAIL.
 # ---------------------------------------------------------------------------------------------
@@ -255,19 +289,36 @@ def gate_cosim(ctx):
                 if isinstance(gap, (int, float)) and gap > LATENCY_CAP:
                     raise GateFail(f"cosim FAIL on {where}: max_cycles_per_insn {gap} exceeds the "
                                    f"latency cap {LATENCY_CAP} (contract section 4)")
+                cm = s.get("coremark_cycles_per_iter")
+                if cm is not None and not positive_number(cm):
+                    raise GateFail(f"cosim FAIL on {where}: bad coremark_cycles_per_iter {cm!r} "
+                                   f"(log {ctx.log_rel(log)})")
                 runs.append({"prog": name, "mode": mode, "seed": seed,
                              "retired": s.get("retired"), "cycles": s.get("cycles"),
-                             "cpi": s.get("cpi"), "max_cycles_per_insn": gap})
+                             "cpi": s.get("cpi"), "max_cycles_per_insn": gap,
+                             "coremark_cycles_per_iter": cm})
     base = [r for r in runs if r["mode"] == "pins" and r["seed"] == COSIM_SEEDS[0]
             and isinstance(r["retired"], int) and isinstance(r["cycles"], int)]
     retired = sum(r["retired"] for r in base)
     cpi = round(sum(r["cycles"] for r in base) / retired, 3) if retired else None
     ctx.notes["cpi"] = cpi
+    # The score: the slowest CoreMark run that reports cycles per iteration (every mode and
+    # seed; they should agree). None when no run reports it (the runner or program predates
+    # the iteration marks); --min-ips then counts the candidate as no gain.
+    marks = [r["coremark_cycles_per_iter"] for r in runs
+             if r["prog"] == COREMARK_PROG and r["coremark_cycles_per_iter"] is not None]
+    cm_cycles = max(marks) if marks else None
+    period = clock_period_ns(ctx, "cosim") if cm_cycles is not None else None
+    ips = coremark_ips(cm_cycles, period) if cm_cycles is not None else None
+    ctx.notes.update({"coremark_ips": ips, "coremark_cycles_per_iter": cm_cycles,
+                      "clock_period_ns": period})
     worst = max((r["max_cycles_per_insn"] or 0) for r in runs)
     return (f"{len(runs)} runs pass ({len(hexes)} programs x {len(COSIM_MODES)} modes x "
             f"{len(COSIM_SEEDS)} seeds) + liveness fuzz x {len(FUZZ_SEEDS)}, cpi {cpi}, "
-            f"worst retirement gap {worst}",
-            {"runs": runs, "cpi": cpi})
+            f"worst retirement gap {worst}, coremark_ips {ips} ({cm_cycles} cycles/iteration "
+            f"at {period} ns)",
+            {"runs": runs, "cpi": cpi, "coremark_ips": ips, "coremark_cycles_per_iter": cm_cycles,
+             "clock_period_ns": period})
 
 
 def gate_equiv(ctx):
@@ -334,7 +385,7 @@ def gate_arch(ctx):
     return f"{len(tests)} riscv-arch-test tests pass", {"tests": len(tests)}
 
 
-def gate_area(ctx):
+def synth_area(ctx):
     """tools/area.py --top tt_um_fesens_r32v --src src/ (writes build/area.json)."""
     ctx.need("area", "tools/area.py")
     out = "build/area.json"
@@ -363,6 +414,17 @@ def gate_area(ctx):
             {"area_um2": area, "cells": cells, "flops": j.get("flops")})
 
 
+def gate_area(ctx):
+    """synth_area, then the `fits` pre-filter: synth area <= 11,500 um2 (one 1x1 tile; the
+    harden in a champion round confirms)."""
+    detail, data = synth_area(ctx)
+    area = data["area_um2"]
+    if area > FIT_AREA_UM2:
+        raise GateFail(f"fits FAIL: synth area {area} um2 exceeds {FIT_AREA_UM2:,.0f} um2, the "
+                       f"1x1 pre-filter ({data['cells']} cells)")
+    return f"{detail}, fits (<= {FIT_AREA_UM2:,.0f} um2)", {**data, "fits": True}
+
+
 def junit_counts(path):
     root = ET.parse(path).getroot()
     total = bad = skipped = 0
@@ -378,9 +440,9 @@ def junit_counts(path):
 def gate_gl(ctx):
     """make -C test GATES=yes on the area netlist with the sky130 cell models (plan Task 7)."""
     ctx.need("gl", "test/Makefile")
-    if "netlist" not in ctx.notes:          # standalone `make gl`: synthesize first
+    if "netlist" not in ctx.notes:          # standalone `make gl`: synthesize (no fits check)
         try:
-            gate_area(ctx)
+            synth_area(ctx)
         except GateFail as e:
             raise GateFail(f"gate gl: needs the area netlist, and area failed: {e}")
     netlist = ctx.notes["netlist"]
@@ -479,8 +541,11 @@ def main(argv=None):
     ap.add_argument("--gate", choices=sorted(GATES), help="run one gate only")
     ap.add_argument("--out", help="eval json path (default build/eval.json)")
     ap.add_argument("--repo", default=REPO, help=argparse.SUPPRESS)
-    ap.add_argument("--max-area", type=float, metavar="UM2",
-                    help="retire the candidate after the area gate unless area_um2 < UM2")
+    ap.add_argument("--formal", action="store_true",
+                    help="also run the formal gate, last (contract v3 section 7 cadence)")
+    ap.add_argument("--min-ips", type=float, metavar="IPS",
+                    help="retire the candidate after the cosim gate if coremark_ips < IPS "
+                         "(a tie continues: the area tiebreak may win)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -502,13 +567,15 @@ def main(argv=None):
     out = os.path.abspath(args.out) if args.out else os.path.join(ctx.build, "eval.json")
     if os.path.exists(out):
         os.remove(out)          # a crashed run must not leave a stale passing file behind
+    order = ORDER + ([FORMAL_GATE] if args.formal else [])
     doc = {"sha": sha, "dirty": dirty, "pass": False, "gates": {}, "area_um2": None,
-           "cells": None, "cpi": None, "timestamp": now_iso(), "order": ORDER,
-           "stopped_at": None, "max_area": args.max_area, "no_gain": False,
+           "cells": None, "coremark_ips": None, "cpi": None, "formal": "skipped",
+           "coremark_cycles_per_iter": None, "clock_period_ns": None, "timestamp": now_iso(),
+           "order": order, "stopped_at": None, "min_ips": args.min_ips, "no_gain": False,
            "tools": tool_versions(ctx.env)}
     interrupted = False
     skip_why = None
-    for name in ORDER:
+    for name in order:
         res, _ = run_gate(ctx, name)
         doc["gates"][name] = res
         if not res["pass"]:
@@ -516,24 +583,27 @@ def main(argv=None):
             interrupted = res["detail"] == "interrupted"
             skip_why = f"not run (stopped after {name} failed)"
             break
-        if name == "area" and args.max_area is not None \
-                and not ctx.notes["area_um2"] < args.max_area:
-            doc["stopped_at"], doc["no_gain"] = name, True
-            skip_why = f"not run (area {ctx.notes['area_um2']} um2 is not below --max-area " \
-                       f"{args.max_area})"
-            break
-    for name in ORDER:
+        if name == "cosim" and args.min_ips is not None:
+            ips = ctx.notes.get("coremark_ips")
+            if ips is None or ips < args.min_ips:
+                doc["stopped_at"], doc["no_gain"] = name, True
+                skip_why = f"not run (coremark_ips {ips} is below --min-ips {args.min_ips})"
+                break
+    for name in order:
         doc["gates"].setdefault(name, {"pass": None, "detail": skip_why})
-    doc["pass"] = all(doc["gates"][n]["pass"] is True for n in ORDER)
-    doc["area_um2"] = ctx.notes.get("area_um2")
-    doc["cells"] = ctx.notes.get("cells")
-    doc["cpi"] = ctx.notes.get("cpi")
+    doc["pass"] = all(doc["gates"][n]["pass"] is True for n in order)
+    if args.formal and doc["gates"][FORMAL_GATE]["pass"] is not None:
+        doc["formal"] = "pass" if doc["gates"][FORMAL_GATE]["pass"] else "fail"
+    for k in ("area_um2", "cells", "coremark_ips", "cpi", "coremark_cycles_per_iter",
+              "clock_period_ns"):
+        doc[k] = ctx.notes.get(k)
     doc["runtime_s"] = round(time.time() - t0, 1)
     write_json(out, doc)
-    verdict = ("PASS" if doc["pass"] else "NO_GAIN (not smaller than --max-area)"
+    verdict = ("PASS" if doc["pass"] else "NO_GAIN (slower than --min-ips)"
                if doc["no_gain"] else f"FAIL at {doc['stopped_at']}")
     print(f"[eval] {verdict}: sha {sha[:12]}{' (dirty)' if dirty else ''}, "
-          f"area {doc['area_um2']} um2, cells {doc['cells']}, cpi {doc['cpi']} -> "
+          f"coremark_ips {doc['coremark_ips']}, area {doc['area_um2']} um2, "
+          f"cells {doc['cells']}, cpi {doc['cpi']}, formal {doc['formal']} -> "
           f"{os.path.relpath(out, ctx.repo)}")
     if interrupted:
         return 130

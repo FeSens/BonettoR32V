@@ -7,8 +7,9 @@ Everything here is contract: hypothesis agents run it and never edit it (CLAUDE.
 | Command | Runs |
 |---|---|
 | `make lint` ... `make gl` | one gate: `python3 tools/eval.py --gate <name>`, result in `build/gates/<name>.json` |
-| `make eval` | every gate in order, cheapest first, stops at the first FAIL, writes `build/eval.json` (`V=1` streams runner output). `MAX_AREA=<champion um2>` retires a candidate right after the area gate unless it is smaller (`no_gain: true`, exit 3) |
+| `make eval` | every gate but formal in order, cheapest first, stops at the first FAIL, writes `build/eval.json` (`V=1` streams runner output). `FORMAL=1` (exactly `1`; `0` or empty skips it) adds formal last. `MIN_IPS=<champion coremark_ips>` retires a candidate right after the cosim gate when it is slower (`no_gain: true`, exit 3); a tie runs every gate. Take the value from `python3 tools/ledger.py show --json` (full precision; the board rounds). `MAX_AREA` was replaced by `MIN_IPS` and now stops make with an error |
 | `make gates` | exactly the same command as `make eval`, writing the same `build/eval.json` |
+| `make formal` | the formal gate alone (fast config); `make eval FORMAL=1` runs it as the last gate |
 | `make formal-deep` | the deep formal config (champions); not part of `make eval` |
 | `make harden`, `make tilefit` | `tools/harden_tt.sh $(HARDEN_ARGS)`, `physical/tilefit.py $(TILEFIT_ARGS)` |
 | `make test-tools` | `pytest tools/` (tests for eval, equiv, src_check, contract check, ledger) |
@@ -25,8 +26,22 @@ Everything here is contract: hypothesis agents run it and never edit it (CLAUDE.
 ## Gates, in `make eval` order
 
 Cheapest first, so a bad candidate retires early: lint (~1 s), area (~10 s), cosim and arch
-(minutes), equiv, gl (minutes), formal (the longest). With `--max-area`, a candidate that is not
-smaller than the champion stops after the area gate, because it cannot win.
+(minutes), equiv, gl (minutes), then formal (the longest) only with `--formal` (`make eval
+FORMAL=1`).
+- **Formal cadence (contract v3 section 7):** formal runs at final signoff and on every tenth
+  merged improvement, so most candidates skip it. eval.json then says `"formal": "skipped"`,
+  `gates` has no `formal` entry, and the overall `pass` covers the six gates that ran.
+- **`--min-ips X`:** a candidate whose `coremark_ips` is below X (the champion's) stops right
+  after the cosim gate, because it cannot win. A candidate with no `coremark_ips` (no CoreMark
+  cycles reported) stops there too.
+  - A tie (equal score, as an area-only change gives) runs every gate: the contract's tiebreak,
+    the smaller synth area, may still make it win, and the ledger decides that at merge time.
+  - X must be the champion's exact score: take it from `python3 tools/ledger.py show --json` (or
+    `show`, which prints it at full precision), never from the board, which rounds. A bar
+    rounded up would stop a tie.
+- **The score** (contract v3 section 7): `coremark_ips = f_clk / coremark_cycles_per_iter`, with
+  `f_clk = 1e9 / CLOCK_PERIOD` (ns, from `src/config.json`; 25 ns gives 40 MHz, so 1,000,000
+  cycles per iteration gives 40.0). The cosim gate computes it; see the cosim row below.
 
 Each gate is one adapter function in `tools/eval.py`. An adapter deletes the runner's output json,
 runs the runner from the repo root, and passes only if the exit code is 0 AND the fresh json says
@@ -36,12 +51,12 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 | # | Gate | Runner (as called) | PASS requires |
 |---|---|---|---|
 | 1 | lint | `tools/src_check.py` rules (below), then `verilator --lint-only -Wall --top-module tt_um_fesens_r32v src/*.v`, then again with the RVFI defines | src hygiene clean; Verilator exit 0 for both builds |
-| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract v1), the `netlist` file exists |
-| 3 | cosim | `make -C verif/programs`; the liveness fuzz `run_cosim.py --fuzz-liveness --seed S` for S in 1..5 (each: exit 0, `pass` and `liveness_checked` true, `runs` >= 2,056); then for every `build/programs/*.hex`, mode in {rvfi, pins}, seed in {1, 2, 3}: `run_cosim.py --mode M --prog P --seed S` (no `--max-cycles`: the harness bounds each run by 1,024 x its own ISS retirement count + 16, and its watchdog bounds every gap) | every run exits 0 with a last-line JSON summary `pass: true`, `error` empty, `max_cycles_per_insn <= 1024` |
+| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract v1), the `netlist` file exists; then **`fits`**: `area_um2 <= 11,500` (a fast 1x1 pre-filter; the champion round's `make harden` confirms) |
+| 3 | cosim | `make -C verif/programs`; the liveness fuzz `run_cosim.py --fuzz-liveness --seed S` for S in 1..5 (each: exit 0, `pass` and `liveness_checked` true, `runs` >= 2,056); then for every `build/programs/*.hex`, mode in {rvfi, pins}, seed in {1, 2, 3}: `run_cosim.py --mode M --prog P --seed S` (no `--max-cycles`: the harness bounds each run by 1,024 x its own ISS retirement count + 16, and its watchdog bounds every gap) | every run exits 0 with a last-line JSON summary `pass: true`, `error` empty, `max_cycles_per_insn <= 1024`, and `coremark_cycles_per_iter` (when present and not null) a positive number |
 | 4 | arch | `verif/arch-test/run_arch.py` | exit 0, `pass: true`, at least one test, every test `true` |
 | 5 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` | exit 0 and `pass: true` |
 | 6 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
-| 7 | formal | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` (with `BONETTO_FORMAL_HOST` set, no Mac lock: the solvers run on that host under its own lock) | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
+| 7 | formal (only with `--formal`) | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` (with `BONETTO_FORMAL_HOST` set, no Mac lock: the solvers run on that host under its own lock) | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
 
 Details:
 - **RVFI build flags** (lint, equiv and the differential check): just `-DRISCV_FORMAL`.
@@ -59,7 +74,19 @@ Details:
   - Selftest runs first, then gpio_demo, then the rest alphabetically.
   - The gate stops at the first failing run.
 - **cpi** in eval.json: total cycles over total retired, over the `pins` runs with seed 1.
-- **gl** runs the area gate first when it hasn't run in the same invocation (`make gl` alone).
+- **coremark_ips** in eval.json (the score):
+  - `coremark_cycles_per_iter` is the largest value among the `coremark` program's runs (every
+    mode and seed) whose summary reports it. The runs should agree; the slowest one counts.
+  - The harness fills the field from CoreMark's iteration marks (plan Task 3/4). A runner that
+    doesn't report it, or reports null, leaves `coremark_ips` null without failing the gate.
+    A merge then needs it (see the ledger).
+  - A reported value that isn't a positive number fails the gate. So does an unreadable
+    `src/config.json` or a `CLOCK_PERIOD` that isn't a positive number, once there are cycles to
+    score.
+  - The full-precision value is stored, never rounded, so `--min-ips` compares exactly.
+- **gl** synthesizes first when the area gate hasn't run in the same invocation (`make gl`
+  alone). That synthesis skips the `fits` check: gl tests the netlist, and fitting is the area
+  gate's verdict.
 
 ## Src hygiene (tools/src_check.py)
 
@@ -213,27 +240,40 @@ Fixtures in `tools/test_fixtures/src_check/`:
   "pass": true,
   "gates": {
     "lint":   {"pass": true, "detail": "<one line>", "runtime_s": 1.2},
+    "area":   {"pass": true, "detail": "..., fits (<= 11,500 um2)", "runtime_s": 20.0},
     "cosim":  {"pass": true, "detail": "...", "runtime_s": 300.0},
-    "equiv":  {"pass": true, "detail": "...", "runtime_s": 2.0},
-    "formal": {"pass": true, "detail": "...", "runtime_s": 1800.0},
     "arch":   {"pass": true, "detail": "...", "runtime_s": 60.0},
-    "area":   {"pass": true, "detail": "...", "runtime_s": 20.0},
+    "equiv":  {"pass": true, "detail": "...", "runtime_s": 2.0},
     "gl":     {"pass": true, "detail": "...", "runtime_s": 30.0}
   },
-  "area_um2": 15432.1,
+  "area_um2": 10432.1,
   "cells": 987,
+  "coremark_ips": 0.6667,
   "cpi": 92.4,
+  "formal": "skipped",
+  "coremark_cycles_per_iter": 60000000,
+  "clock_period_ns": 25,
   "timestamp": "2026-10-16T19:43:49Z",
-  "order": ["lint", "area", "cosim", "arch", "equiv", "gl", "formal"],
+  "order": ["lint", "area", "cosim", "arch", "equiv", "gl"],
   "stopped_at": null,
+  "min_ips": null,
+  "no_gain": false,
   "tools": {"yosys": "...", "verilator": "...", "iverilog": "..."},
   "runtime_s": 2213.4
 }
 ```
 
-- `pass` is true only if all seven gates ran and passed.
+- `order` lists the gates this run had: the six above, plus `formal` last with `--formal`.
+  `gates` has exactly those keys.
+- `pass` is true only if every gate in `order` ran and passed. A skipped formal doesn't count
+  against it.
+- `formal` is `"pass"` or `"fail"` when the formal gate ran, else `"skipped"` (not requested, or
+  not reached because an earlier gate failed or `--min-ips` stopped the run).
 - A gate after the first failure has `{"pass": null, "detail": "not run (stopped after X
   failed)"}`, and `stopped_at` names the failing gate.
+- With `--min-ips`: `min_ips` records X. When the candidate is slower (or has no score),
+  `no_gain` is true, `stopped_at` is `cosim`, and the gates after it have `"detail": "not run
+  (coremark_ips V is below --min-ips X)"`. A tie runs on with `no_gain: false`.
 - `dirty` is true when `git status --porcelain --ignore-submodules=untracked` is non-empty at the
   start, so the sha doesn't describe what was evaluated. `ledger.py add --verdict merged` refuses
   a dirty eval.
@@ -241,13 +281,16 @@ Fixtures in `tools/test_fixtures/src_check/`:
     `build/` file in an agent's worktree is therefore invisible to `dirty`.
   - The flag is only trustworthy in the lead's fresh verify worktree (`git worktree add` at the
     exact sha, then `git submodule update --init`), which is where merge decisions are made.
-- `area_um2`, `cells` come from the area gate and `cpi` from cosim; each is null when its gate
-  didn't run.
+- `area_um2` and `cells` come from the area gate. They are reported even when `fits` fails it.
+- `coremark_ips`, `coremark_cycles_per_iter`, `clock_period_ns` and `cpi` come from cosim.
+- Each of these is null when its gate didn't run, and the CoreMark fields are null when no
+  CoreMark run reported cycles.
 - The file is deleted when `make eval` starts, so a crashed run never leaves a stale pass behind.
-- Exit status: 0 on pass, 1 on fail, 130 when interrupted.
+- Exit status: 0 on pass, 1 on fail, 3 on no gain (`--min-ips`), 130 when interrupted.
 
 `build/gates/<name>.json` (one gate): `{"gate", "sha", "dirty", "pass", "detail", "runtime_s",
-"data", "timestamp"}`, where `data` is gate-specific (cosim: every run and the cpi).
+"data", "timestamp"}`, where `data` is gate-specific (cosim: every run with its
+`coremark_cycles_per_iter`, the cpi and the CoreMark fields; area: area, cells, flops, `fits`).
 
 ## Equivalence gate (tools/equiv.py)
 
@@ -354,32 +397,62 @@ made and reverted inside the branch leaves no tree difference and passes.
 python3 tools/ledger.py next-id
 python3 tools/ledger.py add --id NNN --branch hyp/NNN-slug --sha <sha> --idea "..." \
     --eval build/eval.json --verdict merged|rejected|failed|rolled_back [--notes "..."] \
-    [--parent-sha <sha>] [--tile-fraction F] [--formal-deep pass|fail]
+    [--parent-sha <sha>] [--tile-fraction F] [--formal-deep pass|fail] [--force-merge]
 python3 tools/ledger.py annotate --id NNN [--tile-fraction F] [--formal-deep pass|fail] \
     [--notes-append "..."]
 python3 tools/ledger.py board        # regenerates loop/LEADERBOARD.md
-python3 tools/ledger.py show [--json]
+python3 tools/ledger.py show [--json]   # the champion; its exact coremark_ips is MIN_IPS
 ```
 
 `loop/ledger.jsonl` holds one JSON object per line with these fields, in order: `id, ts, branch,
-sha, parent_sha, idea, verdict, area_um2, cells, delta_um2, gates, notes, tile_fraction,
-formal_deep`.
-- `gates` is `{name: true|false|null}` from eval.json.
+sha, parent_sha, idea, verdict, coremark_ips, delta_ips, clock_period_ns, area_um2, cells,
+delta_um2, gates, formal, forced, notes, tile_fraction, formal_deep`.
+- `coremark_ips`, `clock_period_ns` (the clock the score was measured at), `area_um2`, `cells`,
+  `gates` and `formal` come from eval.json.
+  - `gates` is `{name: true|false|null}`. It has no `formal` key when formal was skipped.
+  - `formal` is `pass`, `fail` or `skipped`, or null without an eval or with an eval.json older
+    than v3.
 - `parent_sha` defaults to the current champion's sha.
-- `delta_um2` is `area_um2` minus the champion's area at the time of the entry (negative means
+- `delta_ips` is `coremark_ips` minus the champion's at the time of the entry (positive means
+  faster, which is better). `delta_um2` is `area_um2` minus the champion's area (negative means
   smaller).
+- `forced` is true only for a merge recorded with `--force-merge` (below), else false.
 - `tile_fraction` is the `make tilefit` score, in (0, 1]. `formal_deep` is `pass`, `fail` or
   null. Both are optional and default to null.
+- **Older entries:** entries written before v3 have the v2 field list (`ledger.LEGACY_FIELDS`:
+  no `coremark_ips`, `delta_ips`, `clock_period_ns`, `formal` or `forced`). They read as they
+  are. `annotate` rewrites one in the v3 order, with the new fields null.
 
-**Champion:** the latest `merged` entry that no later `rolled_back` entry names.
+**A merge must become the champion.** `add --verdict merged` refuses an entry that would not
+outrank the current champion: it must be faster, or exactly as fast with a smaller `area_um2`
+(contract v3 section 7 tiebreak). An equal area is not smaller. While the champion has no score
+(v2 history only, or none yet), any merge passes this check.
+- `--force-merge` is the lead's override, for a merge that has to land anyway (a correctness or
+  timing fix that costs speed). It skips only this ranking check; every other merged check
+  still applies.
+- The entry records `"forced": true` and becomes the champion, because it is what main now holds.
+  Later merges must outrank it. Rolling it back restores the best entry from before it.
+
+**Champion:** among the `merged` entries that no later `rolled_back` entry names, the one with
+the highest `coremark_ips` (contract v3 section 7).
+- Ties go to the smaller `area_um2` (the contract's tiebreak), then to the later entry.
+- A standing forced merge restarts the race: only it and the merges after it compete.
+- While no standing entry has a score (v2 history only), the latest one is the champion, the v2
+  rule. The first scored merge outranks every unscored entry.
+- Since every unforced merge must outrank the champion, the champion is normally the latest
+  merge. Hand-edited or older ledgers are still ranked by score.
+- `show` prints the champion's score at full precision (`repr`), and `show --json` gives the
+  raw value. That exact value is what `make eval MIN_IPS=` needs; the board rounds to 4
+  decimals.
 
 **Rollback.** When a champion fails formal-deep (or anything else that disqualifies it):
 1. Record the failure on the champion with
    `annotate --id <champion id> --formal-deep fail --notes-append "<why>"`.
 2. Add `add --verdict rolled_back --sha <champion sha> ...`.
 
-From then on `show` returns the previous merged entry. A `rolled_back` entry must name the
-current champion's sha.
+From then on `show` returns the best remaining standing entry. A `rolled_back` entry must name
+the current champion's sha. It copies the champion's score, clock, formal, area and cells when
+given no `--eval`.
 
 **Champion-round results** (tile fraction, deep formal pass) go onto the champion's own entry
 with `annotate`. It rewrites that one line; comment lines, blank lines and every other entry stay
@@ -389,13 +462,21 @@ byte for byte, and git keeps the history.
 - a duplicate or non-numeric id;
 - an eval.json whose sha differs from `--sha`;
 - a `tile_fraction` outside (0, 1];
-- for `merged`: a missing eval, `pass` not true, `dirty` not false, or no `area_um2`;
+- an eval.json whose `formal` isn't `pass`, `fail`, `skipped` or absent;
+- `--force-merge` with any verdict but `merged`;
+- for `merged`: a missing eval, `pass` not true, `dirty` not false, `formal: fail`, no positive
+  `coremark_ips`, no positive `clock_period_ns`, or no `area_um2`. `formal: skipped` is fine:
+  formal runs only on every tenth merged improvement;
+- for `merged` without `--force-merge`: an entry that would not become the champion (above);
 - for `rolled_back`: a sha that isn't the current champion's.
 
 `board` writes:
-- the current champion, with its tile fraction and deep-formal result;
-- the champion history: merged entries in order, with delta in µm² and percent, tile fraction,
-  deep formal, and status (champion, or rolled back by NNN);
-- the last 20 entries with their verdicts and failed gates.
+- the current champion, with its score (rounded), clock, area, formal status, tile fraction
+  and deep-formal result;
+- the champion history: merged entries in order, with the score and its percent change against
+  the previous standing merged entry, clock, area, cells, delta µm², formal, tile fraction,
+  deep formal, and status (champion, or rolled back by NNN, with "(forced)" on forced merges);
+- the last 20 entries with their verdicts ("merged (forced)" when forced), score and delta,
+  clock, area and delta, formal, and failed gates.
 
 Blank lines and lines starting with `#` in the ledger are skipped.
