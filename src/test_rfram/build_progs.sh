@@ -1,12 +1,8 @@
 #!/bin/sh
-# Build the cosim test programs for the register-file-and-pc-in-RAM core (hypothesis 002, v2).
+# Build the cosim test programs for the register-file-and-pc-in-RAM core (hypotheses 002 and 005).
 #   src/test_rfram/build_progs.sh <verif_programs_dir> <out_dir>
-# <verif_programs_dir> is verif/programs from the setup/cosim branch (read only). The programs
-# are copied and patched so they never touch the reserved region 0xFF80..0xFFFF:
-#   - link.ld: the stack starts at 0xFF80 instead of 0x10000;
-#   - selftest.S: section 6 (misaligned accesses that wrap at 64 KB through 0xFFFC..0xFFFF) is
-#     left out, as in the spike cross-check build;
-#   - gen_random.py: RAM accesses stay below 0xFF80 (no stores at 0xFFF0..0xFFFF, no wraps).
+# <verif_programs_dir> is main's verif/programs (read only), which contract v2 already keeps out
+# of the core region 0xFF80..0xFFFF (stack top 0xFF80). Adds the directed v2_*.S tests.
 set -e
 SRCP=$(cd "$1" && pwd)
 OUT=$2
@@ -14,7 +10,6 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT/p"
 W="$OUT/p"
 cp -R "$SRCP"/. "$W"/
-python3 "$HERE/patch_progs.py" "$W"
 CC=${CROSS:-riscv32-unknown-elf-}gcc
 ARCH="-march=rv32e -mabi=ilp32e"
 LDF="-nostdlib -nostartfiles -static -T $W/link.ld -Wl,--no-warn-rwx-segments"
@@ -31,7 +26,7 @@ for t in ecall jal jalr branch zero ones; do
     $CC $ARCH -I$W -DTRAP_KIND=$k $LDF trap.S -o "$OUT/trap_$t.elf"
     k=$((k + 1))
 done
-for t in first_sw first_jalr; do
+for t in first_sw first_jalr first_btaken first_bnot first_auipc first_jal first_io; do
     $CC $ARCH -I$W $LDF "$HERE/v2_$t.S" -o "$OUT/v2_$t.elf"
 done
 for s in 1 2 3 4 5 6; do

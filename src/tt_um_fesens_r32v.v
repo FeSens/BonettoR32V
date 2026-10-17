@@ -82,7 +82,7 @@ module tt_um_fesens_r32v (
     localparam [2:0] E_IDLE = 3'b000,    // CS_n high, wait for the slot's start phase
                      E_PW   = 3'b001,    // shift pre-roll: wait for the reference phase
                      E_PC   = 3'b010,    // shift pre-roll: count j up to 63
-                     E_RET  = 3'b011,    // retire; a trap stays here (halt)
+                     E_HALT = 3'b011,    // after a trap
                      E_CMD  = 3'b100,    // command and address bits
                      E_DATA = 3'b101,    // data bits
                      E_GAP  = 3'b110,    // one clock between the address bytes
@@ -93,7 +93,7 @@ module tt_um_fesens_r32v (
     reg  [5:0]  ph;     // 0..32
     reg  [5:0]  j;      // bit counter (40..63 command/address, 0.. data), shift pre-roll
     reg         sck, mosi;
-    reg         mem;    // load/store goes to RAM (address bit 31 = 0); 1 during the boot slot
+    reg         mem;    // load/store goes to RAM (address bit 31 = 0); 1 until the first retirement
     reg         cy;     // ALU carry; sign latch in W
     reg         cmp;    // compare; address[1:0] == 0; JALR target[1]; shift fill state
     reg         c4;     // carry of the on-the-fly + 4 (W family) and + 2 (BH2)
@@ -142,6 +142,7 @@ module tt_um_fesens_r32v (
     wire fO   = ~sl[3] &  sl[2];
     wire fM   =  sl[3] & ~sl[2];
     wire fW   =  sl[3] &  sl[2];
+    wire sP   = fR & ~sl[1] & ~sl[0];
     wire sA   = fR & ~sl[1] &  sl[0];
     wire sPX  = fR &  sl[1] & ~sl[0];
     wire sB   = fR &  sl[1] &  sl[0];
@@ -256,7 +257,7 @@ module tt_um_fesens_r32v (
                   c_slt ? ((j[4:0] == 5'd0) & cmp) :
                   c_sh  ? (shfill ? (insn[30] & cy) : bfm) :
                           bfm;
-    wire wpl    = (bfr[0] ^ (c4 & winc)) & ~mem;  // WP, WP4, W4; the boot WP writes 0
+    wire wpl    = bfr[0] ^ (c4 & winc);           // WP, WP4, W4
     wire wdo    = sW ? wd : wpl;
 
     // BH2: address + 2 on the even phases, in the SCK-low clocks between the data strobes
@@ -295,7 +296,8 @@ module tt_um_fesens_r32v (
     wire mask = (sA & (c_u | c_jal | (rs1_f == 4'd0))) |
                 (sB & ~(c_op | c_br)) |
                 ((sB | fO) & (rs2_f == 4'd0)) |
-                (fW & sl[1] & (rd_f == 4'd0));
+                (fW & sl[1] & (rd_f == 4'd0)) |
+                (mem & (sP | (sPX & c_br)));            // first instruction: pc = 0
     assign cs_n   = ~ep[2] | mask;
     assign miso_m = uio_in[2] & ~cs_n;   // 0 in a masked (x0) slot
     wire [5:0] dlen = (fM & ~sF) ? {c_ld & (nm1 == 2'b11), (nm1 == 2'b01) | (c_st & (nm1 == 2'b11)),
@@ -347,8 +349,8 @@ module tt_um_fesens_r32v (
             end
             SL_PX: nsl = c_br ? SL_WP : SL_W;
             SL_WP: begin
-                nsl  = mem ? SL_P : SL_PX;
-                nret = ~mem & ~(c_jalr & (rd_f != 4'd0));
+                nsl  = SL_PX;
+                nret = ~(c_jalr & (rd_f != 4'd0));
             end
             SL_M: begin
                 nsl  = c_ld ? SL_W : SL_BH2;
@@ -435,9 +437,9 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
-            sl   <= SL_WP;
+            sl   <= SL_P;
             ep   <= E_IDLE;
-            ph   <= 6'd17;                                // the boot WP starts at once
+            ph   <= 6'd15;                                // the first P starts at once
             sck  <= 1'b0;
             mem  <= 1'b1;
             gpo  <= 8'd0;
@@ -458,22 +460,18 @@ module tt_um_fesens_r32v (
                 end
                 E_GAP:  ep <= E_CMD;
                 E_DATA: if (sck & dend) ep <= E_END;
-                E_END: begin
-                    sl   <= nsl;
-                    ep   <= npre ? E_PW : nret ? E_RET : E_IDLE;
-                    if (fW & ~sl[1] & ~sl[0])
-                        mem <= 1'b0;                        // WP: ends the boot slot
+                E_END: begin                                // retires if nret
+                    sl   <= nret ? SL_P : nsl;
+                    ep   <= npre ? E_PW : (nret & trap) ? E_HALT : E_IDLE;
+                    if (nret) begin
+                        mem <= 1'b0;
+                        if (c_st & ~mem & cmp & ~trap)
+                            gpo <= {bfr[17], bfr[15], bfr[13], bfr[11], bfr[9], bfr[7], bfr[5], bfr[3]};
+                    end
                 end
                 E_PW: if (ph == {3'b000, sh_left, 2'b10}) ep <= E_PC;
                 E_PC: if (j == 6'd63) ep <= E_CMD;
-                default: begin                              // E_RET
-                    if (c_st & ~mem & cmp & ~trap)
-                        gpo <= {bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4], bfr[2]};
-                    mem <= 1'b0;
-                    sl  <= SL_P;
-                    if (~trap)
-                        ep <= E_IDLE;
-                end
+                default: ;                                  // E_HALT
             endcase
         end
     end
@@ -482,22 +480,25 @@ module tt_um_fesens_r32v (
     // RVFI (formal and cosim builds only; observes, never drives the pins)
     // ------------------------------------------------------------------------------------
 `ifdef RISCV_FORMAL
-    wire        sP       = fR & ~sl[1] & ~sl[0];
     reg         r_i1;                                   // insn[1], not stored by the design
 
     reg [63:0] r_order;
-    reg        r_halt;
+    reg        r_halt, r_v;
     reg [31:0] r_rs1, r_rs2, r_rd, r_pc, r_npc, r_mrd;
     integer    mi;
     wire [4:0] dj    = j[4:0] - 5'd1;
-    wire       r_ret = (ep == E_RET) & ~r_halt;
+    wire       r_ret = r_v & ~r_halt;
     always @(posedge clk) begin
         if (!rst_n) begin
             r_order <= 64'd0;
             r_halt  <= 1'b0;
-        end else if (r_ret) begin
-            r_order <= r_order + 64'd1;
-            r_halt  <= trap;
+            r_v     <= 1'b0;
+        end else begin
+            r_v <= (ep == E_END) & nret;
+            if (r_ret) begin
+                r_order <= r_order + 64'd1;
+                r_halt  <= trap;
+            end
         end
         if (stb & sP)
             r_pc <= {miso_m, r_pc[31:1]};
