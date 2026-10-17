@@ -163,19 +163,23 @@ module tt_um_fesens_r32v (
     wire [4:0] kb = ph[0] ? {1'b1, ph[4:1] + 4'd1} : ph[5:1];
     wire       k0 = (ph == 6'd0);
 
+    // Three shared selectors: insn[20 + i] (i = k for k < 12, k - 20 for the U-type k >= 20),
+    // insn[7 + k] (k < 5) and insn[k] (k = 12..19).
+    wire [3:0]  ki   = kb[3:0] - {1'b0, kb[4], 2'b00};
     wire [15:0] va   = {4'd0, insn[31:20]};
     wire [7:0]  vb   = {3'd0, insn[11:7]};
-    wire        m_a  = va[kb[3:0]];
+    wire [7:0]  vm   = {insn[15:12], insn[19:16]};
+    wire        m_a  = va[ki];
     wire        m_b  = vb[kb[2:0]];
-    wire        m_c  = insn[kb];
+    wire        m_m  = vm[kb[2:0]];
     wire        k_hi = kb[4] | (kb[3] & kb[2]);                       // k >= 12
+    wire        k_20 = kb[4] & (kb[3] | kb[2]);                       // k >= 20
     wire        k11  = (kb == 5'd11);
     wire        k_lo5 = ~kb[4] & ~kb[3] & ~(kb[2] & (kb[1] | kb[0]));  // k < 5
     wire        sign = insn[31];
     wire        imm_bit =
-        c_u   ? (k_hi & m_c) :
-        c_jal ? (k_hi ? ((~kb[4] | (kb[3:2] == 2'b00)) ? m_c : sign) :
-                        (k0 ? 1'b0 : k11 ? insn[20] : m_a)) :
+        c_u   ? (k_20 ? m_a : (k_hi & m_m)) :
+        c_jal ? (k_20 ? sign : k_hi ? m_m : (k0 ? 1'b0 : k11 ? insn[20] : m_a)) :
         k_hi  ? sign :
         c_br  ? (k0 ? 1'b0 : k11 ? insn[7] : k_lo5 ? m_b : m_a) :
         c_st  ? (k_lo5 ? m_b : m_a) :
