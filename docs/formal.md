@@ -333,7 +333,7 @@ first few instructions fails, because its window closes within the depth. An unb
 | checks | every check except liveness | every check, liveness included |
 | depth | short depth, per class group | full depth D; liveness D + 1,024 |
 | instruction tasks | 9 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
-| task timeout | 7,200 s | 21,600 s |
+| task timeout | 21,600 s (V2-class cores, see "Measured runtimes") | 21,600 s |
 | depth cap | 2,048 | 4,096 |
 
 Fast keeps every instruction check and every bus, SPI, GPIO and RVFI-consistency check. It does
@@ -358,12 +358,31 @@ Neither config is an unbounded proof (see "What is and is not proven").
 
 ### Measured runtimes
 
-Every completed run below passed every check (56 in fast, 57 in deep: 40 instructions, 14 or
-15 SBY checks, structure and equiv). Times are wall clock for the whole runner (timing given, so no
-cosim), with `--keep-going` (a passing run is the same either way). Mac: Apple M5, 10 cores,
-8 jobs, shared with other agents' jobs (load average 14.7 at the end of the fast bit-serial
-run). hwe-bench: Intel Core Ultra 7 265 (8 P + 12 E cores, 62 GB). The fast runs used a trial config
-with the same checks and depths as `checks.cfg` (only the cap and timeout differed).
+Mac: Apple M5, 10 cores, 32 GB, shared with other agents' jobs. hwe-bench: Intel Core Ultra 7
+265 (8 P + 12 E cores, 62 GB), shared with another project's jobs at times. Times are wall
+clock for the whole runner, with `--keep-going` (a passing run is the same either way).
+
+**Contract v2 checks (this version).** Every run below passed every check it ran (56 in fast).
+
+| run | Mac, 8 jobs | hwe-bench |
+|---|---|---|
+| seed, fast | 486.5 s, cosim timing included (reg 419 s, bus_dmem 358 s; load ~11 from other agents) | 253 s with 18 jobs (reg 220 s, bus_dmem 210 s; measured before bb05e68); 215 to 253 s with 10 jobs for each seed-based legal variant at bb05e68 |
+| V2 = hyp/002-rf-in-ram-pcram b9a5211, fast (depths 1,461 to 1,623) | not run (memory) | first 7-job attempt hung up after 2 h 20 min when the Mac crashed (see "Orphans"); a detached 6-job rerun was still running at the time of writing |
+| fc07cc3 (hyp/002-rf-in-ram), fast (depths up to 1,222) | not run (memory) | a detached 3-job run was still running at the time of writing |
+
+The first V2 attempt (7 jobs, the host partly shared) finished these proofs before it was hung
+up, every one PASS: bus_dmem 6,495 s, the instruction groups 919 to 3,196 s, pc_bwd 2,859 s,
+rvfi 1,860 s, gpio 1,668 s, causal 713 s, ill 374 s; every instruction group's reach task
+reached all its triggers (267 to 1,407 s). reg was still running at about 8,260 s. Memory: at
+depth 1,623 each bitwuzla holds about 6 GB, so 10 jobs pushed the host into swap (11 GB after
+38 minutes, that run was stopped); use at most about one job per 9 GB on V2-class cores.
+The fast timeout is 21,600 s per task: at least 2 x the longest V2 task measured so far only if
+reg finishes under 10,800 s, which the running V2 measurement has to confirm.
+
+**Contract v1 checks (commit 738a135, before the v2 port).** Every completed run below passed
+every check (56 in fast, 57 in deep: 40 instructions, 14 or 15 SBY checks, structure and
+equiv). Timing given, so no cosim. The fast runs used a trial config with the same checks and
+depths as `checks.cfg` (only the cap and timeout differed).
 
 | run | Mac, 8 jobs | hwe-bench, 18 jobs |
 |---|---|---|
@@ -488,13 +507,13 @@ Results, on hwe-bench unless marked Mac:
 | legal_uo_early | seed | uo_out set on the edge into the retirement cycle | all (fast) | PASS, 56 checks |
 | legal_trap_region | seed | a region READ (0xFF80) before a trap | all (fast) | PASS, 56 checks |
 | legal_null_read | seed | a null READ (0x1234, header only) before a trap | all (fast) | PASS, 56 checks |
-| legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | H002RF_RESULT |
-| legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | H002PC_RESULT |
+| legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | running at the time of writing (detached, hwe-bench) |
+| legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | running at the time of writing (detached, hwe-bench); the first attempt PASSed every proof that finished (see "Measured runtimes") |
 
 On the seed's timing, every FAIL above came within 210 s of proof time (the slowest: the
 `stall_first_1025` liveness counterexample, 208 s on the Mac; on hwe-bench `write_midbyte`'s
 `bus_dmem`, 181 s, with other runs sharing the host). A legal variant's whole fast run took
-215 to 253 s with 10 jobs. MUTANT_TIMES_H002
+215 to 253 s with 10 jobs. The hyp/002 region mutants FAILed within 317 s of proof time on the Mac (2 jobs).
 
 ## Fail fast, scheduling, remote runs
 
