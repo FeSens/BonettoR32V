@@ -361,7 +361,14 @@ The budget is `$BONETTO_FORMAL_MEM_GB` if set, else 85 % of `MemAvailable` on Li
 users' jobs on a shared host count), else half the RAM on macOS (the Mac is shared with other
 agents). On hwe-bench with about 55 GB available that is 18 jobs for the seed but 7 for V2; on
 the Mac 8 for the seed and 2 for V2. Before this cap, 10 V2 jobs pushed hwe-bench 11 GB into
-swap.
+swap. Some tasks need several times the estimate: `reset` (free reset length) reached 22 GB at
+depth 1,222 on fc07cc3, against 4.9 GB estimated, so it counts five times (`TASK_MEM_WEIGHT`).
+On top of the job cap, each task waits until its estimate fits in the budget next to the
+running ones (`MemGate`; a task alone always runs).
+
+Stopping a run (fail-fast, a signal, a timeout, an exception) signals every process below each
+SBY run (`kill_tree`): its solvers can sit in other process groups, and on hwe-bench bitwuzla
+processes outlived a process-group kill.
 
 Fast keeps every instruction check and every bus, SPI, GPIO and RVFI-consistency check. It does
 not cover:

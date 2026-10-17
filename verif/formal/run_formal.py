@@ -933,6 +933,37 @@ def mem_budget_gb():
         return 16.0
 
 
+# Tasks that need several times the linear estimate: reset (free reset length) reached
+# 22 GB at depth 1,222 on hyp/002-rf-in-ram (fc07cc3), against 4.9 GB estimated.
+TASK_MEM_WEIGHT = {"reset": 5}
+
+
+def task_mem_gb(name, depth):
+    base = name[:-6] if name.endswith("_reach") else name
+    return (GB_BASE + GB_PER_STEP * depth) * TASK_MEM_WEIGHT.get(base, 1)
+
+
+class MemGate:
+    """A task waits until its estimated memory fits in the budget next to the running
+    ones (a task alone always runs)."""
+    def __init__(self, budget):
+        self.budget, self.used, self.cond = budget, 0.0, threading.Condition()
+
+    def acquire(self, need):
+        with self.cond:
+            while self.used > 0 and self.used + need > self.budget and not STOP.is_set():
+                self.cond.wait(5)
+            self.used += need
+
+    def release(self, need):
+        with self.cond:
+            self.used -= need
+            self.cond.notify_all()
+
+
+MEM_GATE = None
+
+
 def mem_jobs(depth, jobs, budget=None):
     """(jobs, GB per task, budget GB): at most `jobs`, at least 1, and no more than the
     memory budget holds at this depth."""
@@ -957,7 +988,18 @@ def task_cost(tname):
     return TASK_COST.get(tname, 100)
 
 
-def run_task(name, path, timeout):
+def run_task(name, path, timeout, depth=0):
+    need = task_mem_gb(name, depth)
+    if MEM_GATE:
+        MEM_GATE.acquire(need)
+    try:
+        return _run_task(name, path, timeout)
+    finally:
+        if MEM_GATE:
+            MEM_GATE.release(need)
+
+
+def _run_task(name, path, timeout):
     tdir = os.path.dirname(path)
     t0 = time.time()
     if STOP.is_set():
@@ -1475,7 +1517,7 @@ def main():
     # (its triggers, same design and depth).
     only = re.compile(args.only) if args.only else None
     units = []      # (task name, [(check name, required reach labels)])
-    jobs_todo = []  # (task name, sby path, timeout)
+    jobs_todo = []  # (task name, sby path, timeout, depth)
     task_depths = {}
     reach_eng = cfg["engines"]["reach"]
     for name, kind, opts in cfg["checks"]:
@@ -1510,7 +1552,7 @@ def main():
             r = write_sby(work, tname + "_reach", checker, tdepth, reach_eng, timeout,
                           model=model, reset_free=rf, role="reach",
                           reach=[l for _, labels in req for l in labels])
-            jobs_todo += [(tname, p, timeout), (tname + "_reach", r, timeout)]
+            jobs_todo += [(tname, p, timeout, tdepth), (tname + "_reach", r, timeout, tdepth)]
             units.append((tname, req))
             for cname, _ in req:
                 task_depths[cname] = tdepth
@@ -1527,6 +1569,8 @@ def main():
     # Memory: as many tasks as the host's memory holds at the deepest task's depth.
     max_tdepth = max(task_depths.values()) if task_depths else deepest
     jobs, per_gb, budget_gb = mem_jobs(max_tdepth, jobs)
+    global MEM_GATE
+    MEM_GATE = MemGate(budget_gb)   # heavier tasks (reset) also wait for room
     result["jobs"] = {"used": jobs, "gb_per_task": round(per_gb, 1),
                       "budget_gb": round(budget_gb, 1), "max_task_depth": max_tdepth}
     log(f"jobs={jobs}: about {per_gb:.1f} GB per task at depth {max_tdepth}, memory budget "
@@ -1539,7 +1583,7 @@ def main():
     results = {}
     first_fail = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(run_task, n, p, to) for n, p, to in jobs_todo]
+        futs = [ex.submit(run_task, n, p, to, d) for n, p, to, d in jobs_todo]
         for fu in concurrent.futures.as_completed(futs):
             res = fu.result()
             results[res[0]] = res

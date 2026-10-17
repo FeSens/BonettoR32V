@@ -162,6 +162,23 @@ def test_mem_jobs(monkeypatch):
     assert run_formal.mem_jobs(5000, 8, budget=4.0)[0] == 1
     monkeypatch.setenv("BONETTO_FORMAL_MEM_GB", "13")
     assert run_formal.mem_budget_gb() == 13.0
+    # reset counts five times (22 GB seen at depth 1,222); reach tasks like their check.
+    assert abs(run_formal.task_mem_gb("reset", 1222) - 5 * run_formal.task_mem_gb("reg", 1222)) < 1e-9
+    assert run_formal.task_mem_gb("reset_reach", 1222) == run_formal.task_mem_gb("reset", 1222)
+    # The gate: a task waits while it does not fit next to the running ones.
+    import threading
+    g = run_formal.MemGate(10.0)
+    g.acquire(6.0)
+    t = threading.Thread(target=g.acquire, args=(6.0,))
+    t.start()
+    t.join(0.3)
+    assert t.is_alive()          # 6 + 6 > 10: waits
+    g.release(6.0)
+    t.join(2)
+    assert not t.is_alive() and g.used == 6.0
+    g.release(6.0)
+    g.acquire(20.0)              # alone, a task always runs
+    assert g.used == 20.0
 
 
 def test_task_line():
