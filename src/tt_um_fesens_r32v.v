@@ -207,9 +207,10 @@ module tt_um_fesens_r32v (
     wire boolr  = (pp & ~f3[0]) | (f3[1] & gg);
     wire sgnd   = c_br ? ~f3[1] : ~f3[0];
     wire lt     = cout ^ (pp | ~sgnd);
-    wire eqacc  = ~sum & (cmp | k0);
+    wire sumj   = sum & ~(k0 & c_jalr);              // JALR clears target bit 0
+    wire eqacc  = ~sumj & (cmp | k0);
     wire ocmp   = (c_br & ~f3[2]) ? eqacc : lt;
-    wire trap   = trap_dec | (c_br & taken & insn[8]) | (c_jalr & cmp);
+    wire trap   = trap_dec | (c_br & taken & insn[8]) | (c_jalr & ~cmp);
 
     // ------------------------------------------------------------------------------------
     // Ring tap muxes for MSB-first emission, select a = j[2:0]: address bit 15 - a / 7 - a from
@@ -324,7 +325,7 @@ module tt_um_fesens_r32v (
                 nret = ~mem;
             end
             SL_A: begin
-                if (c_jalr & cmp)
+                if (c_jalr & ~cmp)
                     nret = 1'b1;
                 else if (c_jal | c_jalr)
                     nsl = SL_WP;
@@ -361,7 +362,7 @@ module tt_um_fesens_r32v (
     // Ring (no reset: nothing reads it before it is written)
     // ------------------------------------------------------------------------------------
     wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & (f3 != 3'b000));
-    wire alu_w  = useb ? boolr : (sum & ~(k0 & c_jalr));
+    wire alu_w  = useb ? boolr : sumj;
     wire lo16   = ~j[5] & (~j[4] | (j[3:0] == 4'd0));   // data bits 0..15 (j = bit + 1)
     // Three write ports, one per data placement: the ring input (ALU results, bit k at phase
     // 2k + 1), position 0 (store data at the even phases; BH2's address + 2) and position 15 (load
@@ -401,10 +402,8 @@ module tt_um_fesens_r32v (
         if (stb & sA) begin
             if (c_slt)
                 cmp <= ocmp;
-            else if (c_jalr & (ph[4:0] == 5'd3))
-                cmp <= sum;                                 // target[1]
-            else if (c_mem & (ph[4:2] == 3'd0) & ph[0])
-                cmp <= eqacc;                               // address[1:0] == 0
+            else if ((ph[4:2] == 3'd0) & ph[0])             // bits 0 and 1
+                cmp <= eqacc;                               // address[1:0] == 0; JALR target[1] == 0
         end else if (stb & sB & (c_slt | c_br))
             cmp <= ocmp;
         else if (sW & c_sh) begin
