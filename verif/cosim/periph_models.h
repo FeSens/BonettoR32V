@@ -101,24 +101,25 @@ class UartTerm {
   uint32_t div() const { return div_; }
   uint32_t bit_time() const { return div_ + 1; }
   // One cycle: the TX line after edge t. gate = the pin carries UART TX (ALTFN[0] = 1, or always
-  // when the harness can't tell). Returns false on a timing or framing error (error()).
+  // when the harness can't tell). soft = the pin may be leaving UART TX right now (rvfi mode: a
+  // store clearing ALTFN[0] is executing): an anomaly abandons the frame instead of failing.
+  // Returns false on a timing or framing error (error()).
   // A frame: the line falls at t0 (after it was idle high); every change until t0 + 10B must lie
   // on t0 + kB; the bits are the levels after t0 + kB (k = 1..8 data, 9 stop). A stop bit read
   // as 0 is a framing error, unless the line then stays low to the end of the run (the pin went
   // back to a GPIO level of 0, or a break): such a "frame" is no byte.
-  bool tx_step(uint64_t t, bool line, bool gate) {
+  bool tx_step(uint64_t t, bool line, bool gate, bool soft = false) {
     started_ = false;
     completed_ = false;
     if (!err_.empty()) return false;
     if (!gate) {
-      if (in_frame_) abandoned_++;
+      if (in_frame_) abandon();
       in_frame_ = held_low_ = armed_ = false;
       return true;
     }
     if (held_low_) {
-      if (line && lenient_) {
-        held_low_ = false;
-        abandoned_++;
+      if (line && (lenient_ || soft)) {
+        abandon();
         armed_ = true;
         prev_ = true;
         return true;
@@ -141,12 +142,14 @@ class UartTerm {
       return true;
     }
     const uint64_t B = bit_time(), r = t - t0_;
+    if (line != prev_ && r % B != 0 && r < 10 * B && soft) return abandon();
     if (line != prev_ && r % B != 0 && r < 10 * B)
       return fail(pfmt("UART TX: uo[0] changed %llu cycles into the frame that started at cycle "
                        "%llu, not on a bit boundary (bit time DIV+1 = %llu cycles, contract 5.5)",
                        (unsigned long long)r, (unsigned long long)t0_, (unsigned long long)B));
     if (r % B == 0 && r >= B && r <= 8 * B) cur_ |= (uint8_t)((line ? 1 : 0) << (r / B - 1));
     if (r == 9 * B && !line) {
+      if (soft) return abandon();
       if (strict_)
         return fail(pfmt("UART TX framing error: the frame that started at cycle %llu has a stop "
                          "bit of 0 (the line was low at cycle %llu; contract 5.5)",
@@ -178,6 +181,7 @@ class UartTerm {
   bool tx_started() const { return started_; }      // a frame started at the last tx_step
   bool tx_completed() const { return completed_; }  // a frame completed at the last tx_step
   uint64_t tx_abandoned() const { return abandoned_; }
+  uint64_t tx_abandoned_t0() const { return abandoned_t0_; }  // start of the last one
   const std::vector<UartFrame>& tx_frames() const { return frames_; }
   std::string tx_text() const {
     std::string s;
@@ -199,11 +203,17 @@ class UartTerm {
   bool armed_ = false, in_frame_ = false, held_low_ = false, prev_ = true, strict_ = false;
   bool lenient_ = false;
   bool started_ = false, completed_ = false;
-  uint64_t t0_ = 0, abandoned_ = 0;
+  uint64_t t0_ = 0, abandoned_ = 0, abandoned_t0_ = 0;
   uint8_t cur_ = 0;
   std::vector<UartFrame> frames_;
   std::string err_;
 
+  bool abandon() {  // the frame in progress (or held low) is no frame; wait for idle high
+    abandoned_++;
+    abandoned_t0_ = t0_;
+    in_frame_ = held_low_ = armed_ = false;
+    return true;
+  }
   void begin(uint64_t t) {
     in_frame_ = true;
     started_ = true;

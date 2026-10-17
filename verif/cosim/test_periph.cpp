@@ -166,6 +166,23 @@ std::string uart_tx_framing() {
       if (!u.tx_step(t, a[t], true)) return "lenient: " + u.error();
     if (u.tx_text() != "B" || u.tx_abandoned() != 1) return "lenient decoded '" + u.tx_text() + "'";
   }
+  // soft (rvfi mode, a store clearing ALTFN[0] executing): a held-low stop bit or an off-boundary
+  // change abandons the frame, even in strict mode
+  {
+    UartTerm u(15);
+    u.set_strict(true);
+    for (uint64_t t = 0; t < held.size(); t++)
+      if (!u.tx_step(t, held[t], true, true)) return "soft stop: " + u.error();
+    if (u.tx_abandoned() != 1 || !u.tx_frames().empty()) return "soft stop: not abandoned";
+    std::vector<int> a = tx_wave('A', 16, 10, 0);
+    a.resize(10 + 40);
+    for (int i = 0; i < 7; i++) a.push_back(1 - a.back());  // toggles off the bit grid
+    UartTerm v(15);
+    v.set_strict(true);
+    for (uint64_t t = 0; t < a.size(); t++)
+      if (!v.tx_step(t, a[t], true, true)) return "soft boundary: " + v.error();
+    if (v.tx_abandoned() < 1) return "soft boundary: not abandoned";
+  }
   // strict (rvfi mode: ALTFN known): the same held-low stop bit is a framing error at once
   {
     UartTerm u(15);

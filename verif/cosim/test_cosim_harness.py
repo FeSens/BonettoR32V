@@ -844,6 +844,94 @@ def test_pwm_through_the_harness(tools, tmp_path, mode):
             r["error"])
 
 
+def test_uart_pins_lenient_cut_frame(tools, tmp_path):
+    """pins mode, a program the ISS can't run alone (its ALTFN writes are unknown): a frame whose
+    stop bit is 0 and whose line then rises may be the pin going to GPIO 0 and back, so it is
+    abandoned, not a framing error. uart_tx_expect then catches the missing byte; without
+    uart_tx_expect the abandoned frame fails at once."""
+    prog = [lui(1, 0x80000), lw(6, 4, 1)] + PROG_UART[1:]  # GPIO_IN read: volatile
+    hexf = flash_hex(tmp_path / "uvol.hex", {0: prog})
+    bits = [0] + [(0x55 >> k) & 1 for k in range(8)]
+
+    def uo(c, stop):
+        if c < 401:
+            return 0
+        if c >= 1101:
+            return 0x5A
+        base = 0x5A if c >= 1001 else 0x00
+        if 805 <= c < 805 + 153:
+            return base | bits[(c - 805) // 17]
+        if 805 + 153 <= c < 990 and not stop:
+            return base
+        return base | 1
+
+    good = {"uart_div": 16, "uart_tx_expect": "U", "result_gpio": 0x5A}
+    r = stub("pins", hexf, tmp_path, wave(Pins(), 1, 1200, lambda c: uo(c, True)), expect=good)
+    assert r["pass"] and r["uart_tx"] == "U", r
+    cut = wave(Pins(), 1, 1200, lambda c: uo(c, False))
+    r = stub("pins", hexf, tmp_path, cut, expect=good)
+    assert not r["pass"] and 'UART TX sent "", expect.json uart_tx_expect is "U"' in r["error"], (
+        r["error"])
+    r = stub("pins", hexf, tmp_path, cut, expect={"uart_div": 16, "result_gpio": 0x5A})
+    assert not r["pass"] and "no uart_tx_expect to judge the bytes" in r["error"], r["error"]
+    assert "cycle 990:" in r["error"] and "started at cycle 805" in r["error"], r["error"]
+
+
+def test_uart_pins_byte_against_reference(tools, tmp_path):
+    """pins mode, deterministic program (R33): the UART frame must carry the reference run's
+    UART_DATA byte."""
+    hexf = flash_hex(tmp_path / "uart.hex", {0: PROG_UART})
+    pins = Pins().set_uo(301, 0x01)
+    pins.uart_frame(705, 0x54, 17, 0x00)
+    pins.set_uo(901, 0x5B).set_uo(1001, 0x5A)
+    r = stub("pins", hexf, tmp_path, pins, expect={"uart_div": 16, "result_gpio": 0x5A})
+    assert not r["pass"] and "UART TX sent 0x54 (#0, started at cycle 705)" in r["error"], (
+        r["error"])
+    assert "reference run's UART_DATA write #0 is 0x55" in r["error"], r["error"]
+
+
+def test_uart_gate_soft_while_altfn_clear_executes(tools, tmp_path):
+    """rvfi mode: while a store clearing ALTFN[0] executes, uo[0] may take its GPIO value early
+    (contract 6), so a falling line there is no framing error (the frame is abandoned); the same
+    drop while another instruction executes still is one."""
+    hexf = flash_hex(tmp_path / "uart.hex", {0: PROG_UART})
+    rets = iss_log(hexf)
+    exp = {"uart_div": 16, "uart_tx_expect": "U", "result_gpio": 0x5A}
+    # #8 GPIO_OUT = 0x5A retires at 900, #9 ALTFN = 0 at 1300; the pin drops at 950
+    pins = Pins().set_uo(301, 0x01)
+    pins.uart_frame(705, 0x55, 17, 0x00)
+    pins.set_uo(901, 0x5B).set_uo(950, 0x5A)
+    r = stub("rvfi", hexf, tmp_path, pins, rets, every(9) + [1300, 1400, 1500], exp)
+    assert r["pass"] and r["uart_tx"] == "U", r["error"]
+    # the drop at 900, while #8 (GPIO_OUT, ALTFN unchanged) executes: a stop bit of 0
+    early = Pins().set_uo(301, 0x01)
+    early.uart_frame(705, 0x55, 17, 0x00)
+    early.set_uo(900, 0x00).set_uo(1201, 0x5A)
+    r = stub("rvfi", hexf, tmp_path, early, rets, every(8) + [1200, 1300, 1400, 1500], exp)
+    assert not r["pass"] and "stop bit of 0" in r["error"], r["error"]
+
+
+def test_expect_max_cycles_budget(tools, tmp_path):
+    """R35: expect.json max_cycles is the run budget; the CLI --max-cycles wins over it, and
+    run_cosim passes --max-cycles only when given, so it never replaces the expect value."""
+    prog = [lui(1, 0x80000), lw(2, 4, 1), addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "vbud.hex", {0: prog})
+    exp = {"result_gpio": 0x5A, "max_cycles": 15000}
+    r = stub("pins", hexf, tmp_path, Pins(), expect=exp)
+    assert not r["pass"] and "timeout after 15001 cycles (expect.json max_cycles)" in r["error"], (
+        r["error"])
+    r = stub("pins", hexf, tmp_path, Pins(), expect=exp, extra=("--max-cycles", "12000"))
+    assert not r["pass"] and "timeout after 12001 cycles (--max-cycles)" in r["error"], r["error"]
+    assert "max_cycles" in stub_setup_error("pins", hexf, tmp_path, {**exp, "max_cycles": 0})
+    # through run_cosim: <name>.expect.json beside the hex
+    (tmp_path / "vbud.expect.json").write_text(json.dumps(exp))
+    s, _ = run_cosim.run_one("pins", hexf, 1, src=PLAYBACK, v3=True)
+    assert not s["pass"] and "timeout after 15001 cycles (expect.json max_cycles)" in s["error"], (
+        s["error"])
+    s, _ = run_cosim.run_one("pins", hexf, 1, max_cycles=12000, src=PLAYBACK, v3=True)
+    assert not s["pass"] and "timeout after 12001 cycles (--max-cycles)" in s["error"], s["error"]
+
+
 # ------------------------------------------------------------------------------------------------
 # 3. the tCEM mutant (R12), run_cosim.py --v3 (R18), the v3 fuzz
 @pytest.mark.parametrize("mode", ["rvfi", "pins"])

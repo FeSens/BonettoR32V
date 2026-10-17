@@ -277,6 +277,7 @@ struct Expect {
   uint8_t result_gpio = 0;
   uint8_t final_altfn = 0;  // ALTFN at the end: result_gpio is compared on the other pins (R24)
   uint64_t coremark_iters = 0;
+  uint64_t max_cycles = 0;  // R35: the run budget (CLI --max-cycles wins), 0 = the default
 };
 
 bool load_expect(const char* path, Expect* ex, std::string* err) {
@@ -397,6 +398,10 @@ bool load_expect(const char* path, Expect* ex, std::string* err) {
   if (const JVal* v = j.get("coremark_iters"); v && v->t != JVal::Null) {
     if (!uint_of(v, &u) || u == 0) return bad("coremark_iters", "a positive integer");
     ex->coremark_iters = u;
+  }
+  if (const JVal* v = j.get("max_cycles"); v && v->t != JVal::Null) {
+    if (!uint_of(v, &u) || u == 0) return bad("max_cycles", "a positive integer");
+    ex->max_cycles = u;
   }
   return true;
 }
@@ -755,6 +760,8 @@ class Harness {
   uint64_t pwm_marker_ = INF;
   bool marker_was_ = false, fail_was_ = false;  // rvfi: GPIO_OUT showed 0xA5 / 0xEE last time
   bool cm_was0_ = false, cm_was1_ = false;      // the pins showed 0xC0 / 0xC1 last cycle
+  bool uart_soft_ = false;      // rvfi: the next instruction may clear ALTFN[0] (UART gate unknown)
+  uint64_t uart_abandoned_ = 0;  // pins: lenient abandonments already judged
   bool vread_used_ = false;
   uint32_t vread_slot_ = 0, vread_val_ = 0;
   XferTrack ut_, st_;  // UART TX, SPI master (rvfi)
@@ -910,7 +917,11 @@ bool Harness::pre_run_body() {
                       "ALTFN = 0x%02x",
                       ex_.final_altfn, ref_final_.a));
   }
-  budget_ = o_.max_cycles ? o_.max_cycles : det_ ? LAT_CAP * (n + 16) : DEFAULT_BUDGET;
+  // R35: CLI --max-cycles > expect.json max_cycles > the default
+  budget_ = o_.max_cycles    ? o_.max_cycles
+            : ex_.max_cycles ? ex_.max_cycles
+            : det_           ? LAT_CAP * (n + 16)
+                             : DEFAULT_BUDGET;
   return true;
 }
 
@@ -1036,7 +1047,24 @@ bool Harness::peripherals(uint8_t uo) {
         uart_.tx_frames().size() < ref_uart_.size())
       uart_.set_div(ref_uart_[uart_.tx_frames().size()].div);
 #endif
-    if (!uart_.tx_step(t_, uo & 1, alt & 1)) return fail(uart_.error());
+#ifdef RVFI_MODE
+    const bool soft = uart_soft_;
+#else
+    const bool soft = false;
+#endif
+    if (!uart_.tx_step(t_, uo & 1, alt & 1, soft)) return fail(uart_.error());
+#ifndef RVFI_MODE
+    // lenient (ALTFN unknown): an abandoned frame is judged only by uart_tx_expect
+    if (!det_ && uart_.tx_abandoned() > uart_abandoned_) {
+      uart_abandoned_ = uart_.tx_abandoned();
+      if (!ex_.have_tx_expect)
+        return fail(fmt("UART TX: the frame that started at cycle %llu has a stop bit of 0 and the "
+                        "line rose later; pins mode can't tell whether uo[0] still carried UART TX "
+                        "(the program's ALTFN writes are unknown), and expect.json has no "
+                        "uart_tx_expect to judge the bytes",
+                        (unsigned long long)rel(uart_.tx_abandoned_t0())));
+    }
+#endif
 #ifdef RVFI_MODE
     if (uart_.tx_started() && !xfer_start(ut_, t_, uart_.div() + 2, "a UART TX frame"))
       return false;
@@ -1482,9 +1510,14 @@ bool Harness::retirement() {
   // GPIO pins: this retirement's state is due next cycle; predict the next instruction's
   const std::string ge = gpio_.retire(iss_gpio(), t_, who);
   if (!ge.empty()) return fail(ge);
-  gpio_.set_alts(predictions());
+  const std::vector<GState> next = predictions();
+  gpio_.set_alts(next);
   // UART TX and the SPI master: pins vs writes and busy reads
   const uint8_t alt = iss_.io().altfn();
+  // the UART gate is unknown while a store clearing ALTFN[0] executes (the pin may take its GPIO
+  // value any time before the store retires; from its retirement the gate is 0)
+  uart_soft_ = false;
+  for (const GState& g : next) uart_soft_ = uart_soft_ || ((alt & 1) && !(g.a & 1));
   xfer_gate(ut_, alt & 1, uart_settle());
   xfer_gate(st_, (alt & 0x70) == 0x70, spi_settle());
   if (e.wmask && area_of(e.maddr) == Area::Io && (e.maddr & 3) == 0) {
@@ -1582,7 +1615,7 @@ int Harness::run() {
   if (pre_run()) {
 #ifdef RVFI_MODE
     gpio_.init(iss_gpio());
-    gpio_.set_alts(predictions());
+    gpio_.set_alts(predictions());  // ALTFN resets to 0: no UART soft window yet
     marker_was_ = gmatch(iss_.io().gpio_out(), PWM_MARKER, iss_.io().altfn());
     fail_was_ = gmatch(iss_.io().gpio_out(), GPIO_FAIL, ex_.final_altfn);
     uart_.set_strict(true);  // ALTFN is known: a stop bit of 0 is a framing error
@@ -1668,8 +1701,11 @@ int Harness::run() {
 #endif
       if (prog_end_ == INF && rel(t_) > budget_) {
         fail(fmt("timeout after %llu cycles (%s)", (unsigned long long)rel(t_),
-                 det_ ? "the latency cap bounds a correct run by 2,048 x (ISS retirements + 16)"
-                      : "default budget for programs the ISS can't run alone; see --max-cycles"));
+                 o_.max_cycles    ? "--max-cycles"
+                 : ex_.max_cycles ? "expect.json max_cycles"
+                 : det_ ? "the latency cap bounds a correct run by 2,048 x (ISS retirements + 16)"
+                        : "default budget of 50,000,000 cycles for programs the ISS can't run "
+                          "alone; see expect.json max_cycles or --max-cycles"));
         break;
       }
       if (end_ready()) {

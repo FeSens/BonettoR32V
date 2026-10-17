@@ -110,6 +110,15 @@ Malformed fields are setup errors (exit 2, no JSON):
 | `pwm` | `[{ch, per, q, duty}]`, checked after the GPIO-mode pins show 0xA5. Period (PER+1) 2^Q, high min(DUTY, PER+1) 2^Q, measured exactly after one settling period, within 4 periods. `ch` 7 is the timer output on uo[7] (`per` 65535 without auto-reload, `q` = P, `duty` = CMP). Extra keys (`pin`) are ignored. |
 | `loop_uo7_to_ui0`, `gpio_script` | ui[0] follows uo[7]; ui_in from `[[cycle, value], ...]` relative to the anchor |
 | `coremark_iters` | N: `coremark_cycles_per_iter` = cycles from the GPIO-mode pins showing 0xC0 to their showing 0xC1, divided by N (R21, R24) |
+| `max_cycles` | N (positive): the run budget (R35; below) |
+
+**Run budget** (R35). The run fails with `timeout after N+1 cycles (<source>)` past its budget,
+taken in this order:
+1. `--max-cycles` on the harness command line (`run_cosim.py --max-cycles` passes it through, and
+   only when given: `--all` never passes it);
+2. expect.json `max_cycles`;
+3. the default: 2,048 x (reference retirements + 16) for deterministic programs (the latency cap
+   bounds a correct run), else 50,000,000 cycles.
 
 The 0xA5 and 0xC0/0xC1 marks are looked for only when `pwm` / `coremark_iters` is present. They
 are masked with ALTFN:
@@ -148,7 +157,16 @@ GPIO (contract 6):
 UART (5.5):
 - Exact bit times: `not on a bit boundary`, `framing error`.
 - In rvfi mode (ALTFN known) a stop bit of 0 fails at once: `stop bit of 0`.
-- In pins mode a stop bit of 0, followed by the line staying low to the end, is no byte.
+- rvfi mode, soft window: while a store that clears ALTFN[0] executes (from the previous
+  retirement to its own), the pin may take its GPIO value early (contract 6). A frame cut there
+  (a stop bit of 0 or a change off the bit grid) is abandoned, not failed. From the store's
+  retirement the gate is 0, and a frame in progress is abandoned too.
+- pins mode, deterministic programs: a stop bit of 0, followed by the line staying low to the end,
+  is no byte (the pin may have gone back to GPIO 0). A rise after it is a framing error.
+- pins mode, other programs (lenient; the program's ALTFN writes are unknown): a stop bit of 0
+  followed by a rise is abandoned too (the pin may have gone to GPIO 0 and then 1). Such a
+  program's bytes are judged by `uart_tx_expect`. Without it, an abandoned frame fails at once:
+  `no uart_tx_expect to judge the bytes`.
 - A start bit at most DIV+2 cycles after the UART_DATA store's retirement edge (rvfi mode, R28,
   7c5740e; no slack): `no UART start bit within DIV+2`.
 - The sent byte is the written byte: rvfi mode via the retired store, pins mode via the reference
@@ -174,7 +192,7 @@ PWM: the meter's message. In rvfi mode, clearing ALTFN before the measurement en
 
 Self-check: `the program's self-check failed`.
 
-**Self-tests.** `pytest verif/cosim/test_cosim_harness.py` (40 tests) runs the following.
+**Self-tests.** `pytest verif/cosim/test_cosim_harness.py` (44 tests) runs the following.
 - **Pin-model unit tests.** These use `build/cosim/test_periph`, built by `build.sh` with no
   arguments. The UART RX edges are recomputed exactly in Python.
 - **Harness tests on `test_fixtures/playback`.** This stub replays a pin script (`+PINS=`) and an
@@ -182,7 +200,9 @@ Self-check: `the program's self-check failed`.
   `iss_main --v3 --log`. One build per mode covers:
   - UART bit time 17 against DIV 16 and DIV 15;
   - the start bit at DIV+2 (passes) and DIV+3 (fails);
-  - the stop bit of 0;
+  - the stop bit of 0 (strict, rvfi mode), the lenient cut frame (pins mode) and the soft window
+    while an ALTFN[0] clear executes;
+  - a wrong UART byte against the reference run (pins mode);
   - orphan frames;
   - TX_BUSY and TXIDLE reads;
   - interrupt follow and masked interrupts;
@@ -197,6 +217,8 @@ Self-check: `the program's self-check failed`.
   - 0xEE fast fail;
   - CoreMark marks;
   - volatile programs in pins mode;
+  - the run budget: expect.json `max_cycles`, `--max-cycles` over it, and `run_cosim` passing
+    neither by default (R35);
   - the SPI master pins, `spi_tx_expect` and the reference bytes;
   - SPI_DATA against MISO;
   - an SPI transfer in flight at the end;
@@ -206,23 +228,24 @@ Self-check: `the program's self-check failed`.
   fail with `tCEM`.
 - **`run_cosim.py --v3`**, the program-list rule, and the v3 fuzz.
 
-**Measured on the MCU seed** (fix round 1).
+**Measured on the MCU seed** (fix round 2).
 - **Setup.**
-  - Design: setup/v3-seed 5879b91.
-  - Programs: Task 4's setup/v3-programs de2629d, built on the Mac (`make list`: 28 programs).
+  - Design: setup/v3-seed 133d76b.
+  - Programs: Task 4's setup/v3-programs 2bab5a2, built on the Mac (`make list`: 28 programs).
+  - That run used 2bab5a2's `verif/cosim/iss3.h` (R32: mstatus.MPIE resets to 0), which the
+    merged tree will carry. With this branch's older iss3.h, every C program stops at once as a
+    setup error, because crt0 reads mstatus before writing MPIE.
   - Command: `run_cosim.py --all --v3 --no-make --src <seed src> --jobs 6` on hwe-bench.
   - Wall clock: 271 s for 224 runs and 5 fuzz seeds.
 - **Results.**
-  - 208 of 224 runs pass. The 26 programs other than uart_echo / uart_echo_fast pass 8 of 8 (2 modes x 4 seeds).
-  - uart_echo and uart_echo_fast fail 0 of 8, in both modes, with `the program's self-check failed` at cycle 47,189. The cause is the program's check 0x11, which expects TX_BUSY = 1 in the instruction right after the send.
-    - c7d9910 dropped that rule.
-    - On the seed, the 400-cycle frame ends before that load retires 660 cycles later. The read of 0 is legal, and the harness accepts it.
-    - Task 4 is fixing the program.
-  - The first frame met the DIV+2 start rule (R28) on all 4 seeds.
-  - The rvfi-mode fuzz passes seeds 1-5: 2,056 sub-runs each, 2,048 probes retired, worst gap 1,319.
+  - 224 of 224 runs pass: all 28 programs, 8 of 8 each (2 modes x 4 seeds).
+  - The rvfi-mode fuzz passes seeds 1-5: 2,056 sub-runs each, 2,048 probes retired, worst gap
+    1,319.
 - **Timing.**
-  - Worst non-exempt retirement gap: 1,188, and 1,716 in wfi.
+  - Worst non-exempt retirement gap: 1,203, and 1,716 in wfi.
   - CPI in rvfi mode: 709-830.
+  - Run lengths: irq_stress 15.8M cycles (inside the 50M default; R35 lets it declare its own);
+    uart_echo 2.1M; CoreMark 605M.
   - CoreMark: `coremark_cycles_per_iter` = 578,875,473 (ITERATIONS = 1).
 
 **Contract v2, the core region.** RAM bytes 0xFF80-0xFFFF, in every 64 KB alias, may hold the

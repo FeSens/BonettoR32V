@@ -17,6 +17,9 @@ expect.json coremark_iters (contract v3; never 0).
 
 Contract v3 (--v3): the same, plus --clk-ns (default 25, contract 7) and <name>.expect.json passed
 to the harness as --expect (the peripheral stimulus and checks). The latency cap is 2,048 cycles.
+The run budget (R35): --max-cycles > expect.json max_cycles > the harness default (2,048 x
+(reference retirements + 16), or 50,000,000 for programs the ISS can't run alone). run_cosim
+passes --max-cycles only when it is given, so it never replaces an expect.json max_cycles.
 
 Everything (the `make cosim` gate):
   run_cosim.py --all [--src DIR] [--jobs N]
