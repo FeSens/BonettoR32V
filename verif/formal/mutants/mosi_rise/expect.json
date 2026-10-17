@@ -3,5 +3,7 @@
   "checks": [
     "spi"
   ],
-  "description": "MOSI is XORed with the next bit while SCK is high."
+  "description": "MOSI is XORed with the next bit while SCK is high.",
+  "expect": "fail",
+  "deep": false
 }

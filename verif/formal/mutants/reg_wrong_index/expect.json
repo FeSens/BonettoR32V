@@ -3,5 +3,7 @@
   "checks": [
     "reg"
   ],
-  "description": "Even destination registers are written one register up (x2 writes x3); RVFI reports x2."
+  "description": "Even destination registers are written one register up (x2 writes x3); RVFI reports x2.",
+  "expect": "fail",
+  "deep": false
 }

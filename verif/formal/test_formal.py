@@ -42,8 +42,10 @@ def mutants():
 
 @pytest.fixture(scope="session")
 def heavy_lock():
-    """Hold the heavy-job lock for every formal run of the session (one acquisition)."""
-    if os.environ.get("BONETTO_HEAVY_LOCK_HELD") == "1":
+    """Hold the heavy-job lock for every formal run of the session (one acquisition).
+    Not needed when the runs go to a remote host (BONETTO_FORMAL_HOST): that host has
+    its own lock."""
+    if os.environ.get("BONETTO_HEAVY_LOCK_HELD") == "1" or os.environ.get("BONETTO_FORMAL_HOST"):
         yield
         return
     with open(LOCK_PATH, "a") as f:
@@ -99,7 +101,8 @@ def test_check_verdicts():
     for st in ("TIMEOUT", "UNKNOWN", "ERROR"):
         assert c(st, det(), "FAIL", both, req)[0] == "FAIL"
         assert c("PASS", det(), st, both, req)[0] == "FAIL"
-    assert run_formal.insn_reach("jal") == req and run_formal.insn_reach("add") == ["reach_insn"]
+    assert run_formal.insn_reach("jal") == ["reach_insn_jal", "reach_insn_jal_trap"]
+    assert run_formal.insn_reach("add") == ["reach_insn_add"]
 
 
 def test_reach_and_proof_tasks_are_separate(tmp_path):
@@ -281,8 +284,19 @@ def seed_timing(tmp_path_factory, heavy_lock):
     return str(out)
 
 
+def fast_checks():
+    cfg = run_formal.load_config(os.path.join(HERE, "checks.cfg"))
+    names = set()
+    for name, kind, _ in cfg["checks"]:
+        names |= {f"insn_{i}" for i in run_formal.isa_insns()} if kind == "insn" else {name}
+    return names | {"structure", "equiv"}
+
+
 @pytest.mark.parametrize("mutant", mutants())
 def test_mutant_fails(mutant, tmp_path, seed_timing, heavy_lock):
+    """Each mutant FAILS (a counterexample) in the checks its expect.json names, at the
+    seed's depth; the liveness boundary mutants marked "pass" PASS. A check that is only
+    in the deep config runs with --deep."""
     mdir = os.path.join(MUT_DIR, mutant)
     expect = json.load(open(os.path.join(mdir, "expect.json")))
     src = tmp_path / "src"
@@ -292,9 +306,16 @@ def test_mutant_fails(mutant, tmp_path, seed_timing, heavy_lock):
             shutil.copy(os.path.join(mdir, f), src / f)
     out = tmp_path / "formal.json"
     regex = "^(" + "|".join(expect["checks"]) + ")$"
+    deep = expect.get("deep") or not set(expect["checks"]) <= fast_checks()
     rc, text = formal(["--src", str(src), "--timing", seed_timing, "--only", regex,
-                       "--out", str(out)])
+                       "--out", str(out), "--keep-going"] + (["--deep"] if deep else []))
     res = json.load(open(out))
+    if expect.get("expect") == "pass":
+        assert rc == 0 and all(res["checks"].get(c) == "PASS" for c in expect["checks"]), \
+            f"{mutant}: expected PASS in {expect['checks']}, got {res['checks']}\n" \
+            f"{res.get('failures')}\n{text[-2000:]}"
+        print(f"{mutant}: PASS in {expect['checks']} (depth {res.get('per_check_depth')})")
+        return
     # A FAIL must be a counterexample (a failed assertion), not a timeout or an error;
     # equiv fails in the pre-pass and has no SBY task.
     failed = [c for c, v in res["checks"].items() if v == "FAIL" and

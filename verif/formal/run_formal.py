@@ -37,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,8 @@ CHECKER_FILES = [
     "isa_rv32e.v",
 ]
 NEW_INSNS = ("fence", "ecall", "ebreak")
+# Parallel SBY tasks: at most 8 on the Mac (heavy-lock rule); a remote host sets more.
+MAX_JOBS = int(os.environ.get("BONETTO_FORMAL_MAX_JOBS", "8"))
 
 # Checker module per (non-insn) check.
 CHECKERS = {
@@ -99,7 +102,30 @@ TRAPPING = {"jal", "jalr", "beq", "bne", "blt", "bge", "bltu", "bgeu", "ecall", 
 
 
 def insn_reach(insn):
-    return ["reach_insn", "reach_insn_trap"] if insn in TRAPPING else ["reach_insn"]
+    return [f"reach_insn_{insn}"] + ([f"reach_insn_{insn}_trap"] if insn in TRAPPING else [])
+
+
+def insn_name(w):
+    """RV32I/E name of an instruction word (for attributing a group counterexample)."""
+    op, f3, f7 = w & 0x7f, (w >> 12) & 7, w >> 25
+    if op == 0x37: return "lui"
+    if op == 0x17: return "auipc"
+    if op == 0x6f: return "jal"
+    if op == 0x67: return "jalr"
+    if op == 0x63: return {0: "beq", 1: "bne", 4: "blt", 5: "bge", 6: "bltu", 7: "bgeu"}.get(f3, "?")
+    if op == 0x03: return {0: "lb", 1: "lh", 2: "lw", 4: "lbu", 5: "lhu"}.get(f3, "?")
+    if op == 0x23: return {0: "sb", 1: "sh", 2: "sw"}.get(f3, "?")
+    if op == 0x13:
+        if f3 == 5: return "srai" if f7 == 0x20 else "srli"
+        return {0: "addi", 1: "slli", 2: "slti", 3: "sltiu", 4: "xori", 6: "ori", 7: "andi"}[f3]
+    if op == 0x33:
+        if f3 == 0: return "sub" if f7 == 0x20 else "add"
+        if f3 == 5: return "sra" if f7 == 0x20 else "srl"
+        return {1: "sll", 2: "slt", 3: "sltu", 4: "xor", 6: "or", 7: "and"}[f3]
+    if op == 0x0f: return "fence"
+    if w == 0x00000073: return "ecall"
+    if w == 0x00100073: return "ebreak"
+    return "?"
 
 
 def is_reach_label(lbl):
@@ -462,6 +488,44 @@ def engine_line(spec, depth, reach=False):
     raise ValueError(f"engine '{spec}' is not supported")
 
 
+SPEC_SIGS = [("valid", ""), ("trap", ""), ("rs1_addr", "[4:0] "), ("rs2_addr", "[4:0] "),
+             ("rd_addr", "[4:0] "), ("rd_wdata", "[31:0] "), ("pc_wdata", "[31:0] "),
+             ("mem_addr", "[31:0] "), ("mem_rmask", "[3:0] "), ("mem_wmask", "[3:0] "),
+             ("mem_wdata", "[31:0] ")]
+
+
+def group_model(insns):
+    """Verilog for bonetto_insn_group: the E-filtered models of `insns` muxed into one spec
+    (their spec_valid are mutually exclusive: distinct encodings), plus one trigger per
+    instruction (reach_insn_<i>, and reach_insn_<i>_trap where the spec can trap). One
+    insn check over the group checks every member at each of its retirements."""
+    ports = ("input clock, input reset, input rvfi_valid, input [31:0] rvfi_insn, "
+             "input [31:0] rvfi_pc_rdata, input [31:0] rvfi_rs1_rdata, "
+             "input [31:0] rvfi_rs2_rdata, input [31:0] rvfi_mem_rdata")
+    outs = ", ".join(f"output {w}spec_{n}" for n, w in SPEC_SIGS)
+    lines = ['`include "bonetto_macros.vh"', f"module bonetto_insn_group ({ports}, {outs});"]
+    for i in insns:
+        for n, w in SPEC_SIGS:
+            lines.append(f"  wire {w}s_{i}_{n};")
+        conns = ", ".join(f".spec_{n}(s_{i}_{n})" for n, _ in SPEC_SIGS)
+        lines.append(f"  rvfi_insn_e_{i} m_{i} (.rvfi_valid(rvfi_valid), .rvfi_insn(rvfi_insn), "
+                     f".rvfi_pc_rdata(rvfi_pc_rdata), .rvfi_rs1_rdata(rvfi_rs1_rdata), "
+                     f".rvfi_rs2_rdata(rvfi_rs2_rdata), .rvfi_mem_rdata(rvfi_mem_rdata), {conns});")
+    for n, _ in SPEC_SIGS:
+        terms = " : ".join(f"s_{i}_valid ? s_{i}_{n}" for i in insns)
+        lines.append(f"  assign spec_{n} = {terms} : 0;")
+    lines.append("  always @* begin")
+    lines.append("    if (!reset) begin")
+    for i in insns:
+        lines.append(f"      `BONETTO_REACH(reach_insn_{i}, s_{i}_valid)")
+        if i in TRAPPING:
+            lines.append(f"      `BONETTO_REACH(reach_insn_{i}_trap, s_{i}_valid && s_{i}_trap)")
+    lines.append("    end")
+    lines.append("  end")
+    lines.append("endmodule")
+    return "\n".join(lines) + "\n"
+
+
 def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, reset_free=False,
               role="proof", reach=None):
     """One SBY task. role "proof": the check's assertions (reach statements removed).
@@ -476,10 +540,11 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
     read = [os.path.basename(f) for f in CHECKER_FILES if not f.endswith(".vh")]
     insns = []
     if model is not None:
+        # model: the list of instructions this insn check covers (one group model).
         files.append(os.path.join(HERE, "checks", "bonetto_insn_check.sv"))
         read.append("bonetto_insn_check.sv")
-        if model not in NEW_INSNS:
-            insns.append(model)
+        read.append("group.v")
+        insns = [i for i in model if i not in NEW_INSNS]
     for i in insns:
         files.append(os.path.join(RVF, "insns", f"insn_{i}.v"))
         read.append(f"insn_{i}.v")
@@ -494,7 +559,7 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
         "`define BONETTO_RESET_MAX 8",
     ]
     if model is not None:
-        defines.append(f"`define RISCV_FORMAL_INSN_MODEL rvfi_insn_e_{model}")
+        defines.append("`define RISCV_FORMAL_INSN_MODEL bonetto_insn_group")
     if reset_free:
         defines.append("`define BONETTO_RESET_FREE")
     if role == "reach":
@@ -526,6 +591,8 @@ core.il {core_il}
 [file defines.sv]
 {chr(10).join(defines)}
 """
+    if model is not None:
+        text += f"\n[file group.v]\n{group_model(model)}"
     path = os.path.join(tdir, f"{name}.sby")
     with open(path, "w") as f:
         f.write(text)
@@ -602,7 +669,7 @@ def vcd_retirements(vcd_path, limit=8):
         return []
 
     def emit():
-        if step >= 0 and vals.get("rvfi_valid") == 1:
+        if step >= 1 and vals.get("rvfi_valid") == 1:   # step 0 is the reset state
             r = {"step": step}
             for k in ("rvfi_pc_rdata", "rvfi_insn", "rvfi_trap", "rvfi_rd_addr", "rvfi_rd_wdata",
                       "rvfi_mem_addr", "rvfi_mem_rmask", "rvfi_mem_wmask"):
@@ -645,15 +712,61 @@ def vcd_retirements(vcd_path, limit=8):
     return rows[:limit]
 
 
+RUNNING = {}   # pid -> Popen of the SBY runs in flight (own process groups)
+STOP = threading.Event()   # set on fail-fast: tasks not yet started are skipped
+
+
+def stop_all():
+    STOP.set()
+    for pr in list(RUNNING.values()):
+        try:
+            os.killpg(pr.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def kill_running(*_):
+    """SIGTERM/SIGINT/SIGHUP: stop every SBY run (each in its own process group), exit."""
+    stop_all()
+    log("interrupted: SBY runs stopped")
+    os._exit(130)
+
+
+# Relative cost of each task (measured on the seed, see docs/formal.md), for ordering.
+TASK_COST = {"liveness": 900, "bus_dmem": 500, "insn_group": 300, "bus_imem": 150,
+             "reg": 120, "pc_fwd": 120, "pc_bwd": 120, "causal": 120, "unique": 120,
+             "gpio": 100, "rvfi": 80, "silent": 60, "ill": 60, "reset": 60, "spi": 40,
+             "cover": 10}
+
+
+def task_cost(tname):
+    if tname.endswith("_reach"):
+        return 30
+    if tname.startswith("insn_group"):
+        return TASK_COST["insn_group"]
+    if tname.startswith("insn_"):
+        return 140
+    return TASK_COST.get(tname, 100)
+
+
 def run_task(name, path, timeout):
     tdir = os.path.dirname(path)
     t0 = time.time()
+    if STOP.is_set():
+        return name, "SKIPPED", 0.0, {"failed": [], "traces": {}, "errors": []}
+    pr = subprocess.Popen(["sby", "-f", os.path.basename(path)], cwd=tdir,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          start_new_session=True)
+    RUNNING[pr.pid] = pr
     try:
-        subprocess.run(["sby", "-f", os.path.basename(path)], cwd=tdir,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=timeout + 300, start_new_session=True)
+        pr.wait(timeout=timeout + 300)
     except subprocess.TimeoutExpired:
-        pass
+        try:
+            os.killpg(pr.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        pr.wait()
+    RUNNING.pop(pr.pid, None)
     dt = time.time() - t0
     status, detail = parse_task(tdir, name)
     return name, status, dt, detail
@@ -678,6 +791,112 @@ def combine(proof, reach, required):
 
 
 # ---------------------------------------------------------------------------
+# Remote host (formal verdicts are pass/fail, so another machine may run them)
+# ---------------------------------------------------------------------------
+
+REMOTE_BASE = os.environ.get("BONETTO_FORMAL_REMOTE_DIR", "bonetto-formal")   # under ~ on the host
+REMOTE_OSS = os.environ.get("BONETTO_FORMAL_REMOTE_OSS", "/opt/hwe-toolchain/oss-cad-suite/bin")
+REMOTE_JOBS = int(os.environ.get("BONETTO_FORMAL_REMOTE_JOBS", "18"))
+
+
+def run_remote(args, host):
+    """Run this gate on `host` (ssh): the timing is measured here; exactly the inputs
+    (the candidate's src, verif/formal, the riscv-formal checks and insn models, the
+    timing JSON) are rsynced into a fresh ~/bonetto-formal/run-<id> on the host; the
+    remote run holds the host's own lock (flock ~/bonetto-formal/formal.lock, so two
+    formal runs don't stack); build/formal.json and the task logs come back; the remote
+    run dir is always deleted. Returns the remote exit code."""
+    import tempfile
+    run_id = f"run-{os.uname().nodename.split('.')[0]}-{os.getpid()}-{int(time.time())}"
+    rdir = f"{REMOTE_BASE}/{run_id}"
+    local_logs = os.path.join(ROOT, "build", "formal", f"remote-{run_id}")
+    with tempfile.TemporaryDirectory(prefix="bonetto-formal-") as stg:
+        # Timing (cosim or the Icarus fallback) runs here, where the cosim lives.
+        timing = args.timing
+        if not timing:
+            timing = os.path.join(stg, "local_timing.json")
+            env = dict(os.environ, BONETTO_FORMAL_HOST="")
+            p = subprocess.run([sys.executable, os.path.abspath(__file__), "--host", "",
+                                "--src", args.src, "--timing-only", timing], env=env,
+                               capture_output=True, text=True)
+            sys.stdout.write(p.stdout)
+            if p.returncode != 0 or not os.path.isfile(timing):
+                log("remote: local pre-pass/timing failed")
+                sys.stdout.write(p.stderr)
+                return 1
+        # Stage exactly the inputs.
+        os.makedirs(os.path.join(stg, "src"))
+        for name in os.listdir(args.src):
+            sp = os.path.join(args.src, name)
+            if os.path.isfile(sp) and name.endswith((".v", ".sv", ".vh", ".svh")):
+                shutil.copy(sp, os.path.join(stg, "src", name))
+        shutil.copytree(HERE, os.path.join(stg, "verif", "formal"),
+                        ignore=shutil.ignore_patterns("mutants", "__pycache__", "*.pyc"))
+        os.makedirs(os.path.join(stg, "third_party", "riscv-formal", "checks"))
+        shutil.copy(os.path.join(RVF, "checks", "rvfi_macros.vh"),
+                    os.path.join(stg, "third_party", "riscv-formal", "checks"))
+        shutil.copytree(os.path.join(RVF, "insns"),
+                        os.path.join(stg, "third_party", "riscv-formal", "insns"))
+        shutil.copy(timing, os.path.join(stg, "timing.json"))
+        cfg_arg = []
+        if args.config:
+            shutil.copy(args.config, os.path.join(stg, "config.cfg"))
+            cfg_arg = ["--config", "config.cfg"]
+        ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", host]
+        try:
+            rc = subprocess.run(ssh + [f"mkdir -p {rdir}"]).returncode
+            if rc != 0:
+                log(f"remote: cannot reach {host}")
+                return 1
+            rc = subprocess.run(["rsync", "-a", "--delete", stg + "/", f"{host}:{rdir}/"]).returncode
+            if rc != 0:
+                log("remote: rsync failed")
+                return 1
+            fwd = ["--deep"] if args.deep else []
+            fwd += ["--only", args.only] if args.only else []
+            fwd += ["--keep-going"] if args.keep_going else []
+            jobs = args.jobs or REMOTE_JOBS
+            rcmd = (f"cd {rdir} && flock ../formal.lock env BONETTO_OSS_CAD={REMOTE_OSS} "
+                    f"BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
+                    f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
+                    f"--out out/formal.json --jobs {jobs} --keep "
+                    + " ".join(cfg_arg + [f"'{a}'" for a in fwd]))
+            log(f"remote: {host}:{rdir} (jobs={jobs})")
+            # -tt: closing this ssh (Ctrl-C, kill) hangs up the remote run, which then
+            # stops its SBY tasks (SIGHUP handler).
+            rc = subprocess.run(ssh[:1] + ["-tt"] + ssh[1:] + [rcmd]).returncode
+            os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+            os.makedirs(local_logs, exist_ok=True)
+            subprocess.run(["rsync", "-a", f"{host}:{rdir}/out/formal.json", args.out])
+            subprocess.run(["rsync", "-a", "--prune-empty-dirs", "--include=*/",
+                            "--include=logfile.txt", "--include=*.sby", "--exclude=*",
+                            f"{host}:{rdir}/build/formal/", local_logs + "/"])
+            if os.path.isfile(args.out):
+                with open(args.out) as f:
+                    res = json.load(f)
+                # Counterexample traces of failed checks come back too; paths made local.
+                for c, info in res.get("failures", {}).items():
+                    tr = info.get("trace")
+                    if tr and "/build/formal/" in tr:
+                        rel = tr.split("/build/formal/", 1)[1]
+                        dst = os.path.join(local_logs, rel)
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        subprocess.run(["rsync", "-a", f"{host}:{rdir}/build/formal/{rel}", dst])
+                        info["trace"] = dst
+                res["host"] = host
+                res["work"] = local_logs
+                with open(args.out, "w") as f:
+                    json.dump(res, f, indent=2, sort_keys=True)
+                log(f"remote: {args.out} (logs in {os.path.relpath(local_logs, ROOT)})")
+            else:
+                log("remote: no formal.json came back")
+                rc = rc or 1
+            return rc
+        finally:
+            subprocess.run(ssh + [f"rm -rf {rdir}"])
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -687,7 +906,14 @@ def main():
     ap.add_argument("--config", help="config file (default checks.cfg / checks-deep.cfg)")
     ap.add_argument("--src", default=os.path.join(ROOT, "src"), help="design sources (default src/)")
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "formal.json"))
-    ap.add_argument("--jobs", type=int, help="parallel tasks (capped at 8)")
+    ap.add_argument("--jobs", type=int, help="parallel tasks (capped at 8, or "
+                    "$BONETTO_FORMAL_MAX_JOBS)")
+    ap.add_argument("--keep-going", action="store_true",
+                    help="run every task even after a FAIL (default: stop at the first FAIL "
+                    "or UNREACHED)")
+    ap.add_argument("--host", default=os.environ.get("BONETTO_FORMAL_HOST") or None,
+                    help="run on this ssh host instead (default $BONETTO_FORMAL_HOST; unset = "
+                    "locally). See run_remote().")
     ap.add_argument("--timing", help="timing JSON (cosim --timing-json format)")
     ap.add_argument("--only", help="regex: run only matching checks (result is marked partial)")
     ap.add_argument("--keep", action="store_true", help="keep the work dir")
@@ -695,10 +921,15 @@ def main():
                     help="measure the candidate's timing, write it to JSON and exit")
     args = ap.parse_args()
 
+    if args.host and not args.timing_only:
+        sys.exit(run_remote(args, args.host))
     setup_path()
+    signal.signal(signal.SIGTERM, kill_running)
+    signal.signal(signal.SIGINT, kill_running)
+    signal.signal(signal.SIGHUP, kill_running)
     cfg_path = args.config or os.path.join(HERE, "checks-deep.cfg" if args.deep else "checks.cfg")
     cfg = load_config(cfg_path)
-    jobs = min(8, args.jobs or cfg["jobs"])
+    jobs = min(MAX_JOBS, args.jobs or cfg["jobs"])
     t_start = time.time()
 
     base = os.path.join(ROOT, "build", "formal")
@@ -764,10 +995,11 @@ def main():
         log(result["error"])
         finish(1)
 
-    # Tasks: per check, a proof task and a reach task (its triggers, same design).
+    # Tasks: per check (or group of instruction checks), a proof task and a reach task
+    # (its triggers, same design and depth).
     only = re.compile(args.only) if args.only else None
-    checks_todo = []   # (check name, required reach labels)
-    jobs_todo = []     # (task name, sby path, timeout)
+    units = []      # (task name, [(check name, required reach labels)])
+    jobs_todo = []  # (task name, sby path, timeout)
     task_depths = {}
     reach_eng = cfg["engines"]["reach"]
     for name, kind, opts in cfg["checks"]:
@@ -776,46 +1008,95 @@ def main():
         eng = cfg["engines"][ekey]
         tdepth = depth + int(opts.get("depth_add", 0))
         if kind == "insn":
-            items = [(f"insn_{i}", "bonetto_insn_check", i, insn_reach(i)) for i in isa_insns()]
+            insns = [i for i in isa_insns() if not only or only.search(f"insn_{i}")]
+            ngroups = min(len(insns), int(opts.get("groups", len(insns)))) if insns else 0
+            items = []
+            for g in range(ngroups):
+                members = insns[g::ngroups]   # round robin: mixes the instruction classes
+                tname = f"insn_{members[0]}" if len(members) == 1 else f"insn_group{g}"
+                req = [(f"insn_{i}", insn_reach(i)) for i in members]
+                items.append((tname, "bonetto_insn_check", members, req))
         else:
-            items = [(name, CHECKERS[name], None, REACH[name])]
-        for cname, checker, model, req in items:
-            if only and not only.search(cname):
+            if only and not only.search(name):
                 continue
-            rf = (cname == "reset")
-            p = write_sby(work, cname, checker, tdepth, eng, timeout, model=model, reset_free=rf)
-            r = write_sby(work, cname + "_reach", checker, tdepth, reach_eng, timeout,
-                          model=model, reset_free=rf, role="reach", reach=req)
-            jobs_todo += [(cname, p, timeout), (cname + "_reach", r, timeout)]
-            checks_todo.append((cname, req))
-            task_depths[cname] = tdepth
+            items = [(name, CHECKERS[name], None, [(name, REACH[name])])]
+        for tname, checker, model, req in items:
+            rf = (tname == "reset")
+            p = write_sby(work, tname, checker, tdepth, eng, timeout, model=model, reset_free=rf)
+            r = write_sby(work, tname + "_reach", checker, tdepth, reach_eng, timeout,
+                          model=model, reset_free=rf, role="reach",
+                          reach=[l for _, labels in req for l in labels])
+            jobs_todo += [(tname, p, timeout), (tname + "_reach", r, timeout)]
+            units.append((tname, req))
+            for cname, _ in req:
+                task_depths[cname] = tdepth
 
-    # Longest first (measured on the seed: liveness, then the bus checks).
-    order = {"liveness": 0, "bus_dmem": 1, "bus_imem": 2}
-    jobs_todo.sort(key=lambda t: order.get(t[0], 9))
-    log(f"running {len(jobs_todo)} SBY task(s) for {len(checks_todo)} check(s), jobs={jobs}, D={depth}")
+    # Longest first (makespan for the common, passing case). Reach tasks are short.
+    jobs_todo.sort(key=lambda t: -task_cost(t[0]))
+    log(f"running {len(jobs_todo)} SBY task(s) for {sum(len(r) for _, r in units)} check(s), "
+        f"jobs={jobs}, D={depth}" + ("" if args.keep_going else ", stop at the first FAIL"))
+    unit_req = {}
+    for tname, req in units:
+        unit_req[tname] = [l for _, labels in req for l in labels]
     results = {}
+    first_fail = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
         futs = [ex.submit(run_task, n, p, to) for n, p, to in jobs_todo]
         for fu in concurrent.futures.as_completed(futs):
             res = fu.result()
             results[res[0]] = res
+            if res[1] == "SKIPPED":
+                continue
             failed = [l for l in res[3]["failed"]]
             extra = f" failed: {', '.join(failed[:6])}" if failed else ""
             log(f"  {res[0]:<22} {res[1]:<8} {res[2]:7.1f}s{extra}")
+            if args.keep_going or first_fail:
+                continue
+            # Fail fast: a proof that did not PASS, or a reach task that finished without
+            # every required trigger.
+            if res[0].endswith("_reach"):
+                missing = [l for l in unit_req[res[0][:-6]] if l not in failed]
+                bad = res[1] not in ("PASS", "FAIL") or missing
+            else:
+                bad = res[1] != "PASS"
+            if bad:
+                first_fail = res[0]
+                log(f"first failure: {res[0]}; stopping the remaining tasks (--keep-going runs all)")
+                stop_all()
+    result["first_failure"] = first_fail
 
     checks = dict(result["checks"])  # structure, equiv
     runtimes, failures, reached = {}, {}, {}
     missing_res = (None, "ERROR", 0.0, {"failed": [], "traces": {}, "errors": ["no result"]})
-    for cname, req in checks_todo:
-        verdict, info = combine(results.get(cname, missing_res),
-                                results.get(cname + "_reach", missing_res), req)
-        checks[cname] = verdict
-        runtimes[cname] = {"proof": info["proof_s"], "reach": info["reach_s"]}
-        reached[cname] = info["reached"]
-        if verdict != "PASS":
-            failures[cname] = info
+    skipped = []
+    for tname, req in units:
+        culprit = None
+        statuses = [results.get(t, missing_res)[1] for t in (tname, tname + "_reach")]
+        if first_fail and "SKIPPED" in statuses and first_fail not in (tname, tname + "_reach"):
+            for cname, _ in req:
+                checks[cname] = "SKIPPED"
+                skipped.append(cname)
+            continue
+        for cname, labels in req:
+            verdict, info = combine(results.get(tname, missing_res),
+                                    results.get(tname + "_reach", missing_res), labels)
+            if len(req) > 1:
+                info["task"] = tname
+                info["reached"] = [l for l in info["reached"] if l in labels]
+                if verdict == "FAIL" and info.get("cex_retirements"):
+                    culprit = culprit or insn_name(int(info["cex_retirements"][-1]["insn"], 16))
+                    if culprit != cname[5:]:
+                        info = {"task": tname, "why": f"not proven: the group's proof stopped at a "
+                                f"counterexample of insn_{culprit}", "reached": info["reached"]}
+            checks[cname] = verdict
+            runtimes[cname] = {"proof": info["proof_s"], "reach": info["reach_s"]}
+            if len(req) > 1:
+                runtimes[cname]["task"] = tname
+            reached[cname] = info["reached"]
+            if verdict != "PASS":
+                failures[cname] = info
     result["checks"] = checks
+    result["skipped"] = skipped
     result["per_check_runtime_s"] = runtimes
     result["per_check_depth"] = task_depths
     result["reached"] = reached

@@ -3,7 +3,11 @@
 
 Each mutant is a full copy of the seed's top file with exactly one bug, plus
 expect.json naming the formal check(s) that must FAIL on it. test_formal.py runs
-those checks on each mutant at the seed's depth and expects a FAIL.
+those checks on each mutant at the seed's depth and expects a FAIL. The liveness
+boundary pairs (stall_*) are not bugs on one side: a core whose worst-case retirement
+comes exactly 1,024 edges after reset or after the previous retirement must PASS
+(expect "pass"), one edge later must FAIL (contract section 4, latency cap). They run
+in the deep config, where liveness lives.
 
   python3 verif/formal/mutants/make_mutants.py [seed.v]
 
@@ -111,11 +115,72 @@ MUTANTS = {
     ),
 }
 
+# Liveness boundary (contract section 4). Measured on the seed: the latest first
+# retirement is a 4-byte RAM access at edge 230, and the longest gap between
+# retirements is 230 edges (a 4-byte RAM access). A fetch stall of N cycles moves the
+# first retirement to edge 230 + N (stall_first) or the gap after the first retirement
+# to 230 + N (stall_later); N = 794 gives exactly 1,024, N = 795 gives 1,025. Each pair
+# also pins formal's count: the PASS/FAIL flip is at exactly one cycle.
+_DECL = ("    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n",
+         "    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n"
+         "    reg  [10:0] stall_n;     // MUTANT: fetch stall counter\n"
+         "    reg         armed;\n")
+_FETCH = ("                S_FETCH: begin\n"
+          "                    cs_n  <= 1'b0;\n"
+          "                    state <= S_FSPI;\n"
+          "                end\n",
+          "                S_FETCH: begin\n"
+          "                    if (stall_n != 11'd0) begin\n"
+          "                        stall_n <= stall_n - 11'd1;\n"
+          "                    end else begin\n"
+          "                        cs_n  <= 1'b0;\n"
+          "                        state <= S_FSPI;\n"
+          "                    end\n"
+          "                end\n")
+
+
+def _reset(first_n):
+    return ("            gpio_out <= 8'd0;\n        end else begin\n",
+            "            gpio_out <= 8'd0;\n"
+            f"            stall_n  <= 11'd{first_n};\n"
+            "            armed    <= 1'b1;\n"
+            "        end else begin\n")
+
+
+def _wb(later_n):
+    return ("                S_WB: begin\n                    pc <= npc;\n",
+            "                S_WB: begin\n                    pc <= npc;\n"
+            "                    if (armed) begin\n"
+            f"                        stall_n <= 11'd{later_n};\n"
+            "                        armed   <= 1'b0;\n"
+            "                    end\n")
+
+
+for _n, _exp in ((794, "pass"), (795, "fail")):
+    MUTANTS[f"stall_first_{230 + _n}"] = (
+        f"first retirement at edge {230 + _n} at the latest",
+        ["liveness"],
+        f"The first fetch waits {_n} extra cycles after reset: the latest first retirement "
+        f"(a 4-byte RAM access) is sampled at edge {230 + _n}. Expect {_exp.upper()}.",
+        [_DECL, _reset(_n), _FETCH],
+        {"expect": _exp, "deep": True},
+    )
+    MUTANTS[f"stall_later_{230 + _n}"] = (
+        f"second retirement {230 + _n} edges after the first at the latest",
+        ["liveness"],
+        f"The second fetch waits {_n} extra cycles: the longest gap (a 4-byte RAM access "
+        f"second) is {230 + _n} edges. Expect {_exp.upper()}.",
+        [_DECL, _reset(0), _FETCH, _wb(_n)],
+        {"expect": _exp, "deep": True},
+    )
+
 
 def main():
     seed = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "src", TOPFILE)
     text = open(seed).read()
-    for name, (cls, checks, desc, subs) in MUTANTS.items():
+    for name, spec in MUTANTS.items():
+        cls, checks, desc, subs = spec[:4]
+        opts = spec[4] if len(spec) > 4 else {}
         m = text
         for old, new in subs:
             n = m.count(old)
@@ -128,9 +193,12 @@ def main():
         with open(os.path.join(d, TOPFILE), "w") as f:
             f.write(hdr + m)
         with open(os.path.join(d, "expect.json"), "w") as f:
-            json.dump({"class": cls, "checks": checks, "description": desc}, f, indent=2)
+            json.dump({"class": cls, "checks": checks, "description": desc,
+                       "expect": opts.get("expect", "fail"), "deep": opts.get("deep", False)},
+                      f, indent=2)
             f.write("\n")
-        print(f"wrote mutants/{name} (expect FAIL in {', '.join(checks)})")
+        print(f"wrote mutants/{name} (expect {opts.get('expect', 'fail').upper()} in "
+              f"{', '.join(checks)})")
 
 
 if __name__ == "__main__":

@@ -3,5 +3,7 @@
   "checks": [
     "gpio"
   ],
-  "description": "Any IO store sets uo_out, even when it writes no byte with X[1:0] = 0."
+  "description": "Any IO store sets uo_out, even when it writes no byte with X[1:0] = 0.",
+  "expect": "fail",
+  "deep": false
 }

@@ -3,5 +3,7 @@
   "checks": [
     "equiv"
   ],
-  "description": "uo_out is inverted in the plain build only."
+  "description": "uo_out is inverted in the plain build only.",
+  "expect": "fail",
+  "deep": false
 }

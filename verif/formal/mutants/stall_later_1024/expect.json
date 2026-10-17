@@ -1,0 +1,9 @@
+{
+  "class": "second retirement 1024 edges after the first at the latest",
+  "checks": [
+    "liveness"
+  ],
+  "description": "The second fetch waits 794 extra cycles: the longest gap (a 4-byte RAM access second) is 1024 edges. Expect PASS.",
+  "expect": "pass",
+  "deep": true
+}

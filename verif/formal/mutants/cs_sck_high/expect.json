@@ -3,5 +3,7 @@
   "checks": [
     "spi"
   ],
-  "description": "CS_n rises on the edge where SCK falls after the last bit."
+  "description": "CS_n rises on the edge where SCK falls after the last bit.",
+  "expect": "fail",
+  "deep": false
 }

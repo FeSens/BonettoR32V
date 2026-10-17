@@ -3,5 +3,7 @@
   "checks": [
     "insn_sub"
   ],
-  "description": "SUB (funct3 000) is decoded as ADD."
+  "description": "SUB (funct3 000) is decoded as ADD.",
+  "expect": "fail",
+  "deep": false
 }
