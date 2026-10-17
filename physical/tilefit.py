@@ -4,21 +4,29 @@
 Every trial is a full tools/harden_tt.sh run (tt_tool config, the TT tile's die, top-edge pins
 and PDN, LibreLane 3.0.14, then TT's precheck) with one extra LibreLane key:
 
-  FP_OBSTRUCTIONS = [[x_cut, core_y0, core_x1, core_y1]]
+  FP_OBSTRUCTIONS = [[x_cut, die_y0, die_x1, die_y1]]
 
 LibreLane 3.0.14 turns each FP_OBSTRUCTIONS box into a hard placement blockage
 (odb::dbBlockage_create in scripts/openroad/floorplan.tcl, before initialize_floorplan); cut_rows
-then removes the rows under it, so no standard cell, tap, endcap or filler is ever placed there.
-Routing and the PDN are not obstructed. The blockage covers the right-hand part of the core;
-the placeable fraction is (x_cut - core_x0) / core_width, with x_cut on the 0.46 um site grid.
+then removes the rows under it, so no standard cell, tap, endcap or filler is placed there.
+Routing and the PDN are not obstructed. The blockage runs from x_cut to the die's right edge
+over the full die height, so nothing right of x_cut is placeable whatever the core box is; the
+placeable fraction is (x_cut - core_x0) / core_width, with x_cut on the 0.46 um site grid.
 
-A trial passes when harden_tt.sh's summary says pass: completed flow, magic DRC, route DRC,
-KLayout DRC (precheck decks), LVS, antenna, setup and hold at every corner, power grid,
-disconnected pins, and TT's precheck.
+Every trial is cross-checked, and a mismatch aborts the search as a tool error:
+  - the run's core area (summary.json core_um2) must equal the core this script computed, so a
+    config overlay that moves the core (CORE_AREA, margins) cannot open an uncounted strip;
+  - after a passing trial, no instance of the final DEF may reach past x_cut (bounding boxes
+    from the PDK's LEF macro sizes).
+
+A trial passes when harden_tt.sh exits 0 (completed flow, magic DRC, route DRC, KLayout DRC via
+the precheck decks, LVS, antenna, setup and hold at every corner, power grid, disconnected
+pins, overlap, TT's precheck). Exit 1 there is a design failure at that fraction; exit 2 (tool
+error) aborts the whole search, so a broken tool never reads as a failing fraction.
 
 Placement density: trials keep the config's PL_TARGET_DENSITY_PCT (60 in TT's template). The
 OpenROAD in LibreLane 3.0.14 raises the target itself when the free area is too small for it
-(warning GPL-0302, "Automatically adjusting to uniform density"), so the density is raised only
+(warning GPL-0302, "Automatically adjusting to uniform density"), so density is raised only
 when the blockage forces it; each run records the target global placement actually used
 (gpl_target_density). GPL-0301 (utilization above 100 %, counting OpenROAD's pin-density area
 adjustment) means the cells do not fit at all. If a future OpenROAD made GPL-0302 an error
@@ -32,7 +40,8 @@ assumes pass/fail is monotonic in the fraction, which PnR noise can violate near
 Usage:
   physical/tilefit.py [--project DIR] [--tiles 1x1] [--steps 6] [--out build/tilefit.json]
 Output: build/tilefit.json {"min_fraction", "placeable_um2", "density", "runs": [...], ...}
-Each harden_tt.sh run takes /tmp/bonetto-heavy.lock itself, so do not wrap this in lockf.
+Exit status: 0 with a min_fraction, 1 when nothing signs off (not even the full tile), 2 on a
+tool error. Each harden_tt.sh run takes the heavy lock itself, so do not wrap this in lockf.
 """
 
 import argparse
@@ -48,6 +57,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SITE_W, SITE_H = 0.46, 2.72  # sky130_fd_sc_hd unithd
+PDK_HASH = "8afc8346a57fe1ab7934ba5a6056ea8b43078e71"  # LibreLane 3.0.14's sky130 pin
+CORE_TOL_UM2 = 0.5  # LibreLane rounds design__core__area to 0.1 um2
 
 
 def die(msg):
@@ -77,6 +88,44 @@ def info_field(info, key):
     return m.group(1) if m else None
 
 
+def lef_sizes(paths):
+    """{macro: (width_um, height_um)} from LEF files."""
+    sizes, cur = {}, None
+    for p in paths:
+        for line in Path(p).read_text(errors="replace").splitlines():
+            m = re.match(r"^\s*MACRO\s+(\S+)", line)
+            if m:
+                cur = m.group(1)
+                continue
+            m = re.match(r"^\s*SIZE\s+([0-9.]+)\s+BY\s+([0-9.]+)", line)
+            if m and cur and cur not in sizes:
+                sizes[cur] = (float(m.group(1)), float(m.group(2)))
+    return sizes
+
+
+def def_overreach(def_text, sizes, x_cut_um):
+    """Instances of a DEF whose bounding box reaches past x_cut: [(name, macro, right_um)].
+    Raises ValueError for an instance whose macro size is unknown."""
+    m = re.search(r"^UNITS DISTANCE MICRONS (\d+)", def_text, re.M)
+    dbu = int(m.group(1)) if m else 1000
+    start, end = def_text.find("\nCOMPONENTS"), def_text.find("\nEND COMPONENTS")
+    if start < 0 or end < 0:
+        raise ValueError("no COMPONENTS section")
+    limit = round(x_cut_um * dbu)
+    bad = []
+    for c in re.finditer(r"^\s*-\s+(\S+)\s+(\S+)\b[^;]*?\+\s*(?:PLACED|FIXED|COVER)\s*\(\s*(-?\d+)"
+                         r"\s+(-?\d+)\s*\)\s*(\S+)", def_text[start:end], re.M):
+        name, macro, x, orient = c.group(1), c.group(2), int(c.group(3)), c.group(5)
+        if macro not in sizes:
+            raise ValueError(f"unknown macro {macro} for instance {name}")
+        w, h = sizes[macro]
+        width = h if orient in ("E", "W", "FE", "FW") else w
+        right = x + round(width * dbu)
+        if right > limit:
+            bad.append((name, macro, right / dbu))
+    return bad
+
+
 class Search:
     def __init__(self, a):
         self.a = a
@@ -98,6 +147,12 @@ class Search:
         self.core = core_box(self.die, cfg)
         self.core_w = self.core[2] - self.core[0]
         self.core_h = self.core[3] - self.core[1]
+        pdk = Path(os.environ.get("PDK_ROOT", str(Path.home() / ".ciel"))) / "ciel" / "sky130" \
+            / "versions" / PDK_HASH / "sky130A" / "libs.ref" / "sky130_fd_sc_hd" / "lef"
+        lefs = sorted(pdk.glob("*.lef"))
+        if not lefs:
+            die(f"no LEF files in {pdk}; run tools/harden_tt.sh --setup-only")
+        self.sizes = lef_sizes(lefs)
         self.runs = []
 
     def geometry(self, fraction):
@@ -108,15 +163,19 @@ class Search:
     def harden(self, fraction, density, tag):
         x_cut, frac, placeable = self.geometry(fraction)
         overlay = {}
+        if self.a.overlay:
+            overlay.update(json.loads(Path(self.a.overlay).read_text()))
         if frac < 1.0:
-            overlay["FP_OBSTRUCTIONS"] = [[round(x_cut, 3), round(self.core[1], 3),
-                                          round(self.core[2], 3), round(self.core[3], 3)]]
+            # from x_cut to the DIE edge, full die height: nothing right of x_cut is placeable
+            # (appended to any obstructions a physical hypothesis's overlay already sets)
+            overlay["FP_OBSTRUCTIONS"] = list(overlay.get("FP_OBSTRUCTIONS") or []) + [
+                [round(x_cut, 3), round(self.die[1], 3), round(self.die[2], 3),
+                 round(self.die[3], 3)]]
         if density is not None:
             overlay["PL_TARGET_DENSITY_PCT"] = density
-        if self.a.overlay:
-            overlay = {**json.loads(Path(self.a.overlay).read_text()), **overlay}
         out = self.outdir / tag
         out.mkdir(parents=True, exist_ok=True)
+        (out / "summary.json").unlink(missing_ok=True)
         ov_path = self.outdir / f"{tag}.overlay.json"
         ov_path.write_text(json.dumps(overlay, indent=2) + "\n")
         cmd = [str(REPO / "tools" / "harden_tt.sh"), "--project", str(self.project),
@@ -130,16 +189,36 @@ class Search:
             rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         dt = round(time.time() - t0)
         sfile = out / "summary.json"
-        if rc == 2 or not sfile.exists():
-            die(f"harden_tt.sh tool error in {tag}, see {self.outdir / f'{tag}.log'}")
+        if rc not in (0, 1) or not sfile.exists():
+            die(f"harden_tt.sh tool error (exit {rc}) in {tag}; search aborted, see "
+                f"{self.outdir / f'{tag}.log'} and {sfile}")
         s = json.loads(sfile.read_text())
+        if s.get("status") != ("pass" if rc == 0 else "fail"):
+            die(f"{tag}: harden exit {rc} disagrees with summary status {s.get('status')!r}")
+        core = s.get("core_um2")
+        want = self.core_w * self.core_h
+        if core is None and rc == 0:
+            die(f"{tag}: passing run reports no core area")
+        if core is not None and abs(float(core) - want) > CORE_TOL_UM2:
+            die(f"{tag}: run core area {core} um2 != computed {want:.2f} um2 (does the config "
+                f"or overlay move the core?); the placeable fraction would be wrong")
         err = ""
-        errlog = out / "proj" / "runs" / "wokwi" / "error.log"
-        if errlog.exists():
-            err = errlog.read_text(errors="replace")
+        run = out / "proj" / "runs" / "wokwi"
+        if (run / "error.log").exists():
+            err = (run / "error.log").read_text(errors="replace")
+        if rc == 0 and frac < 1.0:
+            defs = sorted((run / "final" / "def").glob("*.def"))
+            if len(defs) != 1:
+                die(f"{tag}: expected one final DEF, found {defs}")
+            try:
+                bad = def_overreach(defs[0].read_text(), self.sizes, x_cut)
+            except ValueError as e:
+                die(f"{tag}: cannot check the final DEF: {e}")
+            if bad:
+                die(f"{tag}: {len(bad)} instances reach past x_cut={x_cut:.3f} um, e.g. "
+                    f"{bad[:3]}; the blockage did not hold")
         gpl_density = None
-        for gl in sorted((out / "proj" / "runs" / "wokwi").glob(
-                "*-openroad-globalplacement/openroad-globalplacement.log")):
+        for gl in sorted(run.glob("*-openroad-globalplacement/openroad-globalplacement.log")):
             dens = re.findall(r"Placement target density:\s*([0-9.]+)", gl.read_text(errors="replace"))
             if dens:
                 gpl_density = float(dens[0])
@@ -147,10 +226,12 @@ class Search:
             "tag": tag, "fraction": round(frac, 5), "x_cut_um": round(x_cut, 3),
             "placeable_um2": round(placeable, 2), "target_density_pct": density
             if density is not None else self.base_density,
-            "pass": bool(s["pass"]), "checks": s["checks"], "failure": s.get("failure"),
+            "pass": rc == 0, "checks": s["checks"], "failure": s.get("failure"),
+            "evidence": s.get("evidence"),
             "utilization": s.get("utilization"), "stdcell_area_um2": s.get("stdcell_area_um2"),
+            "repair_um2": s.get("repair_um2"), "hold_buffers": s.get("hold_buffers"),
             "setup_ws": s.get("setup_ws"), "hold_ws": s.get("hold_ws"),
-            "gpl_target_density": gpl_density,
+            "gpl_target_density": gpl_density, "core_um2": core,
             "runtime_s": dt, "summary": str(sfile),
         }
         self.runs.append(rec)
@@ -203,7 +284,8 @@ class Search:
                "--synth-dir", str(self.outdir / "synth")]
         if self.a.keep_info_sources:
             cmd += ["--info", str(self.project / "info.yaml")]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        if subprocess.run(cmd, stdout=subprocess.DEVNULL).returncode != 0:
+            die("tools/area.py failed, cannot set the lower bound")
         return json.loads((self.outdir / "area.json").read_text())["area_um2"]
 
 
@@ -224,6 +306,8 @@ def main():
                          "run's; each is about 200 MB)")
     a = ap.parse_args()
 
+    out = Path(a.out)
+    out.unlink(missing_ok=True)  # no stale score survives a failed or aborted search
     t0 = time.time()
     s = Search(a)
     s.outdir.mkdir(parents=True, exist_ok=True)
@@ -242,23 +326,26 @@ def main():
         "density_definition": "standard-cell area of the min-fraction run (LibreLane "
                               "design__instance__area__stdcell) / placeable_um2",
         "target_density_pct": best["target_density_pct"] if best else None,
+        "repair_um2": best.get("repair_um2") if best else None,
+        "hold_buffers": best.get("hold_buffers") if best else None,
         "highest_failing_fraction": max((r["fraction"] for r in s.runs if not r["pass"]),
                                         default=None),
         "lower_bound_fraction": round(lo, 5),
         "tiles": s.tiles, "die_box_um": s.die, "core_box_um": [round(v, 3) for v in s.core],
         "core_um2": round(s.core_w * s.core_h, 2),
-        "blockage": "FP_OBSTRUCTIONS hard placement blockage over the right part of the core",
+        "blockage": "FP_OBSTRUCTIONS hard placement blockage from x_cut to the die's right "
+                    "edge, full die height",
         "top": s.top, "project": str(s.project), "steps": a.steps,
         "precheck": not a.no_precheck,
         "runs": s.runs,
         "runtime_s": round(time.time() - t0),
     }
-    out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=2) + "\n")
     print(f"[tilefit] min_fraction={res['min_fraction']} placeable_um2={res['placeable_um2']} "
           f"density={density} runs={len(s.runs)} runtime_s={res['runtime_s']}")
     print(f"wrote {out}")
+    sys.exit(0 if best is not None else 1)
 
 
 if __name__ == "__main__":

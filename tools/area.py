@@ -45,7 +45,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-LIBRELANE_IMAGE = "ghcr.io/librelane/librelane:3.0.14"
+# ghcr.io/librelane/librelane:3.0.14, pinned by digest
+LIBRELANE_IMAGE = ("ghcr.io/librelane/librelane@sha256:"
+                   "f91b21d75f79871f9ccf37451020b5d2f7b3236881a997ff709c561e8280a30f")
 # open_pdks commit LibreLane 3.0.14 pins for sky130 (librelane/pdk_hashes.yaml).
 SKY130_PDK_HASH = "8afc8346a57fe1ab7934ba5a6056ea8b43078e71"
 SCL = "sky130_fd_sc_hd"
@@ -62,10 +64,14 @@ def die(msg):
 
 
 def pdk_root():
-    """The ciel version directory of the pinned PDK (immune to `ciel enable` of others)."""
+    """The ciel version directory of the pinned PDK (immune to `ciel enable` of others).
+    No fallback: without that exact version the score is not the real flow's."""
     base = Path(os.environ.get("PDK_ROOT", str(Path.home() / ".ciel")))
     pinned = base / "ciel" / "sky130" / "versions" / SKY130_PDK_HASH
-    return pinned if (pinned / "sky130A").is_dir() else base
+    if not (pinned / "sky130A").is_dir():
+        die(f"missing {pinned}/sky130A (open_pdks {SKY130_PDK_HASH}, the LibreLane 3.0.14 "
+            f"pin); fetch it with tools/harden_tt.sh --setup-only")
+    return pinned
 
 
 def liberty_path(root):
@@ -77,7 +83,11 @@ def check_pdk(root):
     if not lib.exists():
         die(f"missing {lib}; fetch the PDK with tools/harden_tt.sh --setup-only")
     sources = root / "sky130A" / "SOURCES"
-    if sources.exists() and SKY130_PDK_HASH not in sources.read_text():
+    try:
+        ok = sources.read_text().split() == ["open_pdks", SKY130_PDK_HASH]
+    except OSError as e:
+        die(f"cannot check the PDK version in {sources}: {e}")
+    if not ok:
         die(f"{sources} is not open_pdks {SKY130_PDK_HASH} (the LibreLane 3.0.14 pin)")
     return lib
 
@@ -330,6 +340,40 @@ def run_yosys(st, rel, top, cfg, lib, root, params, hier):
     return out
 
 
+SYNTH_CHECK_METRICS = ("synthesis__check_error__count", "design__instance_unmapped__count")
+
+
+def synth_checks(step_dir, engine):
+    """TT's flow stops on these (Checker.YosysSynthChecks, Checker.YosysUnmappedCells), so a
+    design that fails them has no valid score. LibreLane engine: the step's own metrics.
+    Yosys fallback: the same reports, counted the same way (approximation of LibreLane's
+    _parse_yosys_check: every check warning not about tristates is an error)."""
+    if engine == "librelane":
+        state = step_dir / "state_out.json"
+        try:
+            metrics = json.loads(state.read_text())["metrics"]
+        except (OSError, KeyError, ValueError) as e:
+            die(f"cannot read synthesis metrics from {state}: {e}")
+        vals = {k: metrics.get(k) for k in SYNTH_CHECK_METRICS}
+    else:
+        errors = 0
+        for rpt in ("pre_synth_chk.rpt", "chk.rpt"):
+            text = (step_dir / "reports" / rpt).read_text(errors="replace")
+            for block in re.split(r"\n(?=Warning:)", text):
+                if block.startswith("Warning:") and "tribuf" not in block and "ebuf" not in block:
+                    errors += 1
+        stat = json.loads((step_dir / "reports" / "stat.json").read_text())["design"]
+        unmapped = sum(n for c, n in stat["num_cells_by_type"].items()
+                       if c.startswith("$") and c != "$assert")
+        vals = {SYNTH_CHECK_METRICS[0]: errors, SYNTH_CHECK_METRICS[1]: unmapped}
+    bad = {k: v for k, v in vals.items() if v is None or int(v) != 0}
+    if bad:
+        log = step_dir / "yosys-synthesis.log"
+        die(f"synthesis checks failed in {step_dir.parent.name} run: {bad} "
+            f"(see {step_dir / 'reports'} and {log}); TT's flow would stop here, no score")
+    return {k: int(v) for k, v in vals.items()}
+
+
 def summarize(step_dir, top, libcells):
     stat = json.loads((step_dir / "reports" / "stat.json").read_text())
     design = stat["design"]
@@ -393,16 +437,18 @@ def main():
     ap.add_argument("--param", action="append", default=[],
                     help="top-level parameter KEY=VALUE (baselines only)")
     a = ap.parse_args()
+    t0 = time.time()
+    src = Path(a.src).resolve()
+    synth_dir = Path(a.synth_dir).resolve()
+    out = Path(a.out).resolve()
+    # No stale result may survive a failed run (eval and the gate-level test read these).
+    out.unlink(missing_ok=True)
+    (synth_dir / "netlist.v").unlink(missing_ok=True)
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", a.top):
         die(f"bad --top {a.top!r}")
     for p in a.param:
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_']+$", p):
             die(f"bad --param {p!r}")
-
-    t0 = time.time()
-    src = Path(a.src).resolve()
-    synth_dir = Path(a.synth_dir).resolve()
-    out = Path(a.out).resolve()
     root = pdk_root()
     lib = check_pdk(root)
     libcells = parse_liberty(lib)
@@ -415,7 +461,9 @@ def main():
     else:
         steps = run_yosys(st, rel, a.top, cfg, lib, root, a.param, not a.no_hier)
 
+    checks = {k: synth_checks(d, a.engine) for k, d in steps.items()}
     res, _ = summarize(steps["flat"], a.top, libcells)
+    res["synth_checks"] = checks["flat"]
     netlist = synth_dir / "netlist.v"
     shutil.copy2(steps["flat"] / f"{a.top}.nl.v", netlist)
     hier_total = None

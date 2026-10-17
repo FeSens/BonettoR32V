@@ -169,7 +169,8 @@ SERV without CSRs, top cell types: dfxtp_2 1,190 (25,311.8 um2, 47.3 %), mux2_1 
 
 Hardening the seed (`tools/harden_tt.sh --tiles NxM`, the repo's `src/config.json`):
 
-- **2x2: does not fit.**
+- **2x2: unproven, probably doesn't fit.** `harden_tt.sh` now classifies this run (exit 137,
+  stopped by hand) as a tool error, not a measured failure.
   - Global placement auto-raised the target density from 0.60 to 0.76 (utilization 75.9 %,
     including a 5,885.7 um2 pin-density adjustment).
   - The resizer added 575 hold buffers, which took the standard-cell area to 62,931.6 um2.
@@ -188,7 +189,9 @@ Hardening the seed (`tools/harden_tt.sh --tiles NxM`, the repo's `src/config.jso
   - 2,252 max-slew and 24 max-cap violations (not gated by TT);
   - LibreLane 253 s plus precheck 59 s.
 - **Timing repair grows the seed by a quarter.** The resizer inserts 1,285 timing-repair
-  buffers worth 12,238 um2, on top of the 47,725 um2 of logic: 607 `dlygate4sd3_1` hold
+  buffers worth 12,238 um2 (LibreLane's `timing_repair_buffer` metrics; `harden_tt.sh`'s
+  netlist difference, `repair_um2`, counts 1,185 cells and 11,531.06 um2), on top of the
+  47,725 um2 of logic: 607 `dlygate4sd3_1` hold
   buffers ("Inserted 607 hold buffers", hold margin 0.1 ns from TT's
   `PL_RESIZER_HOLD_SLACK_MARGIN`), 465 `clkdlybuf4s25_1`, and `buf_2`, `buf_4` and `buf_6`.
   NanoV in 1x2 needed no hold buffers. `area.py` doesn't see this overhead; tilefit does.

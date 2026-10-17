@@ -14,7 +14,7 @@ Three tools score a candidate, from cheap to expensive:
 |---|---|---|
 | TT action | `TinyTapeout/tt-gds-action@ttsky26d` (commit 395eedb) | `.github/workflows/gds.yaml` |
 | tt-support-tools | `01d5d2814fa9dd61e9d211e0b235a4a592a9316a` (main, 2026-08-20) | the action checks out `main`; pinned here |
-| LibreLane | 3.0.14, image `ghcr.io/librelane/librelane:3.0.14` (native arm64) | the action's `librelane-version` default |
+| LibreLane | 3.0.14, image `ghcr.io/librelane/librelane:3.0.14` (native arm64), pinned by digest `sha256:f91b21d75f79871f9ccf37451020b5d2f7b3236881a997ff709c561e8280a30f` in `area.py` and `harden_tt.sh` | the action's `librelane-version` default |
 | Tools in that image | yosys 0.62, OpenROAD dcf36133, magic 8.3.623, klayout 0.30.7, netgen 1.5.316, Verilator 5.044 | `docker run ... --version` |
 | sky130A for the flow | open_pdks `8afc8346a57fe1ab7934ba5a6056ea8b43078e71` | LibreLane 3.0.14 `pdk_hashes.yaml`, fetched with ciel 2.4.0 into `~/.ciel` |
 | sky130A for the precheck | open_pdks `0536d02d875c8f67dd7cca3902ac457e62f20005` | `tt-gds-action/precheck@ttsky26d`; fetched (not enabled) into `~/.ciel/ciel/sky130/versions/` |
@@ -55,8 +55,9 @@ tools/area.py --top tt_um_fesens_r32v --src src/
   - `build/area.json`.
   - `build/synth/netlist.v`: the flattened, unpowered LibreLane netlist, for the gate-level
     test.
-- **Sources.** By default, every `*.v` and `*.sv` under `--src`, minus any path component
-  starting with `test_`. TT's `info.yaml` list isn't used, since hypotheses can't edit it.
+- **Sources.** By default, every `*.v` directly in `--src`, minus any path component starting
+  with `test_`. A `.sv` file or a `.v` file in a subdirectory isn't skipped: it stops the run
+  (see the name check). TT's `info.yaml` list isn't used, since hypotheses can't edit it.
   `--files` or `--info` override this (baselines).
 - **Name check.** Source names reach yosys command strings, so a file named
   `z.v; exec -- cmd; y.v` would inject commands. Every collected `src/` file must therefore
@@ -64,6 +65,19 @@ tools/area.py --top tt_um_fesens_r32v --src src/
   with status 2. Explicit baseline lists may add plain `[A-Za-z0-9_]+` directory components.
   `--top` and `--param` are checked the same way, and the yosys fallback also quotes paths.
   `harden_tt.sh` applies the same rule before `tt_tool` sees the list.
+- **Synthesis checks.** TT's flow stops when yosys' `check` finds errors (combinational loops,
+  multiple drivers and the like) or cells stay unmapped (LibreLane's `Checker.YosysSynthChecks`
+  and `Checker.YosysUnmappedCells`). `area.py` reads the same metrics from the synthesis step's
+  `state_out.json`: `synthesis__check_error__count` and `design__instance_unmapped__count`. If
+  either is non-zero or missing, in the flat or the hierarchical run, it exits 2 and writes no
+  `area.json`. The yosys fallback counts the same reports (`pre_synth_chk.rpt`, `chk.rpt`,
+  `stat.json`). `area.json` records the flat run's values in `synth_checks`.
+- **No stale output.** `--out` (`build/area.json`) and `build/synth/netlist.v` are deleted
+  before anything else, so a failed run leaves neither behind.
+- **PDK pin.** The PDK is taken only from the pinned ciel version directory
+  (`~/.ciel/ciel/sky130/versions/8afc8346.../sky130A`), whose `SOURCES` must read `open_pdks
+  8afc8346...`. A missing directory, a missing or unreadable `SOURCES`, or another version exits
+  2; there's no fallback to the enabled PDK.
 - **Speed.** 3.6 to 7.7 s per call (flat and hierarchical runs in parallel), measured on NanoV
   and SERV.
 - **Determinism.** Two NanoV runs gave identical JSON, `runtime_s` aside, and a byte-identical
@@ -110,7 +124,14 @@ never touched). Then it does what the action does:
 - `commit_id.json` and `pdk.json` are written locally, as `tt_tool --harden` would, so that
   `--create-tt-submission` works.
 
-**`build/harden/summary.json`.** `pass` is true only when all of these hold:
+**Options.** Every option also takes the `--option=value` form (`--tiles=3x2`). `--out` is
+wiped before anything else runs, so it refuses `/`, `$HOME`, the project, this repo and any
+ancestor of them, any path inside a checkout outside its `build/`, and a non-empty directory
+that isn't a previous `harden_tt.sh` output (marker `.harden_tt_out`). Paths are compared as
+real paths, so a symlink doesn't get around it.
+
+**`build/harden/summary.json`.** The summary is written by `tools/harden_summary.py`. `status`
+is `pass`, `fail` or `tool_error`, and `pass` is true only when all of these hold:
 
 - the flow completed;
 - magic DRC = 0 and TritonRoute DRC = 0;
@@ -133,11 +154,31 @@ Definitions:
 - Max slew and max cap violations are reported, not gated: TT's flow doesn't gate them either.
 - With `--no-precheck`, `klayout_drc` and `precheck` become null and `pass` covers the rest.
 
-Exit status: 0 = pass, 1 = it doesn't sign off, 2 = tool error.
+- `repair_um2`, `repair_cells` and `repair_by_type`: timing-repair cells, counted as the
+  buffers and delay cells (`buf_*`, `dlygate*`, `clkdlybuf*`, `dlymetal*`) the final netlist has
+  beyond the synthesized one, with areas from the tt liberty. `hold_buffers` is LibreLane's
+  `design__instance__count__hold_buffer`. `repair_librelane` keeps LibreLane's own
+  `timing_repair_buffer` class metrics, which run a bit higher because they also count buffers
+  that replaced synthesized ones (seed 3x2: 1,285 cells and 12,238 um2 there, 1,185 cells and
+  11,531.06 um2 by netlist difference).
+- `info_sources_match` is false when the `src/` files hardened here differ from the committed
+  `info.yaml` list (TT's CI uses that list); the script then prints a loud warning.
+  `sources_used` is the list hardened.
+- `evidence`, `failure`, `tool_error`, `librelane_exit`, `submission_exit` and `last_step`
+  explain the status.
 
-**Locking.** The script takes `/tmp/bonetto-heavy.lock` itself (`lockf -k`). Don't wrap it in
-`lockf` yourself: the second lock waits on the first forever. If you already hold the lock, set
-`BONETTO_HEAVY_LOCKED=1`.
+**Exit status, decided from evidence.** The exit code is read back from `summary.json`'s
+`status`, never taken from a process's own exit code, and any unexpected script failure is 2.
+
+| Exit | Status | When |
+|---|---|---|
+| 0 | `pass` | every check above holds |
+| 1 | `fail` | a named signoff check reports a violation (from `final/metrics.json`), a precheck row fails, or a failed flow's logs show GPL-0301, a detailed-placement failure, GRT-0116 (routing overflow) or a LibreLane checker's "N ... found" |
+| 2 | `tool_error` | LibreLane exits 125, 126, 127 or above 128 (Docker could not run it, or it was killed); no flow step directory exists; a non-zero LibreLane exit has none of the evidence above; a signoff metric is missing; `--create-tt-submission` fails; the precheck writes no `results.md`, or exits non-zero with every row passing |
+
+**Locking.** The script takes the heavy lock itself (`lockf -k` on `$BONETTO_HEAVY_LOCK`,
+default `/tmp/bonetto-heavy.lock`). Don't wrap it in `lockf` yourself: the second lock waits on
+the first forever. If you already hold the lock, set `BONETTO_HEAVY_LOCKED=1`.
 
 **Proof.** Two runs passed every check, the precheck included:
 
@@ -146,7 +187,7 @@ Exit status: 0 = pass, 1 = it doesn't sign off, 2 = tool error.
 - The seed, `--tiles 3x2`: LibreLane 253 s plus precheck 59 s; setup worst slack 20.56 ns,
   hold worst slack 0.115 ns; utilization 0.573.
 
-The 1x1 and 2x2 failures are under "Findings".
+The NanoV 1x1 failure and the unfinished seed 2x2 run are under "Findings".
 
 ## `physical/tilefit.py`: the physical score
 
@@ -156,14 +197,24 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
 
 - **Blockage.** Each trial is a full `harden_tt.sh` run, in the same staged TT template (tt_tool
   config, the tile's die, top-edge pins and PDN), plus one LibreLane key:
-  `FP_OBSTRUCTIONS = [[x_cut, core_y0, core_x1, core_y1]]`. That's LibreLane 3.0.14's supported
-  hard placement blockage: `floorplan.tcl` calls `odb::dbBlockage_create` before
-  `initialize_floorplan`, and the docs say no placement site is ever generated there. Routing
-  and the PDN aren't obstructed.
+  `FP_OBSTRUCTIONS = [[x_cut, die_y0, die_x1, die_y1]]`, from `x_cut` to the die's right edge
+  over the full die height. That's LibreLane 3.0.14's supported hard placement blockage:
+  `floorplan.tcl` calls `odb::dbBlockage_create` before `initialize_floorplan`, and `cut_rows`
+  removes the rows under it, so no cell, tap, endcap or filler lands there. Routing and the PDN
+  aren't obstructed. An `--overlay` that sets its own `FP_OBSTRUCTIONS` keeps them; the tilefit
+  box is appended.
 - **Fraction.** The placeable fraction is `(x_cut - core_x0) / core_width`, with `x_cut` on the
   0.46 um site grid. The 1x1 core is (2.76, 2.72) to (158.24, 108.80), which is 16,493.3 um2.
-- **Pass.** A trial passes when its `summary.json` passes: every check above, the precheck
-  included.
+- **Pass.** A trial passes when `harden_tt.sh` exits 0: every check above, the precheck
+  included. Exit 1 is a failing fraction. Exit 2, any other exit code, a missing `summary.json`
+  or a summary status that disagrees with the exit code aborts the whole search with exit 2, so
+  a broken tool never reads as a failing fraction.
+- **Cross-checks.** Each also aborts the search as a tool error:
+  - the run's `core_um2` must equal the core tilefit computed (within 0.5 um2), so a config or
+    overlay that moves the core can't open an uncounted strip;
+  - after every passing trial below the full tile, no instance in the final DEF may reach past
+    `x_cut`. Bounding boxes come from the PDK's LEF `SIZE`s (rotated for E, W, FE and FW); an
+    instance of an unknown macro also aborts.
 - **Density.** Trials keep the config's `PL_TARGET_DENSITY_PCT` (60 in TT's template).
   LibreLane 3.0.14's OpenROAD raises the target itself when the free area is too small for it.
   It logs warning GPL-0302, "Automatically adjusting to uniform density". The seed in 2x2, for
@@ -181,9 +232,12 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
      happen.
   The search assumes pass and fail are monotonic in the fraction. PnR noise can break that near
   the edge.
-- **Output.** `build/tilefit.json`: `min_fraction`, `placeable_um2`, `density` (the passing
-  run's standard-cell area over `placeable_um2`), `target_density_pct`,
-  `highest_failing_fraction`, and every run with its checks and failure reason.
+- **Output.** `build/tilefit.json` (deleted at start, so an aborted search leaves none):
+  `min_fraction`, `placeable_um2`, `density` (the passing run's standard-cell area over
+  `placeable_um2`), `target_density_pct`, `repair_um2`, `hold_buffers`,
+  `highest_failing_fraction`, and every run with its checks, evidence and failure reason.
+- **Exit status.** 0 with a `min_fraction`; 1 when nothing signs off, not even the full tile
+  (`min_fraction` null); 2 on a tool error.
 - **Physical hypotheses** pass `--overlay FILE.json` (extra LibreLane keys for every trial),
   kept under `physical/`.
 
@@ -202,12 +256,50 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
 - **Our 1x1 has no room for a flip-flop register file.**
   - 16 x 32 RF bits as `dfxtp_2` alone are 10,890 um2 (512 x 21.27).
   - SERV with its RF cut to 16 registers synthesizes to 30,820 um2 (docs/baselines.md).
-  - The seed (47,725 um2 synthesized) passes in 3x2, not in 2x2 (docs/baselines.md). Neither
-    NanoV nor the seed fits 1x1 in the stock flow, so the 1x1 tilefit has no candidate yet.
+  - The seed (47,725 um2 synthesized) passes in 3x2. Its 2x2 run is unproven: I stopped it
+    in detailed routing (exit 137), which the classification above counts as a tool error, not
+    a failure (docs/baselines.md). Neither NanoV nor the seed fits 1x1 in the stock flow, so
+    the 1x1 tilefit has no candidate yet.
     `--tiles` runs it in a bigger tile meanwhile; NanoV in 1x2 is the worked example.
 - **Hold fixing is a large physical cost for the seed.** 1,285 timing-repair buffers
   (12,238 um2) on 47,725 um2 of logic, 607 of them hold buffers. `area.py` can't see this;
   tilefit and harden do.
+
+## Lowering 1x1 placement utilization: what LibreLane 3.0.14 exposes
+
+The question: is there a variable for GPL's pin-density adjustment, or any other variable that
+lowers placement utilization in a 1x1, and may a TT project set it?
+
+- **No variable controls the pin-density adjustment.** `scripts/openroad/gpl.tcl:40-82` builds
+  every `global_placement` argument: `-density` from `PL_TARGET_DENSITY_PCT` (42),
+  `-timing_driven` (44-47), `-routability_driven` and `-routability_check_overflow` (49-57),
+  `-skip_initial_place` (59-61), `-skip_io` (63-65), `-min_phi_coef` and `-max_phi_coef`
+  (67-73), `-pad_left` and `-pad_right` from `GPL_CELL_PADDING` (75-78), `-init_wirelength_coef`
+  (79) and `-keep_resize_below_overflow` (80). None is `-disable_pin_density_adjust`, and a
+  recursive search for "pin_density" or "pin density" over the whole LibreLane 3.0.14 package
+  finds nothing. NanoV's 1x1 used a patched image for exactly this reason.
+- **Other levers, none of them a clean win:**
+  - `GPL_CELL_PADDING` (`steps/openroad.py:1555`) is already 0 for sky130_fd_sc_hd (PDK
+    `libs.tech/openlane/sky130_fd_sc_hd/config.tcl:53`).
+  - `PL_TARGET_DENSITY_PCT` (in TT's user-editable section, `src/config.json:14-16`) doesn't
+    lower utilization; GPL raises it itself when needed (GPL-0302).
+  - `PL_ROUTABILITY_DRIVEN` (`steps/openroad.py:1609-1612`, default true) inflates cells in
+    congested regions; turning it off saves virtual area at the cost of routability.
+  - `FP_TAPCELL_DIST` (`steps/openroad.py:1380`; PDK `libs.tech/openlane/config.tcl:79` sets
+    13 um) would cut the tap cells (574 um2 in NanoV's 1x1), with latch-up risk.
+  - `CORE_AREA` (`steps/openroad.py:1139`, used in `floorplan.tcl:68-85`) and the margin
+    multipliers would enlarge the core. They sit in TT's "DO NOT CHANGE" section
+    (`src/config.json:37-51`), and for tilefit they're caught by the core-area cross-check.
+  - `PL_RESIZER_HOLD_SLACK_MARGIN` and `GRT_RESIZER_HOLD_SLACK_MARGIN` (user-editable,
+    `src/config.json:22-24`) set how many hold buffers are inserted; lowering them shrinks the
+    repair area but trades away hold margin.
+- **TT has no allowed-variable list in code.** tt-support-tools 01d5d281 `project.py:480-484`
+  (`create_merged_config`) merges `src/config.json` and `src/user_config.json` verbatim, and
+  `config_utils.py:12-14` (`read_json_config`) only drops the `"//"` comments. The "allowed"
+  set is only the comment convention in TT's `src/config.json` (user section above line 37).
+  `user_config.json` (`DIE_AREA`, `FP_DEF_TEMPLATE`, pins) wins over `config.json`. Nothing
+  enforces the convention in CI, but changing the protected keys is outside TT's support, and
+  `src/config.json` is on this repo's don't-touch list anyway.
 
 ## Which flip-flop and latch cells the flow uses
 
@@ -234,3 +326,26 @@ physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.j
   directory, the PDK and `build/`. That's also why `harden_tt.sh` doesn't use
   `librelane --dockerized`. There's been no crash since.
 - **If Docker is down**, `area.py --engine yosys` still works, with the caveat above.
+
+## Tests
+
+```
+python3 -m unittest tools/test_physical.py -v
+```
+
+Fixture tests for all three tools; none takes the heavy lock or runs LibreLane's full flow.
+
+- `area.py`: injected and `.sv` file names, a bad `--top` or `--param`, and a missing or wrong
+  PDK version all exit 2 and leave no `area.json`. A combinational loop dies under both engines
+  (the LibreLane one needs Docker). A clean design scores with zero check counts.
+- `harden_summary.py` on synthetic run directories: exits 137 and 125 to 127, no steps,
+  GPL-0301, GRT-0116, an unknown LibreLane failure, deferred magic DRC, a clean pass with the
+  repair fields, `--no-precheck`, a failed submission, a precheck with no results, a failing
+  precheck row, and a missing overlap metric. It also reclassifies the runs kept under `build/`
+  when present.
+- `harden_tt.sh`: the `--out` guard (including a symlink to the repo), `--tiles` forms, and a
+  stale `summary.json` wiped before a failing setup, which exits 2.
+- `tilefit.py`: the LEF and DEF scan (also on a kept real run) and the search with a stub in
+  place of `harden_tt.sh` (die-edge blockage on the site grid, convergence, user obstructions
+  kept, exit 1 when nothing passes, aborts on tool errors, status mismatch, core mismatch and
+  an instance past `x_cut`).

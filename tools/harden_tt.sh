@@ -4,7 +4,7 @@
 # Mirrors TinyTapeout/tt-gds-action@ttsky26d (pdk: sky130A):
 #   1. tt-support-tools (pinned below) `tt_tool.py --create-user-config`
 #   2. LibreLane 3.0.14 Classic flow on src/config_merged.json (what `tt_tool.py --harden`
-#      runs, inside the same ghcr.io/librelane/librelane:3.0.14 image)
+#      runs, inside the same ghcr.io/librelane/librelane:3.0.14 image, pinned by digest)
 #   3. `tt_tool.py --create-tt-submission`, then TT's precheck (tt-gds-action/precheck) on the
 #      submission GDS, with the precheck's own PDK pin.
 # Deviations from CI (all mechanical, none touch the flow config): LibreLane runs in the image
@@ -15,34 +15,53 @@
 # Usage:
 #   tools/harden_tt.sh [--project DIR] [--out DIR] [--overlay FILE.json] [--tiles 1x2]
 #                      [--keep-info-sources] [--no-precheck] [--setup-only]
+#   (every option also accepts the --option=value form)
 #     --project DIR        TT project root with info.yaml and src/ (default: this repo)
-#     --out DIR            output directory (default: build/harden); it is wiped first
+#     --out DIR            output directory (default: build/harden); it is wiped first, so it
+#                          must not be /, $HOME, the project or this repo or any ancestor of
+#                          them, nor inside a checkout outside its build/, nor a non-empty
+#                          directory that is not a previous harden_tt.sh output
 #     --overlay FILE.json  extra LibreLane config keys merged into the staged src/config.json
 #                          (tilefit uses this for FP_OBSTRUCTIONS; never edits the real one)
 #     --tiles NxM          override info.yaml's tile count in the staged copy
 #     --keep-info-sources  use info.yaml's source_files verbatim (default: regenerate the list
-#                          from src/**/*.v,*.sv minus test_* paths, like tools/area.py does)
+#                          from src/*.v, like tools/area.py does)
 #     --no-precheck        skip TT's precheck
 #     --setup-only         only fetch tools, venvs and PDKs
 #
 # Output: OUT/summary.json
-#   {"pass", "drc", "lvs", "antenna", "setup_wns", "hold_wns", "utilization", "die_um2", ...}
-# Exit status: 0 when pass is true, 1 when the design does not sign off, 2 on a tool error.
+#   {"status", "pass", "drc", "lvs", "antenna", "setup_wns", "hold_wns", "utilization",
+#    "die_um2", "repair_um2", "repair_cells", "hold_buffers", "info_sources_match", ...}
+# Exit status, decided from evidence:
+#   0  every signoff check passed
+#   1  the design does not sign off: a named signoff check reports a violation (DRC, LVS,
+#      antenna, timing, power grid, disconnected pins, overlap, a LibreLane checker, a failing
+#      precheck row) or the flow stopped on GPL-0301, a detailed-placement failure or a
+#      routing overflow
+#   2  tool error: Docker or LibreLane did not run or was killed (rc 125/126/127, >128), no
+#      flow steps, a failure with none of the evidence above, a missing signoff metric, a
+#      failed --create-tt-submission, or a precheck that wrote no results
 #
-# Load: this is a heavy job. The script takes /tmp/bonetto-heavy.lock itself (lockf -k).
-# Do NOT wrap it in lockf yourself (flock would deadlock); if you already hold the lock, set
-# BONETTO_HEAVY_LOCKED=1.
-set -euo pipefail
+# Load: this is a heavy job. The script takes the heavy lock itself (lockf -k on
+# $BONETTO_HEAVY_LOCK, default /tmp/bonetto-heavy.lock). Do NOT wrap it in lockf yourself
+# (flock would deadlock); if you already hold the lock, set BONETTO_HEAVY_LOCKED=1.
+set -Eeuo pipefail
+# Any unexpected failure is a tool error (2), never a design verdict (1).
+on_err() { echo "harden_tt.sh: unexpected failure at line $1 (tool error)" >&2; exit 2; }
+errtrap_on() { trap 'on_err $LINENO' ERR; }
+errtrap_off() { trap - ERR; }
+errtrap_on
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TT_TOOLS_URL="https://github.com/TinyTapeout/tt-support-tools"
 TT_TOOLS_SHA="01d5d2814fa9dd61e9d211e0b235a4a592a9316a"   # main HEAD on 2026-10-16 (CI uses ref main)
-LIBRELANE_IMAGE="ghcr.io/librelane/librelane:3.0.14"
+# ghcr.io/librelane/librelane:3.0.14, pinned by digest
+LIBRELANE_IMAGE="ghcr.io/librelane/librelane@sha256:f91b21d75f79871f9ccf37451020b5d2f7b3236881a997ff709c561e8280a30f"
 PDK_HASH="8afc8346a57fe1ab7934ba5a6056ea8b43078e71"            # LibreLane 3.0.14 pdk_hashes.yaml
 PRECHECK_PDK_HASH="0536d02d875c8f67dd7cca3902ac457e62f20005"   # tt-gds-action/precheck@ttsky26d
 CIEL_ROOT="${PDK_ROOT:-$HOME/.ciel}"
 ENV_DIR="${BONETTO_TT_ENV:-$REPO/build/tt-env}"
-LOCK=/tmp/bonetto-heavy.lock
+LOCK="${BONETTO_HEAVY_LOCK:-/tmp/bonetto-heavy.lock}"
 
 if [ -z "${BONETTO_HEAVY_LOCKED:-}" ]; then
   export BONETTO_HEAVY_LOCKED=1
@@ -58,6 +77,13 @@ PRECHECK=1
 SETUP_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --*=*) a="$1"; shift; set -- "${a%%=*}" "${a#*=}" "$@"; continue ;;
+  esac
+  case "$1" in
+    --project|--out|--overlay|--tiles)
+      [ $# -ge 2 ] || { echo "harden_tt.sh: $1 needs a value" >&2; exit 2; } ;;
+  esac
+  case "$1" in
     --project) PROJECT="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --overlay) OVERLAY="$2"; shift 2 ;;
@@ -65,20 +91,53 @@ while [ $# -gt 0 ]; do
     --keep-info-sources) KEEP_INFO=1; shift ;;
     --no-precheck) PRECHECK=0; shift ;;
     --setup-only) SETUP_ONLY=1; shift ;;
-    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
     *) echo "harden_tt.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
+case "$TILES" in ""|[0-9]x[0-9]) ;; *) echo "harden_tt.sh: bad --tiles $TILES" >&2; exit 2 ;; esac
 
 log() { echo "[harden_tt $(date +%H:%M:%S)] $*" >&2; }
+abspath() { (cd "$(dirname "$1")" && echo "$(pwd)/$(basename "$1")"); }
+
+# ---------------------------------------------------------------- resolve and wipe OUT first
+# (before anything can fail, so no stale summary.json survives a failed run)
+if [ "$SETUP_ONLY" = 0 ]; then
+  [ -d "$PROJECT" ] || { echo "harden_tt.sh: no project dir $PROJECT" >&2; exit 2; }
+  PROJECT="$(cd "$PROJECT" && pwd -P)"
+  # real paths, checked before anything is created or deleted
+  python3 -I - "$PROJECT" "$OUT" "$HOME" "$REPO" <<'PY' || exit 2
+import os, sys
+proj, out, home, repo = (os.path.realpath(os.path.abspath(p)) for p in sys.argv[1:5])
+def covers(a, b):  # a is b or an ancestor of b
+    return b == a or b.startswith(a.rstrip("/") + "/")
+for root in (proj, repo):  # inside a checkout, only under its build/
+    if covers(root, out) and not covers(os.path.join(root, "build"), out):
+        sys.exit(f"harden_tt.sh: refusing --out {out}: inside {root} it must be under build/")
+if out == "/" or covers(out, proj) or covers(out, repo) or covers(out, home):
+    sys.exit(f"harden_tt.sh: refusing --out {out} (project {proj}, home {home})")
+names = os.listdir(out) if os.path.isdir(out) else []
+if names and not ({".harden_tt_out", "summary.json"} & set(names)
+                  or os.path.isfile(os.path.join(out, "proj", "info.yaml"))):
+    sys.exit(f"harden_tt.sh: refusing to wipe --out {out}: not empty and not a harden_tt.sh "
+             f"output directory")
+PY
+  mkdir -p "$OUT"
+  OUT="$(cd "$OUT" && pwd -P)"
+  find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  touch "$OUT/.harden_tt_out"
+  if [ -n "$OVERLAY" ]; then OVERLAY="$(abspath "$OVERLAY")"; fi
+fi
 
 # tt_tool.py imports cairosvg, which dlopens libcairo; on macOS take Homebrew's.
 if [ "$(uname -s)" = Darwin ]; then
   for d in /opt/homebrew/lib /usr/local/lib; do
-    [ -f "$d/libcairo.2.dylib" ] && export DYLD_FALLBACK_LIBRARY_PATH="$d${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" && break
+    if [ -f "$d/libcairo.2.dylib" ]; then
+      export DYLD_FALLBACK_LIBRARY_PATH="$d${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+      break
+    fi
   done
 fi
-abspath() { (cd "$(dirname "$1")" && echo "$(pwd)/$(basename "$1")"); }
 
 # ---------------------------------------------------------------- setup (idempotent)
 setup() {
@@ -133,13 +192,8 @@ setup
 [ "$SETUP_ONLY" = 1 ] && { log "setup done"; exit 0; }
 
 # ---------------------------------------------------------------- stage the project
-PROJECT="$(cd "$PROJECT" && pwd)"
 [ -f "$PROJECT/info.yaml" ] && [ -f "$PROJECT/src/config.json" ] || {
   echo "harden_tt.sh: $PROJECT needs info.yaml and src/config.json" >&2; exit 2; }
-mkdir -p "$OUT"
-OUT="$(cd "$OUT" && pwd)"
-case "$OUT" in "$PROJECT"|"$PROJECT/src"*|/) echo "harden_tt.sh: refusing --out $OUT" >&2; exit 2 ;; esac
-find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 PROJ="$OUT/proj"
 mkdir -p "$PROJ" "$OUT/.home"
 cp "$PROJECT/info.yaml" "$PROJ/info.yaml"
@@ -147,12 +201,12 @@ cp -R "$PROJECT/src" "$PROJ/src"
 rm -f "$PROJ/src/user_config.json" "$PROJ/src/config_merged.json"
 [ -d "$PROJECT/docs" ] && cp -R "$PROJECT/docs" "$PROJ/docs"
 rsync -a --exclude .git "$ENV_DIR/tt-support-tools/" "$PROJ/tt/"
-[ -n "$OVERLAY" ] && OVERLAY="$(abspath "$OVERLAY")"
 
-python3 -I - "$PROJ" "$KEEP_INFO" "$TILES" "$OVERLAY" <<'PY' || exit 2
+python3 -I - "$PROJ" "$KEEP_INFO" "$TILES" "$OVERLAY" "$OUT/sources.json" <<'PY' || exit 2
 import json, re, sys
 from pathlib import Path
-proj, keep, tiles, overlay = Path(sys.argv[1]), sys.argv[2] == "1", sys.argv[3], sys.argv[4]
+proj, keep, tiles, overlay, srcjson = (Path(sys.argv[1]), sys.argv[2] == "1", sys.argv[3],
+                                       sys.argv[4], Path(sys.argv[5]))
 info = (proj / "info.yaml").read_text().splitlines()
 # Source names reach yosys command strings (tt_tool's port check, LibreLane), where a name
 # like `z.v; exec -- cmd; y.v` would inject commands: src/ files must be plain `name.v`.
@@ -161,18 +215,19 @@ def bad(rel, allow_dirs):
     parts = rel.split("/")
     return not (NAME.match(parts[-1]) and (len(parts) == 1 or
                 (allow_dirs and all(DIR.match(d) for d in parts[:-1]))))
+m = re.search(r"source_files\s*:\s*\n((?:[ \t]*-.*\n|[ \t]*#.*\n)+)", "\n".join(info) + "\n")
+committed = re.findall(r'^\s*-\s*"?([^"\n#]+?)"?\s*(?:#.*)?$', m.group(1), re.M) if m else []
 if keep:
-    m = re.search(r"source_files\s*:\s*\n((?:\s*-.*\n|\s*#.*\n)+)", "\n".join(info) + "\n")
-    listed = re.findall(r'^\s*-\s*"?([^"\n#]+?)"?\s*(?:#.*)?$', m.group(1), re.M) if m else []
-    for f in listed:
+    for f in committed:
         if bad(f, allow_dirs=True):
             sys.exit(f"harden_tt.sh: refusing source name {f!r} in info.yaml")
-if not keep:
+    used = committed
+else:
     src = proj / "src"
-    files = sorted(str(p.relative_to(src)) for p in src.rglob("*")
-                   if p.is_file() and p.suffix in (".v", ".sv")
-                   and not any(x.startswith("test_") for x in p.relative_to(src).parts))
-    for f in files:
+    used = sorted(str(p.relative_to(src)) for p in src.rglob("*")
+                  if p.is_file() and p.suffix in (".v", ".sv")
+                  and not any(x.startswith("test_") for x in p.relative_to(src).parts))
+    for f in used:
         if bad(f, allow_dirs=False):
             sys.exit(f"harden_tt.sh: refusing source name {f!r}: src/ files must match "
                      f"{NAME.pattern}")
@@ -180,16 +235,16 @@ if not keep:
     for line in info:
         if re.match(r"^\s*source_files\s*:", line):
             out.append(line)
-            out += [f'    - "{f}"' for f in files]
+            out += [f'    - "{f}"' for f in used]
             skip = True
             continue
-        if skip and re.match(r"^\s*-\s", line):
-            continue
-        if skip and line.strip().startswith("#"):
+        if skip and (re.match(r"^\s*-\s", line) or line.strip().startswith("#")):
             continue
         skip = False
         out.append(line)
     info = out
+srcjson.write_text(json.dumps({"used": used, "committed": committed,
+                               "match": sorted(used) == sorted(committed)}, indent=2) + "\n")
 if tiles:
     info = [re.sub(r'^(\s*tiles\s*:\s*)"?[0-9x]+"?', rf'\g<1>"{tiles}"', l) for l in info]
 (proj / "info.yaml").write_text("\n".join(info) + "\n")
@@ -199,6 +254,11 @@ if overlay:
     cfg.update(json.loads(Path(overlay).read_text()))
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 PY
+
+if ! python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["match"] else 1)' "$OUT/sources.json"; then
+  log "WARNING: info.yaml source_files differ from the src/ files hardened here."
+  log "WARNING: TT's CI uses the committed info.yaml list; see $OUT/sources.json"
+fi
 
 TOP="$(python3 -I -c 'import re,sys; t=open(sys.argv[1]).read(); print(re.search(r"top_module\s*:\s*\"?([A-Za-z0-9_]+)", t).group(1))' "$PROJ/info.yaml")"
 log "project $PROJECT top $TOP -> $OUT"
@@ -211,20 +271,25 @@ T0=$(date +%s)
 # ---------------------------------------------------------------- 2. LibreLane (tt_tool --harden)
 mkdir -p "$PROJ/runs/wokwi"
 log "LibreLane 3.0.14 Classic flow (log: $OUT/librelane.log)"
-set +e
+set +e; errtrap_off
 docker run --rm --user "$(id -u):$(id -g)" -v "$OUT:$OUT" -v "$CIEL_ROOT:$CIEL_ROOT" \
   -e PDK_ROOT="$CIEL_ROOT" -e HOME="$OUT/.home" -w "$PROJ" "$LIBRELANE_IMAGE" \
   librelane --pdk-root "$CIEL_ROOT" --run-tag wokwi --force-run-dir runs/wokwi \
   --hide-progress-bar src/config_merged.json > "$OUT/librelane.log" 2>&1
 LL_RC=$?
-set -e
+set -e; errtrap_on
 T1=$(date +%s)
 log "LibreLane exit $LL_RC after $((T1 - T0)) s"
 
-# tt_tool --harden's post-processing (commit_id.json, pdk.json), needed by --create-tt-submission
-PRE_RC=-1
+# ---------------------------------------------------------------- 3. submission and precheck
+# Only for a flow that ran to the end without errors (deferred checker errors still write
+# final/ but make LibreLane exit non-zero; those are design failures, judged from metrics).
+SUB_RC=-1   # -1: not attempted
+PRE_RC=-1   # -1: not attempted, -2: --no-precheck
 [ "$PRECHECK" = 0 ] && PRE_RC=-2
-if [ "$LL_RC" = 0 ]; then
+if [ "$LL_RC" = 0 ] && [ -f "$PROJ/runs/wokwi/final/metrics.json" ]; then
+  # tt_tool --harden's post-processing (commit_id.json, pdk.json), needed by --create-tt-submission
+  set +e; errtrap_off
   python3 -I - "$PROJ" "$TT_TOOLS_SHA" <<'PY'
 import json, sys
 from pathlib import Path
@@ -239,145 +304,42 @@ src, ver = (Path(ll["PDK_ROOT"]) / "sky130A" / "SOURCES").read_text().split()
     {"FLOW_NAME": "LibreLane", "FLOW_VERSION": ll["meta"]["librelane_version"], "PDK": ll["PDK"],
      "PDK_SOURCE": src, "PDK_VERSION": ver}, indent=2))
 PY
-  (cd "$PROJ" && PATH="$ENV_DIR/venv/bin:$PATH" python tt/tt_tool.py --create-tt-submission) \
-    > "$OUT/create-tt-submission.log" 2>&1 || { tail -20 "$OUT/create-tt-submission.log" >&2; LL_RC=97; }
+  SUB_RC=$?
+  if [ "$SUB_RC" = 0 ]; then
+    (cd "$PROJ" && PATH="$ENV_DIR/venv/bin:$PATH" python tt/tt_tool.py --create-tt-submission) \
+      > "$OUT/create-tt-submission.log" 2>&1
+    SUB_RC=$?
+  fi
+  set -e; errtrap_on
+  [ "$SUB_RC" = 0 ] || { tail -20 "$OUT/create-tt-submission.log" >&2 2>/dev/null || true; }
 
-  # -------------------------------------------------------------- 3. TT precheck
-  if [ "$PRECHECK" = 1 ] && [ "$LL_RC" = 0 ]; then
+  if [ "$PRECHECK" = 1 ] && [ "$SUB_RC" = 0 ]; then
     log "TT precheck (log: $OUT/precheck.log)"
-    set +e
+    rm -rf "$PROJ/tt/precheck/reports"
+    set +e; errtrap_off
     (cd "$PROJ/tt/precheck" && mkdir -p reports && \
       PATH="$ENV_DIR/shims:$ENV_DIR/precheck-venv/bin:$PATH" \
       PDK_ROOT="$CIEL_ROOT/ciel/sky130/versions/$PRECHECK_PDK_HASH" PDK=sky130A \
       BONETTO_DOCKER_MOUNTS="$OUT $CIEL_ROOT" \
       python precheck.py --gds "$PROJ/tt_submission/$TOP.gds") > "$OUT/precheck.log" 2>&1
     PRE_RC=$?
-    set -e
+    set -e; errtrap_on
     log "precheck exit $PRE_RC after $(( $(date +%s) - T1 )) s"
   fi
 fi
 T2=$(date +%s)
 
-# ---------------------------------------------------------------- summary
-python3 -I - "$OUT" "$PROJ" "$TOP" "$LL_RC" "$PRE_RC" "$((T1 - T0))" "$((T2 - T1))" <<'PY'
-import glob, json, os, re, sys
-from pathlib import Path
-out, proj, top = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-ll_rc, pre_rc, t_ll, t_pre = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
-run = proj / "runs" / "wokwi"
-m = {}
-final = run / "final" / "metrics.json"
-if final.exists():
-    m = json.loads(final.read_text())
-else:  # failed run: take the metrics of the last step that finished
-    states = sorted(glob.glob(str(run / "*" / "state_out.json")))
-    if states:
-        m = json.loads(Path(states[-1]).read_text()).get("metrics", {})
-
-def g(k, default=None):
-    v = m.get(k, default)
-    return float(v) if isinstance(v, str) and re.match(r"^-?[0-9.eE+-]+$", v) else v
-
-def count(k):
-    v = g(k)
-    return None if v is None else int(v)
-
-complete = ll_rc == 0 and final.exists()
-failed_step = None
-if not complete:
-    steps = sorted(p.name for p in run.iterdir() if p.is_dir() and re.match(r"^\d+-", p.name)) \
-        if run.exists() else []
-    err = (run / "error.log").read_text(errors="replace").strip() if (run / "error.log").exists() else ""
-    failed_step = f"last step dir: {steps[-1] if steps else 'none'}; " + \
-        (err[-1200:] if err else f"LibreLane exit code {ll_rc}, see librelane.log")
-precheck_skipped = pre_rc == -2
-precheck = {"ran": pre_rc >= 0, "pass": pre_rc == 0, "skipped": precheck_skipped}
-res_md = proj / "tt" / "precheck" / "reports" / "results.md"
-if res_md.exists():
-    rows = {}
-    for line in res_md.read_text().splitlines():
-        mm = re.match(r"^\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|$", line)
-        if mm and mm.group(1) not in ("Check", "-----------"):
-            rows[mm.group(1)] = "pass" if "✅" in mm.group(2) else mm.group(2)
-    precheck["checks"] = rows
-klayout_ok = None
-if "checks" in precheck:
-    kl = {k: v for k, v in precheck["checks"].items() if k.startswith("KLayout")}
-    klayout_ok = bool(kl) and all(v == "pass" for v in kl.values())
-
-magic = count("magic__drc_error__count")
-route_drc = count("route__drc_errors")
-lvs = count("design__lvs_error__count")
-ant_nets = count("antenna__violating__nets")
-ant_pins = count("antenna__violating__pins")
-setup_vio = count("timing__setup_vio__count")
-hold_vio = count("timing__hold_vio__count")
-setup_ws = g("timing__setup__ws")
-hold_ws = g("timing__hold__ws")
-pgrid = count("design__power_grid_violation__count")
-disc = count("design__critical_disconnected_pin__count")
-overlap = count("magic__illegal_overlap__count")
-
-drc_clean = (magic == 0 and route_drc == 0 and klayout_ok is True)
-# Every check needs a completed flow: metrics from a run that died early (for example the
-# pre-PnR STA) say nothing about signoff.
-checks = {k: complete and v for k, v in {
-    "librelane_flow": True,
-    "magic_drc": magic == 0,
-    "route_drc": route_drc == 0,
-    "klayout_drc": klayout_ok is True,
-    "lvs": lvs == 0,
-    "antenna": ant_nets == 0 and ant_pins == 0,
-    "setup_all_corners": setup_vio == 0 and setup_ws is not None and setup_ws >= 0,
-    "hold_all_corners": hold_vio == 0 and hold_ws is not None and hold_ws >= 0,
-    "power_grid": pgrid == 0,
-    "disconnected_pins": disc == 0,
-    "illegal_overlap": overlap in (0, None),
-    "precheck": precheck["pass"],
-}.items()}
-if precheck_skipped:  # --no-precheck: KLayout DRC comes only from the precheck
-    checks["klayout_drc"] = None
-    checks["precheck"] = None
-summary = {
-    "pass": all(v for v in checks.values() if v is not None),
-    "complete": complete,
-    "drc": {"clean": drc_clean, "magic_errors": magic, "route_errors": route_drc,
-            "klayout_clean": klayout_ok,
-            "klayout_source": "TT precheck KLayout FEOL/BEOL/offgrid decks (TT's config sets RUN_KLAYOUT_DRC=0)"},
-    "lvs": {"clean": lvs == 0, "errors": lvs},
-    "antenna": {"clean": ant_nets == 0 and ant_pins == 0, "violating_nets": ant_nets,
-                "violating_pins": ant_pins},
-    "setup_wns": None if setup_ws is None else min(0.0, setup_ws),
-    "hold_wns": None if hold_ws is None else min(0.0, hold_ws),
-    "setup_ws": setup_ws, "hold_ws": hold_ws,
-    "setup_violations": setup_vio, "hold_violations": hold_vio,
-    "utilization": g("design__instance__utilization"),
-    "utilization_stdcell": g("design__instance__utilization__stdcell"),
-    "die_um2": g("design__die__area"),
-    "core_um2": g("design__core__area"),
-    "instance_area_um2": g("design__instance__area"),
-    "stdcell_area_um2": g("design__instance__area__stdcell"),
-    "instance_count": count("design__instance__count"),
-    "max_slew_violations": count("design__max_slew_violation__count"),
-    "max_cap_violations": count("design__max_cap_violation__count"),
-    "ir_drop_worst_v": g("ir__drop__worst"),
-    "power_grid_violations": pgrid,
-    "disconnected_pins": disc,
-    "wirelength_um": g("route__wirelength"),
-    "precheck": precheck,
-    "checks": checks,
-    "failure": failed_step,
-    "top": top,
-    "flow": "TT tt-gds-action@ttsky26d: tt-support-tools 01d5d281, LibreLane 3.0.14, sky130A",
-    "runtime_s": {"librelane": t_ll, "precheck": t_pre},
-    "run_dir": str(run),
-}
-(out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-print(json.dumps({k: summary[k] for k in ("pass", "checks", "setup_ws", "hold_ws",
-                  "utilization", "die_um2", "runtime_s")}, indent=1))
-if failed_step:
-    print("failure:", failed_step[-600:])
-PY
-
-PASS="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["pass"])' "$OUT/summary.json")"
-[ "$PASS" = "True" ] && exit 0 || exit 1
+# ---------------------------------------------------------------- summary and exit status
+LIB="$CIEL_ROOT/ciel/sky130/versions/$PDK_HASH/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+set +e; errtrap_off
+python3 -I "$REPO/tools/harden_summary.py" "$OUT" "$PROJ" "$TOP" "$LL_RC" "$SUB_RC" "$PRE_RC" \
+  "$((T1 - T0))" "$((T2 - T1))" "$LIB"
+set -e; errtrap_on
+# The exit status comes from the summary's status, never from the summarizer's own exit code:
+# a crash there must read as a tool error (2), not as a design failure (1).
+STATUS="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$OUT/summary.json" 2>/dev/null || echo missing)"
+case "$STATUS" in
+  pass) exit 0 ;;
+  fail) exit 1 ;;
+  *) echo "harden_tt.sh: tool error (status: $STATUS), see $OUT/summary.json" >&2; exit 2 ;;
+esac
