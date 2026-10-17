@@ -120,7 +120,8 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
 ## 3. Memory map
 
 - **Core region: RAM bytes 0xFF80-0xFFFF (128 bytes), in every 64 KB alias.** It is reserved for
-  the core's architectural state: x1..x15, the pc and core scratch, in any layout and bit order the
+  the core's architectural state: x1..x15, the pc and any other core state (for example the
+  fetched instruction word or parts of it, operand temporaries), in any layout and bit order the
   core likes. The core may also keep any of that state on the die instead.
   - A program fetch or data access that touches a region byte is UNSPECIFIED: the core may return
     or change its own state, but it must still retire or trap and halt (liveness applies). Checkers
