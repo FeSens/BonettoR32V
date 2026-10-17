@@ -18,7 +18,7 @@ first, then the smallest share of the real 1x1 tile that hardens clean. Speed is
 | 2 | The pins follow the SPI waveform rules (contract section 2), and every SPI transaction matches the RVFI-reported fetch, load or store | formal bus checks via the SPI monitor, cosim memory model |
 | 3 | GPIO behaves per contract section 3 | formal GPIO check, cosim |
 | 4 | Logic under `ifdef RISCV_FORMAL` only observes; the design without it behaves identically | equivalence gate (RVFI-stripped build equals plain build), plain-build cosim, gate-level test |
-| 5 | Registers live on the die; no hard-wired GPRs; no state in the SPI RAM other than program data | review and formal (reg check) |
+| 5 | Architectural state (x1..x15, pc) lives on the die or in the core region 0xFF80-0xFFFF of the SPI RAM (contract v2); no hard-wired GPRs; no other core state in RAM | review, formal (reg check with a real region memory), cosim |
 | 6 | The design doesn't rely on power-up values | cosim with random init (several seeds), gate-level X propagation |
 | 7 | Plain RTL, one posedge clock, no latches in v1 (contract section 1) | lint and review |
 | 8 | Every instruction retires within 1,024 cycles of the previous one | cosim watchdog, formal liveness |
@@ -51,7 +51,7 @@ this design pass". If a gate looks wrong, report it to the lead; don't route aro
 | `make gl` | gate-level test of the synthesized netlist |
 | `make equiv` | the RVFI-stripped build equals the plain build |
 | `make area` | the fast score: sky130 cell area, broken down |
-| `make eval` | every gate plus the score, writing `build/eval.json` |
+| `make eval` | every gate plus the score, cheapest first, writing `build/eval.json`; `MAX_AREA=<champion um2>` stops a candidate that isn't smaller right after the area gate |
 | `make harden` | TT 1x1 hardening (LibreLane) |
 | `make tilefit` | the physical score: the smallest fraction of the real 1x1 tile the design signs off in |
 

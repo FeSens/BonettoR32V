@@ -35,8 +35,10 @@ correct, smaller design counts.
 1. Implement the hypothesis. Keep RVFI under `` `ifdef RISCV_FORMAL `` purely observational:
    nothing that drives a pin may depend on it.
 2. Iterate with the fast gates: `make lint`, `make cosim`, `make area`.
-3. Before you report, run `make eval`, which runs every gate. All of them must pass, and
-   `area_um2` must be below {CHAMPION_AREA}.
+3. Before you report, run `make eval MAX_AREA={CHAMPION_AREA}`, which runs every gate, cheapest
+   first (lint, area, cosim, arch, equiv, gl, formal). All of them must pass, and `area_um2` must
+   be below {CHAMPION_AREA}. If the area isn't below it, eval stops after the area gate with
+   `no_gain` (exit 3). Then report NO_GAIN, or keep shrinking.
 4. If the idea doesn't pay, a negative result is a fine outcome. Report the measured area and why.
 5. Commit with `git -c commit.gpgsign=false commit`. Don't push, don't merge, don't touch main.
 6. Formal is heavy: run it under `lockf -k /tmp/bonetto-heavy.lock` (`make` does this).

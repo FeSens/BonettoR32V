@@ -1,0 +1,404 @@
+// MUTANT miso_sck_low (harness self-test, verif/cosim/test_cosim_harness.py): a copy of the
+// seed core (29861ce) with one deliberate bug. It must FAIL the cosim.
+// Bug: MISO is sampled while SCK is low (into a flop at the rising SCK edge), so it reads noise.
+/*
+ * BonettoR32V seed core (champion zero).
+ *
+ * A plain multi-cycle RV32E hart behind the Tiny Tapeout top module. Correctness first; the
+ * area loop shrinks it later. docs/contract.md is the interface, docs/seed.md describes this
+ * design (states, cycle counts, RVFI timing).
+ *
+ * Per instruction:
+ *   FETCH  one SPI READ of the 4 instruction bytes at pc[15:0]
+ *   EXEC   decode (strict), register read, 32-bit ALU and barrel shifter, branch/jump target
+ *   MEM    loads/stores with addr[31] = 0: one SPI READ or WRITE of 1, 2 or 4 bytes at the
+ *          exact byte address (sequential mode does misaligned and the 64 KB wrap for free);
+ *          addr[31] = 1 is GPIO and never touches SPI
+ *   WB     retire (rvfi_valid), write rd, pc and uo_out at the end of the cycle
+ *   HALT   after a fatal trap
+ *
+ * SPI: mode 0, SCK = clk/2 while a transaction runs. The shift register (and so MOSI) changes
+ * only on edges where SCK stays low (loading a transaction) or falls (shifting), never where it
+ * rises. MISO is captured on the falling edge, while it is still valid (SCK was high before).
+ * CS_n changes only on edges where SCK is low before and after.
+ *
+ * Copyright 2026 Felipe Sens Bonetto
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+`default_nettype none
+
+module tt_um_fesens_r32v (
+    input  wire [7:0]  ui_in,     // GPIO in
+    output wire [7:0]  uo_out,    // GPIO out
+    input  wire [7:0]  uio_in,    // uio[2] = SPI MISO
+    output wire [7:0]  uio_out,   // uio[0] = CS_n, uio[1] = MOSI, uio[3] = SCK
+    output wire [7:0]  uio_oe,
+    input  wire        ena,       // ignored
+    input  wire        clk,
+    input  wire        rst_n
+`ifdef RISCV_FORMAL
+    ,
+    output wire        rvfi_valid,
+    output wire [63:0] rvfi_order,
+    output wire [31:0] rvfi_insn,
+    output wire        rvfi_trap,
+    output wire        rvfi_halt,
+    output wire        rvfi_intr,
+    output wire [1:0]  rvfi_mode,
+    output wire [1:0]  rvfi_ixl,
+    output wire [4:0]  rvfi_rs1_addr,
+    output wire [4:0]  rvfi_rs2_addr,
+    output wire [31:0] rvfi_rs1_rdata,
+    output wire [31:0] rvfi_rs2_rdata,
+    output wire [4:0]  rvfi_rd_addr,
+    output wire [31:0] rvfi_rd_wdata,
+    output wire [31:0] rvfi_pc_rdata,
+    output wire [31:0] rvfi_pc_wdata,
+    output wire [31:0] rvfi_mem_addr,
+    output wire [3:0]  rvfi_mem_rmask,
+    output wire [3:0]  rvfi_mem_wmask,
+    output wire [31:0] rvfi_mem_rdata,
+    output wire [31:0] rvfi_mem_wdata
+`endif
+);
+
+    // ------------------------------------------------------------------------------------
+    // State
+    // ------------------------------------------------------------------------------------
+    localparam [3:0] S_FETCH = 4'd0,   // CS_n high; the next edge starts the fetch READ
+                     S_FSPI  = 4'd1,   // fetch transaction: 8 + 16 + 32 bits
+                     S_FEND  = 4'd2,   // SCK low after the last bit; next edge: CS_n high, ir
+                     S_EXEC  = 4'd3,   // decode and execute; start a RAM access or sample GPIO
+                     S_MSPI  = 4'd4,   // data transaction: 8 + 16 + 8n bits
+                     S_MEND  = 4'd5,   // next edge: CS_n high
+                     S_MGAP  = 4'd6,   // CS_n high for a whole cycle before retirement
+                     S_WB    = 4'd7,   // retire; rd, pc and uo_out update at the next edge
+                     S_HALT  = 4'd8;   // after a fatal trap: never leaves (until reset)
+
+    reg  [3:0]  state;
+    reg         cs_n;
+    reg         sck;
+    reg  [55:0] sr;          // SPI shift register: {command, address, data}, MSB out first
+    reg  [5:0]  bitcnt;      // bits left in the transaction, minus one
+    reg  [31:0] ir;          // instruction register
+    reg  [31:0] pc;
+    reg  [7:0]  gpio_out;
+    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero
+
+    reg  miso_q;   // MUTANT: sampled at the edge where SCK rises
+    always @(posedge clk) if (!sck) miso_q <= uio_in[2];
+    wire miso = miso_q;
+    // MOSI is 0 whenever CS_n is high (also during reset, before sr is ever loaded)
+    wire mosi = sr[55] & ~cs_n;
+
+    assign uo_out  = gpio_out;
+    assign uio_out = {4'b0000, sck, 1'b0, mosi, cs_n};
+    assign uio_oe  = 8'b0000_1011;
+
+    wire _unused = &{ena, uio_in[7:3], uio_in[1:0], 1'b0};
+
+    // ------------------------------------------------------------------------------------
+    // Decode (ir is stable from EXEC through WB)
+    // ------------------------------------------------------------------------------------
+    wire [6:0] opcode = ir[6:0];
+    wire [4:0] rd     = ir[11:7];
+    wire [2:0] funct3 = ir[14:12];
+    wire [4:0] rs1    = ir[19:15];
+    wire [4:0] rs2    = ir[24:20];
+    wire [6:0] funct7 = ir[31:25];
+
+    wire is_lui    = (opcode == 7'b0110111);
+    wire is_auipc  = (opcode == 7'b0010111);
+    wire is_jal    = (opcode == 7'b1101111);
+    wire is_jalr   = (opcode == 7'b1100111);
+    wire is_branch = (opcode == 7'b1100011);
+    wire is_load   = (opcode == 7'b0000011);
+    wire is_store  = (opcode == 7'b0100011);
+    wire is_opimm  = (opcode == 7'b0010011);
+    wire is_op     = (opcode == 7'b0110011);
+    wire is_fence  = (opcode == 7'b0001111);
+
+    wire f7_zero = (funct7 == 7'b0000000);
+    wire f7_alt  = (funct7 == 7'b0100000);
+
+    // Strict decoding: anything that is not an RV32E instruction takes the trap path.
+    wire ok_jalr   = is_jalr & (funct3 == 3'b000);
+    wire ok_branch = is_branch & (funct3[2:1] != 2'b01);                       // not 010, 011
+    wire ok_load   = is_load & (funct3 != 3'b011) & (funct3[2:1] != 2'b11);    // 000 001 010 100 101
+    wire ok_store  = is_store & ~funct3[2] & (funct3[1:0] != 2'b11);           // 000 001 010
+    wire ok_opimm  = is_opimm & ((funct3 == 3'b001) ? f7_zero :
+                                 (funct3 == 3'b101) ? (f7_zero | f7_alt) : 1'b1);
+    wire ok_op     = is_op & (f7_zero | (f7_alt & ((funct3 == 3'b000) | (funct3 == 3'b101))));
+    wire ok_fence  = is_fence & (funct3 == 3'b000);   // FENCE ignores its rd/rs1 fields
+
+    wire uses_rd  = is_lui | is_auipc | is_jal | is_jalr | is_load | is_opimm | is_op;
+    wire uses_rs1 = is_jalr | is_branch | is_load | is_store | is_opimm | is_op;
+    wire uses_rs2 = is_branch | is_store | is_op;
+    wire regs_ok  = ~(uses_rd & rd[4]) & ~(uses_rs1 & rs1[4]) & ~(uses_rs2 & rs2[4]);
+
+    wire legal = regs_ok & (is_lui | is_auipc | is_jal | ok_jalr | ok_branch | ok_load |
+                            ok_store | ok_opimm | ok_op | ok_fence);
+
+    // ------------------------------------------------------------------------------------
+    // Register read, immediates
+    // ------------------------------------------------------------------------------------
+    wire [31:0] rs1_val = (rs1[3:0] == 4'd0) ? 32'd0 : regs[rs1[3:0]];
+    wire [31:0] rs2_val = (rs2[3:0] == 4'd0) ? 32'd0 : regs[rs2[3:0]];
+
+    wire [31:0] imm_i = {{20{ir[31]}}, ir[31:20]};
+    wire [31:0] imm_s = {{20{ir[31]}}, ir[31:25], ir[11:7]};
+    wire [31:0] imm_b = {{20{ir[31]}}, ir[7], ir[30:25], ir[11:8], 1'b0};
+    wire [31:0] imm_u = {ir[31:12], 12'd0};
+    wire [31:0] imm_j = {{12{ir[31]}}, ir[19:12], ir[20], ir[30:21], 1'b0};
+
+    // ------------------------------------------------------------------------------------
+    // ALU (OP and OP-IMM) with a barrel shifter
+    // ------------------------------------------------------------------------------------
+    wire [31:0] alu_b   = is_op ? rs2_val : imm_i;
+    wire        alu_sub = is_op & ir[30];
+    wire [31:0] alu_add = alu_sub ? (rs1_val - alu_b) : (rs1_val + alu_b);
+    wire        lt_s    = $signed(rs1_val) < $signed(alu_b);
+    wire        lt_u    = rs1_val < alu_b;
+    wire [4:0]  shamt   = alu_b[4:0];
+    wire [31:0] sh_sll  = rs1_val << shamt;
+    wire [31:0] sh_srl  = rs1_val >> shamt;
+    wire [31:0] sh_sra  = $signed(rs1_val) >>> shamt;   // own wire: keeps the shift signed
+
+    reg [31:0] alu_res;
+    always @(*) begin
+        case (funct3)
+            3'b000:  alu_res = alu_add;
+            3'b001:  alu_res = sh_sll;
+            3'b010:  alu_res = {31'd0, lt_s};
+            3'b011:  alu_res = {31'd0, lt_u};
+            3'b100:  alu_res = rs1_val ^ alu_b;
+            3'b101:  alu_res = ir[30] ? sh_sra : sh_srl;
+            3'b110:  alu_res = rs1_val | alu_b;
+            default: alu_res = rs1_val & alu_b;
+        endcase
+    end
+
+    // ------------------------------------------------------------------------------------
+    // Branches, jumps, next pc, traps
+    // ------------------------------------------------------------------------------------
+    wire br_eq  = (rs1_val == rs2_val);
+    wire br_lt  = $signed(rs1_val) < $signed(rs2_val);
+    wire br_ltu = rs1_val < rs2_val;
+    reg  br_cmp;
+    always @(*) begin
+        case (funct3[2:1])
+            2'b00:   br_cmp = br_eq;
+            2'b10:   br_cmp = br_lt;
+            2'b11:   br_cmp = br_ltu;
+            default: br_cmp = 1'b0;
+        endcase
+    end
+    wire br_taken = is_branch & (br_cmp ^ funct3[0]);
+
+    wire [31:0] pc_plus4 = pc + 32'd4;
+    wire [31:0] pc_rel   = pc + (is_jal ? imm_j : is_branch ? imm_b : imm_u);
+    wire [31:0] mem_addr = rs1_val + (is_store ? imm_s : imm_i);   // also the JALR sum
+    wire [31:0] npc      = is_jalr ? {mem_addr[31:1], 1'b0} :
+                           (is_jal | br_taken) ? pc_rel : pc_plus4;
+
+    wire misaligned = (is_jal | is_jalr | br_taken) & npc[1];
+    wire trap       = ~legal | misaligned;
+
+    // ------------------------------------------------------------------------------------
+    // Memory access: sizes, byte order, GPIO
+    // ------------------------------------------------------------------------------------
+    // sr[31:0] after an n-byte READ holds the first byte in its top used byte:
+    // n=1: sr[7:0] = b0; n=2: sr[15:0] = {b0, b1}; n=4: sr[31:0] = {b0, b1, b2, b3}.
+    // swap_n converts between that layout and the LSB-aligned little-endian value (both ways).
+    function [31:0] swap_n;
+        input [1:0]  size;   // funct3[1:0]: 00 byte, 01 half, 10 word
+        input [31:0] x;
+        begin
+            case (size)
+                2'b00:   swap_n = {24'd0, x[7:0]};
+                2'b01:   swap_n = {16'd0, x[7:0], x[15:8]};
+                default: swap_n = {x[7:0], x[15:8], x[23:16], x[31:24]};
+            endcase
+        end
+    endfunction
+
+    wire [1:0]  msize    = funct3[1:0];
+    wire        is_io    = mem_addr[31];
+    wire [31:0] load_raw   = swap_n(msize, sr[31:0]);   // LSB-aligned load bytes
+    wire [31:0] fetch_word = swap_n(2'b10, sr[31:0]);   // the fetched instruction
+    reg  [31:0] load_val;
+    always @(*) begin
+        case (funct3)
+            3'b000:  load_val = {{24{load_raw[7]}}, load_raw[7:0]};
+            3'b001:  load_val = {{16{load_raw[15]}}, load_raw[15:0]};
+            default: load_val = load_raw;   // LW, LBU, LHU (upper bytes already zero)
+        endcase
+    end
+
+    // GPIO: byte k of the access is at X = addr + k. Only X[1:0] = 0 maps to ui_in / uo_out,
+    // so at most one byte of the access hits: k = (0 - addr[1:0]) mod 4, if k < n.
+    wire [1:0]  io_k     = 2'd0 - mem_addr[1:0];
+    wire        io_hit   = (io_k == 2'd0) | ((msize == 2'b01) & (io_k == 2'd1)) |
+                           (msize == 2'b10);
+    wire [31:0] io_le    = io_hit ? ({24'd0, ui_in} << {io_k, 3'b000}) : 32'd0;
+    wire [31:0] io_sr    = swap_n(msize, io_le);       // GPIO load data in the READ layout
+    wire        io_write = ~trap & is_store & is_io & io_hit;
+    reg  [7:0]  io_wbyte;    // byte k of the store data
+    always @(*) begin
+        case (io_k)
+            2'd0:    io_wbyte = rs2_val[7:0];
+            2'd1:    io_wbyte = rs2_val[15:8];
+            2'd2:    io_wbyte = rs2_val[23:16];
+            default: io_wbyte = rs2_val[31:24];
+        endcase
+    end
+
+    // ------------------------------------------------------------------------------------
+    // Register write-back value
+    // ------------------------------------------------------------------------------------
+    wire [31:0] rd_wdata = is_lui              ? imm_u    :
+                           is_auipc            ? pc_rel   :
+                           (is_jal | is_jalr)  ? pc_plus4 :
+                           is_load             ? load_val : alu_res;
+    wire        rd_we    = ~trap & uses_rd & (rd[3:0] != 4'd0);
+
+    // Bit count for a data transaction, minus one: 24 + 8n - 1
+    wire [5:0] mem_bits = (msize == 2'b00) ? 6'd31 : (msize == 2'b01) ? 6'd39 : 6'd55;
+
+    // ------------------------------------------------------------------------------------
+    // Control: the only flops with a reset
+    // ------------------------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            state    <= S_FETCH;
+            cs_n     <= 1'b1;
+            sck      <= 1'b0;
+            pc       <= 32'd0;
+            gpio_out <= 8'd0;
+        end else begin
+            case (state)
+                S_FETCH: begin
+                    cs_n  <= 1'b0;
+                    state <= S_FSPI;
+                end
+                S_FSPI, S_MSPI: begin
+                    sck <= ~sck;
+                    if (sck && bitcnt == 6'd0)
+                        state <= (state == S_FSPI) ? S_FEND : S_MEND;
+                end
+                S_FEND: begin
+                    cs_n  <= 1'b1;
+                    state <= S_EXEC;
+                end
+                S_EXEC: begin
+                    if (trap) begin
+                        state <= S_WB;
+                    end else if ((is_load | is_store) & ~is_io) begin
+                        cs_n  <= 1'b0;
+                        state <= S_MSPI;
+                    end else begin
+                        state <= S_WB;
+                    end
+                end
+                S_MEND: begin
+                    cs_n  <= 1'b1;
+                    state <= S_MGAP;
+                end
+                S_MGAP: state <= S_WB;
+                S_WB: begin
+                    pc <= npc;
+                    if (io_write)
+                        gpio_out <= io_wbyte;
+                    state <= trap ? S_HALT : S_FETCH;
+                end
+                default: state <= state;   // S_HALT
+            endcase
+        end
+    end
+
+    // ------------------------------------------------------------------------------------
+    // Datapath: no reset (power-up values are never used before being loaded)
+    // ------------------------------------------------------------------------------------
+    always @(posedge clk) begin
+        case (state)
+            S_FETCH: begin
+                sr     <= {8'h03, pc[15:0], 32'd0};
+                bitcnt <= 6'd55;
+            end
+            S_FSPI, S_MSPI: begin
+                if (sck) begin
+                    // MISO is valid while SCK is high; capture it as SCK falls. While
+                    // bitcnt >= 32 (the header of a 56-bit transaction) shift in 0 instead, so
+                    // MOSI never echoes MISO noise back while CS_n is low.
+                    sr     <= {sr[54:0], miso & ~bitcnt[5]};
+                    bitcnt <= bitcnt - 6'd1;
+                end
+            end
+            S_FEND: ir <= fetch_word;
+            S_EXEC: begin
+                if (is_load | is_store) begin
+                    if (~is_io) begin
+                        // command, address, then the store bytes in address order
+                        sr     <= {is_store ? 8'h02 : 8'h03, mem_addr[15:0],
+                                   rs2_val[7:0], rs2_val[15:8], rs2_val[23:16], rs2_val[31:24]};
+                        bitcnt <= mem_bits;
+                    end else begin
+                        // GPIO load: sample ui_in now, in the READ layout
+                        sr[31:0] <= io_sr;
+                    end
+                end
+            end
+            S_WB: begin
+                if (rd_we)
+                    regs[rd[3:0]] <= rd_wdata;
+            end
+            default: ;
+        endcase
+    end
+
+    // ------------------------------------------------------------------------------------
+    // RVFI (formal and cosim builds only; observes, never drives the pins)
+    // ------------------------------------------------------------------------------------
+`ifdef RISCV_FORMAL
+    reg [63:0] order_q;
+    always @(posedge clk) begin
+        if (!rst_n)
+            order_q <= 64'd0;
+        else if (state == S_WB)
+            order_q <= order_q + 64'd1;
+    end
+
+    wire        r_rs1  = legal & uses_rs1;
+    wire        r_rs2  = legal & uses_rs2;
+    wire        r_mem  = ~trap & (is_load | is_store);
+    wire [3:0]  r_mask = (msize == 2'b00) ? 4'b0001 : (msize == 2'b01) ? 4'b0011 : 4'b1111;
+    wire [31:0] r_wdat = (msize == 2'b00) ? {24'd0, rs2_val[7:0]}  :
+                         (msize == 2'b01) ? {16'd0, rs2_val[15:0]} : rs2_val;
+
+    assign rvfi_valid     = (state == S_WB);
+    assign rvfi_order     = order_q;
+    assign rvfi_insn      = ir;
+    assign rvfi_trap      = trap;
+    assign rvfi_halt      = trap;
+    assign rvfi_intr      = 1'b0;
+    assign rvfi_mode      = 2'd3;
+    assign rvfi_ixl       = 2'd1;
+    assign rvfi_rs1_addr  = r_rs1 ? rs1 : 5'd0;
+    assign rvfi_rs2_addr  = r_rs2 ? rs2 : 5'd0;
+    assign rvfi_rs1_rdata = r_rs1 ? rs1_val : 32'd0;
+    assign rvfi_rs2_rdata = r_rs2 ? rs2_val : 32'd0;
+    assign rvfi_rd_addr   = rd_we ? rd : 5'd0;
+    assign rvfi_rd_wdata  = rd_we ? rd_wdata : 32'd0;
+    assign rvfi_pc_rdata  = pc;
+    assign rvfi_pc_wdata  = npc;
+    assign rvfi_mem_addr  = r_mem ? mem_addr : 32'd0;
+    assign rvfi_mem_rmask = (r_mem & is_load) ? r_mask : 4'd0;
+    assign rvfi_mem_wmask = (r_mem & is_store) ? r_mask : 4'd0;
+    assign rvfi_mem_rdata = (r_mem & is_load) ? load_raw : 32'd0;
+    assign rvfi_mem_wdata = (r_mem & is_store) ? r_wdat : 32'd0;
+`endif
+
+endmodule
+
+`default_nettype wire
