@@ -2,7 +2,7 @@
  "prog": "gpio_demo",
  "kind": "iss",
  "result_gpio": 90,
- "retired": 350,
+ "retired": 410,
  "end": "selfloop",
  "end_pc": 188,
  "uo_trace": [

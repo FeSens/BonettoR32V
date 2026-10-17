@@ -28,6 +28,7 @@ module tb_slot ();
   wire [7:0] uo_out;
   wire [7:0] uio_out;
   wire [7:0] uio_oe;
+  wire [23:0] outs = {uo_out, uio_out, uio_oe};  // one read per sample in test.py
 `ifdef GL_TEST
 `ifndef NO_POWER_PINS
   wire VPWR = 1'b1;

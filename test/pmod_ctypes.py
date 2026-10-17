@@ -48,6 +48,15 @@ def _load():
         lib.pmod_error.argtypes = [ctypes.c_void_p]
         lib.pmod_free.restype = None
         lib.pmod_free.argtypes = [ctypes.c_void_p]
+        lib.pmod_psram_write_count.restype = ctypes.c_uint64
+        lib.pmod_psram_write_count.argtypes = [ctypes.c_void_p]
+        lib.pmod_psram_write.restype = ctypes.c_int
+        lib.pmod_psram_write.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
+                                         ctypes.POINTER(ctypes.c_uint64),
+                                         ctypes.POINTER(ctypes.c_uint32),
+                                         ctypes.POINTER(ctypes.c_uint8)]
+        lib.pmod_psram_byte.restype = ctypes.c_uint8
+        lib.pmod_psram_byte.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         _lib = lib
     return _lib
 
@@ -100,6 +109,24 @@ class Pmod:
 
     def error(self) -> str:
         return self._lib.pmod_error(self._p).decode()
+
+    def write_count(self) -> int:
+        """The number of PSRAM bytes written so far."""
+        return self._lib.pmod_psram_write_count(self._p)
+
+    def writes(self, start: int = 0):
+        """[(clk edge, 23-bit address, byte)] of the PSRAM writes from index `start` on."""
+        t, a, d = ctypes.c_uint64(), ctypes.c_uint32(), ctypes.c_uint8()
+        out, i = [], start
+        while self._lib.pmod_psram_write(self._p, i, ctypes.byref(t), ctypes.byref(a),
+                                         ctypes.byref(d)):
+            out.append((t.value, a.value, d.value))
+            i += 1
+        return out
+
+    def psram_byte(self, a: int) -> int:
+        """The PSRAM's current byte at a[22:0]."""
+        return self._lib.pmod_psram_byte(self._p, a)
 
     def close(self):
         if self._p:

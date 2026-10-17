@@ -12,7 +12,9 @@
 #
 # The QSPI Pmod is the C++ model of the cosim (verif/cosim/pmod.h) loaded through ctypes
 # (pmod_ctypes.py) from build/cosim/libpmod.so, which this Makefile (re)builds with the C++
-# compiler when pmod.h or pmod_capi.cpp is newer (the command of verif/cosim/build.sh).
+# compiler (PMOD_CXX, default c++) when pmod.h or pmod_capi.cpp is newer (the command of
+# verif/cosim/build.sh). Unit tests of the test's Python models, no simulator:
+# python3 -m pytest test/test_tbmodels.py
 
 # defaults
 SIM ?= icarus
@@ -97,8 +99,9 @@ endif
 # include cocotb's make rules to take care of the simulator setup
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-# After the include, so that cocotb's default goal stays the default.
-CXX ?= c++
+# After the include, so that cocotb's default goal stays the default. build.sh compiles with c++
+# (CXX there; make predefines CXX = g++, so this one has its own name).
+PMOD_CXX ?= c++
 $(PMOD_LIB): $(COSIM_DIR)/pmod_capi.cpp $(COSIM_DIR)/pmod.h
 	mkdir -p $(dir $@)
-	$(CXX) -O2 -std=c++17 -Wall -Wextra -I$(COSIM_DIR) -fPIC -shared $< -o $@
+	$(PMOD_CXX) -O2 -std=c++17 -Wall -Wextra -I$(COSIM_DIR) -fPIC -shared $< -o $@
