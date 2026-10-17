@@ -897,6 +897,21 @@ def run_remote(args, host):
     formal runs don't stack); build/formal.json and the task logs come back; the remote
     run dir is always deleted. Returns the remote exit code."""
     import tempfile
+
+    # SIGTERM/SIGINT/SIGHUP at any point (staging, rsync, the run) unwind through the
+    # cleanup below, so the remote run dir never outlives an interrupted run.
+    def _stop(*_):
+        raise KeyboardInterrupt
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _stop)
+    try:
+        return _run_remote(args, host, tempfile)
+    except KeyboardInterrupt:
+        log("remote: interrupted; the remote run dir was removed")
+        return 130
+
+
+def _run_remote(args, host, tempfile):
     run_id = f"run-{os.uname().nodename.split('.')[0]}-{os.getpid()}-{int(time.time())}"
     rdir = f"{REMOTE_BASE}/{run_id}"
     local_logs = os.path.join(ROOT, "build", "formal", f"remote-{run_id}")
@@ -955,11 +970,6 @@ def run_remote(args, host):
             # -tt: closing this ssh hangs up the remote run, which then stops its SBY tasks
             # (SIGHUP handler). On SIGTERM/SIGINT/SIGHUP here: close it, then clean up.
             sshp = subprocess.Popen(ssh[:1] + ["-tt"] + ssh[1:] + [rcmd])
-
-            def _stop(*_):
-                raise KeyboardInterrupt
-            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                signal.signal(sig, _stop)
             try:
                 rc = sshp.wait()
             except KeyboardInterrupt:
