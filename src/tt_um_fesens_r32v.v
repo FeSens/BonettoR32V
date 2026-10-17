@@ -105,7 +105,9 @@ module tt_um_fesens_r32v (
     wire miso_m  = uio_in[2] & ~cs_n;   // 0 in a masked (x0) slot
 
     // ------------------------------------------------------------------------------------
-    // Decode (strict legality, as hypothesis 001)
+    // Decode. Only the contract's fatal traps trap (contract section 4): SYSTEM (ECALL, EBREAK),
+    // the all-zeros and all-ones words, and misaligned JAL. Every other reserved encoding is
+    // unspecified and executes as the class its opcode bits select; register fields use 4 bits.
     // ------------------------------------------------------------------------------------
     wire [31:0] insn  = {irs[7:0], irs[15:8], irs[23:16], irs[31:24]};
     wire [2:0]  f3    = insn[14:12];
@@ -114,7 +116,6 @@ module tt_um_fesens_r32v (
     wire [3:0]  rs2_f = insn[23:20];
 
     wire [6:0] opcode   = insn[6:0];
-    wire [6:0] funct7   = insn[31:25];
     wire is_lui    = (opcode == 7'b0110111);
     wire is_auipc  = (opcode == 7'b0010111);
     wire is_jal    = (opcode == 7'b1101111);
@@ -125,22 +126,10 @@ module tt_um_fesens_r32v (
     wire is_opimm  = (opcode == 7'b0010011);
     wire is_op     = (opcode == 7'b0110011);
     wire is_fence  = (opcode == 7'b0001111);
-    wire f7_zero   = (funct7 == 7'b0000000);
-    wire f7_alt    = (funct7 == 7'b0100000);
-    wire ok_jalr   = is_jalr & (f3 == 3'b000);
-    wire ok_branch = is_branch & (f3[2:1] != 2'b01);
-    wire ok_load   = is_load & (f3 != 3'b011) & (f3[2:1] != 2'b11);
-    wire ok_store  = is_store & ~f3[2] & (f3[1:0] != 2'b11);
-    wire ok_opimm  = is_opimm & ((f3 == 3'b001) ? f7_zero :
-                                 (f3 == 3'b101) ? (f7_zero | f7_alt) : 1'b1);
-    wire ok_op     = is_op & (f7_zero | (f7_alt & ((f3 == 3'b000) | (f3 == 3'b101))));
-    wire ok_fence  = is_fence & (f3 == 3'b000);
     wire uses_rd   = is_lui | is_auipc | is_jal | is_jalr | is_load | is_opimm | is_op;
     wire uses_rs1  = is_jalr | is_branch | is_load | is_store | is_opimm | is_op;
     wire uses_rs2  = is_branch | is_store | is_op;
-    wire regs_ok   = ~(uses_rd & insn[11]) & ~(uses_rs1 & insn[19]) & ~(uses_rs2 & insn[24]);
-    wire legal     = regs_ok & (is_lui | is_auipc | is_jal | ok_jalr | ok_branch | ok_load |
-                                ok_store | ok_opimm | ok_op | ok_fence);
+    wire legal     = uses_rd | uses_rs1 | is_fence;   // a known opcode
     wire trap_dec  = ~legal | (is_jal & insn[21]);
 
     // Datapath classes (legal instructions only)
@@ -557,11 +546,11 @@ module tt_um_fesens_r32v (
     assign rvfi_intr      = 1'b0;
     assign rvfi_mode      = 2'd3;
     assign rvfi_ixl       = 2'd1;
-    assign rvfi_rs1_addr  = r_rs1e ? insn[19:15] : 5'd0;
-    assign rvfi_rs2_addr  = r_rs2e ? insn[24:20] : 5'd0;
+    assign rvfi_rs1_addr  = r_rs1e ? {1'b0, rs1_f} : 5'd0;
+    assign rvfi_rs2_addr  = r_rs2e ? {1'b0, rs2_f} : 5'd0;
     assign rvfi_rs1_rdata = r_rs1e ? r_rs1 : 32'd0;
     assign rvfi_rs2_rdata = r_rs2e ? r_rs2 : 32'd0;
-    assign rvfi_rd_addr   = r_rde ? insn[11:7] : 5'd0;
+    assign rvfi_rd_addr   = r_rde ? {1'b0, rd_f} : 5'd0;
     assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;
     assign rvfi_pc_rdata  = r_pc;
     assign rvfi_pc_wdata  = trap ? npc_t : pcv;
