@@ -54,7 +54,7 @@ list:
 $(OUT) $(SPIKEOUT) $(ROOT)/build/cosim:
 	mkdir -p $@
 
-$(ISS): $(ROOT)/verif/cosim/iss_main.cpp $(ROOT)/verif/cosim/iss.h | $(ROOT)/build/cosim
+$(ISS): $(ROOT)/verif/cosim/iss_main.cpp $(ROOT)/verif/cosim/iss.h $(ROOT)/verif/cosim/iss3.h | $(ROOT)/build/cosim
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ $<
 
 # ---- ELF builds -------------------------------------------------------------------------------

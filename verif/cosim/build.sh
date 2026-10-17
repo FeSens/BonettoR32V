@@ -2,6 +2,7 @@
 # Build the cosim harness against a design.
 #
 #   verif/cosim/build.sh MODE [SRC_DIR] [OUT_DIR]
+#   verif/cosim/build.sh            (no MODE: only the support tools, see below)
 #
 # MODE is rvfi (design built with RISCV_FORMAL, RVFI compared every retirement) or pins (the plain
 # design). SRC_DIR defaults to src/. Every SRC_DIR/*.v file is part of the design (contract
@@ -14,6 +15,17 @@
 # power-up value at run time from its --seed, so a design that relies on zero-initialized state
 # fails.
 set -euo pipefail
+
+# Support tools (no MODE argument), built without a design:
+#   build/cosim/iss_main   the reference ISS runner (v2 by default, contract v3 with --v3)
+if [ $# -eq 0 ]; then
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  mkdir -p "$ROOT/build/cosim"
+  "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -I"$ROOT/verif/cosim" \
+    -o "$ROOT/build/cosim/iss_main" "$ROOT/verif/cosim/iss_main.cpp"
+  echo "built $ROOT/build/cosim/iss_main"
+  exit 0
+fi
 
 MODE="${1:?usage: build.sh rvfi|pins [SRC_DIR] [OUT_DIR]}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
