@@ -2,32 +2,32 @@
 `timescale 1ns / 1ps
 
 /*
- * Tiny Tapeout testbench: tt_um_fesens_r32v with the 23LC512 SPI RAM model on uio (contract
- * section 1: uio[0] CS_n, uio[1] MOSI, uio[2] MISO, uio[3] SCK). test.py drives clk, rst_n, ena
- * and ui_in and checks uo_out.
+ * Tiny Tapeout testbench for tt_um_fesens_r32v, contract v3 (docs/contract-v3.md).
+ *
+ * The TT QSPI Pmod (flash on uio[0], SD0/SD1 on uio[1:2], SCK on uio[3], SD2/SD3 on uio[4:5],
+ * PSRAM A on uio[6], PSRAM B CS_n on uio[7]) is not a Verilog model: test.py runs the C++ chip
+ * models (verif/cosim/pmod.h) through ctypes (pmod_ctypes.py), feeds them uio_out/uio_oe once per
+ * clock and drives uio_in from them, as the cosim harness does.
+ *
+ * Each cocotb test gets its own copy of the design (a slot: s0, s1, ...), so every test starts
+ * from Icarus X power-up (no initial values anywhere, contract 1). A slot whose clock never
+ * toggles costs nothing, so the idle copies don't slow the active one down.
  *
  * Gate level: GL_TEST. TT's CI netlist has VPWR/VGND ports (the Makefile defines USE_POWER_PINS);
  * an unpowered synthesis netlist has none (the Makefile defines NO_POWER_PINS).
+ *
+ * Waves: `make WAVES=1` (cocotb's own dump: sim_build/<rtl|gl>/tb.fst). Off by default: the runs
+ * are long and the files big.
  */
-module tb ();
-
-  // Dump the signals to a FST file. You can view it with gtkwave or surfer.
-  initial begin
-    $dumpfile("tb.fst");
-    $dumpvars(0, tb);
-    #1;
-  end
-
+module tb_slot ();
   reg clk;
   reg rst_n;
   reg ena;
   reg [7:0] ui_in;
+  reg [7:0] uio_in;  // from the Pmod model, set by test.py at every falling clk edge
   wire [7:0] uo_out;
   wire [7:0] uio_out;
   wire [7:0] uio_oe;
-  wire miso;
-  // The unused uio inputs are X: a design that reads them fails.
-  wire [7:0] uio_in = {5'bxxxxx, miso, 2'bxx};
 `ifdef GL_TEST
 `ifndef NO_POWER_PINS
   wire VPWR = 1'b1;
@@ -52,14 +52,13 @@ module tb ();
       .clk    (clk),      // clock
       .rst_n  (rst_n)     // not reset
   );
+endmodule
 
-  spiram_23lc512 #(.HEX("gpio_demo.hex")) ram (
-      .clk  (clk),
-      .rst_n(rst_n),
-      .cs_n (uio_out[0]),
-      .sck  (uio_out[3]),
-      .mosi (uio_out[1]),
-      .miso (miso)
-  );
-
+module tb ();
+  // one slot per cocotb test (test.py SLOTS)
+  tb_slot s0 ();
+  tb_slot s1 ();
+  tb_slot s2 ();
+  tb_slot s3 ();
+  tb_slot s4 ();
 endmodule

@@ -1,28 +1,36 @@
 # Makefile
 # See https://docs.cocotb.org/en/stable/quickstart.html for more info
 #
-#   make                                  RTL simulation of src/ (info.yaml source_files)
+#   make                                  RTL simulation of every top-level src/*.v
+#   make SRC_DIR=<dir>                    RTL simulation of another design directory (*.v in it)
 #   make GATES=yes                        gate level on gate_level_netlist.v
 #   make GATES=yes GL_NETLIST=<file>      gate level on another netlist file
+#   make WAVES=1                          also dump tb.fst (cocotb's dump, in sim_build/)
 # The netlist may have power pins (TT's CI) or not (an unpowered synthesis netlist); the Makefile
 # looks for VPWR in it and defines USE_POWER_PINS or NO_POWER_PINS. The cell models come from
 # $(PDK_ROOT)/$(PDK) (PDK defaults to sky130A; locally PDK_ROOT=~/.ciel).
+#
+# The QSPI Pmod is the C++ model of the cosim (verif/cosim/pmod.h) loaded through ctypes
+# (pmod_ctypes.py) from build/cosim/libpmod.so, which this Makefile (re)builds with the C++
+# compiler when pmod.h or pmod_capi.cpp is newer (the command of verif/cosim/build.sh).
 
 # defaults
 SIM ?= icarus
 TOPLEVEL_LANG ?= verilog
-SRC_DIR = $(CURDIR)/../src
+ROOT := $(abspath $(CURDIR)/..)
+SRC_DIR ?= $(ROOT)/src
 PDK ?= sky130A
-# The design files, from info.yaml's source_files list
-PROJECT_SOURCES := $(shell awk '/^[[:space:]]*source_files:/ {f = 1; next} \
-  f && /^[[:space:]]*-/ {s = $$0; sub(/^[[:space:]]*-[[:space:]]*/, "", s); sub(/[[:space:]]*\#.*/, "", s); \
-  gsub(/"/, "", s); print s; next} f && !/^[[:space:]]*(\#|$$)/ {f = 0}' $(CURDIR)/../info.yaml)
 
 ifneq ($(GATES),yes)
 
-# RTL simulation:
+# RTL simulation: every top-level *.v in SRC_DIR is part of the design (contract section 1), in
+# byte order like verif/cosim/build.sh.
 SIM_BUILD				= sim_build/rtl
-VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
+PROJECT_SOURCES := $(sort $(wildcard $(abspath $(SRC_DIR))/*.v))
+ifeq ($(PROJECT_SOURCES),)
+$(error no Verilog sources in $(SRC_DIR))
+endif
+VERILOG_SOURCES += $(PROJECT_SOURCES)
 
 else
 
@@ -50,7 +58,6 @@ endif
 endif
 
 # Include the testbench sources:
-VERILOG_SOURCES += $(CURDIR)/spiram_23lc512.v
 VERILOG_SOURCES += $(CURDIR)/tb.v
 COCOTB_TOPLEVEL = tb
 
@@ -65,6 +72,12 @@ $(shell mkdir -p $(SIM_BUILD) && echo '$(VERILOG_SOURCES) $(COMPILE_ARGS)' > $(I
   (cmp -s $(INPUTS_STAMP).new $(INPUTS_STAMP) || mv $(INPUTS_STAMP).new $(INPUTS_STAMP)); \
   rm -f $(INPUTS_STAMP).new)
 CUSTOM_COMPILE_DEPS += $(INPUTS_STAMP)
+
+# The Pmod model library (pmod_ctypes.py loads it; PMOD_LIB=<path> overrides the path).
+COSIM_DIR := $(ROOT)/verif/cosim
+PMOD_LIB ?= $(ROOT)/build/cosim/libpmod.so
+export PMOD_LIB
+CUSTOM_SIM_DEPS += $(PMOD_LIB)
 
 # oss-cad-suite's bin/vvp is a wrapper script that points PYTHONHOME at oss-cad-suite's own
 # Python, so cocotb's embedded interpreter can't start ("Failed to import encodings module").
@@ -83,3 +96,9 @@ endif
 
 # include cocotb's make rules to take care of the simulator setup
 include $(shell cocotb-config --makefiles)/Makefile.sim
+
+# After the include, so that cocotb's default goal stays the default.
+CXX ?= c++
+$(PMOD_LIB): $(COSIM_DIR)/pmod_capi.cpp $(COSIM_DIR)/pmod.h
+	mkdir -p $(dir $@)
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -I$(COSIM_DIR) -fPIC -shared $< -o $@
