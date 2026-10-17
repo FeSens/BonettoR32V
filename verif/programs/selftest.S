@@ -1,18 +1,21 @@
-# BonettoR32V selftest (docs/contract.md sections 3 and 4).
+# BonettoR32V selftest, contract v3 (docs/contract-v3.md sections 3-5).
 #
-# Executes every RV32E instruction (ECALL is in the trap_* programs, since it halts), every branch
-# taken and not taken, x0 writes, JALR with bit 0 set, a not-taken branch to a misaligned target,
-# misaligned LW/LH/LHU/SW/SH up to 0xFF7F (the last byte below the core region), data and fetch
-# aliasing, every shift amount, FENCE variants, and GPIO reads and writes on every byte lane.
+# Executes every RV32E instruction (ECALL and EBREAK trap: see the trap_* programs), every branch
+# taken and not taken, x0 writes, JALR with bit 0 set, JAL offsets with J-imm bits 16-20 (to
+# .farcode at 0x000F_8000 and back), not-taken branches to targets with bit 1 set, loads of
+# every width from flash and from PSRAM, misaligned LW/LH/LHU/SW/SH up to CPU 0x017F_FF7F (the
+# last PSRAM byte below the core region), flash and PSRAM data aliasing (bits
+# 30:25, and 23 for PSRAM), fetch aliasing in flash, every shift amount, FENCE variants, and IO:
+# GPIO_OUT on every byte lane, slot decode by addr[6:2], and the read/write masks of the slots
+# that have no side effects.
 #
-# Results also go to a signature area in RAM, so the pins-mode cosim (final RAM image) sees every
-# computed value. The verdict is written to GPIO: 0xA5 pass, 0xEE fail; then EBREAK.
+# Results also go to a signature area in PSRAM (.bss), so the pins-mode cosim (final PSRAM
+# image) sees every computed value. Linked with crt0.S: main ends at _pass (GPIO_OUT = 0x5A) or,
+# on a failed check, at _fail with the failing test id (a5).
 #
 # Registers: a5 (x15) test id, a4 (x14) expected value, a3 (x13) signature pointer,
-# a2 (x12) GPIO base in the GPIO section. x1..x11 are scratch.
-#
-# Built with -DSPIKE_XCHECK for the spike cross-check of the ISS: that build skips the sections
-# spike can't model (aliasing, GPIO).
+# a2 (x12) IO base in the IO sections. x1..x11 are scratch; the stack is not used.
+#include "bonetto.h"
 
     .macro TEST id
     li   a5, \id
@@ -22,14 +25,14 @@
     .macro EXPECT reg, val
     li   a4, \val
     beq  \reg, a4, .Lok\@
-    j    fail
+    j    st_fail
 .Lok\@:
     .endm
 
     # ra == rb, else fail
     .macro EQ ra, rb
     beq  \ra, \rb, .Leq\@
-    j    fail
+    j    st_fail
 .Leq\@:
     .endm
 
@@ -40,7 +43,7 @@
 
     .macro TAKEN br, ra, rb
     \br  \ra, \rb, .Lt\@
-    j    fail
+    j    st_fail
 .Lt\@:
     .endm
 
@@ -48,7 +51,7 @@
     \br  \ra, \rb, .Lnt\@
     j    .Lntok\@
 .Lnt\@:
-    j    fail
+    j    st_fail
 .Lntok\@:
     .endm
 
@@ -57,26 +60,9 @@
     addi \rd, \rd, %lo(\sym)
     .endm
 
-    .section .text.start, "ax"
-    .global _start
-_start:
-    # The core's registers start unknown: write every one before any read.
-    li   x1, 0
-    li   x2, 0
-    li   x3, 0
-    li   x4, 0
-    li   x5, 0
-    li   x6, 0
-    li   x7, 0
-    li   x8, 0
-    li   x9, 0
-    li   x10, 0
-    li   x11, 0
-    li   x12, 0
-    li   x13, 0
-    li   x14, 0
-    li   x15, 0
-    ABS  sp, _stack_top
+    .text
+    .global main
+main:
     ABS  a3, sig_area
 
 # ---------------------------------------------------------------------------------------------
@@ -281,43 +267,62 @@ auipc1:
     .endr
 
 # ---------------------------------------------------------------------------------------------
-# 5. Loads and stores, aligned and misaligned (inside one buffer, no 64 KB wrap)
-    TEST 5
-    ABS  x1, ldbuf
-    lb   x2, 0(x1)
+# 5. Loads and stores, aligned and misaligned. Loads from flash (ldbuf, .rodata) and from PSRAM
+#    (ldbuf_ram, .data: crt0 copied it from flash); stores to PSRAM (stbuf, .bss).
+    .macro LOADCHECK base
+    lb   x2, 0(\base)
     EXPECT x2, 0xffffff80
-    lbu  x2, 0(x1)
+    lbu  x2, 0(\base)
     EXPECT x2, 0x80
-    lb   x2, 2(x1)
+    lb   x2, 2(\base)
     EXPECT x2, 0x02
-    lh   x2, 0(x1)
+    lh   x2, 0(\base)
     EXPECT x2, 0xffff8180
-    lhu  x2, 0(x1)
+    lhu  x2, 0(\base)
     EXPECT x2, 0x8180
-    lh   x2, 1(x1)
+    lh   x2, 1(\base)
     EXPECT x2, 0x0281
-    lh   x2, 3(x1)
+    lh   x2, 3(\base)
     EXPECT x2, 0xffff8483
-    lhu  x2, 3(x1)
+    lhu  x2, 3(\base)
     EXPECT x2, 0x8483
-    lh   x2, 5(x1)
+    lh   x2, 5(\base)
     EXPECT x2, 0xffff8605
-    lw   x2, 0(x1)
+    lw   x2, 0(\base)
     EXPECT x2, 0x83028180
-    lw   x2, 1(x1)
+    lw   x2, 1(\base)
     EXPECT x2, 0x84830281
-    lw   x2, 2(x1)
+    lw   x2, 2(\base)
     EXPECT x2, 0x05848302
-    lw   x2, 3(x1)
+    lw   x2, 3(\base)
     EXPECT x2, 0x86058483
     SIG  x2
-    addi x3, x1, 8
+    lw   x2, 9(\base)
+    EXPECT x2, 0x0c8b7a09
+    lh   x2, 13(\base)
+    EXPECT x2, 0x0efd
+    lhu  x2, 14(\base)
+    EXPECT x2, 0x8f0e
+    lb   x2, 15(\base)
+    EXPECT x2, 0xffffff8f
+    lw   x2, 12(\base)
+    EXPECT x2, 0x8f0efd0c
+    addi x3, \base, 8
     lw   x2, -5(x3)            # negative offset, misaligned
     EXPECT x2, 0x86058483
-    lw   x0, 1(x1)             # load into x0 is discarded
+    lw   x0, 1(\base)          # load into x0 is discarded
     add  x2, x0, x0
     EXPECT x2, 0
+    .endm
 
+    TEST 5
+    ABS  x1, ldbuf
+    LOADCHECK x1
+    TEST 0x15
+    ABS  x1, ldbuf_ram
+    LOADCHECK x1
+
+    TEST 0x25
     ABS  x1, stbuf
     li   x2, 0xa1b2c3d4
     sw   x2, 0(x1)
@@ -376,8 +381,7 @@ auipc1:
     SIG  x3
     lw   x3, 8(x1)
     SIG  x3
-    # Loads of the instruction's own bytes: the load still needs its own SPI READ (contract
-    # section 6, fetch and load completeness), it can't reuse the fetch.
+    # Loads of the instruction's own bytes (flash): the load can't reuse a stale fetch.
     ABS  x6, .Lself1
 .Lself1:
     lw   x5, 0(x6)             # 0x00032283, its own encoding
@@ -390,52 +394,49 @@ auipc1:
     EXPECT x5, 0x00130023
     SIG  x5
 
-#ifndef SPIKE_XCHECK
 # ---------------------------------------------------------------------------------------------
-# 6. Misaligned accesses that end at 0xFF7F, the last RAM byte below the core region
-#    0xFF80-0xFFFF (contract v2 section 3). Contract v1's 64 KB data wrap (0xFFFD..0x0002) and
-#    the LW at 0x7FFFFFFE that crosses into bit 31 both touch the region, so they are
-#    unspecified now and no longer tested. 0xFF78..0xFF7F is the top of the stack, which
-#    selftest never uses.
+# 6. Misaligned accesses that end at CPU 0x017F_FF7F, the last PSRAM byte below the core region
+#    0x7F_FF80-0x7F_FFFF (contract 3), directly and through alias bits. 0x017F_FF78..7F is the
+#    top of the stack, which selftest never uses (main is a leaf and doesn't touch sp).
     TEST 6
-    li   x1, 0xff7c
+    li   x1, 0x017fff7c
     li   x2, 0x44332211
-    sw   x2, 0(x1)             # 0xff7c..0xff7f = 11 22 33 44
+    sw   x2, 0(x1)             # 0x..7c..0x..7f = 11 22 33 44
     li   x2, 0x88776655
-    sw   x2, -4(x1)            # 0xff78..0xff7b = 55 66 77 88
-    lw   x3, -1(x1)            # 0xff7b
+    sw   x2, -4(x1)            # 0x..78..0x..7b = 55 66 77 88
+    lw   x3, -1(x1)            # 0x..7b
     EXPECT x3, 0x33221188
-    lw   x3, -3(x1)            # 0xff79
+    lw   x3, -3(x1)            # 0x..79
     EXPECT x3, 0x11887766
-    lh   x3, 1(x1)             # 0xff7d
+    lh   x3, 1(x1)             # 0x..7d
     EXPECT x3, 0x3322
-    lhu  x3, -1(x1)            # 0xff7b
+    lhu  x3, -1(x1)            # 0x..7b
     EXPECT x3, 0x1188
-    lb   x3, 3(x1)             # 0xff7f
+    lb   x3, 3(x1)             # 0x..7f
     EXPECT x3, 0x44
     li   x2, 0xddccbbaa
-    sw   x2, -2(x1)            # 0xff7a..0xff7d = aa bb cc dd
+    sw   x2, -2(x1)            # 0x..7a..0x..7d = aa bb cc dd
     lw   x3, 0(x1)
     EXPECT x3, 0x4433ddcc
     lw   x3, -4(x1)
     EXPECT x3, 0xbbaa6655
     li   x2, 0xf234
-    sh   x2, -1(x1)            # 0xff7b = 34, 0xff7c = f2
+    sh   x2, -1(x1)            # 0x..7b = 34, 0x..7c = f2
     lh   x3, -1(x1)
     EXPECT x3, 0xfffff234
-    lhu  x3, 1(x1)             # 0xff7d..0xff7e = dd 33
+    lhu  x3, 1(x1)             # 0x..7d..0x..7e = dd 33
     EXPECT x3, 0x33dd
     li   x2, 0x8001
-    sh   x2, 2(x1)             # 0xff7e..0xff7f = 01 80
+    sh   x2, 2(x1)             # 0x..7e..0x..7f = 01 80
     lh   x3, 2(x1)
     EXPECT x3, 0xffff8001
     SIG  x3
-    # the same bytes through alias bits addr[30:16], addr[31] = 0
+    # the same bytes through PSRAM alias bits 30:25 and 23 (addr[31] = 0, addr[24] = 1)
     li   x4, 0x7fffff7c
-    lw   x3, 0(x4)             # RAM 0xff7c..0xff7f = f2 dd 01 80
+    lw   x3, 0(x4)             # 0x..7c..0x..7f = f2 dd 01 80
     EXPECT x3, 0x8001ddf2
     li   x2, 0x13579bdf
-    sw   x2, -3(x4)            # 0xff79..0xff7c = df 9b 57 13
+    sw   x2, -3(x4)            # 0x..79..0x..7c = df 9b 57 13
     lw   x3, -4(x1)
     EXPECT x3, 0x579bdf55
     lw   x3, 0(x1)
@@ -443,16 +444,17 @@ auipc1:
     SIG  x3
 
 # ---------------------------------------------------------------------------------------------
-# 7. Aliasing: data and fetch use only address bits [15:0] (and addr[31] = 0 for data)
+# 7. Aliasing (contract 3): flash ignores address bits 30:25 and PSRAM bits 30:25 and 23, for
+#    data and for fetch
     TEST 7
     ABS  x1, stbuf
-    li   x2, 0x10000
-    add  x3, x1, x2            # stbuf + 64 KB
+    li   x2, 0x02000000
+    add  x3, x1, x2            # stbuf + 32 MiB (bit 25)
     li   x4, 0x600dcafe
     sw   x4, 16(x3)
     lw   x5, 16(x1)
     EQ   x5, x4
-    li   x2, 0x7fff0000
+    li   x2, 0x7e800000        # bits 30:25 and 23
     add  x3, x1, x2
     lw   x5, 16(x3)
     EQ   x5, x4
@@ -461,64 +463,60 @@ auipc1:
     lw   x5, 16(x1)
     EXPECT x5, 0x1234cafe
     SIG  x5
-    # fetch alias: run alias_code at +64 KB and at 0xabcd0000 + offset
+    li   x2, 0x00800000        # bit 23 alone
+    add  x3, x1, x2
+    li   x4, 0x77
+    sb   x4, 17(x3)
+    lw   x5, 16(x1)
+    EXPECT x5, 0x123477fe
+    SIG  x5
+    # flash data through bits 30:25
+    ABS  x1, ldbuf
+    li   x2, 0x7e000000
+    add  x3, x1, x2
+    lw   x5, 9(x3)
+    EXPECT x5, 0x0c8b7a09
+    li   x2, 0x04000000
+    add  x3, x1, x2
+    lh   x5, 13(x3)
+    EXPECT x5, 0x0efd
+    # fetch alias: run alias_code at +32 MiB (bit 25) and at +0x7e000000 (bits 30:25)
     ABS  x1, alias_code
-    li   x2, 0x10000
+    li   x2, 0x02000000
     add  x1, x1, x2
+    li   x7, 0
     jalr ra, 0(x1)
     ABS  x6, alias_code
-    li   x2, 0x10000
+    li   x2, 0x02000000
     add  x6, x6, x2
     EQ   x3, x6                # auipc saw the aliased pc
     addi x6, x6, 8
     EQ   x4, x6                # jal linked the aliased pc + 4
+    EXPECT x7, 0x2468ace0      # a load relative to the aliased pc
     SIG  x4
     ABS  x1, alias_code
-    li   x2, 0xabcd0000
+    li   x2, 0x7e000000
     add  x1, x1, x2
+    li   x7, 0
     jalr ra, 0(x1)
     ABS  x6, alias_code
-    li   x2, 0xabcd0000
+    li   x2, 0x7e000000
     add  x6, x6, x2
     EQ   x3, x6
+    EXPECT x7, 0x2468ace0
     SIG  x3
     j    alias_done
 alias_code:
     auipc x3, 0
     jal  x4, 1f
 1:  beq  x0, x0, 2f
-    j    fail
-2:  jalr x0, 0(ra)
+    j    st_fail
+2:  lw   x7, 24(x3)            # alias_word (alias_code + 24), through the aliased pc
+    jalr x0, 0(ra)
+    .align 2
+alias_word:
+    .word 0x2468ace0
 alias_done:
-    # JAL and branches with offsets whose low 16 bits are small: the target aliases to code a few
-    # bytes ahead, while the 32-bit pc moves by the full offset (J immediate bits 16..20, the
-    # sign included; riscv-arch-test's jal-01 cases of this kind don't fit a 64 KB RAM)
-    auipc x6, 0                # P
-    jal  x5, 3f + 0xf0000      # P + 4 -> P + 0xf0010 (runs 3f at pc 3f + 0xf0000)
-    j    fail
-    j    fail
-3:  auipc x7, 0                # P + 0x10 + 0xf0000
-    sub  x7, x7, x6
-    EXPECT x7, 0x000f0010
-    sub  x5, x5, x6
-    EXPECT x5, 8
-    SIG  x7
-    auipc x6, 0                # Q (= its link-time address + 0xf0000)
-    jal  x5, 4f - 0x100000     # offset 0x10 - 0x100000: to Q + 0x14 - 0x100000
-    j    fail
-    j    fail
-    j    fail
-4:  auipc x7, 0
-    sub  x7, x7, x6
-    EXPECT x7, 0xfff00014
-    SIG  x7
-    jal  x0, alias_back + 0x10000  # pc is link-time - 0x10000 here: back to link-time
-    j    fail
-alias_back:
-    auipc x7, 0
-    ABS  x6, alias_back
-    EQ   x7, x6
-#endif
 
 # ---------------------------------------------------------------------------------------------
 # 8. Branches: each one taken and not taken, signed and unsigned edges
@@ -566,35 +564,52 @@ alias_back:
     TEST 9
     jal  x1, 91f
 jal_link:
-    j    fail
+    j    st_fail
 91: ABS  x2, jal_link
     EQ   x1, x2
     SIG  x1
     jal  x0, 92f
-    j    fail
+    j    st_fail
 92: ABS  x5, 93f
     addi x5, x5, 1             # bit 0 set: JALR clears it
     jalr x6, 0(x5)
 jalr_link:
-    j    fail
+    j    st_fail
 93: ABS  x2, jalr_link
     EQ   x6, x2
     ABS  x7, 94f
     addi x7, x7, -8
     jalr x7, 8(x7)             # rd == rs1: the target uses the old value
 jalr_link2:
-    j    fail
+    j    st_fail
 94: ABS  x2, jalr_link2
     EQ   x7, x2
     ABS  x8, 95f
     addi x8, x8, 2047
     jalr x9, -2047(x8)         # large negative offset
-    j    fail
+    j    st_fail
 95: ABS  x8, 96f
     addi x8, x8, 3
     jalr x0, -3(x8)            # negative offset
-    j    fail
+    j    st_fail
 96: SIG  x9
+    # JAL offsets with J-imm bits 16-20: to far_code (CPU 0x000F_8000, about +0xF7C00: bits 16-19
+    # = 1, bit 20 = 0) and back (about -0xF7C00: bits 16-19 = 0, bit 20 = 1)
+    jal  x1, far_code
+far_link:
+    j    st_fail
+far_back:
+    ABS  x2, far_link
+    EQ   x1, x2
+    ABS  x2, far_code
+    EQ   x10, x2               # far_code's AUIPC ran at its own address
+    SIG  x10
+
+    .pushsection .farcode, "ax"
+far_code:
+    auipc x10, 0
+    jal  x0, far_back
+    .popsection
 
 # ---------------------------------------------------------------------------------------------
 # 10. Writes to x0 are discarded; x0 reads as 0
@@ -637,116 +652,226 @@ jalr_link2:
     EXPECT x5, 0x1234
     EXPECT x6, 0x5678
 
-#ifndef SPIKE_XCHECK
+
 # ---------------------------------------------------------------------------------------------
-# 12. GPIO: writes and reads on every byte lane
+# 12. GPIO_OUT and GPIO_IN (contract 5.1): every byte lane, the slot decode by addr[6:2]. Slot
+#     bits that aren't implemented ignore writes and read 0; a halfword at slot byte 2 is legal.
     TEST 12
     lui  a2, 0x80000
     li   x1, 0x3c
-    sb   x1, 0(a2)             # uo_out = 0x3c
+    sb   x1, OFS_GPIO_OUT(a2)  # uo = 0x3c
+    lw   x3, OFS_GPIO_OUT(a2)
+    EXPECT x3, 0x3c
     li   x1, 0xff
-    sb   x1, 1(a2)             # ignored
-    sb   x1, 2(a2)             # ignored
-    sb   x1, 3(a2)             # ignored
-    li   x1, 0x12345678
-    sw   x1, 0(a2)             # uo_out = 0x78
-    li   x1, 0xabcd
-    sh   x1, 4(a2)             # uo_out = 0xcd
-    sh   x1, 0(a2)             # same value: no change
-    li   x1, 0x5a
-    sb   x1, 4(a2)             # 0x80000004: uo_out = 0x5a
-    li   x2, 0x80001230
-    li   x1, 0x69
-    sb   x1, 0(x2)             # uo_out = 0x69
-    li   x2, 0xfffffffc
-    li   x1, 0x96
-    sb   x1, 0(x2)             # uo_out = 0x96
-    li   x2, 0xc0000001
-    li   x1, 0x11
-    sb   x1, 0(x2)             # ignored
-    sb   x1, 1(x2)             # 0xc0000002: ignored
-    # reads: byte 0 of each word is ui_in, every other byte is 0. IO accesses wider than a byte
-    # are only specified at addr[1:0] = 0.
+    sb   x1, 1(a2)             # bytes 1..3: not implemented
+    sb   x1, 2(a2)
+    sb   x1, 3(a2)
     lw   x3, 0(a2)
-    srli x4, x3, 8
-    EXPECT x4, 0
-    SIG  x3
+    EXPECT x3, 0x3c
+    li   x1, 0x12345678
+    sw   x1, 0(a2)             # uo = 0x78
+    lw   x3, 0(a2)
+    EXPECT x3, 0x78
+    li   x1, 0xabcd
+    sh   x1, 0(a2)             # uo = 0xcd
+    sh   x1, 2(a2)             # bytes 2..3: ignored
+    lhu  x3, 2(a2)
+    EXPECT x3, 0
+    lhu  x3, 0(a2)
+    EXPECT x3, 0xcd
     lbu  x3, 1(a2)
     EXPECT x3, 0
-    lbu  x3, 2(a2)
-    EXPECT x3, 0
-    lb   x3, 3(a2)
-    EXPECT x3, 0
-    lhu  x3, 4(a2)
-    srli x4, x3, 8
-    EXPECT x4, 0
-    lh   x3, 0(a2)
-    srli x4, x3, 8
-    EXPECT x4, 0
+    lb   x3, 0(a2)
+    EXPECT x3, 0xffffffcd      # sign-extended byte
     SIG  x3
-    lb   x3, 0(a2)             # sign-extended ui_in
-    SIG  x3
-    lbu  x3, 4(a2)
-    SIG  x3
-    li   x2, 0xfffffffc
-    lbu  x3, 0(x2)
-    SIG  x3
-    li   x2, 0x80000005
-    lbu  x3, 0(x2)
-    EXPECT x3, 0
-    lw   x3, 4(a2)
-    srli x4, x3, 8
-    EXPECT x4, 0
-    # echo ui_in to uo_out, then a word store whose upper bytes must not matter
-    lbu  x3, 0(a2)
-    sb   x3, 0(a2)
+    li   x2, 0x80000080        # addr[6:2] = 0: GPIO_OUT (bit 7 and above ignored)
+    li   x1, 0x69
+    sb   x1, 0(x2)             # uo = 0x69
     lw   x3, 0(a2)
-    li   x4, 0xffffff00
-    or   x3, x3, x4
-    sw   x3, 0(a2)
-#endif
+    EXPECT x3, 0x69
+    li   x2, 0xffffff80        # slot 0 again
+    li   x1, 0x96
+    sb   x1, 0(x2)             # uo = 0x96
+    lw   x3, 0(a2)
+    EXPECT x3, 0x96
+    li   x2, 0xc0000001        # slot 0, byte 1: ignored
+    li   x1, 0x11
+    sb   x1, 0(x2)
+    lw   x3, -1(x2)            # 0xc0000000: slot 0
+    EXPECT x3, 0x96
+    li   x2, 0x8000ff84        # addr[6:2] = 1: GPIO_IN; bits 31:8 read 0
+    lw   x3, 0(x2)
+    srli x4, x3, 8
+    EXPECT x4, 0
+    SIG  x4
+    lbu  x3, OFS_GPIO_IN+1(a2)
+    EXPECT x3, 0
+    lhu  x3, OFS_GPIO_IN+2(a2)
+    EXPECT x3, 0
+    li   x1, -1
+    sw   x1, OFS_GPIO_IN(a2)   # read-only: ignored
+    lhu  x3, OFS_GPIO_IN+2(a2)
+    EXPECT x3, 0
 
 # ---------------------------------------------------------------------------------------------
-pass:
-    ABS  x1, verdict
-    li   x2, 0xa5
-    sw   x2, 0(x1)
-    lui  a2, 0x80000
-    sb   x2, 0(a2)
-    ebreak
-    # Guard: a core that doesn't halt at EBREAK makes visible changes.
-    li   x2, 0x5e
-    sb   x2, 0(a2)
-    sw   x2, 0(x1)
-    li   x2, 0xe5
-    sb   x2, 0(a2)
-1:  j    1b
+# 13. The read/write masks of the slots without side effects (contract 5.1), reset values,
+#     read-only bits, unimplemented slots. Every register goes back to its reset value.
+#     No counter, transfer or interrupt starts: TIMER_CTRL, PWM_CTRL keep enable = 0, the capture
+#     edge stays off, and mstatus.MIE = mie.MEIE = 0 while IRQ_EN is set.
+    TEST 13
+    lw   x3, OFS_SPI_CTRL(a2)  # reset: CS_n = 1, D = 0, BUSY = 0
+    EXPECT x3, 1
+    lw   x3, OFS_TIMER_CAP(a2) # nothing captured since reset
+    EXPECT x3, 0
+    li   x1, -1
+    sw   x1, OFS_ALTFN(a2)     # every uo pin carries its (idle) peripheral function
+    lw   x3, OFS_ALTFN(a2)
+    EXPECT x3, 0xff
+    li   x2, 0x80000088        # addr[6:2] = 2: ALTFN
+    li   x1, 0x0f
+    sw   x1, 0(x2)
+    lw   x3, OFS_ALTFN(a2)
+    EXPECT x3, 0x0f
+    sw   zero, OFS_ALTFN(a2)
+    lw   x3, OFS_ALTFN(a2)
+    EXPECT x3, 0
+    li   x1, -1
+    sw   x1, OFS_TIMER_CMP(a2)
+    lw   x3, OFS_TIMER_CMP(a2)
+    EXPECT x3, 0xffff
+    li   x1, 0x1234
+    sh   x1, OFS_TIMER_CMP+2(a2)   # bytes 2..3: not implemented
+    lw   x3, OFS_TIMER_CMP(a2)
+    EXPECT x3, 0xffff
+    sb   x1, OFS_TIMER_CMP+1(a2)   # byte 1 only
+    lw   x3, OFS_TIMER_CMP(a2)
+    EXPECT x3, 0x34ff
+    lhu  x3, OFS_TIMER_CMP(a2)
+    EXPECT x3, 0x34ff
+    sw   zero, OFS_TIMER_CMP(a2)
+    li   x1, 0xffff1234
+    sw   x1, OFS_TIMER_CNT(a2)     # the timer is disabled: CNT holds the value
+    lw   x3, OFS_TIMER_CNT(a2)
+    EXPECT x3, 0x1234
+    sw   zero, OFS_TIMER_CNT(a2)
+    li   x1, -1
+    sw   x1, OFS_TIMER_CAP(a2)     # read-only
+    lw   x3, OFS_TIMER_CAP(a2)
+    EXPECT x3, 0
+    li   x1, 0x6f                  # P = 15, auto-reload, toggle mode; enable 0, capture off
+    sw   x1, OFS_TIMER_CTRL(a2)
+    lw   x3, OFS_TIMER_CTRL(a2)
+    EXPECT x3, 0x6f
+    li   x1, 0xffff00a3            # P = 3, auto-reload, PWM mode; bits above 9 not implemented
+    sw   x1, OFS_TIMER_CTRL(a2)
+    lw   x3, OFS_TIMER_CTRL(a2)
+    EXPECT x3, 0xa3
+    sw   zero, OFS_TIMER_CTRL(a2)
+    li   x1, 0xffff5fff            # PER 0x3ff, Q 7, IR gate; enable 0; bits above 14 unused
+    sw   x1, OFS_PWM_CTRL(a2)
+    lw   x3, OFS_PWM_CTRL(a2)
+    EXPECT x3, 0x5fff
+    sw   zero, OFS_PWM_CTRL(a2)
+    li   x1, -1
+    sw   x1, OFS_PWM_DUTY0(a2)
+    li   x1, 0x12345
+    sw   x1, OFS_PWM_DUTY1(a2)
+    li   x1, 0x2aa
+    sh   x1, OFS_PWM_DUTY2(a2)
+    lw   x3, OFS_PWM_DUTY0(a2)
+    EXPECT x3, 0x3ff
+    lw   x3, OFS_PWM_DUTY1(a2)
+    EXPECT x3, 0x345
+    lw   x3, OFS_PWM_DUTY2(a2)
+    EXPECT x3, 0x2aa
+    sw   zero, OFS_PWM_DUTY0(a2)
+    sw   zero, OFS_PWM_DUTY1(a2)
+    sw   zero, OFS_PWM_DUTY2(a2)
+    li   x1, -1
+    sw   x1, OFS_UART_CTRL(a2)     # DIV = 0x1fff; TX_BUSY, RX_FULL, RX_OVR are read-only
+    lw   x3, OFS_UART_CTRL(a2)
+    li   x4, 0x1fff
+    and  x3, x3, x4
+    EXPECT x3, 0x1fff
+    lw   x3, OFS_UART_CTRL(a2)
+    srli x3, x3, 13
+    andi x3, x3, 1
+    EXPECT x3, 0                   # TX_BUSY: nothing sent
+    sw   zero, OFS_UART_CTRL(a2)
+    li   x1, -1
+    sw   x1, OFS_SPI_CTRL(a2)      # CS_n = 1, D = 7; BUSY is read-only
+    lw   x3, OFS_SPI_CTRL(a2)
+    EXPECT x3, 0x0f
+    li   x1, 1
+    sw   x1, OFS_SPI_CTRL(a2)
+    lw   x3, OFS_SPI_CTRL(a2)
+    EXPECT x3, 1
+    li   x1, -1
+    sw   x1, OFS_IRQ_EN(a2)        # mstatus.MIE = mie.MEIE = 0: no interrupt
+    lw   x3, OFS_IRQ_EN(a2)
+    EXPECT x3, 0x1f
+    sw   zero, OFS_IRQ_EN(a2)
+    lw   x3, OFS_IRQ_EN(a2)
+    EXPECT x3, 0
+    li   x1, -1
+    sw   x1, OFS_IRQ_PEND(a2)      # W1C on CMP and CAP (both 0), the rest read-only
+    lw   x3, OFS_IRQ_PEND(a2)
+    andi x3, x3, IRQ_CMP | IRQ_CAP | IRQ_TXIDLE
+    EXPECT x3, IRQ_TXIDLE          # no match, no capture, TX idle
+    li   x1, 0xffff
+    sw   x1, OFS_GPIO_EDGE(a2)
+    lw   x3, OFS_GPIO_EDGE(a2)
+    EXPECT x3, 0xffff
+    li   x1, 0x00a5c3              # bits above 15 not implemented
+    sw   x1, OFS_GPIO_EDGE(a2)
+    lw   x3, OFS_GPIO_EDGE(a2)
+    EXPECT x3, 0xa5c3
+    sw   zero, OFS_GPIO_EDGE(a2)
+    li   x1, -1
+    sw   x1, OFS_GPIO_EPEND(a2)    # W1C: clears any flag the edges above may have set
+    sw   x1, 0x4c(a2)              # slots 19, 25 and 31: not implemented
+    sw   x1, 0x64(a2)
+    sw   x1, 0x7c(a2)
+    lw   x3, 0x4c(a2)
+    EXPECT x3, 0
+    lw   x3, 0x64(a2)
+    EXPECT x3, 0
+    lw   x3, 0x7c(a2)
+    EXPECT x3, 0
+    lhu  x3, 0x7e(a2)
+    EXPECT x3, 0
+    SIG  x3
 
-fail:
-    ABS  x1, verdict
-    sw   a5, 4(x1)             # failing test id
-    li   x2, 0xee
-    sw   x2, 0(x1)
-    lui  a2, 0x80000
-    sb   x2, 0(a2)
-    ebreak
-    li   x2, 0x5e
-    sb   x2, 0(a2)
-    li   x2, 0xe5
-    sb   x2, 0(a2)
-1:  j    1b
+# ---------------------------------------------------------------------------------------------
+    ABS  x1, sig_end
+    bltu x1, a3, st_fail       # the signature area overflowed
+    j    _pass
+
+st_fail:
+    mv   a0, a5                # the failing test id
+    j    _fail
+
+    .section .rodata
+    .align 2
+ldbuf:
+    .byte 0x80, 0x81, 0x02, 0x83, 0x84, 0x05, 0x86, 0x07
+    .byte 0xf8, 0x09, 0x7a, 0x8b, 0x0c, 0xfd, 0x0e, 0x8f
+    .align 2
+    .global _psram_window
+_psram_window:                 # results outside .data/.bss (mkexpect.py): section 6's bytes
+    .word 0x017fff78, 0x017fff80
+    .word 0, 0
 
     .section .data
     .align 2
-ldbuf:
+ldbuf_ram:
     .byte 0x80, 0x81, 0x02, 0x83, 0x84, 0x05, 0x86, 0x07
     .byte 0xf8, 0x09, 0x7a, 0x8b, 0x0c, 0xfd, 0x0e, 0x8f
 
     .section .bss
     .align 2
-verdict:
-    .space 8
 stbuf:
     .space 32
 sig_area:
-    .space 4096
+    .space 1280
+sig_end:
