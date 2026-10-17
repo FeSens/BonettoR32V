@@ -119,6 +119,24 @@ MUTANTS = {
         [("                2'b01:   swap_n = {16'd0, x[7:0], x[15:8]};",
           "                2'b01:   swap_n = {16'd0, x[15:8], x[7:0]};")],
     ),
+    "refetch": (
+        "fetches every instruction twice",
+        ["bus_imem"],
+        "After the fetch READ the core sends the same 4-byte READ at pc again before it "
+        "executes (contract section 6: exactly one fetch; a re-fetch fails).",
+        [("    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n",
+          "    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n"
+          "    reg         refetched;\n"),
+         ("            gpio_out <= 8'd0;\n        end else begin\n",
+          "            gpio_out <= 8'd0;\n            refetched <= 1'b0;\n        end else begin\n"),
+         ("                S_FEND: begin\n"
+          "                    cs_n  <= 1'b1;\n"
+          "                    state <= S_EXEC;\n",
+          "                S_FEND: begin\n"
+          "                    cs_n      <= 1'b1;\n"
+          "                    refetched <= ~refetched;\n"
+          "                    state     <= refetched ? S_EXEC : S_FETCH;\n")],
+    ),
 }
 
 
