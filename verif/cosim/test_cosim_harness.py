@@ -1,506 +1,590 @@
-"""Tests for the pin-level cosim harness itself (verif/cosim/harness.cpp, spiram.h, run_cosim.py).
+"""Tests for the contract v3 cosim harness (verif/cosim/harness.cpp, periph_models.h,
+run_cosim.py --v3). The contract v2 tests are in test_cosim_harness_v2.py until the swap.
 
-1. Stand-in SPI driver (mutants/standin): the waveform checker, the reset and constant-pin
-   checks, the output-stability check and random power-up state, through `harness --spi-only`.
-2. The design in src/ must pass the cosim (both modes, several seeds), and --timing-json and
-   --dump-ram must produce what Tasks 5 and 6 consume.
-3. Mutants (mutants/<name>/, listed in mutants/MANIFEST.json; copies of the seed or of the
-   contract v2 designs of hyp/002) must each fail with their specific error; the legal variants
-   (legal_*) must pass. 3b: the core region of contract v2 (random at reset; both hyp/002
-   designs pass the full matrix). 3c: the liveness fuzz (run_cosim.py --fuzz-liveness) passes
-   the seed and both hyp/002 designs and fails the hang mutants.
-4. The TT test (test/, RTL) passes on the seed and the legal variants and fails on pin-visible
-   mutants, the contract section 6 transaction classes included.
+1. The peripheral pin models (periph_models.h) through their unit-test binary test_periph:
+   UART RX bit edges at round(k (DIV+1) (1 +- 1%)), UART TX exact bit times, the SPI echo device
+   (mode 0, MISO held through 3 cycles after each rising edge), the PWM meter.
+2. The harness on hand-written stub designs. test_fixtures/playback replays a pin script and an
+   RVFI script given as plusargs (one Verilator build per mode); the scripts come from tiny
+   hand-assembled programs run on the reference ISS (iss_main --v3 --log), so every retirement
+   matches the ISS unless a test changes it on purpose.
+3. The tcem_stall mutant (ruling R12) and run_cosim.py --v3 (ruling R18).
 
+Every program here is hand-encoded (no RISC-V compiler needed), so the suite runs on hwe-bench.
 Run: pytest verif/cosim/test_cosim_harness.py -v
 """
 import json
 import subprocess
 import sys
+from fractions import Fraction
+from math import floor
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 COSIM = ROOT / "verif" / "cosim"
-PROGS = ROOT / "build" / "programs"
-SRC = ROOT / "src"
-STANDIN = COSIM / "mutants" / "standin"
-MANIFEST = COSIM / "mutants" / "MANIFEST.json"
+TOOLS = ROOT / "build" / "cosim"
+PLAYBACK = COSIM / "test_fixtures" / "playback"
+TCEM = COSIM / "mutants" / "tcem_stall"
 sys.path.insert(0, str(COSIM))
 import run_cosim  # noqa: E402
 
-GOOD_TRACE = [0xDE, 0xAD, 0xBE, 0xEF]
-
 
 @pytest.fixture(scope="session")
-def programs():
-    subprocess.run(["make", "-C", str(ROOT / "verif/programs"), "-j8", "all"], check=True,
-                   capture_output=True, text=True)
-    return PROGS
-
-
-def standin(bug: str, seed: int = 1, cycles: int = 400):
-    exe = run_cosim.ensure_built("pins", STANDIN, vflags=f"+define+{bug}" if bug else "")
-    ram = ROOT / "build" / "cosim" / f"standin-{bug or 'ok'}-{seed}.ram"
-    p = subprocess.run([str(exe), "--spi-only", str(cycles), "--seed", str(seed), "--dump-ram",
-                        str(ram)], capture_output=True, text=True)
-    res = json.loads(p.stdout.strip().splitlines()[-1])
-    assert (p.returncode == 0) == res["pass"]
-    return res, ram.read_bytes()
+def tools():
+    p = subprocess.run(["bash", str(COSIM / "build.sh")], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr[-3000:]
+    return TOOLS
 
 
 # ------------------------------------------------------------------------------------------------
-# 1. stand-in driver
-@pytest.mark.parametrize("seed", [1, 2, 3])
-def test_standin_good_driver_passes(seed):
-    res, ram = standin("", seed)
-    assert res["pass"], res["error"]
-    assert res["uo_trace"] == GOOD_TRACE, "the READ must return what the WRITE stored"
-    assert ram[0x8000:0x8004] == bytes(GOOD_TRACE)
+# a tiny RV32 encoder and the flash image
+def _i(op, f3, rd, rs1, imm):
+    return ((imm & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
 
 
-WAVEFORM_BUGS = {
-    "BUG_MOSI_RISE": "MOSI changed on a rising SCK edge",
-    "BUG_CS_SCK_HIGH": "CS_n changed while SCK was high",
-    "BUG_WRITE_MIDBYTE": "WRITE ended mid-byte",
-    "BUG_BAD_CMD": "invalid command 0x05",
-    "BUG_SHORT_TXN": "before its command and address were complete",
-    "BUG_COMB_OUT": "outputs changed between rising clk edges",
-    "BUG_UIO_OUT": "bits [7:4] and [2] must be 0",
-    "BUG_OE": "uio_oe = 0x0f",
-    "BUG_RESET_CS": "during reset CS_n = 0",
-}
+def _s(f3, rs2, imm, rs1):
+    return (((imm >> 5) & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | \
+        ((imm & 0x1F) << 7) | 0x23
 
 
-@pytest.mark.parametrize("bug", sorted(WAVEFORM_BUGS))
-def test_standin_bug_is_reported(bug):
-    res, _ = standin(bug)
-    assert not res["pass"]
-    assert WAVEFORM_BUGS[bug] in res["error"], res["error"]
+def lui(rd, imm20): return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0x37
+def addi(rd, rs1, imm): return _i(0x13, 0, rd, rs1, imm)
+def lw(rd, imm, rs1): return _i(0x03, 2, rd, rs1, imm)
+def sb(rs2, imm, rs1): return _s(0, rs2, imm, rs1)
+def sw(rs2, imm, rs1): return _s(2, rs2, imm, rs1)
+def csrrw(rd, csr, rs1): return (csr << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x73
+def csrrs(rd, csr, rs1): return (csr << 20) | (rs1 << 15) | (2 << 12) | (rd << 7) | 0x73
+def csrrsi(rd, csr, zimm): return (csr << 20) | (zimm << 15) | (6 << 12) | (rd << 7) | 0x73
 
 
-def test_standin_miso_sampled_low_reads_noise():
-    # Sampling MISO while SCK is low breaks no waveform rule, but the harness drives noise there,
-    # so the data read back is garbage (with a core, the cosim then reports a mismatch).
-    for seed in (1, 2, 3):
-        res, _ = standin("BUG_MISO_LOW", seed)
-        assert res["uo_trace"] != GOOD_TRACE
+ECALL = 0x00000073
+SELF = 0x0000006F  # jal x0, 0: the program end (retired twice)
+GPIO_OUT, ALTFN, UART_DATA, UART_CTRL, SPI_DATA, SPI_CTRL = 0, 8, 44, 48, 52, 56  # slot offsets
 
 
-def test_standin_zero_init_reliance_fails():
-    # A register that is never reset only works if it powers up as 0. Every seed randomizes it.
-    traces = [standin("BUG_NO_RESET", seed)[0]["uo_trace"] for seed in (1, 2, 3)]
-    assert all(t != GOOD_TRACE for t in traces), traces
-    assert len({tuple(t) for t in traces}) > 1, "power-up state must depend on the seed"
+def flash_hex(path: Path, segments: dict) -> Path:
+    """A sparse $readmemh flash image: {byte address: [32-bit words]}."""
+    lines = []
+    for addr in sorted(segments):
+        lines.append(f"@{addr:x}")
+        lines += [" ".join(f"{(w >> (8 * b)) & 0xFF:02x}" for b in range(4))
+                  for w in segments[addr]]
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def iss_log(hexf: Path, *args):
+    """The ISS's retirements for a program (iss_main --v3 --log), interrupt entries left out."""
+    p = subprocess.run([str(TOOLS / "iss_main"), "--v3", str(hexf), "--log", "--json", "--max",
+                        "1000", *args], capture_output=True, text=True)
+    rows = [json.loads(ln) for ln in p.stdout.splitlines() if ln.startswith("{")]
+    assert rows and rows[-1].get("summary") and rows[-1]["end"] == "selfloop", (p.stdout, p.stderr)
+    return [r for r in rows[:-1] if not r.get("irq_entry")]
 
 
 # ------------------------------------------------------------------------------------------------
-# 2. the design in src/ passes
-def have_design():
-    return bool(run_cosim.src_files(SRC))
+# the playback stub's scripts
+SD0, SD1, SCK, SD2, SD3, CSF, CSR = 0x02, 0x04, 0x08, 0x10, 0x20, 0x01, 0x40
+IDLE_UIO, IDLE_OE = 0xC1, 0xC9  # both CS_n high, PSRAM B CS_n high, SCK low; fixed outputs
 
 
-QUICK = ["selftest", "gpio_demo", "trap_ecall", "trap_jal", "trap_jalr", "trap_branch",
-         "trap_zero", "trap_ones", "random_1", "random_2"]
+def nib_uio(n):
+    return ((n & 1) << 1) | (((n >> 1) & 1) << 2) | (((n >> 2) & 1) << 4) | (((n >> 3) & 1) << 5)
+
+
+def single(value, n):
+    return [(SD0 if (value >> (n - 1 - i)) & 1 else 0, IDLE_OE | SD0) for i in range(n)]
+
+
+def quad(value, n):
+    return [(nib_uio((value >> (4 * (n - 1 - i))) & 0xF), 0xFF) for i in range(n)]
+
+
+class Pins:
+    """A pin script: uo_out and the Pmod pins, each held from the cycle it is set."""
+
+    def __init__(self):
+        self.uo, self.bus = {}, {}
+
+    def set_uo(self, c, v):
+        self.uo[c] = v
+        return self
+
+    def txn(self, start, cs, edges):
+        """One transaction with chip select bit cs; edges: (uio data bits, uio_oe) per rising SCK
+        edge, or ("pause", n) to hold SCK low n cycles. SCK = clk/2. Returns the first cycle
+        after it with CS_n high again (one cycle of tCPH)."""
+        low, t, last = IDLE_UIO & ~cs, start, (0, IDLE_OE)
+        for e in edges:
+            if e[0] == "pause":
+                t += e[1]
+                continue
+            self.bus[t] = (low | e[0], e[1])
+            self.bus[t + 1] = (low | e[0] | SCK, e[1])
+            last, t = e, t + 2
+        self.bus[t] = (low | last[0], last[1])
+        self.bus[t + 1] = (IDLE_UIO, IDLE_OE)
+        return t + 2
+
+    def psram_reset(self, start):
+        """Contract 2.4: QPI-form 0xF5, then 0x66 and 0x99 in SPI form; tRST after."""
+        t = self.txn(start, CSR, quad(0xF5, 2))
+        t = self.txn(t + 1, CSR, single(0x66, 8))
+        t = self.txn(t + 1, CSR, single(0x99, 8))
+        return t + 3
+
+    def psram_write(self, start, addr, data):
+        edges = single(0x02, 8) + single(addr, 24)
+        for b in data:
+            edges += single(b, 8)
+        return self.txn(start, CSR, edges)
+
+    def uart_frame(self, start, byte, bit, base):
+        """8N1 on uo[0], LSB first; base: the other uo bits."""
+        bits = [0] + [(byte >> k) & 1 for k in range(8)] + [1]
+        for k, b in enumerate(bits):
+            self.set_uo(start + k * bit, base | b)
+        return start + 10 * bit
+
+    def spi_xfer(self, start, byte, half, base, glitch_at=None):
+        """SPI mode 0 on uo[5] SCK, uo[6] MOSI (MSB first), each phase `half` cycles; base: the
+        other uo bits (uo[4] = CS_n). glitch_at: flip MOSI at that cycle."""
+        t = start
+        for k in range(7, -1, -1):
+            m = ((byte >> k) & 1) << 6
+            self.set_uo(t, base | m)
+            self.set_uo(t + half, base | m | 0x20)
+            t += 2 * half
+        self.set_uo(t, base | m)
+        if glitch_at is not None:
+            prev = max(c for c in self.uo if c <= glitch_at)
+            self.set_uo(glitch_at, self.uo[prev] ^ 0x40)
+            self.set_uo(glitch_at + 1, self.uo[prev])
+        return t
+
+    def write(self, path: Path):
+        words, uo, uio, oe = [], 0, IDLE_UIO, IDLE_OE
+        for c in sorted(set(self.uo) | set(self.bus)):
+            uo = self.uo.get(c, uo)
+            uio, oe = self.bus.get(c, (uio, oe))
+            words += [c, (oe << 16) | (uio << 8) | uo]
+        words += [0xFFFFFFFF, 0]
+        path.write_text("".join(f"{w:08x}\n" for w in words))
+
+
+def rvfi_rom(path: Path, rets, cycles):
+    words = []
+    for order, (r, c) in enumerate(zip(rets, cycles)):
+        flags = (r["trap"] & 1) | ((r["intr"] & 1) << 2) | (3 << 4) | (1 << 6)
+        words += [c, order & 0xFFFFFFFF, order >> 32, r["insn"], flags, r["rs1"], r["rs2"],
+                  r["rs1v"], r["rs2v"], r["rd"], r["rdv"], r["pc"], r["npc"], r["maddr"],
+                  r["rmask"], r["wmask"], r["mrdata"], r["mwdata"]]
+    words += [0xFFFFFFFF] + [0] * 17
+    path.write_text("".join(f"{w & 0xFFFFFFFF:08x}\n" for w in words))
+
+
+_n = [0]
+
+
+def stub(mode, hexf, tmp, pins=None, rets=None, cycles=None, expect=None, seed=1, extra=(),
+         src=PLAYBACK):
+    """Run the harness on the playback stub. Returns the JSON summary."""
+    exe = run_cosim.ensure_built(mode, src, v3=True)
+    _n[0] += 1
+    cmd = [str(exe), str(hexf), "--seed", str(seed), *extra]
+    if expect is not None:
+        ep = tmp / f"expect{_n[0]}.json"
+        ep.write_text(json.dumps(expect))
+        cmd += ["--expect", str(ep)]
+    if pins is not None:
+        pp = tmp / f"pins{_n[0]}.hex"
+        pins.write(pp)
+        cmd.append(f"+PINS={pp}")
+    if rets is not None and mode == "rvfi":
+        rp = tmp / f"rvfi{_n[0]}.hex"
+        rvfi_rom(rp, rets, cycles)
+        cmd.append(f"+RVFI={rp}")
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    lines = p.stdout.strip().splitlines()
+    assert lines, (p.returncode, p.stderr[-3000:])
+    res = json.loads(lines[-1])
+    assert p.returncode == (0 if res["pass"] else 1), (p.returncode, res, p.stderr[-2000:])
+    return res
+
+
+def every(n, step=100, first=100):
+    return [first + step * k for k in range(n)]
+
+
+# ------------------------------------------------------------------------------------------------
+# 1. the peripheral pin models (test_periph.cpp)
+@pytest.fixture(scope="session")
+def periph(tools):
+    p = subprocess.run([str(tools / "test_periph")], capture_output=True, text=True)
+    return p.stdout.splitlines()
+
+
+def case(lines, name):
+    hit = [ln for ln in lines if ln.split(":")[0] in (f"PASS {name}", f"FAIL {name}")]
+    assert hit == [f"PASS {name}"], hit or lines
+
+
+def test_uart_rx_rate_and_overrun(periph):
+    """The UartTerm RX driver puts bit edge k (0 = start, 9 = stop) at
+    round(k (DIV+1) (1 + ppm / 10^6)) after the frame start: +1% and -1% here, recomputed with
+    exact fractions. A second byte queued while the first is on the line starts right at the end
+    of the first's stop bit (the overrun case; the DUT-side check is Task 4's uart_echo)."""
+    case(periph, "uart_rx_edges")
+    case(periph, "uart_rx_back_to_back")
+    seen = set()
+    for ln in periph:
+        if not ln.startswith("EDGES uart_rx "):
+            continue
+        head, edges = ln[len("EDGES uart_rx "):].split(":")
+        div, ppm = (int(x) for x in head.split())
+        got = [int(x) for x in edges.split()]
+        want = [floor(Fraction(k * (div + 1)) * (1 + Fraction(ppm, 10**6)) + Fraction(1, 2))
+                for k in range(10)]
+        assert got == want, (div, ppm, got, want)
+        seen.add(ppm)
+    assert {10000, -10000, 0} <= seen
+
+
+def test_uart_tx_decoder(periph):
+    case(periph, "uart_tx_exact")
+    case(periph, "uart_tx_framing")
+
+
+def test_spi_device_mode0(periph):
+    """The echo device returns the previous byte (0xFF first), each MISO bit held from its rising
+    SCK edge through 3 cycles after it; MOSI changing while SCK is high (or at the rising edge)
+    fails, and so do high or low phases other than 2^D."""
+    case(periph, "spi_device_mode0")
+    case(periph, "spi_device_errors")
+
+
+def test_pwm_meter(periph):
+    """Period (PER+1) 2^Q and high time min(DUTY, PER+1) 2^Q, measured exactly after one settling
+    period (duty 0: always 0; duty above PER: always 1); the timer's PWM mode (period 65,536)."""
+    case(periph, "pwm_meter")
+    case(periph, "gpio_stim_and_loop")
+
+
+# ------------------------------------------------------------------------------------------------
+# 2. the harness on stubs
+PROG_LOOP = [SELF]
+PROG_ST = [lui(1, 0x1000), addi(2, 0, 0x5A), sb(2, 0, 1), SELF]  # PSRAM[0] = 0x5A
 
 
 @pytest.mark.parametrize("mode", ["rvfi", "pins"])
-@pytest.mark.parametrize("prog", QUICK)
-def test_design_passes(programs, prog, mode):
-    assert have_design(), "no design in src/"
-    for seed in (1, 2, 3):
-        s, _ = run_cosim.run_one(mode, PROGS / f"{prog}.hex", seed)
-        assert s["pass"], f"{prog} {mode} seed {seed}: {s['error']}"
+def test_uart_tx_exact_bit_time(tools, tmp_path, mode):
+    """A stub sending 'U' with a bit time of 17 cycles passes with uart_div = 16 and fails with
+    uart_div = 15 (contract 5.5: each bit exactly DIV+1 cycles)."""
+    prog = [lui(1, 0x80000), addi(2, 0, 1), sw(2, ALTFN, 1),      # ALTFN = 1: uo[0] is UART TX
+            addi(2, 0, 16), sw(2, UART_CTRL, 1),                 # DIV = 16
+            addi(2, 0, 0x55), sw(2, UART_DATA, 1),               # send 'U' (retires at 700)
+            addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), sw(0, ALTFN, 1),  # result, ALTFN = 0
+            SELF]
+    hexf = flash_hex(tmp_path / "uart.hex", {0: prog})
+    rets = iss_log(hexf)
+    assert len(rets) == 12
+    pins = Pins().set_uo(301, 0x01)                 # ALTFN = 1: the TX line idles high
+    assert pins.uart_frame(705, 0x55, 17, 0x00) == 875
+    pins.set_uo(901, 0x5B).set_uo(1001, 0x5A)       # GPIO_OUT = 0x5A, then ALTFN = 0
+    exp = {"uart_div": 16, "uart_tx_expect": "U", "result_gpio": 0x5A}
+    r = stub(mode, hexf, tmp_path, pins, rets, every(12), exp)
+    assert r["pass"], r["error"]
+    assert r["uart_tx"] == "U" and r["end"] == "selfloop"
+    r = stub(mode, hexf, tmp_path, pins, rets, every(12), dict(exp, uart_div=15))
+    assert not r["pass"] and "not on a bit boundary" in r["error"], r["error"]
+    # the frame starting later than DIV+2 cycles after the write retired (rvfi mode)
+    if mode == "rvfi":
+        late = Pins().set_uo(301, 0x01)
+        late.uart_frame(721, 0x55, 17, 0x00)
+        late.set_uo(901, 0x5B).set_uo(1001, 0x5A)
+        r = stub(mode, hexf, tmp_path, late, rets, every(12), exp)
+        assert not r["pass"] and "no UART start bit within DIV+2" in r["error"], r["error"]
+
+
+def test_uart_busy_read_follows_pins(tools, tmp_path):
+    """R20 (contract 5.5 as of c7d9910): a TX_BUSY read must be 1 while the pins show the frame in
+    progress over the whole reading instruction, 0 when no frame is in progress or pending, either
+    when the frame ends during the instruction."""
+    prog = [lui(1, 0x80000), addi(2, 0, 1), sw(2, ALTFN, 1), addi(2, 0, 16), sw(2, UART_CTRL, 1),
+            addi(2, 0, 0x55), sw(2, UART_DATA, 1),   # #6 retires at 700, frame 705..875
+            addi(5, 0, 0),                           # #7
+            lw(4, UART_CTRL, 1),                     # #8 reads TX_BUSY
+            addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), sw(0, ALTFN, 1), SELF]
+    hexf = flash_hex(tmp_path / "busy.hex", {0: prog})
+
+    def run(busy, t7, t8):
+        rets = iss_log(hexf, "--vread", f"12={0x2010 if busy else 0x0010}")
+        assert len(rets) == 14 and rets[8]["mrdata"] == (0x2010 if busy else 0x0010)
+        cycles = every(7) + [t7, t8] + [1100, 1200, 1300, 1400, 1500]
+        pins = Pins().set_uo(301, 0x01)
+        pins.uart_frame(705, 0x55, 17, 0x00)
+        pins.set_uo(1201, 0x5B).set_uo(1301, 0x5A)
+        return stub("rvfi", hexf, tmp_path, pins, rets, cycles,
+                    {"uart_div": 16, "uart_tx_expect": "U", "result_gpio": 0x5A})
+
+    assert run(True, 720, 760)["pass"]                         # inside the frame: 1
+    r = run(False, 720, 760)
+    assert not r["pass"] and "TX_BUSY (UART_CTRL[13]) read 0" in r["error"], r["error"]
+    assert run(False, 900, 1000)["pass"]                       # after the frame: 0
+    r = run(True, 900, 1000)
+    assert not r["pass"] and "TX_BUSY (UART_CTRL[13]) read 1" in r["error"], r["error"]
+    assert run(True, 860, 880)["pass"] and run(False, 860, 880)["pass"]  # the frame ends inside
+
+
+def test_rvfi_intr_follow(tools, tmp_path):
+    """rvfi mode: a retirement with rvfi_intr = 1 that doesn't follow a trap is an interrupt entry
+    (Iss3::take_interrupt); it fails with "interrupt while masked" unless mstatus.MIE and mie.MEIE
+    are set. A trap handler's first instruction (rvfi_intr = 1 after a trap) is no interrupt."""
+    prog = {0: [addi(1, 0, 0x100), csrrw(0, 0x305, 1),          # mtvec = 0x100
+                lui(2, 1), addi(2, 2, -2048), csrrs(0, 0x304, 2),  # mie.MEIE = 1 (#4)
+                csrrsi(0, 0x300, 8),                               # mstatus.MIE = 1 (#5)
+                SELF],
+            0x100: [SELF]}
+    hexf = flash_hex(tmp_path / "irq.hex", prog)
+    taken = iss_log(hexf, "--irq", "6")
+    assert len(taken) == 8 and taken[6]["intr"] == 1 and taken[6]["pc"] == 0x100
+    r = stub("rvfi", hexf, tmp_path, Pins(), taken, every(8))
+    assert r["pass"] and r["interrupts"] == 1, r["error"]
+    plain = iss_log(hexf)
+    masked = plain[:5] + taken[6:]  # the interrupt after #4: MEIE = 1 but MIE = 0
+    r = stub("rvfi", hexf, tmp_path, Pins(), masked, every(7))
+    assert not r["pass"] and "interrupt while masked" in r["error"], r["error"]
+    assert "retirement #5" in r["error"] and "mstatus.MIE = 0" in r["error"], r["error"]
+    trap = {0: [addi(1, 0, 0x100), csrrw(0, 0x305, 1), ECALL], 0x100: [SELF]}
+    hext = flash_hex(tmp_path / "trap.hex", trap)
+    rets = iss_log(hext)
+    assert [x["intr"] for x in rets] == [0, 0, 0, 1, 0] and rets[2]["trap"] == 1
+    r = stub("rvfi", hext, tmp_path, Pins(), rets, every(5))
+    assert r["pass"] and r["interrupts"] == 0, r["error"]
 
 
 @pytest.mark.parametrize("mode", ["rvfi", "pins"])
-def test_design_passes_coremark(programs, mode):
-    assert have_design(), "no design in src/"
-    s, _ = run_cosim.run_one(mode, PROGS / "coremark.hex", 1)
-    assert s["pass"], s["error"]
-    assert s["retired"] == json.loads((PROGS / "coremark.expect.json").read_text())["retired"]
+def test_psram_write_attribution(tools, tmp_path, mode):
+    """Contract 8: outside the core region, every PSRAM write writes a byte of a (retired / the
+    reference run's) store at its address with its data. Core-region writes are free."""
+    hexf = flash_hex(tmp_path / "st.hex", {0: PROG_ST})
+    rets = iss_log(hexf)
+
+    def run(writes):
+        pins = Pins()
+        t = pins.psram_reset(10)
+        for addr, data in writes:
+            t = pins.psram_write(max(t, 150), addr, data)
+        return stub(mode, hexf, tmp_path, pins, rets, every(5))
+
+    r = run([(0, b"\x5a")])
+    assert r["pass"] and r["psram_writes"] == 1, r["error"]
+    for bad in ([(0, b"\x5b")], [(1, b"\x5a")], [(0, b"\x5a\x5a")]):
+        r = run(bad)
+        assert not r["pass"] and "matches no" in r["error"] and "contract 8" in r["error"], (
+            bad, r["error"])
+    r = run([(0, b"\x5a"), (0x7FFF80, b"\x01\x02\x03")])  # the core region: the core's own
+    assert r["pass"], r["error"]
 
 
-def test_timing_json(programs, tmp_path):
-    assert have_design(), "no design in src/"
-    out = tmp_path / "timing.json"
-    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--mode", "rvfi", "--prog",
-                        str(PROGS / "selftest.hex"), "--timing-json", str(out)],
-                       capture_output=True, text=True)
-    summary = json.loads(p.stdout.strip().splitlines()[-1])
-    assert p.returncode == 0 and summary["pass"], summary
-    assert list(summary) == ["prog", "mode", "seed", "pass", "retired", "cycles", "cpi",
-                             "max_cycles_per_insn", "error"]
-    t = json.loads(out.read_text())
-    assert set(t) == {"pass", "first_retire_cycle", "max_cycles_per_insn", "per_class"}
-    assert t["pass"] is True
-    classes = {"alu", "alu_imm", "shift", "lui_auipc", "branch_taken", "branch_not_taken", "jal",
-               "jalr", "load", "store", "io_load", "io_store", "fence", "trap"}
-    assert set(t["per_class"]) == classes
-    assert t["max_cycles_per_insn"] == max(t["per_class"].values()) == summary[
-        "max_cycles_per_insn"]
-    assert 0 < t["first_retire_cycle"] <= 1024 and t["max_cycles_per_insn"] <= 1024
-
-
-def test_dump_ram_matches_reference(programs, tmp_path):
-    assert have_design(), "no design in src/"
-    for mode in ("rvfi", "pins"):
-        out = tmp_path / f"{mode}.bin"
-        s, _ = run_cosim.run_one(mode, PROGS / "selftest.hex", 2, dump_ram=out)
-        assert s["pass"], s["error"]
-        ref = tmp_path / "ref.bin"
-        subprocess.run([str(ROOT / "build/cosim/iss_main"), str(PROGS / "selftest.hex"), "--ui",
-                        "rvfi" if mode == "rvfi" else "pins", "--seed", "2", "--dump-ram",
-                        str(ref)], capture_output=True, check=True)
-        # the whole 64 KB as the design left it; the core region 0xFF80-0xFFFF is the core's own
-        # (random at reset, contract v2 section 3), so only the program RAM below it is compared
-        got = out.read_bytes()
-        assert len(got) == 65536 and got[:0xFF80] == ref.read_bytes()[:0xFF80]
-
-
-def test_build_key_covers_every_src_file_and_the_tools(tmp_path, monkeypatch):
-    # Any file under src/ may matter (a header someone includes by mistake, a second .v file, a
-    # test_*.v file, which is part of the design); the unit tests' test_*.py files can't reach
-    # the model; a different Verilator must rebuild too.
-    d = tmp_path / "src"
-    d.mkdir()
-    (d / "top.v").write_text("module top; endmodule\n")
-    key = lambda: run_cosim.build_key("pins", d, "", False)  # noqa: E731
-    k1 = key()
-    (d / "defs.vh").write_text("`define X 1\n")
-    k2 = key()
-    assert k2 != k1
-    (d / "defs.vh").write_text("`define X 2\n")
-    k3 = key()
-    assert k3 != k2
-    (d / "sub").mkdir()
-    (d / "sub" / "more.svh").write_text("\n")
-    k4 = key()
-    assert k4 != k3
-    (d / "test_unit.py").write_text("x = 1\n")
-    assert key() == k4
-    (d / "test_part.v").write_text("module r32v_part; endmodule\n")
-    k5 = key()
-    assert k5 != k4
-    assert [p.name for p in run_cosim.src_files(d)] == ["test_part.v", "top.v"]
-    monkeypatch.setattr(run_cosim, "_verilator_version", "Verilator 0.000")
-    assert key() != k5
+def test_latency_cap_2048(tools, tmp_path):
+    """Contract 4: a retirement 2,048 cycles after the previous one passes, 2,049 fails; the first
+    retirement at edge 2,048 after the last reset edge passes and 2,049 fails (seed 2 has a 6-edge
+    reset); with no retirement the watchdog reports it at cycle 2,049 after the last one."""
+    hexf = flash_hex(tmp_path / "loop.hex", {0: PROG_LOOP})
+    rets = iss_log(hexf)
+    assert len(rets) == 2
+    for seed in (1, 2):
+        r = stub("rvfi", hexf, tmp_path, Pins(), rets, [2048, 4096], seed=seed)
+        assert r["pass"], r["error"]
+        assert r["first_retire_cycle"] == 2048 and r["max_cycles_per_insn"] == 2048
+        r = stub("rvfi", hexf, tmp_path, Pins(), rets, [2049, 2100], seed=seed)
+        assert not r["pass"] and "latency cap: retirement #0 " in r["error"], r["error"]
+        assert "came 2049 cycles after reset release" in r["error"], r["error"]
+    assert stub("rvfi", hexf, tmp_path, Pins(), rets, [100, 2148])["pass"]
+    r = stub("rvfi", hexf, tmp_path, Pins(), rets, [100, 2149])
+    assert not r["pass"] and "retirement #1 " in r["error"], r["error"]
+    assert "came 2049 cycles after the previous retirement" in r["error"], r["error"]
+    r = stub("rvfi", hexf, tmp_path, Pins(), rets[:1], [100])
+    assert r["error"].startswith("cycle 2149: latency cap: no retirement within 2048 cycles of "
+                                 "the previous retirement"), r["error"]
+    r = stub("rvfi", hexf, tmp_path, Pins(), [], [])
+    assert r["error"].startswith("cycle 2049: latency cap: no retirement within 2048 cycles of "
+                                 "reset release"), r["error"]
 
 
 @pytest.mark.parametrize("mode", ["rvfi", "pins"])
-def test_build_reads_exactly_the_design(mode):
-    # Contract sections 1 and 6: every src/*.v file in sorted order, nothing in front of them,
-    # and the RVFI build's only define is RISCV_FORMAL (none at all for the plain build).
-    assert have_design(), "no design in src/"
-    exe = run_cosim.ensure_built(mode)
-    args = (exe.parent / "verilator.args").read_text().splitlines()
-    verilog = [a for a in args if a.endswith((".v", ".sv", ".vh", ".svh"))]
-    assert verilog == [str(p) for p in run_cosim.src_files(SRC.resolve())]
-    assert [a for a in args if a.startswith("+define+")] == (
-        ["+define+RISCV_FORMAL"] if mode == "rvfi" else [])
-    assert not [a for a in args if a.startswith(("+incdir", "-I", "-D", "-y", "-v", "-f"))]
+def test_selfloop_drain(tools, tmp_path, mode):
+    """Contract 4: memory is compared 2,048 cycles after the self-loop (rvfi mode sees it: the
+    second jal x0, 0 retires at cycle 500, so the compare is at 2,548); a PSRAM write landing in
+    that window still counts, one landing after it is missing. pins mode can't see the self-loop
+    and waits (tail + 2) x 2,048 cycles after the pins reach the reference's final state (tail:
+    the reference's retirements after its last GPIO change, all 5 here; pins at it from cycle 1)."""
+    hexf = flash_hex(tmp_path / "st.hex", {0: PROG_ST})
+    rets = iss_log(hexf)
+
+    def run(start):
+        pins = Pins()
+        pins.psram_reset(10)
+        assert pins.psram_write(start, 0, b"\x5a") == start + 82
+        return stub(mode, hexf, tmp_path, pins, rets, every(5))
+
+    r = run(2400)  # the write's last data edge at 2,479
+    assert r["pass"], r["error"]
+    late = 2600 if mode == "rvfi" else 1 + (5 + 2) * 2048 + 100  # tail: all 5 retirements
+    r = run(late)
+    assert not r["pass"] and "final PSRAM byte 0x000000" in r["error"], r["error"]
+    assert "the program stored 0x5a" in r["error"], r["error"]
+    if mode == "rvfi":
+        assert "compared 2048 cycles after the program end" in r["error"], r["error"]
 
 
-def test_build_lock_is_cross_process(programs):
-    # While another process holds build/cosim/pins.lock, ensure_built waits, even for an
-    # up-to-date build.
-    import fcntl
-    run_cosim.ensure_built("pins")
-    lock = ROOT / "build" / "cosim" / "pins.lock"
-    code = (f"import sys; sys.path.insert(0, {str(COSIM)!r}); import run_cosim; "
-            "run_cosim.ensure_built('pins'); print('built')")
-    with open(lock, "a") as f:
-        fcntl.lockf(f, fcntl.LOCK_EX)
-        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
-        try:
-            with pytest.raises(subprocess.TimeoutExpired):
-                p.wait(timeout=3)
-        finally:
-            fcntl.lockf(f, fcntl.LOCK_UN)
-    assert p.wait(timeout=60) == 0 and p.stdout.read().strip() == "built"
+def test_gpio_one_cycle_rule(tools, tmp_path):
+    """Contract 6, rvfi mode: GPIO pins take a stored value no later than 1 cycle after the store
+    retires (they may change earlier, while the store executes) and change for no other reason."""
+    prog = [lui(1, 0x80000), addi(2, 0, 0x5A), sw(2, GPIO_OUT, 1), SELF]  # the store retires at 300
+    hexf = flash_hex(tmp_path / "g.hex", {0: prog})
+    rets = iss_log(hexf)
 
+    def run(*changes):
+        pins = Pins()
+        for c, v in changes:
+            pins.set_uo(c, v)
+        return stub("rvfi", hexf, tmp_path, pins, rets, every(5), {"result_gpio": 0x5A})
 
-def test_latency_cap_boundary(programs, tmp_path):
-    """Contract section 4: a gap of exactly 1,024 cycles passes and 1,025 fails, for the first
-    retirement after reset release and for later ones, whether the late retirement arrives (the
-    check at the retirement edge) or never comes (the watchdog). mutants/stall_gap holds every
-    retirement until exactly STALL_GAP cycles after the previous one."""
-    src = COSIM / "mutants" / "stall_gap"
-    prog = PROGS / "selftest.hex"
-    t = tmp_path / "timing.json"
-
-    def run(mode, vflags="", timing=None):
-        return run_cosim.run_one(mode, prog, 1, timing_json=timing, src=src, vflags=vflags)[0]
-
-    s = run("rvfi", "+define+STALL_GAP=1024", t)
-    assert s["pass"], s["error"]
-    tj = json.loads(t.read_text())
-    assert tj["pass"] and tj["first_retire_cycle"] == 1024 and tj["max_cycles_per_insn"] == 1024
-    assert set(tj["per_class"].values()) == {1024}
-    assert run("pins", "+define+STALL_GAP=1024")["pass"]
-    # An explicit --max-cycles of 1024 x (retired + 1) fits a core at the cap: the budget covers
-    # the program, the windows after the halt don't count
-    tight = 1024 * (json.loads((PROGS / "selftest.expect.json").read_text())["retired"] + 1)
-    for mode in ("rvfi", "pins"):
-        s = run_cosim.run_one(mode, prog, 1, max_cycles=tight, src=src,
-                              vflags="+define+STALL_GAP=1024")[0]
-        assert s["pass"], f"{mode}: {s['error']}"
-    # 1,025: the first retirement is late
-    s = run("rvfi", "", t)
-    assert not s["pass"]
-    assert "latency cap: retirement #0 " in s["error"], s["error"]
-    assert "came 1025 cycles after reset release" in s["error"], s["error"]
-    assert json.loads(t.read_text())["pass"] is False, "a failed run's timing report says so"
-    # 1,025 later on (the first instruction runs at full speed)
-    s = run("rvfi", "+define+STALL_SKIP_FIRST")
-    assert not s["pass"]
-    assert "latency cap: retirement #1 " in s["error"], s["error"]
-    assert "came 1025 cycles after the previous retirement" in s["error"], s["error"]
-    assert run("rvfi", "+define+STALL_SKIP_FIRST +define+STALL_GAP=1024")["pass"]
-    # 1,026: nothing retires at 1,025, so the watchdog reports it at cycle 1,025
-    s = run("rvfi", "+define+STALL_GAP=1026")
-    assert not s["pass"]
-    assert s["error"].startswith("cycle 1025: latency cap: no retirement within 1024 cycles of "
-                                 "reset release"), s["error"]
+    assert run((301, 0x5A))["pass"]
+    assert run((250, 0x5A))["pass"]
+    r = run((302, 0x5A))
+    assert not r["pass"] and "one cycle after the store" in r["error"], r["error"]
+    r = run((150, 0x5A))
+    assert not r["pass"] and "uo_out changed to 0x5a" in r["error"], r["error"]
+    r = run((301, 0x5A), (400, 0x00), (401, 0x5A))
+    assert not r["pass"] and "uo_out changed to 0x00" in r["error"], r["error"]
 
 
 @pytest.mark.parametrize("mode", ["rvfi", "pins"])
-def test_core_at_the_cap_passes_as_eval_runs_it(programs, mode):
-    """A legal core retiring every instruction exactly 1,024 cycles after the previous one passes
-    a ui_in-dependent program, run the way tools/eval.py runs the cosim (no --max-cycles, so the
-    harness budget is 1,024 x (its own ISS count for this mode's ui_in schedule + 16)), on every
-    random program that retires a different number of instructions in rvfi mode than its expect
-    file's pins count (random_3 and random_6 since the contract v2 generator; random_4 before)."""
-    dep = []
-    for n in range(1, 7):
-        exp = json.loads((PROGS / f"random_{n}.expect.json").read_text())
-        if exp["rvfi"]["retired"] != exp["retired"]:
-            dep.append(f"random_{n}")
-    assert dep, "no random program depends on the ui_in schedule any more"
-    src = COSIM / "mutants" / "stall_gap"
-    for prog, seed in ((p, s) for p in dep for s in (1, 2, 3)):
-        p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--mode", mode, "--prog",
-                            str(PROGS / f"{prog}.hex"), "--seed", str(seed), "--src", str(src),
-                            "--vflags", "+define+STALL_GAP=1024 +define+STALL_SKIP_FIRST"],
-                           capture_output=True, text=True)
-        s = json.loads(p.stdout.strip().splitlines()[-1])
-        assert p.returncode == 0 and s["pass"], f"{prog} {mode} seed {seed}: {s['error']}"
-        if mode == "rvfi":
-            assert s["max_cycles_per_insn"] == 1024
+def test_coremark_cycles_per_iter(tools, tmp_path, mode):
+    """R21: coremark_cycles_per_iter = cycles between uo_out changing to 0xC0 and to 0xC1, divided
+    by expect.json coremark_iters; null without coremark_iters; the marks are required with it."""
+    prog = [lui(1, 0x80000), addi(2, 0, 0xC0), sw(2, GPIO_OUT, 1), addi(2, 0, 0xC1),
+            sw(2, GPIO_OUT, 1), addi(2, 0, 0x5A), sw(2, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "cm.hex", {0: prog})
+    rets = iss_log(hexf)
+    pins = Pins().set_uo(301, 0xC0).set_uo(501, 0xC1).set_uo(701, 0x5A)
+    r = stub(mode, hexf, tmp_path, pins, rets, every(9), {"coremark_iters": 4, "result_gpio": 0x5A})
+    assert r["pass"] and r["coremark_cycles_per_iter"] == 50, r
+    r = stub(mode, hexf, tmp_path, pins, rets, every(9), {"coremark_iters": 3})
+    assert r["pass"] and abs(r["coremark_cycles_per_iter"] - 200 / 3) < 1e-5, r
+    r = stub(mode, hexf, tmp_path, pins, rets, every(9), {"result_gpio": 0x5A})
+    assert r["pass"] and r["coremark_cycles_per_iter"] is None, r
+    hexs = flash_hex(tmp_path / "st.hex", {0: PROG_ST})
+    pst = Pins()
+    pst.psram_reset(10)
+    pst.psram_write(150, 0, b"\x5a")
+    r = stub(mode, hexs, tmp_path, pst, iss_log(hexs), every(5), {"coremark_iters": 1})
+    assert not r["pass"] and "coremark_iters" in r["error"], r["error"]
+    assert r["coremark_cycles_per_iter"] is None
 
 
-def test_coremark_log_ring_is_checked(programs, tmp_path):
-    # A RAM image without the validation text must fail the log check, even if the run matched.
-    exp = run_cosim.expect_for(PROGS / "coremark.hex")
-    assert exp["log_contains"] == ["Correct operation validated"]
-    ram = bytearray(65536)
-    ram[0xF000:0xF00C] = b"ERROR! crc\0\0"
-    assert "Correct operation validated" not in run_cosim.log_ring_text(bytes(ram))
-    assert "Correct operation validated" in exp["log"]
+def test_pins_mode_judges_volatile_programs_by_result(tools, tmp_path):
+    """A program that reads a volatile register (here GPIO_IN) can't run on the ISS alone, so pins
+    mode judges it by its self-check: uo_out = result_gpio, held for 3 x 2,048 cycles; 0xEE fails
+    at once; without result_gpio pins mode can't judge it."""
+    prog = [lui(1, 0x80000), lw(2, 4, 1), addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "vol.hex", {0: prog})
+    exp = {"result_gpio": 0x5A}
+    r = stub("pins", hexf, tmp_path, Pins().set_uo(5000, 0x5A), expect=exp)
+    assert r["pass"] and r["end"] == "result_gpio" and r["deterministic"] is False, r
+    assert r["retired"] is None and r["cycles"] == 5000
+    r = stub("pins", hexf, tmp_path, Pins().set_uo(5000, 0x5A).set_uo(6000, 0x01)
+             .set_uo(9000, 0x5A), expect=exp)
+    assert r["pass"] and r["cycles"] == 9000, r
+    r = stub("pins", hexf, tmp_path, Pins().set_uo(5000, 0xEE), expect=exp)
+    assert not r["pass"] and "self-check failed" in r["error"], r["error"]
+    r = stub("pins", hexf, tmp_path, Pins().set_uo(5000, 0x5A))
+    assert not r["pass"] and "can't judge" in r["error"], r["error"]
+    r = stub("pins", hexf, tmp_path, Pins(), expect=exp, extra=("--max-cycles", "20000"))
+    assert not r["pass"] and "timeout after 20001 cycles" in r["error"], r["error"]
+    # enabling interrupts (mie.MEIE and mstatus.MIE) makes a program volatile too, even if it
+    # never reads an IO register: an interrupt-driven program may spin on memory forever alone
+    irq = [lui(2, 1), addi(2, 2, -2048), csrrs(0, 0x304, 2), csrrsi(0, 0x300, 8), lui(1, 0x80000),
+           addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+    hexi = flash_hex(tmp_path / "irqen.hex", {0: irq})
+    r = stub("pins", hexi, tmp_path, Pins().set_uo(5000, 0x5A), expect=exp)
+    assert r["pass"] and r["end"] == "result_gpio" and r["deterministic"] is False, r
 
 
-# ------------------------------------------------------------------------------------------------
-# 3. mutants of the seed
-def manifest():
-    return json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_spi_master_pins(tools, tmp_path, mode):
+    """Contract 5.6 at the pins: MOSI changes only while SCK is low, phases are 2^D cycles, and
+    (rvfi mode) the byte on MOSI is the byte the program wrote to SPI_DATA."""
+    prog = [lui(1, 0x80000), addi(2, 0, 0x70), sw(2, ALTFN, 1),    # uo[4..6]: CS_n, SCK, MOSI
+            addi(2, 0, 2), sw(2, SPI_CTRL, 1),                     # CS_n = 0, D = 1
+            addi(2, 0, 0xA5), sw(2, SPI_DATA, 1),                  # transfer 0xA5 (#6 at 700)
+            sw(0, ALTFN, 1), addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "spi.hex", {0: prog})
+    rets = iss_log(hexf)
+    exp = {"spi_div_d": 1, "result_gpio": 0x5A}
 
+    def run(byte, glitch=None):
+        pins = Pins().set_uo(301, 0x10).set_uo(501, 0x00)  # CS_n high (reset 1), then low
+        assert pins.spi_xfer(702, byte, 2, 0x00, glitch) == 734
+        pins.set_uo(801, 0x00).set_uo(1001, 0x5A)
+        return stub(mode, hexf, tmp_path, pins, rets, every(12), exp)
 
-def mutant_ids():
-    return sorted(manifest()) or ["<missing: mutants/MANIFEST.json>"]
-
-
-@pytest.mark.parametrize("name", mutant_ids())
-def test_mutant_fails(programs, name):
-    """Each mutant fails in every mode listed under "fail" with that mode's error text ("" means
-    any error), for every listed seed, and passes the modes listed under "pass" (an RVFI-only bug
-    passes pins mode; a bug hidden under RISCV_FORMAL passes rvfi mode). A "fuzz_fail" entry (a
-    hang on a reserved encoding, which no program contains) must fail the rvfi-mode liveness fuzz
-    in seeds 1-5 with "latency cap" and that text in the error."""
-    m = manifest()
-    assert name in m, "mutants/MANIFEST.json is missing (mutants are built from the seed)"
-    spec = m[name]
-    src = COSIM / "mutants" / name
-    assert (src / "tt_um_fesens_r32v.v").exists()
-    progs = spec.get("progs", [spec.get("prog", "selftest")])
-    for prog in (PROGS / f"{p}.hex" for p in progs):
-        for mode in spec.get("pass", []):
-            s, _ = run_cosim.run_one(mode, prog, 1, src=src)
-            assert s["pass"], f"{name} should pass {mode} mode on {prog.name}: {s['error']}"
-        for mode, err in spec["fail"].items():
-            for seed in spec.get("seeds", [1]):
-                s, _ = run_cosim.run_one(mode, prog, seed, src=src)
-                assert not s["pass"], f"{name} passed {mode} mode (seed {seed})"
-                assert s["error"] and err in s["error"], f"{name} {mode} seed {seed}: {s['error']}"
-    if "fuzz_fail" in spec:
-        for seed in range(1, 6):
-            s = run_cosim.run_fuzz("rvfi", seed, src=src)
-            assert not s["pass"] and s["liveness_checked"], f"{name} passed the fuzz (seed {seed})"
-            assert "latency cap" in s["error"] and spec["fuzz_fail"] in s["error"], (
-                f"{name} fuzz seed {seed}: {s['error']}")
-
-
-def test_fetch_reading_its_load_bytes_is_named(tmp_path):
-    """Contract section 6: a fetch may only read its instruction's bytes. lw x1, 4(x0) at pc 0
-    loads the next word; fetch_extra_byte's fetch READ continues into byte 4, one of the load's own
-    bytes, so the error names the fetch overrun (not a missing load byte). The seed passes."""
-    img = bytearray(65536)
-    img[0:8] = (0x00402083).to_bytes(4, "little") + (0x00100073).to_bytes(4, "little")  # ebreak
-    hexf = tmp_path / "lw_next.hex"
-    hexf.write_text("".join(f"{b:02x}\n" for b in img))
-    s, _ = run_cosim.run_one("rvfi", hexf, 1)
-    assert s["pass"] and s["retired"] == 2, s["error"]
-    s, _ = run_cosim.run_one("rvfi", hexf, 1, src=COSIM / "mutants" / "fetch_extra_byte")
-    assert not s["pass"]
-    assert ("the fetch READ of retirement #0" in s["error"]
-            and "read beyond the instruction's 4 bytes (byte 0x0004)" in s["error"]), s["error"]
-
-
-def test_trap_retirement_compares_only_the_contract_fields():
-    """Contract section 6 (e321614): on a trapping retirement only trap, halt, insn, pc_rdata,
-    rd_addr = 0 and no memory write are compared, plus the rs1/rs2 addr and rdata of a trapping
-    branch or JALR. legal_trap_fields reports arbitrary rd_wdata and pc_wdata on every trap and
-    arbitrary rs fields on the other traps, and must pass; trap_rs_garbage (arbitrary rs fields on
-    a trapping branch or JALR too) and trap_writes_rd (rd_addr != 0 on a trap) must fail."""
-    m = manifest()
-    assert m["legal_trap_fields"]["pass"] == ["rvfi", "pins"] and not m["legal_trap_fields"]["fail"]
-    assert {"trap_jalr", "trap_branch", "trap_ecall"} <= set(m["legal_trap_fields"]["progs"])
-    assert {"trap_jalr", "trap_branch"} <= set(m["trap_rs_garbage"]["progs"])
-    assert m["trap_rs_garbage"]["fail"] == {"rvfi": "RVFI mismatch"}
-    assert m["trap_writes_rd"]["fail"] == {"rvfi": "rvfi_rd_addr"}
-
-
-def test_every_required_mutant_class_is_present():
-    m = manifest()
-    required = {"miso_sck_low", "mosi_on_rise", "cs_sck_high", "write_midbyte", "rvfi_rd_wrong",
-                "rvfi_hidden", "zero_init", "latency", "stall_gap", "ui_at_retire", "uo_glitch",
-                "load_own_fetch",
-                # contract v2 (section 6): region and program transaction rules
-                "region_wrap", "region_straddle", "store_twice", "store_extra_byte",
-                "fetch_extra_byte", "load_skip_byte", "region_zero_init",
-                # 78472fe: a header shorter than 24 bits still fails; e321614: trapping branch or
-                # JALR rs fields; the formal review's C1: liveness on reserved encodings
-                "null_read_short", "trap_rs_garbage", "hang_reserved", "hang_funct3"}
-    assert required <= set(m), required - set(m)
-    assert m["rvfi_hidden"]["pass"] == ["rvfi"] and "pins" in m["rvfi_hidden"]["fail"]
-    assert m["null_read_short"]["fail"].keys() == {"rvfi", "pins"}
-    for legal in ("legal_split_store", "legal_h002_rf", "legal_h002_pcram", "legal_null_read"):
-        assert m[legal]["pass"] == ["rvfi", "pins"] and not m[legal]["fail"], legal
-
-
-# ------------------------------------------------------------------------------------------------
-# 3b. contract v2: the core region
-def test_region_starts_random(programs):
-    """Contract section 3: the region's contents at reset are arbitrary. region_zero_init (the
-    pcram design without its boot write) takes its pc from the region at reset: it passes when the
-    region starts zero (the harness's --region-zero test hook) and fails with the random fill."""
-    src = COSIM / "mutants" / "region_zero_init"
-    exe = run_cosim.ensure_built("rvfi", src)
-    for seed in (1, 2, 3):
-        runs = {}
-        for flag in ([], ["--region-zero"]):
-            p = subprocess.run([str(exe), str(PROGS / "selftest.hex"), "--seed", str(seed), *flag],
-                               capture_output=True, text=True)
-            runs[bool(flag)] = json.loads(p.stdout.strip().splitlines()[-1])
-        assert runs[True]["pass"], f"seed {seed}, zero region: {runs[True]['error']}"
-        assert not runs[False]["pass"] and "retirement #0" in runs[False]["error"], runs[False]
-
-
-@pytest.mark.parametrize("name", ["legal_h002_rf", "legal_h002_pcram"])
-def test_v2_designs_pass_the_full_matrix(programs, name):
-    """The two real contract v2 designs (hyp/002-rf-in-ram fc07cc3: x1..x15 in the region;
-    hyp/002-rf-in-ram-pcram b9a5211: the pc too, read before the fetch, SW split in two) pass
-    every program in both modes with seeds 1-3, as tools/eval.py's cosim gate runs them."""
-    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--all", "--src",
-                        str(COSIM / "mutants" / name)], capture_output=True, text=True)
-    s = json.loads(p.stdout.strip().splitlines()[-1])
-    assert p.returncode == 0 and s["pass"] and s["runs"] == 90 and s["failed"] == 0, (
-        s, p.stderr[-2000:])
-
-
-# ------------------------------------------------------------------------------------------------
-# 3c. the liveness fuzz (contract section 4: liveness on reserved encodings)
-def fuzz_cli(src: Path, seed: int, *extra: str):
-    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--fuzz-liveness", "--seed",
-                        str(seed), "--src", str(src), *extra], capture_output=True, text=True)
-    s = json.loads(p.stdout.strip().splitlines()[-1])
-    assert list(s) == run_cosim.FUZZ_KEYS, list(s)
-    assert (p.returncode == 0) == s["pass"], (p.returncode, s)
-    return s
-
-
-@pytest.mark.parametrize("name", ["(seed)", "legal_h002_rf", "legal_h002_pcram"])
-def test_fuzz_liveness_passes(name):
-    """The seed (strict decode) and both hyp/002 designs (spec-minimum decode) pass the rvfi-mode
-    fuzz in seeds 1-5, as the eval runs it: 2,048 probe sub-runs and 8 walks per seed, each ending
-    in a halt or at the retirement cap."""
-    src = SRC if name == "(seed)" else COSIM / "mutants" / name
-    for seed in range(1, 6):
-        s = fuzz_cli(src, seed)
-        assert s["pass"] and s["error"] is None, s
-        assert s["mode"] == "rvfi" and s["liveness_checked"] is True, s
-        assert s["runs"] == run_cosim.FUZZ_RUNS + run_cosim.FUZZ_RUNS // 256 and s["walks"] == 8, s
-        assert s["halted"] + s["capped"] == s["runs"], s
-        assert s["probes_retired"] > 0 and s["max_cycles_per_insn"] <= 1024, s
-
-
-def test_fuzz_pins_mode_cannot_check_liveness():
-    """pins mode sees no retirement and no halt, so it checks only the pin rules: hang_reserved
-    passes it, flagged "liveness_checked": false. The eval runs rvfi mode."""
-    s = fuzz_cli(COSIM / "mutants" / "hang_reserved", 1, "--mode", "pins", "--fuzz-runs", "128")
-    assert s["pass"] and s["mode"] == "pins" and s["liveness_checked"] is False, s
-    assert s["runs"] == 129 and s["halted"] == 0 and s["max_cycles_per_insn"] is None, s
-    s = fuzz_cli(COSIM / "mutants" / "hang_reserved", 1, "--fuzz-runs", "128")
-    assert not s["pass"] and "opcode 0x0b" in s["error"], s
-
-
-# ------------------------------------------------------------------------------------------------
-# 4. the TT test (test/test.py with the 23LC512 model) on legal variants and on mutants
-# It sees only the pins: gpio_demo's uo_out sequence and the RAM model's waveform rules. Mutants
-# whose bug only shows against RVFI or the retirement timing (uo_late, cs_open_at_retire,
-# load_own_fetch) pass it by design, and so does rvfi_hidden (gpio_demo runs no SLTU/SLTIU); the
-# cosim catches those. The RAM model also checks the section 6 transaction classes the pins show
-# (region or program, at most 4 bytes per program READ, each store byte once), so a wrap or a
-# double write that synthesis introduces fails the gate-level test too.
-TT_CASES = {
-    "(seed)": None,
-    "legal_mosi_echo": None,    # MOSI = X when no bit is due: legal
-    "legal_trap_fields": None,
-    "legal_split_store": None,  # contract v2: a store split over two WRITEs
-    "legal_h002_rf": None,      # contract v2: registers in the core region
-    "legal_h002_pcram": None,   # contract v2: registers and pc in the core region
-    "legal_null_read": None,    # 78472fe: a READ with its 24-bit header and no data bit
-    "null_read_short": "transaction ended after 23 bits, before its command and address",
-    "region_wrap": "wraps out of the core region",
-    "region_straddle": "runs from program RAM into the core region",
-    "store_twice": "written a second time since the last program READ",
-    "fetch_extra_byte": "program READ at 0x0000 addresses a fifth byte (0x0004)",
-    "mosi_on_rise": "spiram: MOSI changed on a rising SCK edge",
-    "cs_sck_high": "spiram: CS_n changed while SCK was high",
-    "write_midbyte": "spiram: WRITE ended mid-byte",  # needs gpio_demo's RAM stores
-    "zero_init": "spiram: MOSI = x on a rising SCK edge",
-    "uo_glitch": "uo_out change #1 is 0x00",
-}
-
-
-@pytest.mark.parametrize("name", sorted(TT_CASES))
-def test_tt_test_on_variants(name):
-    """make -C test (RTL) passes on the seed and the legal variants and fails on the mutants with
-    their specific message. legal_mosi_echo drives MOSI = X when no bit is due, which the contract
-    allows (MOSI matters only at rising SCK edges): the TT test must not X-check MOSI."""
-    if name == "legal_mosi_echo":
-        m = manifest()[name]
-        assert m["pass"] == ["rvfi", "pins"] and not m["fail"]
-    src = SRC if name == "(seed)" else COSIM / "mutants" / name
-    tag = "tt_" + name.strip("()")
-    p = subprocess.run(["make", "-C", str(ROOT / "test"), f"SRC_DIR={src}",
-                        f"SIM_BUILD=sim_build/{tag}",
-                        f"COCOTB_RESULTS_FILE=sim_build/{tag}/results.xml"],
-                       capture_output=True, text=True)
-    out = p.stdout + p.stderr
-    want = TT_CASES[name]
-    if want is None:
-        assert p.returncode == 0 and "TESTS=1 PASS=1 FAIL=0" in out, out[-3000:]
+    r = run(0xA5)
+    assert r["pass"], r["error"]
+    r = run(0xA5, glitch=705)
+    assert not r["pass"] and "MOSI (uo[6]) changed" in r["error"], r["error"]
+    r = run(0xA4)
+    if mode == "rvfi":
+        assert not r["pass"] and "SPI MOSI sent 0xa4" in r["error"], r["error"]
     else:
-        assert p.returncode != 0 and "FAIL=1" in out, f"{name} passed the TT test"
-        assert want in out, out[-3000:]
+        assert r["pass"], r["error"]  # pins mode can't relate the byte to the store
+
+
+# ------------------------------------------------------------------------------------------------
+# 3. the tCEM mutant (R12), run_cosim.py --v3 (R18), the v3 fuzz
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_tcem_mutant_fails(tools, tmp_path, mode):
+    """mutants/tcem_stall holds PSRAM CS_n low with SCK paused for 400 cycles during a read:
+    past tCEM = 8 us = 320 cycles at 25 ns (contract 2.1.7)."""
+    hexf = flash_hex(tmp_path / "loop.hex", {0: PROG_LOOP})
+    s, res = run_cosim.run_one(mode, hexf, 1, src=TCEM, v3=True)
+    assert not s["pass"] and "tCEM" in s["error"], s["error"]
+    assert list(s) == list(run_cosim.KEYS) and s["coremark_cycles_per_iter"] is None
+
+
+def test_run_cosim_v3_cli(tools, tmp_path):
+    """R18: --v3 runs the v3 harness and prints KEYS (coremark_cycles_per_iter included); the v3
+    gate is the plan's program list x both modes x seeds 1-4, plus the fuzz at seeds 1-5."""
+    hexf = flash_hex(tmp_path / "loop.hex", {0: PROG_LOOP})
+    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--v3", "--mode", "pins",
+                        "--prog", str(hexf), "--src", str(TCEM)], capture_output=True, text=True)
+    s = json.loads(p.stdout.strip().splitlines()[-1])
+    assert p.returncode == 1 and list(s) == list(run_cosim.KEYS), (p.returncode, s)
+    assert "tCEM" in s["error"] and s["coremark_cycles_per_iter"] is None
+    assert run_cosim.SEEDS_V3 == (1, 2, 3, 4) and run_cosim.FUZZ_SEEDS_V3 == (1, 2, 3, 4, 5)
+    assert run_cosim.LAT_CAP_V3 == 2048 and run_cosim.CLK_NS == 25.0
+    plan = {"selftest", "csr", "irq_timer", "irq_stress", "wfi", "coherence", "uart_echo",
+            "spi_loop", "pwm", "ir_loop", "gpio_edge", "mem_init_check", "coremark"}
+    plan |= {f"trap_{t}" for t in ("ecall", "ebreak", "jal", "jalr", "branch", "zero", "ones")}
+    plan |= {f"random_{n}" for n in range(1, 7)}
+    assert set(run_cosim.V3_PROGRAMS) == plan and len(run_cosim.V3_PROGRAMS) == len(plan)
+    assert run_cosim.build_dir_for("rvfi", run_cosim.SRC, "", False, v3=True).name == "rvfi-v3"
+
+
+def test_fuzz_v3_checks_liveness(tools):
+    """The v3 liveness fuzz on random flash images: a stub that never retires fails the rvfi-mode
+    fuzz with the latency cap; pins mode checks only the pin rules (and the idle stub passes)."""
+    s = run_cosim.run_fuzz("rvfi", 1, runs=4, cap=10, src=PLAYBACK, v3=True)
+    assert list(s) == run_cosim.FUZZ_KEYS_V3
+    assert not s["pass"] and s["liveness_checked"] is True, json.dumps(s)
+    want = "latency cap: no retirement within 2048 cycles of reset release"
+    assert want in s["error"], s["error"]
+    s = run_cosim.run_fuzz("pins", 1, runs=2, cap=10, src=PLAYBACK, v3=True)
+    assert s["pass"] and s["liveness_checked"] is False and s["runs"] == 3, json.dumps(s)
+    s = run_cosim.run_fuzz("rvfi", 3, runs=2, cap=10, src=TCEM, v3=True)
+    assert not s["pass"] and "tCEM" in s["error"], json.dumps(s)
