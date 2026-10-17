@@ -295,10 +295,11 @@ module tt_um_fesens_r32v (
                 (mem & (sP | (sPX & c_br)));            // first instruction: pc = 0
     assign cs_n   = ~ep[2] | mask;
     assign miso_m = uio_in[2] & ~cs_n;   // 0 in a masked (x0) slot
-    wire [5:0] dlen = (fM & ~sF) ? {c_ld & (nm1 == 2'b11), (nm1 == 2'b01) | (c_st & (nm1 == 2'b11)),
-                                    nm1 == 2'b00, 3'b000} :
-                      fO ? {~(f3[1] & mem), f3[1] & mem, 4'b0000} : 6'd32;
-    wire dend = shB ? (ph == 6'd30) : (j == dlen);
+    // data length: 8 bits (LB, SB), 16 (LH, SH, the SW halves and their rs2 halves) or 32; the
+    // data phase ends at the first strobe with j >= length (j counts the data bits up from 1)
+    wire len8  = sMM & (nm1 == 2'b00);
+    wire len16 = (sMM & ((nm1 == 2'b01) | (c_st & nm1[1]))) | (fO & f3[1] & mem);
+    wire dend  = shB ? (ph == 6'd30) : (j[5] | (j[4] & (len16 | len8)) | (j[3] & len8));
 
     // next slot after END
     reg [3:0] nsl;
