@@ -1,13 +1,15 @@
-// Unit test harness for the register-file-in-RAM core (hypothesis 002). Not a contract gate.
+// Unit test harness for the register-file-and-pc-in-RAM core (hypothesis 002, variant 2). Not a
+// contract gate.
 //
 // Verilator top: tt_um_fesens_r32v. A 23LC512 model checks contract section 2 on every clock
-// edge and drives noise on MISO whenever SCK is low. The register region 0xFFC0..0xFFFF (x_r at
-// 0xFFC0 + 4r, stored LSB first: bit 8n+i of x_r is bit 7-i of byte 4r+n) starts with random
-// bytes. Two modes:
+// edge and drives noise on MISO whenever SCK is low. The reserved region 0xFF80..0xFFFF starts
+// with random bytes: x_r at 0xFFC0 + 4r (stored LSB first: bit 8n+i of x_r is bit 7-i of byte
+// 4r+n), the pc in the x0 slot at 0xFFC0, a scratch word at 0xFF80. Two modes:
 //   rvfi  (built with -DRISCV_FORMAL): every retirement is compared with the reference ISS. Its
-//         SPI transactions must be: the fetch first, any number of register-region transactions,
-//         and the data access of a RAM load or store. After every retirement the region must
-//         hold the ISS's value of every register written so far.
+//         SPI transactions outside the region must be: the fetch, then the data access of a RAM
+//         load or store (a SW is two 2-byte WRITEs at addr and addr + 2); region transactions
+//         move 2 or 4 bytes. After every retirement the region must hold the ISS's value of
+//         every register written so far, and the x0 slot the next pc.
 //   pins  (plain build): the final RAM image outside the region, the final register values in
 //         the region and the uo_out change trace are compared with the ISS run on the program.
 // The rvfi mode enforces the 1,024-cycle latency cap per retirement. Programs must not access
@@ -152,14 +154,15 @@ class SpiRam {
   }
 };
 
-const int RF_BASE = 0xFFC0;
+const int RF_BASE = 0xFF80;  // the reserved region
+const int REG_BASE = 0xFFC0;  // x_r at REG_BASE + 4r; the pc in the x0 slot
 
 // x_r as stored in the region: LSB first on the wire, so bit 8n+i is bit 7-i of byte 4r+n.
 uint32_t region_reg(const uint8_t* mem, int r) {
   uint32_t v = 0;
   for (int n = 0; n < 4; n++)
     for (int i = 0; i < 8; i++)
-      v |= (uint32_t)((mem[RF_BASE + 4 * r + n] >> (7 - i)) & 1) << (8 * n + i);
+      v |= (uint32_t)((mem[REG_BASE + 4 * r + n] >> (7 - i)) & 1) << (8 * n + i);
   return v;
 }
 
@@ -227,7 +230,7 @@ int main(int argc, char** argv) {
 #endif
 
   std::string fail;
-  uint64_t cycle = 0, last_ret = 0, retired = 0, max_gap = 0;
+  uint64_t cycle = 0, last_ret = 0, retired = 0, max_gap = 0, first_gap = 0;
   uint64_t uo_changes = 0;
   uint8_t uo_prev = 0;
   std::vector<uint8_t> uo_trace;
@@ -276,12 +279,11 @@ int main(int argc, char** argv) {
 #ifdef TRACE_PUBLIC
     if (getenv("TRACE")) {
       auto* R = top.rootp;
-      printf("c%llu sl=%d ep=%d ph=%d j=%d cs=%d sck=%d mosi=%d miso=%d cy=%d cmp=%d mem=%d pc=%09llx bf=%09llx\n",
+      printf("c%llu sl=%d ep=%d ph=%d j=%d cs=%d sck=%d mosi=%d miso=%d cy=%d cmp=%d mem=%d bf=%09llx\n",
              (unsigned long long)cycle, R->tt_um_fesens_r32v__DOT__sl, R->tt_um_fesens_r32v__DOT__ep,
              R->tt_um_fesens_r32v__DOT__ph, R->tt_um_fesens_r32v__DOT__j, c, s, m,
              (top.uio_in >> 2) & 1, R->tt_um_fesens_r32v__DOT__cy, R->tt_um_fesens_r32v__DOT__cmp,
-             R->tt_um_fesens_r32v__DOT__mem, (unsigned long long)R->tt_um_fesens_r32v__DOT__pcr,
-             (unsigned long long)R->tt_um_fesens_r32v__DOT__bfr);
+             R->tt_um_fesens_r32v__DOT__mem, (unsigned long long)R->tt_um_fesens_r32v__DOT__bfr);
     }
 #endif
     if (!ram.err.empty()) {
@@ -363,9 +365,9 @@ int main(int argc, char** argv) {
         ram.done.clear();
         std::vector<Txn> ts;
         for (size_t i = 0; i < all.size(); i++) {
-          bool reg = in_region(all[i].addr, all[i].data.size()) && !(i == 0 && all[i].addr == (uint16_t)r.pc);
+          bool reg = in_region(all[i].addr, all[i].data.size());
           if (reg) {
-            if (all[i].data.size() != 4) {
+            if (all[i].data.size() != 4 && all[i].data.size() != 2) {
               snprintf(b, sizeof b, "retire %llu: register transaction of %zu bytes", (unsigned long long)retired, all[i].data.size());
               fail = b;
             }
@@ -374,7 +376,9 @@ int main(int argc, char** argv) {
             ts.push_back(all[i]);
         }
         size_t want = 1;
-        if ((r.rmask | r.wmask) && !io) want = 2;
+        bool split = r.wmask == 0xF && !io;  // a RAM SW: two 2-byte WRITEs
+        if ((r.rmask | r.wmask) && !io) want = split ? 3 : 2;
+        if ((r.pc & 0xFFFFu) >= (uint32_t)RF_BASE && fail.empty()) fail = "program executes in the region";
         if (!fail.empty()) {
         } else if (ts.size() != want) {
           snprintf(b, sizeof b, "retire %llu pc %08x %s: %zu SPI transactions, expected %zu",
@@ -386,13 +390,19 @@ int main(int argc, char** argv) {
             snprintf(b, sizeof b, "retire %llu: bad fetch transaction", (unsigned long long)retired);
             fail = b;
           }
-          if (want == 2) {
-            const Txn& d = ts[1];
+          if (want >= 2) {
             unsigned n = (r.rmask | r.wmask) == 1 ? 1 : (r.rmask | r.wmask) == 3 ? 2 : 4;
-            bool okd = d.addr == (uint16_t)r.maddr && d.data.size() == n && d.write == (r.wmask != 0);
+            bool okd = true;
+            std::vector<uint8_t> db;
+            for (size_t q = 1; q < ts.size(); q++) {
+              const Txn& d = ts[q];
+              uint16_t ea = (uint16_t)(r.maddr + (split ? 2 * (q - 1) : 0));
+              if (d.addr != ea || d.write != (r.wmask != 0) || d.data.size() != (split ? 2u : n)) okd = false;
+              db.insert(db.end(), d.data.begin(), d.data.end());
+            }
             for (unsigned k = 0; okd && k < n; k++) {
               uint8_t exp = (uint8_t)((r.wmask ? r.mwdata : r.mrdata) >> (8 * k));
-              if (d.data[k] != exp) okd = false;
+              if (db.size() != n || db[k] != exp) okd = false;
             }
             if (!okd) {
               snprintf(b, sizeof b, "retire %llu pc %08x %s: data transaction mismatch",
@@ -402,8 +412,13 @@ int main(int argc, char** argv) {
           }
         }
       }
-      // the region holds every register the ISS has written
+      // the region holds every register the ISS has written, and the x0 slot the next pc
       if (r.rd) written |= 1u << r.rd;
+      if (fail.empty() && !r.trap && region_reg(ram.mem, 0) != r.npc) {
+        snprintf(b, sizeof b, "retire %llu pc %08x %s: pc slot = %08x, expected %08x",
+                 (unsigned long long)retired, r.pc, iss_disasm(r.insn).c_str(), region_reg(ram.mem, 0), r.npc);
+        fail = b;
+      }
       for (int q = 1; q < 16 && fail.empty(); q++)
         if (((written >> q) & 1) && region_reg(ram.mem, q) != iss.reg(q)) {
           snprintf(b, sizeof b, "retire %llu pc %08x %s: region x%d = %08x, expected %08x",
@@ -414,6 +429,7 @@ int main(int argc, char** argv) {
       // timing by class
       uint64_t gap = cycle - last_ret;
       if (gap > max_gap) max_gap = gap;
+      if (retired == 0) first_gap = gap;  // includes the boot slot; kept out of the class table
       // class name, with the access width for memory classes and the direction for shifts
       std::string cn = iss_class(r);
       unsigned msk = r.rmask | r.wmask;
@@ -424,6 +440,7 @@ int main(int argc, char** argv) {
         cn += s == 0 ? "_0" : s <= 8 ? "_1-8" : s <= 16 ? "_9-16" : s <= 24 ? "_17-24" : "_25-31";
       }
       int ci = 0;
+      if (retired == 0) cn = "first_after_reset";
       for (; ci < ncls; ci++)
         if (cls_names[ci] == cn) break;
       if (ci == ncls) {
@@ -517,11 +534,11 @@ int main(int argc, char** argv) {
   }
 
   printf("{\"prog\":\"%s\",\"mode\":\"%s\",\"seed\":%u,\"pass\":%s,\"retired\":%llu,\"cycles\":%llu,"
-         "\"cpi\":%.1f,\"max_cycles_per_insn\":%llu,\"reg_txns\":%llu,\"error\":\"%s\"}\n",
+         "\"cpi\":%.1f,\"max_cycles_per_insn\":%llu,\"first_gap\":%llu,\"reg_txns\":%llu,\"error\":\"%s\"}\n",
          o.hex, rvfi ? "rvfi" : "pins", o.seed, fail.empty() ? "true" : "false",
          (unsigned long long)retired, (unsigned long long)cycle,
          retired ? (double)cycle / retired : 0.0, (unsigned long long)max_gap,
-         (unsigned long long)reg_txns, fail.c_str());
+         (unsigned long long)first_gap, (unsigned long long)reg_txns, fail.c_str());
   if (rvfi && !o.quiet) {
     for (int i = 0; i < ncls; i++)
       fprintf(stderr, "  %-20s n=%-7llu min=%-5llu avg=%-7.1f max=%llu\n", cls_names[i].c_str(),

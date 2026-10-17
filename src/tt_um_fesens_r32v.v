@@ -1,30 +1,34 @@
 /*
- * BonettoR32V hypothesis 002: bit-serial RV32E with the register file in the SPI RAM.
+ * BonettoR32V hypothesis 002, variant 2: bit-serial RV32E with the register file AND the pc in
+ * the SPI RAM.
  *
- * x1..x15 live in the 23LC512 at 0xFFC0 + 4*r (the x0 slot at 0xFFC0 is core scratch). The die
- * keeps the pc, the instruction register, ONE operand/result buffer, the SPI engine and uo_out.
- * See src/RF_IN_RAM.md for the design and the cycle counts.
+ * x1..x15 live in the 23LC512 at 0xFFC0 + 4*r, the pc in the x0 slot at 0xFFC0, and 0xFF80 is a
+ * scratch word (JALR with rd != 0). The die keeps the instruction register, ONE operand/result
+ * buffer, the SPI engine and uo_out. See src/RF_IN_RAM.md, section 8.
  *
- * Rings. The pc (pcr) and the buffer (bfr) are 33-bit rings that rotate right on every clock. A
- * free-running phase counter ph counts 0..32; the bit at ring position i shows phase ph + i (mod
- * 33). Logical bit k of a value sits at phase 2k (mod 33): bits 0..16 at even phases, 17..31 at
- * odd phases, phase 31 unused. SPI data at SCK = clk/2 moves one bit every 2 clocks, so a data
- * phase whose first bit meets phase 0 hits bit k at phase 2k: register traffic streams straight
- * into and out of the rings with no per-bit enables. 33 is odd, so a time offset of 2s clocks is
- * a shift by s bits: shifts are a delayed emission.
+ * Ring. The buffer (bfr) is a 33-bit ring that rotates right on every clock. A free-running phase
+ * counter ph counts 0..32; the bit at ring position i shows phase ph + i (mod 33). Logical bit k
+ * of a value sits at phase 2k (mod 33): bits 0..16 at even phases, 17..31 at odd phases, phase 31
+ * unused. SPI data at SCK = clk/2 moves one bit every 2 clocks, so a data phase whose first bit
+ * meets phase 0 hits bit k at phase 2k: register traffic streams straight into and out of the
+ * ring with no per-bit enables. 33 is odd, so a time offset of 2s clocks is a shift by s bits:
+ * shifts are a delayed emission. A store keeps its 16-bit RAM address on the even phases and 16
+ * data bits on the odd phases (bit k at phase 2k + 1).
  *
  * Transactions (slots). Every SPI transaction has the same frame: 8 command bits, the address
  * high byte, a one-clock gap, the low byte, then data, all at SCK = clk/2. A slot starts at a
- * slot-specific phase, so every tap below is a fixed ring position:
- *   F fetch      READ  pc[15:0] (pc ring tap mux)          -> instruction register
- *   A rs1        READ  0xFFC0 + 4*rs1                      -> serial ALU (+imm) -> buffer
- *   B rs2        READ  0xFFC0 + 4*rs2                      -> serial ALU with the buffer
- *   S spill      WRITE 0xFFC0 (pc), RAM stores only
- *   M memory     READ/WRITE address from the buffer tap mux, store data from the pc tap mux
- *   R restore    READ  0xFFC0 -> pc ring, RAM stores only
- *   W rd         WRITE 0xFFC0 + 4*rd from the buffer (forward, load-reversed, or shifted)
- *   U update     no SPI: branch pc update
+ * phase set by its family (sl[3:2]), so every tap below is a fixed ring position:
+ *   P   READ  x0 (the pc)                              -> buffer
+ *   A   READ  rs1 -> serial ALU (+imm; AUIPC/JAL: buffer + imm) -> buffer
+ *   PX  READ  x0 -> buffer + (taken ? imm : 4) (branch); READ scratch -> buffer (JALR)
+ *   B   READ  rs2 -> serial ALU with the buffer
+ *   BH  READ  rs2 (BH2: rs2 + 2, and address + 2 in place) -> buffer odd phases (store data)
+ *   F   READ  pc[15:0] (buffer even-tap mux)           -> instruction register
+ *   M   READ/WRITE address from the buffer even taps, store data from the odd taps (M2: high half)
+ *   WP  WRITE x0 <- buffer;  WP4: x0 <- buffer + 4;  W4: rd (JAL) or scratch (JALR) <- buffer + 4
+ *   W   WRITE rd <- buffer (forward, load-reversed, or shifted)
  * A slot whose register is x0 (or that has no register) keeps CS_n high and runs the same timing.
+ * After reset a boot WP writes pc = 0. A trap halts in the retire state.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -67,32 +71,32 @@ module tt_um_fesens_r32v (
 `endif
 );
 
-    // Slot types. Binary codes, used bitwise below (which also keeps synthesis from
-    // re-encoding the register one-hot): 0xx READ slots, A/B/U = 0 with a bit in [1:0].
-    localparam [2:0] SL_F = 3'b000, SL_A = 3'b001, SL_U = 3'b010, SL_B = 3'b011,
-                     SL_S = 3'b100, SL_W = 3'b101, SL_M = 3'b110, SL_R = 3'b111;
-    // Engine phases: 01x0 = command/address or data (SCK runs)
-    localparam [3:0] E_IDLE = 4'b0000,   // CS_n high, wait for the slot's start phase
-                     E_PW   = 4'b0001,   // shift pre-roll: wait for the reference phase
-                     E_PC   = 4'b0010,   // shift pre-roll: count j up to 63
-                     E_RET  = 4'b0011,   // retire
-                     E_CMD  = 4'b0100,   // command and address bits
-                     E_DATA = 4'b0101,   // data bits
-                     E_GAP  = 4'b0110,   // one clock between the address bytes
-                     E_END  = 4'b0111,   // SCK low, then CS_n high
-                     E_CLR  = 4'b1000,   // after reset: pc <- 0
-                     E_HALT = 4'b1001;
+    // Slot types. sl[3:2] is the family: 00 READ into the serial ALU (start phase 16), 01 READ
+    // into the odd phases (17), 10 address from the buffer (2), 11 WRITE from the buffer (W: 5;
+    // WP, WP4, W4: 18, straight from bfr[0]). Binary codes, used bitwise below.
+    localparam [3:0] SL_P  = 4'b0000, SL_A   = 4'b0001, SL_PX = 4'b0010, SL_B  = 4'b0011,
+                     SL_BH = 4'b0100, SL_BH2 = 4'b0110,
+                     SL_F  = 4'b1000, SL_M   = 4'b1001, SL_M2 = 4'b1011,
+                     SL_WP = 4'b1100, SL_WP4 = 4'b1101, SL_W4 = 4'b1110, SL_W  = 4'b1111;
+    // Engine phases: 1x0 = command/address or data (SCK runs)
+    localparam [2:0] E_IDLE = 3'b000,    // CS_n high, wait for the slot's start phase
+                     E_PW   = 3'b001,    // shift pre-roll: wait for the reference phase
+                     E_PC   = 3'b010,    // shift pre-roll: count j up to 63
+                     E_RET  = 3'b011,    // retire; a trap stays here (halt)
+                     E_CMD  = 3'b100,    // command and address bits
+                     E_DATA = 3'b101,    // data bits
+                     E_GAP  = 3'b110,    // one clock between the address bytes
+                     E_END  = 3'b111;    // SCK low, then CS_n high
 
-    reg  [2:0]  sl;
-    reg  [3:0]  ep;
+    reg  [3:0]  sl;
+    reg  [2:0]  ep;
     reg  [5:0]  ph;     // 0..32
     reg  [5:0]  j;      // bit counter (40..63 command/address, 0.. data), shift pre-roll
     reg         cs_n, sck, mosi;
-    reg         mem;    // load/store goes to RAM (address bit 31 = 0)
+    reg         mem;    // load/store goes to RAM (address bit 31 = 0); 1 during the boot slot
     reg         cy;     // ALU carry; sign latch in W
     reg         cmp;    // compare; address[1:0] == 0; JALR target[1]; shift fill state
-    reg         c4;     // pc + 4 carry
-    reg  [32:0] pcr;    // pc ring
+    reg         c4;     // carry of the on-the-fly + 4 (W family) and + 2 (BH2)
     reg  [32:0] bfr;    // operand/result buffer ring
     reg  [31:0] irs;    // instruction register, in SPI order
     reg  [7:0]  gpo;
@@ -140,7 +144,7 @@ module tt_um_fesens_r32v (
     wire c_st    = c_mem & insn[5];
     wire c_ld    = c_mem & ~insn[5];
     wire c_u     = ~insn[6] & insn[4] & insn[2];
-    wire c_lui   = c_u & insn[5];
+    wire c_pcrel = (c_u & ~insn[5]) | c_jal;            // AUIPC, JAL: buffer (pc) + imm
     wire c_alu   = ~insn[6] & insn[4] & ~insn[2];
     wire c_op    = c_alu & insn[5];
     wire c_sh    = c_alu & (f3[1:0] == 2'b01);
@@ -148,18 +152,25 @@ module tt_um_fesens_r32v (
     wire sh_left = ~f3[2];
     wire [1:0] nm1 = {f3[1], f3[1] | f3[0]};   // access bytes - 1
 
-    wire sA = (sl == SL_A);
-    wire sB = (sl == SL_B);
-    wire sU = (sl == SL_U);
-    wire sM = (sl == SL_M);
-    wire sW = (sl == SL_W);
-    wire sS = (sl == SL_S);
-    wire shB = sB & c_sh;
-    wire s_abu = ~sl[2] & (sl[1] | sl[0]);     // A, B or U
-    wire e_cd  = ~ep[3] & ep[2] & ~ep[1];      // CMD or DATA: SCK runs
+    wire fR   = ~sl[3] & ~sl[2];
+    wire fO   = ~sl[3] &  sl[2];
+    wire fM   =  sl[3] & ~sl[2];
+    wire fW   =  sl[3] &  sl[2];
+    wire sA   = fR & ~sl[1] &  sl[0];
+    wire sPX  = fR &  sl[1] & ~sl[0];
+    wire sB   = fR &  sl[1] &  sl[0];
+    wire sF   = fM & ~sl[0];
+    wire sMM  = fM &  sl[0];
+    wire sW   = fW &  sl[1] &  sl[0];
+    wire sW4  = fW &  sl[1] & ~sl[0];
+    wire hi   = sl[1] & (fO | fM);                 // BH2, M2
+    wire winc = fW & (sl[1] ^ sl[0]);              // WP4, W4
+    wire wpln = fW & ~(sl[1] & sl[0]);             // WP, WP4, W4
+    wire shB  = sB & c_sh;
+    wire e_cd = ep[2] & ~ep[1];                    // CMD or DATA: SCK runs
 
     // ------------------------------------------------------------------------------------
-    // Bit index of the current strobe in the aligned slots (A, B, U): bit k meets phase 2k.
+    // Bit index of the current strobe in the ALU slots (family 00): bit k meets phase 2k.
     // ------------------------------------------------------------------------------------
     wire [4:0] kb = ph[0] ? {1'b1, ph[4:1] + 4'd1} : ph[5:1];
     wire       k0 = (ph == 6'd0);
@@ -183,47 +194,36 @@ module tt_um_fesens_r32v (
                 m_a;
 
     // ------------------------------------------------------------------------------------
-    // Serial ALU (strobe = SCK-high clock of a data bit) and pc + 4
+    // Serial ALU (strobe = SCK-high clock of a data bit)
     // ------------------------------------------------------------------------------------
-    wire stb = (ep == E_DATA) & sck;
+    wire stb    = (ep == E_DATA) & sck;
+    wire taken  = cmp ^ f3[0];
     wire bimm_a = ~(c_op | c_br | c_sh);
-    wire a_bit = sA ? ((c_u & ~c_lui) | c_jal ? pcr[0] : c_lui ? 1'b0 : miso_m) :
-                 sB ? bfr[0] : pcr[0];
-    wire b_raw = sA ? (bimm_a & imm_bit) :
-                 sB ? ((c_sh & ~c_op) ? imm_bit : miso_m) : imm_bit;
-    wire sub   = sA ? c_slt : sB ? ((c_op & insn[30] & (f3 == 3'b000)) | c_slt | c_br) : 1'b0;
-    wire b_x   = b_raw ^ sub;
-    wire cin   = k0 ? sub : cy;
-    wire sum   = a_bit ^ b_x ^ cin;
-    wire cout  = (a_bit & b_x) | (cin & (a_bit ^ b_x));
-    wire boolr = ((a_bit ^ b_raw) & ~f3[0]) | (f3[1] & a_bit & b_raw);
-    wire sgnd  = c_br ? ~f3[1] : ~f3[0];
-    wire lt    = (a_bit & sgnd) ^ ~(b_raw & sgnd) ^ cout;
-    wire eqacc = ~sum & (cmp | k0);
-    wire ocmp  = (c_br & ~f3[2]) ? eqacc : lt;
-    wire inc   = pcr[0] ^ (c4 & ~k0);
-    wire taken = cmp ^ f3[0];
-    wire trap  = trap_dec | (c_br & taken & insn[8]) | (c_jalr & cmp);
+    wire a_bit  = (sB | (sA & c_pcrel)) ? bfr[0] : miso_m;
+    wire b_raw  = sA ? (bimm_a & imm_bit) :
+                  sB ? ((c_sh & ~c_op) ? imm_bit : miso_m) :
+                  (sPX & c_br & (taken ? imm_bit : (ph == 6'd4)));
+    wire sub    = sA ? c_slt : (sB & ((c_op & insn[30] & (f3 == 3'b000)) | c_slt | c_br));
+    wire b_x    = b_raw ^ sub;
+    wire cin    = k0 ? sub : cy;
+    wire sum    = a_bit ^ b_x ^ cin;
+    wire cout   = (a_bit & b_x) | (cin & (a_bit ^ b_x));
+    wire boolr  = ((a_bit ^ b_raw) & ~f3[0]) | (f3[1] & a_bit & b_raw);
+    wire sgnd   = c_br ? ~f3[1] : ~f3[0];
+    wire lt     = (a_bit & sgnd) ^ ~(b_raw & sgnd) ^ cout;
+    wire eqacc  = ~sum & (cmp | k0);
+    wire ocmp   = (c_br & ~f3[2]) ? eqacc : lt;
+    wire trap   = trap_dec | (c_br & taken & insn[8]) | (c_jalr & cmp);
 
     // ------------------------------------------------------------------------------------
-    // Ring tap muxes for MSB-first emission. Select a = j[2:0]: address bit 15 - a / 7 - a,
-    // store data bit 7 - a of each byte, load data bit a of each byte (reversed), or 0 for
-    // a forward emission.
+    // Ring tap muxes for MSB-first emission, select a = j[2:0]: address bit 15 - a / 7 - a from
+    // the even phases (bfm), store data bit 7 - a of each byte from the odd phases (bfo), load
+    // data bit a of each byte (reversed, bfm), or select 0 for a forward emission.
     // ------------------------------------------------------------------------------------
-    wire       fwd  = sS | (sW & ~c_ld);
+    wire       fwd  = fW & ~(sW & c_ld);
     wire [2:0] msel = j[2:0] & {3{~fwd}};
-    reg pcm, bfm;
+    reg bfm, bfo;
     always @(*) begin
-        case (msel)
-            3'd0: pcm = pcr[30];
-            3'd1: pcm = pcr[26];
-            3'd2: pcm = pcr[22];
-            3'd3: pcm = pcr[18];
-            3'd4: pcm = pcr[14];
-            3'd5: pcm = pcr[10];
-            3'd6: pcm = pcr[6];
-            default: pcm = pcr[2];
-        endcase
         case (msel)
             3'd0: bfm = bfr[13];
             3'd1: bfm = bfr[9];
@@ -234,12 +234,22 @@ module tt_um_fesens_r32v (
             3'd6: bfm = bfr[22];
             default: bfm = bfr[18];
         endcase
+        case (j[2:0])
+            3'd0: bfo = bfr[31];
+            3'd1: bfo = bfr[27];
+            3'd2: bfo = bfr[23];
+            3'd3: bfo = bfr[19];
+            3'd4: bfo = bfr[15];
+            3'd5: bfo = bfr[11];
+            3'd6: bfo = bfr[7];
+            default: bfo = bfr[3];
+        endcase
     end
 
     // ------------------------------------------------------------------------------------
-    // W data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
+    // W family data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
     // ------------------------------------------------------------------------------------
-    wire wem    = sW & sck & ~j[5] & e_cd;
+    wire wem    = fW & sck & ~j[5] & e_cd;
     wire sh_evt = (ph == {3'b010, sh_left, ~sh_left, 1'b0});  // 18: source 32 passes; 20: source 0
     wire shfill = sh_left ? ~(cmp | sh_evt) : (cmp | sh_evt);
     wire ldfill = (j[4:3] > nm1);
@@ -249,134 +259,119 @@ module tt_um_fesens_r32v (
                   c_slt ? ((j[4:0] == 5'd0) & cmp) :
                   c_sh  ? (shfill ? (insn[30] & cy) : bfm) :
                           bfm;
+    wire wpl    = (bfr[0] ^ (c4 & winc)) & ~mem;  // WP, WP4, W4; the boot WP writes 0
+    wire wdo    = sW ? wd : wpl;
+
+    // BH2: address + 2 on the even phases, in the SCK-low clocks between the data strobes
+    wire inc2   = (ep == E_DATA) & ~sck & hi & fO;
+    wire cin2   = (ph == 6'd2) | c4;
 
     // ------------------------------------------------------------------------------------
     // MOSI
     // ------------------------------------------------------------------------------------
-    wire       wr    = sS | sW | (sM & c_st);
-    wire [3:0] rsel  = sA ? rs1_f : sB ? rs2_f : sW ? rd_f : 4'd0;
+    wire       wr    = fW | (sMM & c_st);
+    wire       scr   = c_jalr & (sPX | sW4);       // the scratch word: address bit 6 = 0
+    wire [3:0] rsel  = sA ? rs1_f : (sB | fO) ? rs2_f : (sW | (sW4 & c_jal)) ? rd_f : 4'd0;
     reg        ra_bit;
     always @(*) begin
         case (j[2:0])
+            3'd0: ra_bit = 1'b1;
+            3'd1: ra_bit = ~scr;
             3'd2: ra_bit = rsel[3];
             3'd3: ra_bit = rsel[2];
             3'd4: ra_bit = rsel[1];
             3'd5: ra_bit = rsel[0];
-            3'd6, 3'd7: ra_bit = 1'b0;
-            default: ra_bit = 1'b1;
+            3'd6: ra_bit = hi;
+            default: ra_bit = 1'b0;
         endcase
     end
     wire cmdbit  = (j[2:1] == 2'b11) & ~(j[0] & wr);
-    wire mosi_ca = (j[4:3] == 2'b01) ? cmdbit :
-                   (sl == SL_F) ? pcm : sM ? bfm :
-                   (~j[3] | ra_bit);
-    wire mosi_d  = (sS | sM) ? pcm : wd;
+    wire mosi_ca = (j[4:3] == 2'b01) ? cmdbit : fM ? bfm : (~j[3] | ra_bit);
+    wire mosi_d  = fM ? bfo : wdo;
     wire mosi_nx = j[5] ? mosi_ca : mosi_d;
 
     // ------------------------------------------------------------------------------------
     // Slot control
     // ------------------------------------------------------------------------------------
-    reg [5:0] tgt;      // the slot starts (CS_n falls) after the IDLE clock at this phase
-    always @(*) begin
-        case (sl)
-            SL_F:    tgt = 6'd17;
-            SL_S:    tgt = 6'd20;
-            SL_M:    tgt = 6'd1;
-            SL_W:    tgt = 6'd4;
-            default: tgt = 6'd15;
-        endcase
-    end
+    // the slot starts (CS_n falls) after the IDLE clock at this phase: 15, 16, 1, 4 (W), 17
+    wire [5:0] tgt = {1'b0, fO | wpln, fR, fR | sW, fR, fR | fM | wpln};
     wire mask = (sA & (~uses_rs1 | (rs1_f == 4'd0))) |
-                (sB & (~(c_op | c_br | c_st) | (rs2_f == 4'd0))) |
-                (sW & (rd_f == 4'd0)) | sU;
-    wire dend = shB ? (ph == 6'd29) :
-                sM  ? (j == {nm1 == 2'b11, nm1 == 2'b01, nm1 == 2'b00, 3'b000}) :
-                      (j == 6'd32);
+                (sB & ~(c_op | c_br)) |
+                ((sB | fO) & (rs2_f == 4'd0)) |
+                (fW & sl[1] & (rd_f == 4'd0));
+    wire [5:0] dlen = (fM & ~sF) ? {c_ld & (nm1 == 2'b11), (nm1 == 2'b01) | (c_st & (nm1 == 2'b11)),
+                                    nm1 == 2'b00, 3'b000} :
+                      fO ? {~(f3[1] & mem), f3[1] & mem, 4'b0000} : 6'd32;
+    wire dend = shB ? (ph == 6'd29) : (j == dlen);
 
     // next slot after END
-    reg [2:0] nsl;
+    reg [3:0] nsl;
     reg       nret, npre;
     always @(*) begin
         nsl  = SL_W;
         nret = 1'b0;
         npre = 1'b0;
         case (sl)
+            SL_P: nsl = SL_F;
             SL_F: begin
-                nsl  = SL_A;
                 nret = trap_dec;
+                nsl  = c_br ? SL_A : (c_jal | c_jalr) ? SL_W4 : SL_WP4;
+            end
+            SL_WP4: begin
+                nret = c_fence;
+                nsl  = SL_A;
+            end
+            SL_W4: nsl = SL_A;
+            SL_BH: begin
+                nsl  = SL_M;
+                nret = ~mem;
             end
             SL_A: begin
-                if (c_fence | (c_jalr & cmp))
+                if (c_jalr & cmp)
                     nret = 1'b1;
-                else if (c_mem)
-                    nsl = mem ? (c_st ? SL_S : SL_M) : (c_st ? SL_B : SL_W);
-                else if (c_op | c_br | c_sh | c_jalr)
+                else if (c_jal | c_jalr)
+                    nsl = SL_WP;
+                else if (c_br | c_op | c_sh)
                     nsl = SL_B;
+                else if (c_st)
+                    nsl = SL_BH;
+                else if (c_ld & mem)
+                    nsl = SL_M;
             end
             SL_B: begin
                 if (c_sh)
                     npre = 1'b1;
                 else if (c_br) begin
-                    nsl  = SL_U;
+                    nsl  = SL_PX;
                     nret = taken & insn[8];
-                end else if (c_st) begin
-                    nsl  = SL_M;
-                    nret = ~mem;
                 end
             end
-            SL_S: nsl = SL_B;
-            SL_M: nsl = c_ld ? SL_W : SL_R;
-            default: nret = 1'b1;     // R, W, U
+            SL_PX: nsl = c_br ? SL_WP : SL_W;
+            SL_WP: begin
+                nsl  = mem ? SL_P : SL_PX;
+                nret = ~mem & ~(c_jalr & (rd_f != 4'd0));
+            end
+            SL_M: begin
+                nsl  = c_ld ? SL_W : SL_BH2;
+                nret = c_st & ~f3[1];
+            end
+            SL_BH2: nsl = SL_M2;
+            default: nret = 1'b1;     // M2, W
         endcase
     end
 
     // ------------------------------------------------------------------------------------
-    // Rings (no reset: nothing reads them before they are written)
+    // Ring (no reset: nothing reads it before it is written)
     // ------------------------------------------------------------------------------------
-    reg bfr_we, bfr_w, pcr_we, pcr_w;
-    always @(*) begin
-        bfr_we = 1'b0;
-        bfr_w  = sum;
-        pcr_we = 1'b0;
-        pcr_w  = inc;
-        if (ep == E_CLR) begin
-            pcr_we = 1'b1;
-            pcr_w  = 1'b0;
-        end else if (stb) begin
-            case (sl)
-                SL_A: begin
-                    bfr_we = 1'b1;
-                    bfr_w  = c_jal ? inc : (c_alu & ~insn[5] & f3[2] & ~c_sh) ? boolr : sum;
-                    pcr_we = ~(c_jalr | c_br);
-                    pcr_w  = c_jal ? sum : inc;
-                end
-                SL_B: begin
-                    bfr_we = ~c_sh & ~(c_st & mem);
-                    bfr_w  = c_jalr ? inc : c_st ? miso_m : (f3 == 3'b000) ? sum : boolr;
-                    pcr_we = c_jalr | (c_st & mem);
-                    pcr_w  = c_jalr ? (bfr[0] & ~k0) : miso_m;
-                end
-                SL_M: begin
-                    bfr_we = c_ld;
-                    bfr_w  = miso_m;
-                end
-                SL_R: begin
-                    pcr_we = 1'b1;
-                    pcr_w  = miso_m;
-                end
-                SL_U: begin
-                    pcr_we = 1'b1;
-                    pcr_w  = taken ? sum : inc;
-                end
-                default: ;
-            endcase
-        end
-    end
+    wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & (f3 != 3'b000));
+    wire alu_w  = useb ? boolr : (sum & ~(k0 & c_jalr));
+    wire lo16   = ~j[5] & (~j[4] | (j[3:0] == 4'd0));   // data bits 0..15 (j = bit + 1)
+    wire bfr_we = inc2 | (stb & (fR ? ~shB : fO ? lo16 : (sMM & c_ld)));
+    wire bfr_w  = inc2 ? (bfr[0] ^ cin2) : fR ? alu_w : miso_m;
 
     always @(posedge clk) begin
-        pcr <= {pcr_we ? pcr_w : pcr[0], pcr[32:1]};
         bfr <= {bfr_we ? bfr_w : bfr[0], bfr[32:1]};
-        if ((sl == SL_F) & stb)
+        if (sF & stb)
             irs <= {irs[30:0], uio_in[2]};
     end
 
@@ -406,8 +401,12 @@ module tt_um_fesens_r32v (
                 cmp <= 1'b1;
         end
 
-        if (stb & s_abu)
-            c4 <= (ph == 6'd2) | (c4 & pcr[0]);
+        if (wem)
+            c4 <= (j[4:0] == 5'd1) | (c4 & bfr[0]);
+        else if (inc2)
+            c4 <= bfr[0] & cin2;
+        else if (ep == E_CMD)
+            c4 <= 1'b0;
 
         // bit counter
         if (((ep == E_IDLE) & (ph == tgt)) | ((ep == E_PC) & (j == 6'd63)))
@@ -433,12 +432,12 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
-            sl   <= SL_F;
-            ep   <= E_CLR;
-            ph   <= 6'd0;
+            sl   <= SL_WP;
+            ep   <= E_IDLE;
+            ph   <= 6'd17;                                // the boot WP starts at once
             cs_n <= 1'b1;
             sck  <= 1'b0;
-            mem  <= 1'b0;
+            mem  <= 1'b1;
             gpo  <= 8'd0;
         end else begin
             ph  <= (ph == 6'd32) ? 6'd0 : ph + 6'd1;
@@ -462,22 +461,22 @@ module tt_um_fesens_r32v (
                     cs_n <= 1'b1;
                     sl   <= nsl;
                     ep   <= npre ? E_PW : nret ? E_RET : E_IDLE;
+                    if (fW & ~sl[1] & ~sl[0])
+                        mem <= 1'b0;                        // WP: ends the boot slot
                 end
                 E_PW: if (ph == {3'b000, sh_left, 2'b10}) ep <= E_PC;
                 E_PC: if (j == 6'd63) begin
                     cs_n <= (rd_f == 4'd0);
                     ep   <= E_CMD;
                 end
-                E_RET: begin
+                default: begin                              // E_RET
                     if (c_st & ~mem & cmp & ~trap)
                         gpo <= {bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4], bfr[2]};
                     mem <= 1'b0;
-                    sl  <= SL_F;
-                    ep  <= trap ? E_HALT : E_IDLE;
+                    sl  <= SL_P;
+                    if (~trap)
+                        ep <= E_IDLE;
                 end
-                E_CLR: if (ph == 6'd32) ep <= E_IDLE;
-                E_HALT: ;
-                default: ep <= E_HALT;
             endcase
         end
     end
@@ -486,36 +485,35 @@ module tt_um_fesens_r32v (
     // RVFI (formal and cosim builds only; observes, never drives the pins)
     // ------------------------------------------------------------------------------------
 `ifdef RISCV_FORMAL
-    genvar gi;
-    // logical bit m of a ring is at phase 2m mod 33, which sits at position (2m - ph) mod 33
-    wire [65:0] pcd   = {pcr, pcr};
-    wire [31:0] pcv;
-    generate
-        for (gi = 0; gi < 32; gi = gi + 1) begin : g_pcv
-            assign pcv[gi] = pcd[7'd33 + ((2 * gi) % 33) - {1'b0, ph}];
-        end
-    endgenerate
     wire        uses_rs2 = is_branch | is_store | is_op;
+    wire        sP       = fR & ~sl[1] & ~sl[0];
 
     reg [63:0] r_order;
-    reg [31:0] r_rs1, r_rs2, r_rd, r_pc, r_mrd;
+    reg        r_halt;
+    reg [31:0] r_rs1, r_rs2, r_rd, r_pc, r_npc, r_mrd;
     integer    mi;
-    wire [4:0] dj = j[4:0] - 5'd1;
+    wire [4:0] dj    = j[4:0] - 5'd1;
+    wire       r_ret = (ep == E_RET) & ~r_halt;
     always @(posedge clk) begin
-        if (!rst_n)
+        if (!rst_n) begin
             r_order <= 64'd0;
-        else if (ep == E_RET)
+            r_halt  <= 1'b0;
+        end else if (r_ret) begin
             r_order <= r_order + 64'd1;
-        if ((sl == SL_F) & (ep == E_END))
-            r_pc <= pcv;
+            r_halt  <= trap;
+        end
+        if (stb & sP)
+            r_pc <= {miso_m, r_pc[31:1]};
+        if (wem & ~sl[1])
+            r_npc <= {wdo, r_npc[31:1]};                    // WP, WP4
         if (stb & sA)
             r_rs1 <= {miso_m, r_rs1[31:1]};
-        if (stb & sB)
+        if (stb & (sB | fO))
             r_rs2 <= {miso_m, r_rs2[31:1]};
-        if (wem)
-            r_rd <= {wd, r_rd[31:1]};
+        if (wem & sl[1] & (sl[0] | c_jal))
+            r_rd <= {wdo, r_rd[31:1]};                      // W, or W4 of a JAL
         for (mi = 0; mi < 32; mi = mi + 1)
-            if (stb & sM & c_ld & ({dj[4:3], ~dj[2:0]} == mi[4:0]))
+            if (stb & sMM & c_ld & ({dj[4:3], ~dj[2:0]} == mi[4:0]))
                 r_mrd[mi] <= uio_in[2];
     end
 
@@ -536,7 +534,7 @@ module tt_um_fesens_r32v (
     wire [31:0] lmask  = {{8{r_mask[3]}}, {8{r_mask[2]}}, {8{r_mask[1]}}, {8{r_mask[0]}}};
     wire [31:0] mrd    = maddr[31] ? {24'd0, cmp ? ui_in : 8'd0} : r_mrd;
 
-    assign rvfi_valid     = (ep == E_RET);
+    assign rvfi_valid     = r_ret;
     assign rvfi_order     = r_order;
     assign rvfi_insn      = insn;
     assign rvfi_trap      = trap;
@@ -551,7 +549,7 @@ module tt_um_fesens_r32v (
     assign rvfi_rd_addr   = r_rde ? {1'b0, rd_f} : 5'd0;
     assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;
     assign rvfi_pc_rdata  = r_pc;
-    assign rvfi_pc_wdata  = trap ? npc_t : pcv;
+    assign rvfi_pc_wdata  = trap ? npc_t : r_npc;
     assign rvfi_mem_addr  = r_mem ? maddr : 32'd0;
     assign rvfi_mem_rmask = (r_mem & is_load) ? r_mask : 4'd0;
     assign rvfi_mem_wmask = (r_mem & is_store) ? r_mask : 4'd0;
