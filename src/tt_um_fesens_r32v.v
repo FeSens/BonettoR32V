@@ -415,7 +415,7 @@ module tt_um_fesens_r32v (
 
 
         // bit counter
-        if (((ep == E_IDLE) & (ph == 6'd16)) | ((ep == E_PC) & (j == 6'd63)))
+        if ((ep == E_IDLE) | ((ep == E_PC) & (j == 6'd63)))
             j <= 6'd40;
         else if (((ep == E_CMD) | ((ep == E_DATA) & ~shB)) & ~sck)
             j <= j + 6'd1;
