@@ -675,7 +675,14 @@ int Harness::run(const uint8_t* img) {
         break;
       }
 #endif
-      if (!passed && error_.empty() && since_release(t_) > budget) {
+      // The budget bounds the program itself (to the halt in rvfi mode, to the last observable
+      // effect in pins mode); the observation windows after it don't count against it.
+#ifdef RVFI_MODE
+      const bool program_done = halted_;
+#else
+      const bool program_done = all_seen;
+#endif
+      if (!passed && error_.empty() && !program_done && since_release(t_) > budget) {
         fail(fmt("timeout after %llu cycles (the latency cap bounds a correct run to %llu)",
                  (unsigned long long)since_release(t_), (unsigned long long)budget));
         break;

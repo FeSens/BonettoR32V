@@ -24,7 +24,10 @@ against `docs/contract.md` sections 2, 3, 4 and 6.
 stamp on every file under the design directory except `__pycache__` and non-Verilog `test_*`
 files, the harness sources and `verilator --version`. Builds hold
 `build/cosim/<build dir>.lock` (lockf), so concurrent processes don't build the same model at
-once. `--max-cycles` defaults to the latency cap's bound, 1,024 x (reference retirements + 16).
+once. `--max-cycles` defaults to the latency cap's bound, 1,024 x (reference retirements + 16)
+(tools/eval.py passes 1,024 x (retirements + 1)). It bounds the program: up to the halt in rvfi
+mode, up to the last store or uo_out change in pins mode. The observation windows after that
+(4,096 cycles after the halt; (tail + 8) x 1,024 quiet cycles) don't count against it.
 
 ## Programs (`verif/programs/`)
 

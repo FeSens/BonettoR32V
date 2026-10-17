@@ -231,6 +231,13 @@ def test_latency_cap_boundary(programs, tmp_path):
     assert tj["pass"] and tj["first_retire_cycle"] == 1024 and tj["max_cycles_per_insn"] == 1024
     assert set(tj["per_class"].values()) == {1024}
     assert run("pins", "+define+STALL_GAP=1024")["pass"]
+    # tools/eval.py passes --max-cycles 1024 x (retired + 1): a core at the cap must fit in it
+    # (the budget covers the program; the windows after the halt don't count)
+    tight = 1024 * (json.loads((PROGS / "selftest.expect.json").read_text())["retired"] + 1)
+    for mode in ("rvfi", "pins"):
+        s = run_cosim.run_one(mode, prog, 1, max_cycles=tight, src=src,
+                              vflags="+define+STALL_GAP=1024")[0]
+        assert s["pass"], f"{mode}: {s['error']}"
     # 1,025: the first retirement is late
     s = run("rvfi", "", t)
     assert not s["pass"]
