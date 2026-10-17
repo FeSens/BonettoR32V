@@ -47,6 +47,7 @@ class SpiRam {
 
   void load(const uint8_t* img) { std::memcpy(mem_, img, SIZE); }
   const uint8_t* mem() const { return mem_; }
+  void poke(uint16_t a, uint8_t v) { mem_[a] = v; }
 
   bool edge(uint64_t t, bool cs_n, bool sck, bool mosi) {
     if (!err_.empty()) return false;
@@ -118,6 +119,11 @@ class SpiRam {
   // Set when a WRITE command is decoded (8th bit); the harness clears it.
   bool write_started = false;
   uint64_t write_started_at = 0;
+  // Set when a WRITE's 16-bit address is complete (24th bit), with that address; the harness
+  // clears it. It tells a region WRITE from a program WRITE before the transaction ends.
+  bool write_addr_seen = false;
+  uint16_t write_addr = 0;
+  uint64_t write_addr_at = 0;
 
   std::vector<SpiTxn>& done() { return done_; }
   const std::string& error() const { return err_; }
@@ -168,6 +174,11 @@ class SpiRam {
     }
     if (n < 24) {
       cur_.addr = (uint16_t)((cur_.addr << 1) | b);
+      if (n == 23 && cur_.write) {
+        write_addr_seen = true;
+        write_addr = cur_.addr;
+        write_addr_at = t;
+      }
       return true;
     }
     uint32_t d = n - 24, k = d / 8, pos = 7 - d % 8;
