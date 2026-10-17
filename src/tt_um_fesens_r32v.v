@@ -456,7 +456,7 @@ module tt_um_fesens_r32v (
                 E_CMD: if (sck) begin
                     if (j == 6'd56)
                         ep <= E_GAP;
-                    else if (j == 6'd0)
+                    else if (~j[5])                         // j wrapped to 0
                         ep <= E_DATA;
                 end
                 E_GAP:  ep <= E_CMD;
