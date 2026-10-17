@@ -92,7 +92,7 @@ module tt_um_fesens_r32v (
     reg  [2:0]  ep;
     reg  [5:0]  ph;     // 0..32
     reg  [5:0]  j;      // bit counter (40..63 command/address, 0.. data), shift pre-roll
-    reg         cs_n, sck, mosi;
+    reg         sck, mosi;
     reg         mem;    // load/store goes to RAM (address bit 31 = 0); 1 during the boot slot
     reg         cy;     // ALU carry; sign latch in W
     reg         cmp;    // compare; address[1:0] == 0; JALR target[1]; shift fill state
@@ -106,7 +106,6 @@ module tt_um_fesens_r32v (
     assign uio_oe  = 8'b0000_1011;
 
     wire _unused = &{ena, uio_in[7:3], uio_in[1:0], 1'b0};
-    wire miso_m  = uio_in[2] & ~cs_n;   // 0 in a masked (x0) slot
 
     // ------------------------------------------------------------------------------------
     // Decode. Only the contract's fatal traps trap (contract section 4): SYSTEM (ECALL, EBREAK),
@@ -168,6 +167,9 @@ module tt_um_fesens_r32v (
     wire wpln = fW & ~(sl[1] & sl[0]);             // WP, WP4, W4
     wire shB  = sB & c_sh;
     wire e_cd = ep[2] & ~ep[1];                    // CMD or DATA: SCK runs
+    // CS_n is low in CMD, GAP, DATA and END (ep[2]) unless the slot is masked
+    wire cs_n;
+    wire miso_m;
 
     // ------------------------------------------------------------------------------------
     // Bit index of the current strobe in the ALU slots (family 00): bit k meets phase 2k.
@@ -299,6 +301,8 @@ module tt_um_fesens_r32v (
                 (sB & ~(c_op | c_br)) |
                 ((sB | fO) & (rs2_f == 4'd0)) |
                 (fW & sl[1] & (rd_f == 4'd0));
+    assign cs_n   = ~ep[2] | mask;
+    assign miso_m = uio_in[2] & ~cs_n;   // 0 in a masked (x0) slot
     wire [5:0] dlen = (fM & ~sF) ? {c_ld & (nm1 == 2'b11), (nm1 == 2'b01) | (c_st & (nm1 == 2'b11)),
                                     nm1 == 2'b00, 3'b000} :
                       fO ? {~(f3[1] & mem), f3[1] & mem, 4'b0000} : 6'd32;
@@ -435,7 +439,6 @@ module tt_um_fesens_r32v (
             sl   <= SL_WP;
             ep   <= E_IDLE;
             ph   <= 6'd17;                                // the boot WP starts at once
-            cs_n <= 1'b1;
             sck  <= 1'b0;
             mem  <= 1'b1;
             gpo  <= 8'd0;
@@ -446,7 +449,6 @@ module tt_um_fesens_r32v (
                 mem <= ~sum;                                // address bit 31 = 0: RAM
             case (ep)
                 E_IDLE: if (ph == tgt) begin
-                    cs_n <= mask;
                     ep   <= E_CMD;
                 end
                 E_CMD: if (sck) begin
@@ -458,17 +460,13 @@ module tt_um_fesens_r32v (
                 E_GAP:  ep <= E_CMD;
                 E_DATA: if (sck & dend) ep <= E_END;
                 E_END: begin
-                    cs_n <= 1'b1;
                     sl   <= nsl;
                     ep   <= npre ? E_PW : nret ? E_RET : E_IDLE;
                     if (fW & ~sl[1] & ~sl[0])
                         mem <= 1'b0;                        // WP: ends the boot slot
                 end
                 E_PW: if (ph == {3'b000, sh_left, 2'b10}) ep <= E_PC;
-                E_PC: if (j == 6'd63) begin
-                    cs_n <= (rd_f == 4'd0);
-                    ep   <= E_CMD;
-                end
+                E_PC: if (j == 6'd63) ep <= E_CMD;
                 default: begin                              // E_RET
                     if (c_st & ~mem & cmp & ~trap)
                         gpo <= {bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4], bfr[2]};
