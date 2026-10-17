@@ -72,20 +72,4 @@
 #define WFI_PERIOD 100000         /* high for half of it */
 #define WFI_PULSES 16
 
-/* ---- irq_stress: GPIO edge interrupts every 37-91 cycles --------------------------------- */
-#define IS_PIN_RISE 4             /* ui4 rising and ui5 falling: each toggle of both is one edge */
-#define IS_PIN_FALL 5
-#define IS_PIN_WFI 6              /* the WFI phase waits for a rising edge here */
-#define IS_GAP_MIN 37
-#define IS_GAP_MAX 91
-#define IS_DENSE_T0 500           /* dense edges from here (GPIO_EDGE is 0 until pass 2) ... */
-#define IS_DENSE_T1 300000        /* ... to here, then bursts */
-#define IS_BURST_EVERY 60000      /* a burst of IS_BURST_EDGES edges every IS_BURST_EVERY */
-#define IS_BURST_EDGES 32
-#define IS_END 6000000            /* last burst start */
-#define IS_WFI_END 12000000       /* ui6 pulses up to here */
-#define IS_WFI_PERIOD 200000      /* ui6: rising every IS_WFI_PERIOD from IS_WFI_PERIOD, high half */
-#define IS_SEED 2026              /* random gaps (Python random.Random) */
-#define IS_ITERS 3                /* main-loop iterations per pass */
-
 #endif /* STIM_H */

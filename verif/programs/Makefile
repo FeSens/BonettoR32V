@@ -3,6 +3,7 @@
 #   make -C verif/programs          build/programs/<name>.{elf,hex,expect.json} for every program
 #   make -C verif/programs NAME...  only those programs (e.g. `selftest coremark`)
 #   make -C verif/programs list     the program names, in harness order
+#   make -C verif/programs list-declared   the peripheral programs (EVENT_PROGS, the one list)
 #   make -C verif/programs check    test_programs.py: the expect.json contract, the random-stream
 #                                   coverage, and progsim (progsim.cpp: a timed peripheral model
 #                                   around the ISS) on the peripheral programs at 3 to 2,048 cycles
@@ -65,6 +66,9 @@ all: $(foreach p,$(PROGS),$(OUT)/$(p).expect.json)
 list:
 	@echo $(PROGS)
 
+list-declared:
+	@echo $(EVENT_PROGS)
+
 # `make -C verif/programs selftest csr`: build those programs only.
 $(PROGS): %: $(OUT)/%.expect.json
 
@@ -112,11 +116,12 @@ $(HEXES): $(OUT)/%.hex: $(OUT)/%.elf elf2hex.py
 
 EXPECTS := $(foreach p,$(PROGS),$(OUT)/$(p).expect.json)
 MKEXPECT_coremark := --coremark-iters $(CM_ITERATIONS)
+$(foreach p,$(EVENT_PROGS),$(eval MKEXPECT_$(p) := --declared))
 $(EXPECTS): $(OUT)/%.expect.json: $(OUT)/%.hex $(OUT)/%.elf $(ISS) mkexpect.py stim.h
 	$(PYTHON) mkexpect.py --iss $(ISS) --hex $< --elf $(OUT)/$*.elf --out $@ $(MKEXPECT_$*)
 
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all list check clean $(PROGS)
+.PHONY: all list list-declared check clean $(PROGS)
 .SECONDARY:

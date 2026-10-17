@@ -4,6 +4,7 @@
  * Flash (CPU 0x0000_0000, read-only; the image is loaded before reset):
  *   0x0000_0000 ..        .text, .rodata, then the load image of .data (and of .window)
  *   0x0001_0000 .. +4 KiB .fwindow: random-stream programs' flash data window (gen_random.py)
+ *   0x000F_8000 ..        .farcode: code reached by JAL offsets with J-imm bits 16-20 (selftest)
  * PSRAM (CPU 0x0100_0000 + byte, starts arbitrary: crt0 copies .data and clears .bss):
  *   0x0100_0000 ..        .data (copied from flash by crt0), then .bss (cleared by crt0)
  *   0x0100_8000 .. +1 KiB .window: random-stream programs' data window (copied by their prologue)
@@ -30,6 +31,9 @@ SECTIONS
   /* Random-stream programs (gen_random.py): the flash data window. The load images of .data and
    * .window still start at _etext, below it (asserted). */
   .fwindow 0x00010000 : { KEEP(*(.fwindow)) }
+
+  /* selftest: a JAL target about 1 MiB away (offset bits 16-20 of the J immediate). */
+  .farcode 0x000F8000 : { KEEP(*(.farcode)) }
 
   .data 0x01000000 : AT(_etext) ALIGN(4) {
     _data_start = .;
@@ -63,6 +67,7 @@ SECTIONS
   ASSERT(_bss_end <= _log_ring, "data and bss must end below the log ring (0x017F0000)")
   ASSERT(SIZEOF(.window) == 0 || _bss_end <= 0x01008000, "data and bss overlap the data window")
   ASSERT(SIZEOF(.fwindow) == 0 || _flash_end <= 0x00010000, "flash image overlaps .fwindow")
+  ASSERT(SIZEOF(.farcode) == 0 || _flash_end <= 0x000F8000, "flash image overlaps .farcode")
   ASSERT(_flash_end <= 0x01000000, "flash image larger than 16 MiB")
 
   /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame .eh_frame_hdr) }

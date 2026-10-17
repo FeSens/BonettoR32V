@@ -219,10 +219,11 @@ class Iss3 {
     reset();
   }
 
-  // Back to the post-reset state: pc = 0, MIE = MEIE = 0, IO registers at their reset values.
-  // x1..x15 = 0 by convention (the RTL's are arbitrary; programs clear them). The other CSRs
-  // reset to arbitrary values in the RTL; the ISS uses 0 and flags a read before any write
-  // (uninit_read). Flash and PSRAM keep their contents.
+  // Back to the post-reset state: pc = 0, mstatus.MIE = mstatus.MPIE = mie.MEIE = 0 (contract 4:
+  // known at reset), IO registers at their reset values. x1..x15 = 0 by convention (the RTL's
+  // are arbitrary; programs clear them). mtvec, mepc, mscratch and mcause reset to arbitrary
+  // values in the RTL; the ISS uses 0 and flags a read before any write (uninit_read). Flash and
+  // PSRAM keep their contents.
   void reset() {
     std::memset(x_, 0, sizeof(x_));
     pc_ = 0;
@@ -272,14 +273,13 @@ class Iss3 {
   bool selfloop() const { return selfloop_; }
   // The value a CSR read would return, with no side effects (mip.MEIP from the model).
   uint32_t csr_peek(uint32_t csr) const { return csr_value(csr, io_.irq_line()); }
-  // Program check: a register or an arbitrary-reset CSR (mtvec, mepc, mscratch, mcause,
-  // mstatus.MPIE) was read before any write. The core's values are unknown there, so such a
-  // program can't be checked.
+  // Program check: a register or an arbitrary-reset CSR (mtvec, mepc, mscratch, mcause) was read
+  // before any write. The core's values are unknown there, so such a program can't be checked.
   bool uninit_read() const { return uninit_read_; }
   uint32_t uninit_pc() const { return uninit_pc_; }
 
  private:
-  enum : uint32_t { K_MTVEC = 1, K_MEPC = 2, K_MSCRATCH = 4, K_MCAUSE = 8, K_MPIE = 16 };
+  enum : uint32_t { K_MTVEC = 1, K_MEPC = 2, K_MSCRATCH = 4, K_MCAUSE = 8 };
 
   std::vector<uint8_t> flash_;
   std::vector<std::vector<uint8_t>> pages_;  // PSRAM: an empty page still holds the seed pattern
@@ -349,7 +349,7 @@ class Iss3 {
     mie_ = 0;
     mcause_ = cause & 0x8000000Fu;
     pc_ = mtvec_;
-    known_ |= K_MEPC | K_MCAUSE | K_MPIE;
+    known_ |= K_MEPC | K_MCAUSE;
     pending_intr_ = true;
   }
 };
@@ -615,11 +615,10 @@ inline Retire Iss3::step(const IoHooks& io) {
         if (insn == 0x00000073u) return trap(11);  // ECALL
         if (insn == 0x00100073u) return trap(3);   // EBREAK
         if (insn == 0x30200073u) {                 // MRET: pc = mepc, MIE = MPIE, MPIE = 1
-          if ((known_ & (K_MEPC | K_MPIE)) != (K_MEPC | K_MPIE)) flag_uninit(pc);
+          if (!(known_ & K_MEPC)) flag_uninit(pc);
           r.npc = mepc_;
           mie_ = mpie_;
           mpie_ = 1;
-          known_ |= K_MPIE;
           return finish(false, 0);
         }
         if (insn == 0x10500073u) return finish(false, 0);  // WFI: a no-op (contract 4)
@@ -649,8 +648,7 @@ inline Retire Iss3::step(const IoHooks& io) {
         old = csr_value(csr, meip);
         if (rd != 0) {
           const uint32_t need = csr == 0x305 ? K_MTVEC : csr == 0x340 ? K_MSCRATCH
-                                : csr == 0x341 ? K_MEPC : csr == 0x342 ? K_MCAUSE
-                                : csr == 0x300 ? K_MPIE : 0;
+                                : csr == 0x341 ? K_MEPC : csr == 0x342 ? K_MCAUSE : 0;
           if ((known_ & need) != need) flag_uninit(pc);
         }
       }
@@ -660,7 +658,6 @@ inline Retire Iss3::step(const IoHooks& io) {
           case 0x300:
             mie_ = (nv >> 3) & 1;
             mpie_ = (nv >> 7) & 1;
-            if (op == 1 || (src & 0x80)) known_ |= K_MPIE;
             break;
           case 0x304: meie_ = (nv >> 11) & 1; break;
           case 0x305:

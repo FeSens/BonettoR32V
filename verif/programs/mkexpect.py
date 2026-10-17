@@ -3,7 +3,9 @@
 cosim harness reads (Task 3's field names), and check the program is valid.
 
 Usage: mkexpect.py --iss ISS_MAIN --hex PROG.hex --elf PROG.elf --out PROG.expect.json
-                   [--coremark-iters N]
+                   [--declared] [--coremark-iters N]
+
+--declared marks a peripheral program (the Makefile's EVENT_PROGS, the one list of them).
 
 Every expect.json has:
   prog          the program name
@@ -38,7 +40,7 @@ kind "declared" adds the stimulus fields the harness drives and checks (values f
                 on uo7 in PWM mode as per = 65535, q = P, duty = CMP), measured after the program
                 writes GPIO_OUT = 0xA5
   ir_loop:      loop_uo7_to_ui0 (true)
-  gpio_edge, wfi, irq_stress: gpio_script ([[cycle, ui_value], ...], ui_in from that cycle on)
+  gpio_edge, wfi: gpio_script ([[cycle, ui_value], ...], ui_in from that cycle on)
 and the program still runs on the standalone ISS up to a bound, which must stop at the bound (or
 the self-loop) with no unspecified step and no read before write. It also writes <name>.stim, the
 same stimulus for progsim.
@@ -46,7 +48,6 @@ same stimulus for progsim.
 import argparse
 import json
 import os
-import random
 import re
 import struct
 import subprocess
@@ -59,8 +60,7 @@ REGION_LO = 0x7FFF80
 LOG_RING = 0x017F0000
 LOG_RING_END = 0x017F0800
 MARKS = {0xA5, 0xC0, 0xC1}
-EVENT_PROGS = {"irq_timer", "irq_stress", "wfi", "uart_echo", "uart_echo_fast", "spi_loop", "pwm",
-               "ir_loop", "gpio_edge"}
+FAIL_MARK = 0xEE  # GPIO_OUT after a failed self-check: never on the way to a pass
 ISS_MAX = {"coremark": 40_000_000}
 FINAL_ALTFN = {"uart_echo": 0x01, "uart_echo_fast": 0x01}
 ISS_MAX_DEFAULT = 3_000_000
@@ -190,48 +190,6 @@ def stim_wfi(s: dict):
     return {"gpio_script": script}, [f"gpio {c} {v}" for c, v in script]
 
 
-def stim_irq_stress(s: dict):
-    """ui4 and ui5 toggle together (ui4 rising and ui5 falling are each one interrupt edge), every
-    IS_GAP_MIN..IS_GAP_MAX cycles: densely in [IS_DENSE_T0, IS_DENSE_T1], then in bursts of
-    IS_BURST_EDGES every IS_BURST_EVERY up to IS_END. ui6 pulses every IS_WFI_PERIOD up to
-    IS_WFI_END (the WFI phase). ui1 stays high (UART idle)."""
-    r = random.Random(s["IS_SEED"])
-    gap = lambda: r.randint(s["IS_GAP_MIN"], s["IS_GAP_MAX"])  # noqa: E731
-    toggles = []
-    t = s["IS_DENSE_T0"]
-    while t <= s["IS_DENSE_T1"]:
-        toggles.append(t)
-        t += gap()
-    start = s["IS_DENSE_T1"] + s["IS_BURST_EVERY"]
-    while start <= s["IS_END"]:
-        t = start
-        for _ in range(s["IS_BURST_EDGES"]):
-            toggles.append(t)
-            t += gap()
-        start += s["IS_BURST_EVERY"]
-    pins = (1 << s["IS_PIN_RISE"]) | (1 << s["IS_PIN_FALL"])
-    wpin, per = 1 << s["IS_PIN_WFI"], s["IS_WFI_PERIOD"]
-    events = {}  # cycle -> list of (kind)
-    for t in toggles:
-        events.setdefault(t, []).append("t")
-    k = 1
-    while k * per <= s["IS_WFI_END"]:
-        events.setdefault(k * per, []).append("w1")
-        events.setdefault(k * per + per // 2, []).append("w0")
-        k += 1
-    ui, script = 0x02, [[0, 0x02]]
-    for t in sorted(events):
-        for e in events[t]:
-            if e == "t":
-                ui ^= pins
-            elif e == "w1":
-                ui |= wpin
-            else:
-                ui &= ~wpin
-        script.append([t, ui])
-    return {"gpio_script": script}, [f"gpio {c} {v}" for c, v in script]
-
-
 def declared(name: str, s: dict):
     if name == "uart_echo":
         return stim_uart(s, s["UART_PPM"])
@@ -249,14 +207,12 @@ def declared(name: str, s: dict):
         return {"pwm": chans}, []
     if name == "ir_loop":
         return {"loop_uo7_to_ui0": True}, ["loop 1"]
-    if name == "irq_timer":
+    if name in ("irq_timer", "irq_stress"):  # no stimulus: the timer interrupts them
         return {}, []
     if name == "gpio_edge":
         return stim_gpio_edge(s)
     if name == "wfi":
         return stim_wfi(s)
-    if name == "irq_stress":
-        return stim_irq_stress(s)
     fail(f"{name}: no declared stimulus")
 
 
@@ -267,15 +223,17 @@ def main() -> int:
     ap.add_argument("--hex", required=True)
     ap.add_argument("--elf", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--declared", action="store_true",
+                    help="a peripheral program: expectations from the declared stimulus")
     ap.add_argument("--coremark-iters", type=int)
     a = ap.parse_args()
     name = os.path.basename(a.hex)[:-len(".hex")]
     syms, segs = elf_parts(a.elf)
     uses_crt0 = "_default_trap" in syms
-    exp = {"prog": name, "kind": "declared" if name in EVENT_PROGS else "iss",
+    exp = {"prog": name, "kind": "declared" if a.declared else "iss",
            "result_gpio": PASS}
 
-    if name in EVENT_PROGS:
+    if a.declared:
         rc, summ, err = run_iss(a.iss, a.hex, EVENT_ISS_MAX)
         if rc == 5:
             fail(f"{name}: register or CSR read before any write at pc {summ['uninit_pc']:#x}")
@@ -308,6 +266,8 @@ def main() -> int:
         trace = summ["uo_trace"]
         if name != "coremark" and not name.startswith("random_") and MARKS & set(trace):
             fail(f"{name}: shows a reserved mark value (0xA5, 0xC0, 0xC1) on GPIO_OUT")
+        if FAIL_MARK in trace:
+            fail(f"{name}: GPIO_OUT showed the fail mark 0xEE on the way: {[hex(v) for v in trace]}")
         for k in ("retired", "end", "end_pc", "uo_trace", "gpio_out", "altfn", "traps",
                   "interrupts"):
             exp[k] = summ[k]

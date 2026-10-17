@@ -1213,9 +1213,10 @@ def test_unspecified_ends_run_v3(built3, name):
     assert rc == 2 and s["end"] == "unspecified" and s["touched_region"] is False, s
 
 
-@pytest.mark.parametrize("body", ["csrr a0, mepc", "csrr a0, mstatus", "ecall", "mret"])
+@pytest.mark.parametrize("body", ["csrr a0, mepc", "csrr a0, mscratch", "csrr a0, mcause",
+                                  "csrr a0, mtvec", "ecall", "mret"])
 def test_uninit_csr_read_is_flagged_v3(built3, body):
-    # mtvec, mepc, mscratch, mcause and MPIE reset to arbitrary values (contract 4)
+    # mtvec, mepc, mscratch and mcause reset to arbitrary values (contract 4)
     h, _ = asm3("uninit3_" + re.sub(r"\W", "_", body), f"{body}\n j .")
     rc, log, _, s = run3(h, "--check-init", "--max", "50")
     assert rc == 5 and s["uninit_read"] is True, s
@@ -1223,3 +1224,17 @@ def test_uninit_csr_read_is_flagged_v3(built3, body):
                 "csrci mstatus, 8\n ecall\n .align 2\n1: j .")
     rc, log, _, s = run3(h, "--check-init")
     assert rc == 0 and s["uninit_read"] is False, s
+
+
+def test_reset_interrupt_state_is_known_v3(built3):
+    # contract 4 (R23): mstatus.MIE, mstatus.MPIE and mie.MEIE reset to 0, so reading them first
+    # is not a read before write; MRET with MPIE never written gives MIE = 0.
+    h, _ = asm3("reset3_known", "csrr a0, mstatus\n csrr a1, mie\n la t0, 1f\n csrw mepc, t0\n"
+                " mret\n .align 2\n1: csrr a2, mstatus\n j .")
+    rc, log, _, s = run3(h, "--check-init")
+    assert rc == 0 and s["uninit_read"] is False and s["end"] == "selfloop", s
+    rd = {r["rd"]: r["rdv"] for r in log if is_csr(r)}
+    a0, a1, a2 = REGNUM["a0"], REGNUM["a1"], REGNUM["a2"]
+    assert rd[a0] == 0x1800, "mstatus at reset: MIE = MPIE = 0, MPP = 3"
+    assert rd[a1] == 0, "mie at reset: MEIE = 0"
+    assert rd[a2] == 0x1880, "after MRET: MIE = old MPIE = 0, MPIE = 1"

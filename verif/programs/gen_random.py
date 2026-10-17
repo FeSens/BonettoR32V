@@ -28,7 +28,9 @@ come N random instructions (valid RV32E only, never a reserved encoding, never a
 The epilogue stores x1..x15 to 0x0100_9000..0x0100_903B (x15 through mscratch), so the pins-mode
 PSRAM comparison sees every register, then writes GPIO_OUT = 0x5A and self-loops (contract 4
 program end). The `_psram_window` table names the window, the dump and the top 16 bytes.
-GPIO_OUT takes random values on the way, so a random stream may show 0xA5, 0xC0 or 0xC1.
+GPIO_OUT takes random values on the way, so a random stream may show 0xA5, 0xC0 or 0xC1, but
+never 0xEE (the fail mark): a store that reaches GPIO_OUT[7:0] takes its data from x0 or from a
+register just loaded with a value whose low byte isn't 0xEE.
 """
 import argparse
 import random
@@ -45,6 +47,7 @@ IO = 0x80000000
 IO_LOAD_SLOTS = [0, 2, 4, 6, 7, 8, 9, 10, 15, 17] + list(range(19, 32))
 IO_STORE_SLOTS = [0, 4, 8, 9, 10, 16, 18] + list(range(19, 32))
 M32 = 0xFFFFFFFF
+FAIL_MARK = 0xEE          # GPIO_OUT value of a failed self-check: never written here
 
 EDGE = [0, 1, 2, 0xFFFFFFFF, 0xFFFFFFFE, 0x7FFFFFFF, 0x80000000, 0x80000001, 0x55555555,
         0xAAAAAAAA, 0x0000FFFF, 0xFFFF0000, 0x00000800, 0xFFFFF800, 31, 32]
@@ -204,9 +207,9 @@ class Gen:
             lo = r.randint(TOP_LO, REGION_LO - n)
         return PSRAM | alias | lo
 
-    def mem_base(self, n: int, kind: str, store: bool) -> tuple[list[str], str, int]:
-        """Base register and offset for one access, plus setup instructions (emitted in the same
-        unit as the access)."""
+    def mem_base(self, n: int, kind: str, store: bool) -> tuple[list[str], int, int, int]:
+        """Base register, offset and effective address for one access, plus setup instructions
+        (emitted in the same unit as the access)."""
         r = self.r
         if self.known and r.random() < 0.4:
             regs = list(self.known.items())
@@ -215,18 +218,28 @@ class Gen:
                 for _ in range(8):
                     off = r.randint(-2048, 2047)
                     if self.valid((v + off) & M32, n, kind, store):
-                        return [], f"x{reg}", off
+                        return [], reg, off, (v + off) & M32
         ea = self.pick_ea(n, kind, store)
         assert self.valid(ea, n, kind, store), (hex(ea), n, kind, store)
         off = r.randint(-2048, 2047)
         rb = self.wreg()
-        return [self.li(rb, ea - off)], f"x{rb}", off
+        return [self.li(rb, ea - off)], rb, off, ea
 
     def access(self, kind: str, store: bool) -> None:
         op, n = self.r.choice(STORES if store else LOADS)
-        setup, base, off = self.mem_base(n, kind, store)
+        setup, rb, off, ea = self.mem_base(n, kind, store)
+        base = f"x{rb}"
         if store:
-            self.emit(*setup, f"{op} {self.src()}, {off}({base})", n=2 * len(setup) + 1)
+            src = self.src()
+            if kind == "io" and (ea >> 2) & 31 == 0 and ea & 3 == 0 and src != "x0":
+                # the store reaches GPIO_OUT[7:0]: data with a low byte other than the fail mark
+                rd = self.r.choice([i for i in self.free() if i != rb])
+                v = self.r.getrandbits(32)
+                if v & 0xFF == FAIL_MARK:
+                    v ^= 0x01
+                setup = setup + [self.li(rd, v)]
+                src = f"x{rd}"
+            self.emit(*setup, f"{op} {src}, {off}({base})", n=2 * len(setup) + 1)
         else:
             self.emit(*setup, f"{op} {self.dst()}, {off}({base})", n=2 * len(setup) + 1)
 

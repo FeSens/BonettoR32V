@@ -3,13 +3,15 @@
 #
 #   1. x1..x15 start unknown on the core (contract 1), so clear them all: otherwise prologues
 #      would store unknown callee-saved values to PSRAM.
-#   2. mtvec = _default_trap; mstatus = mie = 0 (no interrupts until a program enables them).
+#   2. mtvec = _default_trap. mstatus.MIE, mstatus.MPIE and mie.MEIE reset to 0 (contract 4):
+#      read them before anything writes them, and fail with id 0x5F unless all three are 0.
 #   3. PSRAM starts arbitrary (contract 3): copy .data from its flash image, clear .bss.
 #   4. call main. main returns 0 on pass, or a nonzero failure id.
 #   5. _pass: ALTFN = 0 (every uo pin back to GPIO), GPIO_OUT = 0x5A, then the program end
 #      (`jal x0, 0` retired twice at the same pc, contract 4).
 #
 # _fail (a0 = failure id < 0x60): ALTFN = 0, GPIO_OUT = id, then GPIO_OUT = 0xEE, self-loop.
+# 0x5F: the interrupt enables were not 0 after reset.
 # _default_trap (any trap a program doesn't handle): fails with id 0x60 + mcause[3:0], plus 0x10
 # for an interrupt.
 #include "bonetto.h"
@@ -35,8 +37,14 @@ _start:
     lui  t0, %hi(_default_trap)
     addi t0, t0, %lo(_default_trap)
     csrw mtvec, t0
-    csrw mstatus, zero
-    csrw mie, zero
+    csrr t0, mstatus
+    andi t0, t0, MSTATUS_MIE | MSTATUS_MPIE
+    csrr t1, mie                 # MEIE is its only bit that can be 1
+    or   t0, t0, t1
+    beqz t0, 0f
+    li   a0, 0x5F
+    j    _fail
+0:
     lui  sp, %hi(_stack_top)
     addi sp, sp, %lo(_stack_top)
     # .data: words from the flash image (both ends are 4-aligned, see link.ld)

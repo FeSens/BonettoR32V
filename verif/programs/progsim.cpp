@@ -7,21 +7,26 @@
 // The modeled core retires one instruction every CPI cycles (fixed, or uniform in [A, B] per
 // instruction). An instruction's IO access happens when it starts, and its register effects are
 // visible to the next instruction (contract 5). An interrupt is taken at the first boundary where
-// MIE, MEIE and the line are 1; WFI stalls until mip.MEIP & mie.MEIE. Inputs pass a 2-cycle
+// MIE, MEIE and the line are 1. With --irq-defer, when MIE or MEIE has just turned on (by the
+// instruction before) with the line already high, the core retires one more instruction first
+// (contract 4 allows it). WFI stalls until mip.MEIP & mie.MEIE. Inputs pass a 2-cycle
 // synchronizer. The UART receiver samples mid-bit at the programmed DIV; the driver sends at
-// (DIV + 1) * (1 + ppm / 1e6) cycles per bit. TX_BUSY reads 1 on the instruction after the
-// starting write (contract 5.5). The SPI echo device returns the previous byte it received while
-// CS_n was low (0xFF before that).
+// (DIV + 1) * (1 + ppm / 1e6) cycles per bit. TX_BUSY reads 1 from the starting write until the
+// stop bit ends, the start bit beginning DIV + 2 cycles after the write (contract 5.5). The SPI
+// echo device returns the previous byte it received while CS_n was low (0xFF before that).
 //
 // Usage: progsim <prog.hex> [--stim FILE] [--cpi N | --cpi rand:A:B] [--max-cycles C] [--seed S]
-//                [--first-retire N] [-v]
+//                [--first-retire N] [--irq-defer] [-v]
 // .stim lines: "uart_div D", "uart_ppm P", "uart_rx CYCLE BYTE", "gpio CYCLE UI", "loop 1", "spi_echo 1".
 // Cycles count from the first retirement. Without gpio lines ui_in is 0x02 (UART RX idle high).
 // The last stdout line is JSON: end (selfloop | max | unspecified | region), retired, cycles,
-// gpio_out, altfn, uart_tx, spi_tx, interrupts, uo_trace (GPIO-mode uo values, one per change).
+// gpio_out, altfn, uart_tx, spi_tx, interrupts, intr_pcs ([[mepc, count], ...] by mepc),
+// uninit_read and uninit_pc (Iss3: a register or arbitrary-reset CSR read before any write, which
+// fails the run), uo_trace (GPIO-mode uo values, one per change).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,7 +74,7 @@ struct Model {
   uint32_t presc = 0;
   bool tout = false;
   // UART
-  bool tx_busy = false, sticky_now = false, sticky_next = false;
+  bool tx_busy = false;
   uint64_t tx_end = 0;
   bool rx_full = false, rx_ovr = false;
   uint8_t rx_data = 0;
@@ -198,7 +203,7 @@ struct Model {
       case v3::SLOT_TIMER_CAP: return cap;
       case v3::SLOT_UART_DATA: return rx_data;
       case v3::SLOT_UART_CTRL:
-        return uart_div | ((tx_busy || sticky_now) ? v3::UART_TX_BUSY : 0) |
+        return uart_div | (tx_busy ? v3::UART_TX_BUSY : 0) |
                (rx_full ? v3::UART_RX_FULL : 0) | (rx_ovr ? v3::UART_RX_OVR : 0);
       case v3::SLOT_SPI_DATA: return spi_rx;
       case v3::SLOT_SPI_CTRL: return spi_ctrl | (spi_busy ? v3::SPI_BUSY : 0);
@@ -234,7 +239,6 @@ struct Model {
         if ((lanes & 1) && !tx_busy) {
           tx_busy = true;
           tx_end = now + (uart_div + 2) + 10ull * (uart_div + 1);
-          sticky_next = true;
           uart_tx.push_back((char)(v & 0xFF));
         }
         break;
@@ -276,7 +280,7 @@ std::string json_str(const std::string& s) {
 int usage() {
   std::fprintf(stderr,
                "usage: progsim <prog.hex> [--stim FILE] [--cpi N | --cpi rand:A:B] "
-               "[--max-cycles C] [--seed S] [--first-retire N] [-v]\n");
+               "[--max-cycles C] [--seed S] [--first-retire N] [--irq-defer] [-v]\n");
   return 1;
 }
 
@@ -286,7 +290,7 @@ int main(int argc, char** argv) {
   const char *hex = nullptr, *stim_path = nullptr;
   uint64_t cpi_lo = 800, cpi_hi = 800, max_cycles = 20000000, first = 200;
   uint64_t seed = 1;
-  bool verbose = false;
+  bool verbose = false, irq_defer = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> const char* {
@@ -306,6 +310,7 @@ int main(int argc, char** argv) {
     } else if (a == "--max-cycles") max_cycles = std::strtoull(next(), nullptr, 0);
     else if (a == "--seed") seed = std::strtoull(next(), nullptr, 0);
     else if (a == "--first-retire") first = std::strtoull(next(), nullptr, 0);
+    else if (a == "--irq-defer") irq_defer = true;
     else if (a == "-v") verbose = true;
     else if (a[0] == '-') return usage();
     else hex = argv[i];
@@ -336,16 +341,26 @@ int main(int argc, char** argv) {
 
   std::string end = "max";
   std::vector<uint8_t> uo_trace;
+  std::map<uint32_t, uint64_t> intr_pcs;
   uint8_t uo_prev = iss.uo_gpio();
+  bool prev_allowed = false, prev_line = false, deferred = false;
   m.advance(first);
   while (m.now < max_cycles) {
-    if (iss.irq_allowed() && m.line()) {
-      iss.take_interrupt();
-      if (verbose) std::fprintf(stderr, "%llu: interrupt, mepc 0x%08x\n",
-                                (unsigned long long)m.now, iss.csr_peek(0x341));
+    const bool allowed = iss.irq_allowed(), line = m.line();
+    if (allowed && line) {
+      // --irq-defer: MIE / MEIE just turned on with the line already high: one more instruction
+      if (irq_defer && !deferred && !prev_allowed && prev_line) {
+        deferred = true;
+      } else {
+        iss.take_interrupt();
+        deferred = false;
+        intr_pcs[iss.csr_peek(0x341)]++;
+        if (verbose) std::fprintf(stderr, "%llu: interrupt, mepc 0x%08x\n",
+                                  (unsigned long long)m.now, iss.csr_peek(0x341));
+      }
     }
-    m.sticky_now = m.sticky_next;
-    m.sticky_next = false;
+    prev_allowed = iss.irq_allowed();
+    prev_line = line;
     v3::Retire r = iss.step(hooks);
     if (r.reserved) {
       end = r.region ? "region" : "unspecified";
@@ -377,11 +392,20 @@ int main(int argc, char** argv) {
   std::string spi = "[";
   for (size_t i = 0; i < m.spi_tx.size(); i++) spi += (i ? "," : "") + std::to_string(m.spi_tx[i]);
   spi += "]";
+  std::string ipcs = "[";
+  for (const auto& kv : intr_pcs)
+    ipcs += (ipcs.size() > 1 ? ",[" : "[") + std::to_string(kv.first) + "," +
+            std::to_string(kv.second) + "]";
+  ipcs += "]";
+  if (iss.uninit_read())
+    std::fprintf(stderr, "register or CSR read before any write at pc 0x%08x\n", iss.uninit_pc());
   std::printf(
       "{\"end\":\"%s\",\"retired\":%llu,\"cycles\":%llu,\"gpio_out\":%u,\"altfn\":%u,"
-      "\"uart_tx\":%s,\"spi_tx\":%s,\"interrupts\":%llu,\"uo_trace\":%s}\n",
+      "\"uart_tx\":%s,\"spi_tx\":%s,\"interrupts\":%llu,\"intr_pcs\":%s,"
+      "\"uninit_read\":%s,\"uninit_pc\":%u,\"uo_trace\":%s}\n",
       end.c_str(), (unsigned long long)iss.retired(), (unsigned long long)m.now,
       iss.io().gpio_out(), iss.io().altfn(), json_str(m.uart_tx).c_str(), spi.c_str(),
-      (unsigned long long)iss.interrupts(), trace.c_str());
-  return end == "selfloop" && iss.io().gpio_out() == 0x5A ? 0 : 1;
+      (unsigned long long)iss.interrupts(), ipcs.c_str(), iss.uninit_read() ? "true" : "false",
+      iss.uninit_pc(), trace.c_str());
+  return end == "selfloop" && iss.io().gpio_out() == 0x5A && !iss.uninit_read() ? 0 : 1;
 }

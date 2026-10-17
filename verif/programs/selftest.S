@@ -1,9 +1,10 @@
 # BonettoR32V selftest, contract v3 (docs/contract-v3.md sections 3-5).
 #
 # Executes every RV32E instruction (ECALL and EBREAK trap: see the trap_* programs), every branch
-# taken and not taken, x0 writes, JALR with bit 0 set, not-taken branches to targets with bit 1
-# set, loads of every width from flash and from PSRAM, misaligned LW/LH/LHU/SW/SH up to CPU
-# 0x017F_FF7F (the last PSRAM byte below the core region), flash and PSRAM data aliasing (bits
+# taken and not taken, x0 writes, JALR with bit 0 set, JAL offsets with J-imm bits 16-20 (to
+# .farcode at 0x000F_8000 and back), not-taken branches to targets with bit 1 set, loads of
+# every width from flash and from PSRAM, misaligned LW/LH/LHU/SW/SH up to CPU 0x017F_FF7F (the
+# last PSRAM byte below the core region), flash and PSRAM data aliasing (bits
 # 30:25, and 23 for PSRAM), fetch aliasing in flash, every shift amount, FENCE variants, and IO:
 # GPIO_OUT on every byte lane, slot decode by addr[6:2], and the read/write masks of the slots
 # that have no side effects.
@@ -592,6 +593,23 @@ jalr_link2:
     jalr x0, -3(x8)            # negative offset
     j    st_fail
 96: SIG  x9
+    # JAL offsets with J-imm bits 16-20: to far_code (CPU 0x000F_8000, about +0xF7C00: bits 16-19
+    # = 1, bit 20 = 0) and back (about -0xF7C00: bits 16-19 = 0, bit 20 = 1)
+    jal  x1, far_code
+far_link:
+    j    st_fail
+far_back:
+    ABS  x2, far_link
+    EQ   x1, x2
+    ABS  x2, far_code
+    EQ   x10, x2               # far_code's AUIPC ran at its own address
+    SIG  x10
+
+    .pushsection .farcode, "ax"
+far_code:
+    auipc x10, 0
+    jal  x0, far_back
+    .popsection
 
 # ---------------------------------------------------------------------------------------------
 # 10. Writes to x0 are discarded; x0 reads as 0

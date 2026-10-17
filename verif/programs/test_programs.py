@@ -12,8 +12,11 @@ It builds every program (`make -C verif/programs`), then checks:
   - the peripheral programs carry the declared metadata Task 3's harness reads, with the exact
     field names and shapes, consistent with stim.h;
   - progsim (a timed peripheral model around the ISS, progsim.cpp) runs every peripheral program
-    to the self-loop with GPIO_OUT = 0x5A at speeds from 3 to 2,048 cycles per instruction
-    (the contract-4 cap: every stimulus schedule leaves room for the slowest legal core).
+    to the self-loop with GPIO_OUT = 0x5A, with no read before write, at speeds from 3 to 2,048
+    cycles per instruction (the contract-4 cap: every stimulus schedule leaves room for the
+    slowest legal core) and within the harness's 50 M-cycle budget for declared programs; the
+    interrupt programs also with --irq-defer (the core retires one more instruction after MIE
+    turns on, which contract 4 allows).
 Light: the ISS and progsim runs are bounded (CoreMark, the longest, is about 0.8 M retirements).
 """
 import json
@@ -33,11 +36,18 @@ PROGSIM = OUT / "progsim"
 TRAPS = ("ecall", "ebreak", "jal", "jalr", "branch", "zero", "ones")
 ISS_PROGS = (["selftest", "csr", "coherence", "mem_init_check", "gpio_demo", "coremark"]
              + [f"trap_{k}" for k in TRAPS] + [f"random_{i}" for i in range(1, 7)])
-EVENT_PROGS = ["irq_timer", "irq_stress", "wfi", "uart_echo", "uart_echo_fast", "spi_loop", "pwm",
-               "ir_loop", "gpio_edge"]
+
+
+def make_list(target: str) -> list:
+    return subprocess.run(["make", "-s", "-C", str(HERE), target], capture_output=True, text=True,
+                          check=True).stdout.split()
+
+
+EVENT_PROGS = make_list("list-declared")  # the Makefile's EVENT_PROGS: the one list of them
 ALL = ISS_PROGS + EVENT_PROGS
 PASS = 0x5A
 REGION_LO = 0x7FFF80
+BUDGET = 50_000_000  # the harness's cycle budget for declared programs (Task 3 DEFAULT_BUDGET)
 
 
 @pytest.fixture(scope="module")
@@ -54,9 +64,7 @@ def stim():
 
 
 def test_make_list_matches():
-    p = subprocess.run(["make", "-s", "-C", str(HERE), "list"], capture_output=True, text=True,
-                       check=True)
-    assert p.stdout.split() == ALL
+    assert make_list("list") == ALL
 
 
 def test_stim_parse():
@@ -99,6 +107,7 @@ def test_iss_programs_end_in_selfloop_with_pass(built, prog):
     assert e["end"] == "selfloop"
     assert e["gpio_out"] == PASS
     assert e["uo_trace"] and e["uo_trace"][-1] == PASS
+    assert 0xEE not in e["uo_trace"], "the fail mark on the way (random streams never write it)"
     assert e["altfn"] == 0
     assert e["interrupts"] == 0
     assert e["traps"] == (1 if prog.startswith("trap_") else 0)
@@ -158,7 +167,7 @@ def test_spi_pwm_loop_fields(built):
     assert built["ir_loop"]["loop_uo7_to_ui0"] is True
 
 
-@pytest.mark.parametrize("prog", ["gpio_edge", "wfi", "irq_stress"])
+@pytest.mark.parametrize("prog", ["gpio_edge", "wfi"])
 def test_gpio_scripts(built, prog):
     sc = built[prog]["gpio_script"]
     assert sc[0][0] == 0 and all(len(x) == 2 and 0 <= x[1] <= 255 for x in sc)
@@ -166,9 +175,11 @@ def test_gpio_scripts(built, prog):
     assert cycles == sorted(cycles) and len(set(cycles)) == len(cycles)
     if prog != "gpio_edge":
         assert all(v & 2 for _, v in sc), "ui1 (UART RX) stays idle high"
-    if prog == "irq_stress":
-        toggles = [b - a for (a, va), (b, vb) in zip(sc, sc[1:]) if (va ^ vb) & 0x30]
-        assert min(toggles) >= 37 and sum(1 for g in toggles if g <= 91) > 4000
+
+
+def test_irq_programs_have_no_stimulus(built):
+    for prog in ("irq_timer", "irq_stress"):  # the timer interrupts them
+        assert set(built[prog]) == {"prog", "kind", "result_gpio", "psram_window", "final_altfn"}
 
 
 # ---- random streams: what gen_random.py promises ------------------------------------------------
@@ -212,15 +223,30 @@ def test_random_streams_cover_the_v3_map(built, seed):
 
 
 # ---- progsim: the peripheral programs at several core speeds ------------------------------------
-@pytest.mark.parametrize("cpi", ["3", "12", "300", "800", "2048", "rand:20:2048"])
-@pytest.mark.parametrize("prog", EVENT_PROGS)
-def test_progsim_event_programs_pass(built, prog, cpi):
-    cmd = [str(PROGSIM), str(OUT / f"{prog}.hex"), "--cpi", cpi, "--max-cycles", "12000000"]
+def progsim(prog: str, cpi: str, *extra: str) -> dict:
+    cmd = [str(PROGSIM), str(OUT / f"{prog}.hex"), "--cpi", cpi, "--max-cycles", "700000000",
+           *extra]
     if (OUT / f"{prog}.stim").stat().st_size:
         cmd += ["--stim", str(OUT / f"{prog}.stim")]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     res = json.loads(p.stdout.strip().splitlines()[-1])
     assert res["end"] == "selfloop" and res["gpio_out"] == PASS, (res, p.stderr[-2000:])
+    assert not res["uninit_read"], f"read before write at pc {res['uninit_pc']:#x}"
+    if not cpi.startswith("rand"):
+        assert res["cycles"] <= BUDGET, f"{res['cycles']} cycles: over the harness budget"
+    return res
+
+
+def symbols(prog: str) -> dict:
+    nm = subprocess.run(["riscv32-unknown-elf-nm", str(OUT / f"{prog}.elf")], capture_output=True,
+                        text=True, check=True).stdout
+    return {f[2]: int(f[0], 16) for f in (ln.split() for ln in nm.splitlines()) if len(f) == 3}
+
+
+@pytest.mark.parametrize("cpi", ["3", "12", "50", "300", "800", "2048", "rand:20:2048"])
+@pytest.mark.parametrize("prog", EVENT_PROGS)
+def test_progsim_event_programs_pass(built, prog, cpi):
+    res = progsim(prog, cpi)
     e = built[prog]
     assert res["altfn"] == e["final_altfn"]
     if "uart_tx_expect" in e:
@@ -231,3 +257,15 @@ def test_progsim_event_programs_pass(built, prog, cpi):
         assert res["interrupts"] >= 1
     if prog == "pwm":
         assert 0xA5 in res["uo_trace"] or (0xA5 & ~0x8E) in res["uo_trace"]
+    if prog == "irq_stress":
+        # interrupts land all over the steps, and one right after the WFI (progsim's WFI stalls)
+        sym = symbols(prog)
+        pcs = [pc for pc, _ in res["intr_pcs"]]
+        assert sum(sym["steps"] <= pc < sym["steps_end"] for pc in pcs) >= 40
+        assert sym["wfi_poll"] in pcs, "no interrupt landed right after the WFI"
+
+
+@pytest.mark.parametrize("cpi", ["12", "800", "rand:20:2048"])
+@pytest.mark.parametrize("prog", ["irq_timer", "irq_stress", "wfi"])
+def test_progsim_interrupts_deferred_one_instruction(built, prog, cpi):
+    progsim(prog, cpi, "--irq-defer")
