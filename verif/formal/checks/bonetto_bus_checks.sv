@@ -242,14 +242,14 @@ endmodule
 		.store_byte(store_byte) \
 	); \
 	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
-	// The fetch is checked at the stop retirement too, unless the fetch itself touched
-	// the region: its insn decided the stop.
-	wire fvalid = !reset && rvfi_valid && !bon_stopped && !bon_fetch_touch;
 
 module bonetto_bus_imem_check (
 	`BONETTO_CHECKER_PORTS
 );
 	`BONETTO_BUS_COMMON
+	// The fetch is checked at the stop retirement too, unless the fetch itself touched
+	// the region: its instruction word decided the stop.
+	wire fvalid = !reset && rvfi_valid && !bon_stopped && !bon_fetch_touch;
 	always @* begin
 		if (fvalid && check) begin
 			// A fetch: a program READ of exactly the 4 instruction bytes, at the pc.
