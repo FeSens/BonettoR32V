@@ -7,9 +7,10 @@
 3. Mutants (mutants/<name>/, listed in mutants/MANIFEST.json; copies of the seed or of the
    contract v2 designs of hyp/002) must each fail with their specific error; the legal variants
    (legal_*) must pass. 3b: the core region of contract v2 (random at reset; both hyp/002
-   designs pass the full matrix).
+   designs pass the full matrix). 3c: the liveness fuzz (run_cosim.py --fuzz-liveness) passes
+   the seed and both hyp/002 designs and fails the hang mutants.
 4. The TT test (test/, RTL) passes on the seed and the legal variants and fails on pin-visible
-   mutants.
+   mutants, the contract section 6 transaction classes included.
 
 Run: pytest verif/cosim/test_cosim_harness.py -v
 """
@@ -313,7 +314,9 @@ def mutant_ids():
 def test_mutant_fails(programs, name):
     """Each mutant fails in every mode listed under "fail" with that mode's error text ("" means
     any error), for every listed seed, and passes the modes listed under "pass" (an RVFI-only bug
-    passes pins mode; a bug hidden under RISCV_FORMAL passes rvfi mode)."""
+    passes pins mode; a bug hidden under RISCV_FORMAL passes rvfi mode). A "fuzz_fail" entry (a
+    hang on a reserved encoding, which no program contains) must fail the rvfi-mode liveness fuzz
+    in seeds 1-5 with "latency cap" and that text in the error."""
     m = manifest()
     assert name in m, "mutants/MANIFEST.json is missing (mutants are built from the seed)"
     spec = m[name]
@@ -329,6 +332,12 @@ def test_mutant_fails(programs, name):
                 s, _ = run_cosim.run_one(mode, prog, seed, src=src)
                 assert not s["pass"], f"{name} passed {mode} mode (seed {seed})"
                 assert s["error"] and err in s["error"], f"{name} {mode} seed {seed}: {s['error']}"
+    if "fuzz_fail" in spec:
+        for seed in range(1, 6):
+            s = run_cosim.run_fuzz("rvfi", seed, src=src)
+            assert not s["pass"] and s["liveness_checked"], f"{name} passed the fuzz (seed {seed})"
+            assert "latency cap" in s["error"] and spec["fuzz_fail"] in s["error"], (
+                f"{name} fuzz seed {seed}: {s['error']}")
 
 
 def test_fetch_reading_its_load_bytes_is_named(tmp_path):
@@ -348,12 +357,16 @@ def test_fetch_reading_its_load_bytes_is_named(tmp_path):
 
 
 def test_trap_retirement_compares_only_the_contract_fields():
-    """Contract section 6: on a trapping retirement only trap, halt, insn, pc_rdata, rd_addr = 0
-    and no memory write are compared. legal_trap_fields reports arbitrary rs fields, rd_wdata and
-    pc_wdata there and must pass; trap_writes_rd (rd_addr != 0 on a trap) must fail."""
+    """Contract section 6 (e321614): on a trapping retirement only trap, halt, insn, pc_rdata,
+    rd_addr = 0 and no memory write are compared, plus the rs1/rs2 addr and rdata of a trapping
+    branch or JALR. legal_trap_fields reports arbitrary rd_wdata and pc_wdata on every trap and
+    arbitrary rs fields on the other traps, and must pass; trap_rs_garbage (arbitrary rs fields on
+    a trapping branch or JALR too) and trap_writes_rd (rd_addr != 0 on a trap) must fail."""
     m = manifest()
     assert m["legal_trap_fields"]["pass"] == ["rvfi", "pins"] and not m["legal_trap_fields"]["fail"]
-    assert {"trap_jalr", "trap_branch"} <= set(m["legal_trap_fields"]["progs"])
+    assert {"trap_jalr", "trap_branch", "trap_ecall"} <= set(m["legal_trap_fields"]["progs"])
+    assert {"trap_jalr", "trap_branch"} <= set(m["trap_rs_garbage"]["progs"])
+    assert m["trap_rs_garbage"]["fail"] == {"rvfi": "RVFI mismatch"}
     assert m["trap_writes_rd"]["fail"] == {"rvfi": "rvfi_rd_addr"}
 
 
@@ -364,10 +377,14 @@ def test_every_required_mutant_class_is_present():
                 "load_own_fetch",
                 # contract v2 (section 6): region and program transaction rules
                 "region_wrap", "region_straddle", "store_twice", "store_extra_byte",
-                "fetch_extra_byte", "load_skip_byte", "region_zero_init"}
+                "fetch_extra_byte", "load_skip_byte", "region_zero_init",
+                # 78472fe: a header shorter than 24 bits still fails; e321614: trapping branch or
+                # JALR rs fields; the formal review's C1: liveness on reserved encodings
+                "null_read_short", "trap_rs_garbage", "hang_reserved", "hang_funct3"}
     assert required <= set(m), required - set(m)
     assert m["rvfi_hidden"]["pass"] == ["rvfi"] and "pins" in m["rvfi_hidden"]["fail"]
-    for legal in ("legal_split_store", "legal_h002_rf", "legal_h002_pcram"):
+    assert m["null_read_short"]["fail"].keys() == {"rvfi", "pins"}
+    for legal in ("legal_split_store", "legal_h002_rf", "legal_h002_pcram", "legal_null_read"):
         assert m[legal]["pass"] == ["rvfi", "pins"] and not m[legal]["fail"], legal
 
 
@@ -402,11 +419,49 @@ def test_v2_designs_pass_the_full_matrix(programs, name):
 
 
 # ------------------------------------------------------------------------------------------------
+# 3c. the liveness fuzz (contract section 4: liveness on reserved encodings)
+def fuzz_cli(src: Path, seed: int, *extra: str):
+    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--fuzz-liveness", "--seed",
+                        str(seed), "--src", str(src), *extra], capture_output=True, text=True)
+    s = json.loads(p.stdout.strip().splitlines()[-1])
+    assert list(s) == run_cosim.FUZZ_KEYS, list(s)
+    assert (p.returncode == 0) == s["pass"], (p.returncode, s)
+    return s
+
+
+@pytest.mark.parametrize("name", ["(seed)", "legal_h002_rf", "legal_h002_pcram"])
+def test_fuzz_liveness_passes(name):
+    """The seed (strict decode) and both hyp/002 designs (spec-minimum decode) pass the rvfi-mode
+    fuzz in seeds 1-5, as the eval runs it: 2,048 probe sub-runs and 8 walks per seed, each ending
+    in a halt or at the retirement cap."""
+    src = SRC if name == "(seed)" else COSIM / "mutants" / name
+    for seed in range(1, 6):
+        s = fuzz_cli(src, seed)
+        assert s["pass"] and s["error"] is None, s
+        assert s["mode"] == "rvfi" and s["liveness_checked"] is True, s
+        assert s["runs"] == run_cosim.FUZZ_RUNS + run_cosim.FUZZ_RUNS // 256 and s["walks"] == 8, s
+        assert s["halted"] + s["capped"] == s["runs"], s
+        assert s["probes_retired"] > 0 and s["max_cycles_per_insn"] <= 1024, s
+
+
+def test_fuzz_pins_mode_cannot_check_liveness():
+    """pins mode sees no retirement and no halt, so it checks only the pin rules: hang_reserved
+    passes it, flagged "liveness_checked": false. The eval runs rvfi mode."""
+    s = fuzz_cli(COSIM / "mutants" / "hang_reserved", 1, "--mode", "pins", "--fuzz-runs", "128")
+    assert s["pass"] and s["mode"] == "pins" and s["liveness_checked"] is False, s
+    assert s["runs"] == 129 and s["halted"] == 0 and s["max_cycles_per_insn"] is None, s
+    s = fuzz_cli(COSIM / "mutants" / "hang_reserved", 1, "--fuzz-runs", "128")
+    assert not s["pass"] and "opcode 0x0b" in s["error"], s
+
+
+# ------------------------------------------------------------------------------------------------
 # 4. the TT test (test/test.py with the 23LC512 model) on legal variants and on mutants
 # It sees only the pins: gpio_demo's uo_out sequence and the RAM model's waveform rules. Mutants
 # whose bug only shows against RVFI or the retirement timing (uo_late, cs_open_at_retire,
 # load_own_fetch) pass it by design, and so does rvfi_hidden (gpio_demo runs no SLTU/SLTIU); the
-# cosim catches those.
+# cosim catches those. The RAM model also checks the section 6 transaction classes the pins show
+# (region or program, at most 4 bytes per program READ, each store byte once), so a wrap or a
+# double write that synthesis introduces fails the gate-level test too.
 TT_CASES = {
     "(seed)": None,
     "legal_mosi_echo": None,    # MOSI = X when no bit is due: legal
@@ -414,6 +469,12 @@ TT_CASES = {
     "legal_split_store": None,  # contract v2: a store split over two WRITEs
     "legal_h002_rf": None,      # contract v2: registers in the core region
     "legal_h002_pcram": None,   # contract v2: registers and pc in the core region
+    "legal_null_read": None,    # 78472fe: a READ with its 24-bit header and no data bit
+    "null_read_short": "transaction ended after 23 bits, before its command and address",
+    "region_wrap": "wraps out of the core region",
+    "region_straddle": "runs from program RAM into the core region",
+    "store_twice": "written a second time since the last program READ",
+    "fetch_extra_byte": "program READ at 0x0000 addresses a fifth byte (0x0004)",
     "mosi_on_rise": "spiram: MOSI changed on a rising SCK edge",
     "cs_sck_high": "spiram: CS_n changed while SCK was high",
     "write_midbyte": "spiram: WRITE ended mid-byte",  # needs gpio_demo's RAM stores
