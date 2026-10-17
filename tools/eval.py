@@ -266,13 +266,18 @@ def gate_equiv(ctx):
 
 
 def _formal(ctx, gate, deep):
-    """verif/formal/run_formal.py [--deep] under the heavy lock (writes build/formal.json)."""
+    """verif/formal/run_formal.py [--deep] (writes build/formal.json). Local runs take the Mac
+    heavy lock; with BONETTO_FORMAL_HOST set the solvers run on that host under its own lock, so
+    the Mac lock is not taken (the runner only stages, times and rsyncs locally)."""
     ctx.need(gate, "verif/formal/run_formal.py")
-    ctx.need_tool(gate, "lockf")
+    remote = bool(os.environ.get("BONETTO_FORMAL_HOST"))
+    if not remote:
+        ctx.need_tool(gate, "lockf")
     out = "build/formal.json"
     ctx.clear(out)
     t0 = time.time()
-    cmd = HEAVY_LOCK + [ctx.py, "verif/formal/run_formal.py"] + (["--deep"] if deep else [])
+    cmd = ([] if remote else HEAVY_LOCK) + [ctx.py, "verif/formal/run_formal.py"] \
+        + (["--deep"] if deep else [])
     rc, lines = ctx.run(cmd, gate)
     j = ctx.fresh_json(gate, out, t0)
     checks = j.get("checks") or {}

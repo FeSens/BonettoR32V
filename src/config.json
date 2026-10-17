@@ -31,6 +31,33 @@
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
   "CLOCK_PORT": "clk",
 
+  "//": "BonettoR32V (hypothesis 004, docs/synth-cells.md): synthesis cell set and ABC strategy.",
+  "//": "EXTRA_EXCLUDED_CELLS - each '!' entry is a deny wildcard of LibreLane 3.0.14's cell filter",
+  "//": "(librelane/common/misc.py Filter): it takes the matching cells back out of the synthesis",
+  "//": "exclusion set formed by the PDK's no_synth.cells and drc_exclude.cells. Together they allow",
+  "//": "the smallest drive strengths (_1 logic cells, _1 and enable flip-flops, maj3, mux2i, ha, fah).",
+  "//": "No entry matches a drc_exclude.cells cell (those have DRC errors and stay excluded), nor a",
+  "//": "clock, delay, latch, scan, tri-state or physical-only cell. PnR's dont_use list is unchanged:",
+  "//": "OpenROAD's set_dont_use warns STA-0122 once per '!' entry and ignores it.",
+  "EXTRA_EXCLUDED_CELLS": [
+    "!sky130_fd_sc_hd__a*_1",
+    "!sky130_fd_sc_hd__o*_1",
+    "!sky130_fd_sc_hd__n*_1",
+    "!sky130_fd_sc_hd__inv_1",
+    "!sky130_fd_sc_hd__xor2_1",
+    "!sky130_fd_sc_hd__xnor2_1",
+    "!sky130_fd_sc_hd__df*_1",
+    "!sky130_fd_sc_hd__edf*_1",
+    "!sky130_fd_sc_hd__maj3_*",
+    "!sky130_fd_sc_hd__mux2i_*",
+    "!sky130_fd_sc_hd__ha_*",
+    "!sky130_fd_sc_hd__fah*_1"
+  ],
+
+  "//": "SYNTH_STRATEGY - ABC script. Unlike the default AREA 0, AREA 2 resynthesizes with structural",
+  "//": "choices and remaps once more for area recovery (librelane/scripts/pyosys/construct_abc_script.py).",
+  "SYNTH_STRATEGY": "AREA 2",
+
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
   "//": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
