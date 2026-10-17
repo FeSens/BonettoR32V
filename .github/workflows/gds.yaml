@@ -13,7 +13,7 @@ jobs:
       - name: checkout repo
         uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: false  # third_party/ (riscv-formal, riscv-arch-test) is verification-only
 
       - name: Build GDS
         uses: TinyTapeout/tt-gds-action@ttsky26d
@@ -34,7 +34,7 @@ jobs:
       - name: checkout repo
         uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: false  # third_party/ (riscv-formal, riscv-arch-test) is verification-only
 
       - name: GL test
         uses: TinyTapeout/tt-gds-action/gl_test@ttsky26d

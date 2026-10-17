@@ -13,7 +13,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: false  # third_party/ (riscv-formal, riscv-arch-test) is verification-only
 
       - name: Build docs
         uses: TinyTapeout/tt-gds-action/docs@ttsky26d

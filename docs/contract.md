@@ -67,6 +67,20 @@ module tt_um_fesens_r32v (
     design module can shadow a checker's module.
   - Continuous-assignment net declarations (`wire w = expr;`) are fine; they aren't power-up
     values.
+  - **Synthesizable subset**, enforced by `tools/src_check.py`. `docs/eval.md` has the full list.
+    The main rules:
+    - no delay controls (`#` only for `module name #(` parameter ports and `name #(`
+      instantiations);
+    - every `always` takes an edge list or `@(*)` / `@*`, never a level-sensitive list like
+      `@(a or b)`;
+    - no `$` system tasks or functions except `$signed` and `$unsigned` (so no `$clog2`: write
+      literal localparams);
+    - no tasks, no strings, no real numbers, no escaped identifiers;
+    - no SystemVerilog constructs;
+    - no hierarchical references (`.` only in named port connections);
+    - no gate primitives;
+    - no special net types (only `wire`, `reg`, `integer`, `genvar`, `parameter`, `localparam`);
+    - functions must assign every local before reading it, on every path.
   - Every `src/*.v` file is part of the design. The gates read them in sorted order, and the lead
     keeps `info.yaml` `source_files` equal to that list.
 
@@ -138,6 +152,12 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   Cosim programs never contain reserved encodings.
 - **Latency cap.** The first instruction retires within 1,024 cycles of reset release, and every
   later one within 1,024 cycles of the previous retirement. A halted core is exempt.
+  - **Counting:** number the rising clock edges so that edge 0 is the last edge at which `rst_n`
+    is sampled low.
+  - The first retirement (rvfi_valid sampled high) must happen at an edge numbered 1,024 or
+    lower.
+  - Each later retirement must come at most 1,024 edges after the previous one.
+  - Every checker (cosim watchdog, formal liveness) uses this count.
 - **FENCE** is a no-op that retires normally. That covers every MISC-MEM encoding with
   `funct3 = 000`, whatever its fm, pred, succ, rs1 and rd fields hold (x16-x31 included):
   FENCE.TSO, PAUSE and the rest. The spec requires base implementations to ignore those fields.

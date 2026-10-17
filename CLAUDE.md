@@ -51,7 +51,7 @@ this design pass". If a gate looks wrong, report it to the lead; don't route aro
 | `make gl` | gate-level test of the synthesized netlist |
 | `make equiv` | the RVFI-stripped build equals the plain build |
 | `make area` | the fast score: sky130 cell area, broken down |
-| `make eval` | every gate plus the score, writing `build/eval.json` |
+| `make eval` | every gate plus the score, cheapest first, writing `build/eval.json`; `MAX_AREA=<champion um2>` stops a candidate that isn't smaller right after the area gate |
 | `make harden` | TT 1x1 hardening (LibreLane) |
 | `make tilefit` | the physical score: the smallest fraction of the real 1x1 tile the design signs off in |
 
