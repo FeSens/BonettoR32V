@@ -113,9 +113,10 @@ waveform rules apply after it. `wrapper.sv` computes, at each retirement:
     0xFFFD-0xFFFF of the RAM);
   - for a reserved encoding (a used register field x16-x31, an undefined funct3, ...), which
     has no spec access, from the access it claims (non-trapping `rvfi_mem_*`, same formula).
-    The hyp/002 cores decode such encodings as loads and stores (x17 as x1, say) and touch the
-    region with them: without this rule their own register slots get overwritten and the
-    checks after it fail on a legal core (seen at 5d23efc: reg, bus_dmem, insn_group5). A core
+    The hyp/002 cores execute such encodings as loads and stores and can touch the region
+    with them: at 5d23efc, without this rule, a reserved SH (rs1 = x17) on fc07cc3 wrote
+    0xFFC4, its x1 slot, and a later read of x1 failed `reg`; similar traces failed bus_dmem
+    and insn_group5 on fc07cc3 and reg and bus_dmem on b9a5211, all on legal cores. A core
     cannot use it to end the checks, because formal, not the core, picks the instruction
     stream;
 - `bon_region_ret`: either, at this retirement; `bon_stopped`: a region retirement has happened
