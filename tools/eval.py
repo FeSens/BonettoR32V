@@ -46,6 +46,8 @@ HEAVY_LOCK = ["lockf", "-k", os.environ.get("BONETTO_HEAVY_LOCK", "/tmp/bonetto-
 LATENCY_CAP = 1024                       # contract section 4
 COSIM_MODES = ("rvfi", "pins")
 COSIM_SEEDS = (1, 2, 3)
+FUZZ_SEEDS = (1, 2, 3, 4, 5)          # random-image liveness fuzz (reserved encodings etc.)
+FUZZ_MIN_RUNS = 2048 + 8              # run_cosim.py's default: 2,048 probe runs + 8 walks
 EXPECT_RETIRED_KEYS = ("retired", "retired_count", "instret", "insns", "instructions")
 
 
@@ -211,6 +213,23 @@ def gate_cosim(ctx):
     hexes.sort(key=lambda h: (first.get(os.path.basename(h)[:-4], 2), h))
     if not hexes:
         raise GateFail("gate cosim: no build/programs/*.hex after make -C verif/programs")
+    # Liveness on reserved encodings and unspecified accesses first (seconds, and the programs
+    # never contain them): every instruction must retire or trap within the latency cap.
+    for seed in FUZZ_SEEDS:
+        log = f"cosim_fuzz_{seed}"
+        rc, lines = ctx.run([ctx.py, "verif/cosim/run_cosim.py", "--fuzz-liveness",
+                             "--seed", str(seed)], log)
+        s = last_json_line(lines) or {}
+        runs_done = s.get("runs")
+        if rc != 0 or s.get("pass") is not True or s.get("liveness_checked") is not True \
+                or s.get("error") or not (isinstance(runs_done, int) and runs_done >= FUZZ_MIN_RUNS):
+            why = s.get("error") or (f"exit {rc}" if s else "no JSON summary line")
+            if s and s.get("liveness_checked") is not True and not s.get("error"):
+                why = "liveness was not checked"
+            elif s and not s.get("error") and s.get("pass") is True:
+                why = f"only {runs_done!r} fuzz runs (need >= {FUZZ_MIN_RUNS})"
+            raise GateFail(f"cosim FAIL on liveness fuzz --seed {seed}: {why} "
+                           f"(log {ctx.log_rel(log)})")
     runs = []
     for hexpath in hexes:
         name = os.path.basename(hexpath)[:-4]
@@ -246,7 +265,8 @@ def gate_cosim(ctx):
     ctx.notes["cpi"] = cpi
     worst = max((r["max_cycles_per_insn"] or 0) for r in runs)
     return (f"{len(runs)} runs pass ({len(hexes)} programs x {len(COSIM_MODES)} modes x "
-            f"{len(COSIM_SEEDS)} seeds), cpi {cpi}, worst retirement gap {worst}",
+            f"{len(COSIM_SEEDS)} seeds) + liveness fuzz x {len(FUZZ_SEEDS)}, cpi {cpi}, "
+            f"worst retirement gap {worst}",
             {"runs": runs, "cpi": cpi})
 
 
