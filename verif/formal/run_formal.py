@@ -578,11 +578,12 @@ SPEC_SIGS = [("valid", ""), ("trap", ""), ("rs1_addr", "[4:0] "), ("rs2_addr", "
 def group_model(insns):
     """Verilog for bonetto_insn_group: the E-filtered models of `insns` muxed into one spec
     (their spec_valid are mutually exclusive: distinct encodings), plus one trigger per
-    instruction (reach_insn_<i>, and reach_insn_<i>_trap where the spec can trap). One
-    insn check over the group checks every member at each of its retirements."""
+    instruction (reach_insn_<i>, and reach_insn_<i>_trap where the spec can trap), on
+    fully compared retirements (chk: before the first region-touching one). One insn
+    check over the group checks every member at each of its retirements."""
     ports = ("input clock, input reset, input rvfi_valid, input [31:0] rvfi_insn, "
              "input [31:0] rvfi_pc_rdata, input [31:0] rvfi_rs1_rdata, "
-             "input [31:0] rvfi_rs2_rdata, input [31:0] rvfi_mem_rdata")
+             "input [31:0] rvfi_rs2_rdata, input [31:0] rvfi_mem_rdata, input chk")
     outs = ", ".join(f"output {w}spec_{n}" for n, w in SPEC_SIGS)
     lines = ['`include "bonetto_macros.vh"', f"module bonetto_insn_group ({ports}, {outs});"]
     for i in insns:
@@ -598,9 +599,9 @@ def group_model(insns):
     lines.append("  always @* begin")
     lines.append("    if (!reset) begin")
     for i in insns:
-        lines.append(f"      `BONETTO_REACH(reach_insn_{i}, s_{i}_valid)")
+        lines.append(f"      `BONETTO_REACH(reach_insn_{i}, chk && s_{i}_valid)")
         if i in TRAPPING:
-            lines.append(f"      `BONETTO_REACH(reach_insn_{i}_trap, s_{i}_valid && s_{i}_trap)")
+            lines.append(f"      `BONETTO_REACH(reach_insn_{i}_trap, chk && s_{i}_valid && s_{i}_trap)")
     lines.append("    end")
     lines.append("  end")
     lines.append("endmodule")

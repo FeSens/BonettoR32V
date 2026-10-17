@@ -23,6 +23,17 @@
 //     monitor records the bit at the rising edge; the bus checks constrain that bit
 //     to the memory contents. A core that samples MISO while SCK is low reads noise
 //     and fails the bus checks.
+//   - The core region (RAM 0xFF80-0xFFFF, contract section 3) is a real memory in
+//     every task: 128 bytes with free initial contents, written by every WRITE data
+//     byte at a region address and read by every READ data bit at one (the bit at
+//     the rising edge equals the memory's bit). A core keeping x1..x15 or the pc there
+//     reads back what it wrote. Program bytes stay data-free outside the bus checks.
+//
+// Core-region stop (contract section 3): checks stop comparing at the first
+// retirement whose fetch or data access touches the region (bon_region_ret, from the
+// spec-model address); only liveness and the SPI waveform rules apply after it
+// (bon_stopped). The fields that decide the stop are still checked at that retirement:
+// pc_rdata (pc_fwd, pc_bwd), the rs1 read (reg) and mem_addr (insn).
 
 `include "bonetto_macros.vh"
 
@@ -97,7 +108,9 @@ module rvfi_wrapper (
 		.ev_rd_bit(ev_rd_bit), .ev_rd_addr(ev_rd_addr), .ev_rd_idx(ev_rd_idx), .ev_rd_val(ev_rd_val),
 		.ev_byte(ev_byte), .ev_byte_wr(ev_byte_wr), .ev_byte_addr(ev_byte_addr),
 		.ev_byte_data(ev_byte_data), .ev_end(ev_end), .ev_end_hdr(ev_end_hdr),
-		.ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit)
+		.ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit),
+		.ev_end_addr(ev_end_addr), .ev_end_nbits(ev_end_nbits), .ev_end_region(ev_end_region),
+		.ev_end_mixed(ev_end_mixed)
 	);
 
 	// MISO hold (contract rule 3): from the rising edge that clocks a READ data bit
@@ -118,6 +131,55 @@ module rvfi_wrapper (
 		if (!reset && miso_hold && uio_out[3] && !uio_out[0])
 			assume (miso == miso_hold_val);
 	end
+
+	// Core region memory (see the header). No initializer: free initial contents.
+	reg [7:0] rmem [0:127];
+	wire [7:0] rmem_rd = rmem[ev_rd_addr[6:0]];
+	always @* begin
+		if (!reset && ev_rd_bit && ev_rd_addr[15:7] == 9'h1ff)
+			assume (miso == rmem_rd[3'd7 - ev_rd_idx]);
+	end
+	always @(posedge clock) begin
+		if (!reset && ev_byte && ev_byte_wr && ev_byte_addr[15:7] == 9'h1ff)
+			rmem[ev_byte_addr[6:0]] <= ev_byte_data;
+	end
+
+	// Region-touching retirements (contract section 3), from the spec-model address.
+	// Fetch: bytes pc16 + k, k < 4, reach 0xFF80 (or wrap through 0xFFFF) iff
+	// pc16 >= 0xFF7D. Data: an RV32I load/store at rs1 + imm (rs1 = x0 reads 0), RAM
+	// (addr[31] = 0), n bytes touch the region iff addr16 >= 0xFF80 - (n - 1). Any RAM
+	// access the retirement claims (rvfi_mem_*) counts too: a reserved encoding has no
+	// spec address, and a spec instruction's mem_addr is compared by the insn check.
+	wire [6:0] r_op = rvfi_insn[6:0];
+	wire [2:0] r_f3 = rvfi_insn[14:12];
+	wire r_ld = r_op == 7'b0000011 && (r_f3 == 3'd0 || r_f3 == 3'd1 || r_f3 == 3'd2 ||
+	                                   r_f3 == 3'd4 || r_f3 == 3'd5);
+	wire r_st = r_op == 7'b0100011 && (r_f3 == 3'd0 || r_f3 == 3'd1 || r_f3 == 3'd2);
+	wire [15:0] r_nm1 = (r_f3[1:0] == 2'd0) ? 16'd0 : (r_f3[1:0] == 2'd1) ? 16'd1 : 16'd3;
+	wire [31:0] r_rs1 = (rvfi_insn[19:15] == 5'd0) ? 32'd0 : rvfi_rs1_rdata;
+	wire [31:0] r_imm = r_st ? {{20{rvfi_insn[31]}}, rvfi_insn[31:25], rvfi_insn[11:7]}
+	                         : {{20{rvfi_insn[31]}}, rvfi_insn[31:20]};
+	wire [31:0] r_addr = r_rs1 + r_imm;
+	wire spec_touch = (r_ld || r_st) && !r_addr[31] && r_addr[15:0] >= 16'hff80 - r_nm1;
+	wire [3:0] c_mask = rvfi_mem_rmask | rvfi_mem_wmask;
+	wire [15:0] c_nm1 = (c_mask == 4'b0001) ? 16'd0 : (c_mask == 4'b0011) ? 16'd1 : 16'd3;
+	wire claim_touch = !rvfi_trap && c_mask != 4'b0 && !rvfi_mem_addr[31] &&
+	                   rvfi_mem_addr[15:0] >= 16'hff80 - c_nm1;
+	wire fetch_touch = rvfi_pc_rdata[15:0] >= 16'hff7d;
+	assign bon_fetch_touch = fetch_touch;
+	assign bon_region_ret = fetch_touch || spec_touch || claim_touch;
+	reg stopped_r = 1'b0;
+	always @(posedge clock) begin
+		if (reset) stopped_r <= 1'b0;
+		else if (rvfi_valid && bon_region_ret) stopped_r <= 1'b1;
+	end
+	assign bon_stopped = stopped_r;
+
+	// A branch (funct3 not 010/011) or JALR (funct3 000) whose used register fields
+	// are x0..x15: on a trap its rs fields are truthful and checked (section 6).
+	assign bon_brj = (r_op == 7'b1100011 && r_f3 != 3'd2 && r_f3 != 3'd3 &&
+	                  !rvfi_insn[19] && !rvfi_insn[24]) ||
+	                 (r_op == 7'b1100111 && r_f3 == 3'd0 && !rvfi_insn[19] && !rvfi_insn[11]);
 endmodule
 
 // Passive 23LC512 decoder (contract section 2, mode 0, READ 0x03 / WRITE 0x02,
@@ -138,7 +200,11 @@ module bonetto_spi_monitor (
 	output [15:0] ev_byte_addr,
 	output [7:0] ev_byte_data,
 	output ev_end, ev_end_hdr, ev_end_write, ev_end_bytes,
-	output [2:0] ev_end_bit
+	output [2:0] ev_end_bit,
+	output [15:0] ev_end_addr,
+	output [9:0] ev_end_nbits,
+	output ev_end_region,
+	output ev_end_mixed
 );
 	// Steps since the start of the trace, saturating at 2. Step 0 is the initial
 	// state (before any edge); the contract covers the pins from step 1.
@@ -174,6 +240,10 @@ module bonetto_spi_monitor (
 	reg [6:0]  dsh;
 	reg        wr;     // command was WRITE
 	reg        anyb;   // at least one full data byte
+	reg [15:0] taddr;  // start address A
+	reg [9:0]  nbits;  // data bits so far (saturates at 1023)
+	reg        t_reg;  // a data bit of a region byte (0xFF80-0xFFFF)
+	reg        t_prog; // a data bit of a program byte
 
 	wire in_data = hdr == 5'd24;
 	wire bitv = (in_data && !wr) ? miso : mosi;
@@ -193,6 +263,13 @@ module bonetto_spi_monitor (
 	assign ev_end_write = wr;
 	assign ev_end_bytes = anyb;
 	assign ev_end_bit = bidx;
+	assign ev_end_addr = taddr;
+	assign ev_end_nbits = nbits;
+	// Section 6: a region transaction addresses only region bytes (it may not wrap out
+	// of the region); one with no data byte is a region transaction iff A is in the
+	// region. Bytes are the ones with at least one data bit.
+	assign ev_end_region = in_data && (t_reg ? !t_prog : taddr[15:7] == 9'h1ff);
+	assign ev_end_mixed = t_reg && t_prog;
 
 	always @(posedge clock) begin
 		if (reset || cs) begin
@@ -200,6 +277,9 @@ module bonetto_spi_monitor (
 			bidx <= 3'd0;
 			wr <= 1'b0;
 			anyb <= 1'b0;
+			nbits <= 10'd0;
+			t_reg <= 1'b0;
+			t_prog <= 1'b0;
 		end else if (rise) begin
 			if (hdr < 5'd8) begin
 				cmdsh <= {cmdsh[5:0], mosi};
@@ -208,10 +288,16 @@ module bonetto_spi_monitor (
 			end else if (hdr < 5'd24) begin
 				addrsh <= {addrsh[13:0], mosi};
 				hdr <= hdr + 5'd1;
-				if (hdr == 5'd23) baddr <= {addrsh, mosi};
+				if (hdr == 5'd23) begin
+					baddr <= {addrsh, mosi};
+					taddr <= {addrsh, mosi};
+				end
 			end else begin
 				dsh <= {dsh[5:0], bitv};
 				bidx <= bidx + 3'd1;
+				if (nbits != 10'h3ff) nbits <= nbits + 10'd1;
+				if (baddr[15:7] == 9'h1ff) t_reg <= 1'b1;
+				else t_prog <= 1'b1;
 				if (bidx == 3'd7) begin
 					baddr <= baddr + 16'd1;
 					anyb <= 1'b1;
@@ -263,8 +349,9 @@ module bonetto_spi_check (
 
 		// Section 6: all of an instruction's SPI traffic finishes before its
 		// rvfi_valid cycle, so CS_n is high in that cycle. This also makes every
-		// transaction belong to exactly one instruction (the next to retire).
-		if (mon_en && !reset_q && rvfi_valid) spi_cs_at_valid: assert (mon_cs);
+		// transaction belong to exactly one instruction (the next to retire). Not at
+		// or after the first region-touching retirement (section 3).
+		if (mon_en && !reset_q && rvfi_valid && `BONETTO_FULL) spi_cs_at_valid: assert (mon_cs);
 	end
 
 	// Triggers (reach task): a complete READ and a complete WRITE.
@@ -277,11 +364,13 @@ module bonetto_spi_check (
 endmodule
 
 // GPIO at the pins (contract section 3). ui_in is constant (formal environment).
+// Compared up to the first region-touching retirement (section 3), exclusive.
 module bonetto_gpio_check (
 	`BONETTO_CHECKER_PORTS
 );
-	// Retirements with architectural effect (a trapping instruction has none).
-	wire valid = !reset && rvfi_valid && !rvfi_trap;
+	// Compared retirements with architectural effect (a trapping instruction has none).
+	wire full = !reset && rvfi_valid && `BONETTO_FULL;
+	wire valid = full && !rvfi_trap;
 	wire io = rvfi_mem_addr[31];
 	wire [1:0] a10 = rvfi_mem_addr[1:0];
 	wire [3:0] rm = rvfi_mem_rmask;
@@ -327,36 +416,47 @@ module bonetto_gpio_check (
 	// retires. uo_ref is the architectural value, updated one step after the store's
 	// rvfi_valid. Within an instruction's window (after the previous retirement's
 	// "+1" step, up to its own rvfi_valid) uo_out may move once, from uo_ref to the
-	// store's value, and must stay there.
+	// store's value, and must stay there; that is checked at the retirement, so the
+	// window of a region-touching retirement is not compared. After a misaligned IO
+	// store (unspecified) uo_out is not compared again: `unspec` from the next step,
+	// st_unspec at its own retirement step (it may change uo_out in or before it).
 	reg [7:0] uo_ref;
-	reg dev;
-	reg [7:0] dev_val;
+	reg dev;            // uo_out left uo_ref in this window
+	reg [7:0] dev_val;  // ... to this value
+	reg twice;          // ... and then moved again
 	reg unspec;
-	reg strict;  // this step is the step after a retirement (or the first after reset)
+	reg strict;  // this step is the step after a compared retirement (or after reset)
 	wire deviates = pin_uo_out != uo_ref;
 	always @(posedge clock) begin
 		if (reset) begin
 			uo_ref <= 8'h00;
 			dev <= 1'b0;
+			twice <= 1'b0;
 			unspec <= 1'b0;
 			strict <= 1'b1;
 		end else begin
-			strict <= rvfi_valid;
+			strict <= full;
 			if (rvfi_valid) begin
 				dev <= 1'b0;
+				twice <= 1'b0;
 				if (upd) uo_ref <= wr0_val;
 				if (st_unspec) unspec <= 1'b1;
-			end else if (!strict && deviates && !dev) begin
-				dev <= 1'b1;
-				dev_val <= pin_uo_out;
+			end else if (!strict) begin
+				if (deviates && !dev) begin
+					dev <= 1'b1;
+					dev_val <= pin_uo_out;
+				end else if (dev && pin_uo_out != dev_val) begin
+					twice <= 1'b1;
+				end
 			end
 		end
 	end
+	wire live = !reset && !unspec && !bon_stopped;
 	always @* begin
-		if (!reset && !unspec) begin
-			if (strict) gpio_uo_hold: assert (!deviates);
-			if (dev) gpio_uo_once: assert (pin_uo_out == dev_val);
-			if (rvfi_valid && (dev || deviates)) begin
+		if (live && strict) gpio_uo_hold: assert (!deviates);
+		if (live && full && !st_unspec) begin
+			gpio_uo_once: assert (!twice && (!dev || pin_uo_out == dev_val));
+			if (dev || deviates) begin
 				gpio_uo_cause: assert (upd);
 				gpio_uo_value: assert (wr0_val == (dev ? dev_val : pin_uo_out));
 			end

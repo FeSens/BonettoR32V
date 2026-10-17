@@ -4,16 +4,21 @@
 // and rewritten for the uniform checker interface. The free `check` input selects
 // the retirement to check (RISCV_FORMAL_UNBOUNDED style), so BMC checks every
 // retirement within the depth. These checks apply to every retirement, reserved
-// encodings included (contract section 4: the RVFI trace stays consistent).
+// encodings included (contract section 4: the RVFI trace stays consistent), up to
+// the first region-touching retirement (contract section 3: bon_region_ret, then
+// bon_stopped). At that retirement only the fields that decide the stop are checked:
+// its pc_rdata (pc_fwd, pc_bwd, order) and, for a data access, its rs1 read (reg).
 
 `include "bonetto_macros.vh"
 
 // reg: a register read returns the last value written to it (writes of trapping
-// instructions excluded, as in stock; reads of trapping retirements are not compared,
-// contract section 6). Fork: a register that has not been written
-// yet must read the same value every time (the value seen on its first read): the
-// register file may start unknown but does not change by itself. Stock only checks
-// reads after a write.
+// instructions excluded, as in stock). Reads of a trapping retirement are compared
+// only for a branch or JALR (contract section 6: its operands decide the trap). Fork:
+// a register that has not been written yet must read the same value every time (the
+// value seen on its first read): the register file (on the die or in the core region)
+// may start unknown but does not change by itself. Stock only checks reads after a
+// write. At a region-touching retirement only the rs1 read of a data access is
+// compared (its spec address decides the stop), and its write is not recorded.
 module bonetto_reg_check (
 	`BONETTO_CHECKER_PORTS
 );
@@ -21,10 +26,12 @@ module bonetto_reg_check (
 	reg [31:0] shadow;
 	reg known;
 
-	wire valid = !reset && rvfi_valid;
-	wire rd1 = !rvfi_trap && rvfi_rs1_addr == register_index;
-	wire rd2 = !rvfi_trap && rvfi_rs2_addr == register_index;
-	wire wr = !rvfi_trap && rvfi_rd_addr == register_index;
+	wire valid = !reset && rvfi_valid && !bon_stopped;
+	wire full = !bon_region_ret;
+	wire rds = !rvfi_trap || bon_brj;
+	wire rd1 = rds && rvfi_rs1_addr == register_index && (full || !bon_fetch_touch);
+	wire rd2 = rds && rvfi_rs2_addr == register_index && full;
+	wire wr = full && !rvfi_trap && rvfi_rd_addr == register_index;
 
 	always @(posedge clock) begin
 		if (reset) begin
@@ -50,7 +57,7 @@ module bonetto_reg_check (
 			if (rd1 && rd2) reg_rs1_rs2: assert (rvfi_rs1_rdata == rvfi_rs2_rdata);
 		end
 		if (!reset) begin
-			`BONETTO_REACH(reach_reg, valid && known && (rd1 || rd2))
+			`BONETTO_REACH(reach_reg, valid && full && known && (rd1 || rd2))
 		end
 	end
 endmodule
@@ -63,12 +70,12 @@ module bonetto_pc_fwd_check (
 	`rvformal_rand_const_reg [63:0] insn_order;
 	reg [31:0] expect_pc;
 	reg expect_valid;
-	wire valid = !reset && rvfi_valid;
+	wire valid = !reset && rvfi_valid && !bon_stopped;
 
 	always @(posedge clock) begin
 		if (reset) begin
 			expect_valid <= 1'b0;
-		end else if (valid && rvfi_order == insn_order - 64'd1) begin
+		end else if (valid && !bon_region_ret && rvfi_order == insn_order - 64'd1) begin
 			expect_pc <= rvfi_pc_wdata;
 			expect_valid <= 1'b1;
 		end
@@ -94,7 +101,7 @@ module bonetto_pc_bwd_check (
 	reg [31:0] prev_pc_wdata;
 	reg [63:0] prev_order;
 	reg prev_valid;
-	wire valid = !reset && rvfi_valid;
+	wire valid = !reset && rvfi_valid && !bon_stopped;
 
 	always @(posedge clock) begin
 		if (reset) begin
@@ -118,19 +125,20 @@ endmodule
 
 // causal (stock semantics): a register written by the retirement with order N is
 // not read by any retirement with a larger order that retired before it. Trapping
-// retirements neither write nor have their reads compared (contract section 6).
+// retirements write nothing, and only a trapping branch or JALR has its reads
+// compared (contract section 6).
 module bonetto_causal_check (
 	`BONETTO_CHECKER_PORTS
 );
 	`rvformal_rand_const_reg [63:0] insn_order;
 	`rvformal_rand_const_reg [4:0] register_index;
 	reg found_non_causal;
-	wire valid = !reset && rvfi_valid;
+	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
 
 	always @(posedge clock) begin
 		if (reset) begin
 			found_non_causal <= 1'b0;
-		end else if (valid && !rvfi_trap && rvfi_order > insn_order &&
+		end else if (valid && (!rvfi_trap || bon_brj) && rvfi_order > insn_order &&
 				(rvfi_rs1_addr == register_index || rvfi_rs2_addr == register_index)) begin
 			found_non_causal <= 1'b1;
 		end
@@ -154,7 +162,7 @@ module bonetto_unique_check (
 	`rvformal_rand_const_reg [63:0] insn_order;
 	reg seen;
 	reg any;
-	wire valid = !reset && rvfi_valid;
+	wire valid = !reset && rvfi_valid && !bon_stopped;
 
 	always @(posedge clock) begin
 		if (reset) begin
@@ -218,7 +226,7 @@ endmodule
 module bonetto_ill_check (
 	`BONETTO_CHECKER_PORTS
 );
-	wire valid = !reset && rvfi_valid;
+	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
 	wire ill = rvfi_insn == 32'h00000000 || rvfi_insn == 32'hffffffff;
 
 	always @* begin
@@ -235,9 +243,9 @@ module bonetto_ill_check (
 	end
 endmodule
 
-// silent (new): after a retirement with rvfi_halt the core never retires again,
-// never starts another SPI WRITE (contract section 4), and uo_out never changes
-// (no IO store can retire).
+// silent (new): after a compared retirement with rvfi_halt the core never retires
+// again, never starts another SPI WRITE, core region included (contract section 4:
+// nothing after the halt), and uo_out never changes (no IO store can retire).
 module bonetto_silent_check (
 	`BONETTO_CHECKER_PORTS
 );
@@ -247,7 +255,7 @@ module bonetto_silent_check (
 	always @(posedge clock) begin
 		prev_uo <= pin_uo_out;
 		if (reset) halted <= 1'b0;
-		else if (rvfi_valid && rvfi_halt) halted <= 1'b1;
+		else if (rvfi_valid && rvfi_halt && `BONETTO_FULL) halted <= 1'b1;
 	end
 
 	always @* begin
@@ -267,7 +275,7 @@ module bonetto_rvfi_check (
 );
 	reg seen;
 	reg [63:0] last_order;
-	wire valid = !reset && rvfi_valid;
+	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
 
 	function mask_ok(input [3:0] m);
 		mask_ok = m == 4'b0000 || m == 4'b0001 || m == 4'b0011 || m == 4'b1111;
@@ -288,10 +296,13 @@ module bonetto_rvfi_check (
 			conv_mode: assert (rvfi_mode == 2'd3);
 			conv_ixl: assert (rvfi_ixl == 2'd1);
 			// Register and read-mask fields of a trapping retirement are not
-			// compared (contract section 6).
-			if (!rvfi_trap) begin
+			// compared (contract section 6), except the register reads of a
+			// trapping branch or JALR.
+			if (!rvfi_trap || bon_brj) begin
 				if (rvfi_rs1_addr == 0) conv_rs1_x0: assert (rvfi_rs1_rdata == 0);
 				if (rvfi_rs2_addr == 0) conv_rs2_x0: assert (rvfi_rs2_rdata == 0);
+			end
+			if (!rvfi_trap) begin
 				if (rvfi_rd_addr == 0) conv_rd_x0: assert (rvfi_rd_wdata == 0);
 				conv_rmask: assert (mask_ok(rvfi_mem_rmask));
 			end

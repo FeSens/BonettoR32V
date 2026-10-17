@@ -20,7 +20,21 @@
 //   ev_end        CS_n rose this step (end of a transaction); ev_end_hdr = the
 //                 24 header bits were complete, ev_end_write = command was WRITE,
 //                 ev_end_bytes = at least one full data byte, ev_end_bit = data
-//                 bits mod 8
+//                 bits mod 8, ev_end_addr = the start address A, ev_end_nbits = data
+//                 bits (saturates at 1023), ev_end_region = a region transaction
+//                 (contract section 6: every byte it addresses is in 0xFF80-0xFFFF;
+//                 with no data byte, A is in the region), ev_end_mixed = it addresses
+//                 both region and program bytes (forbidden)
+//
+// Core-region stop (contract section 3, computed by rvfi_wrapper):
+//   bon_region_ret   this retirement's fetch or data access touches the core region
+//                    (spec-model address: pc_rdata for the fetch; rs1 + imm for a load
+//                    or store, plus any RAM access the retirement claims)
+//   bon_fetch_touch  ... through its fetch (pc_rdata[15:0] + k in the region)
+//   bon_stopped      a region-touching retirement has happened: from the step after
+//                    it, only liveness and the SPI waveform rules apply
+//   bon_brj          rvfi_insn is a branch or JALR (valid funct3, E register fields):
+//                    on a trap its rs fields are truthful and checked (section 6)
 
 `ifndef BONETTO_MACROS_VH
 `define BONETTO_MACROS_VH
@@ -67,7 +81,15 @@
   input        ev_end_hdr, \
   input        ev_end_write, \
   input        ev_end_bytes, \
-  input [2:0]  ev_end_bit
+  input [2:0]  ev_end_bit, \
+  input [15:0] ev_end_addr, \
+  input [9:0]  ev_end_nbits, \
+  input        ev_end_region, \
+  input        ev_end_mixed, \
+  input        bon_region_ret, \
+  input        bon_fetch_touch, \
+  input        bon_stopped, \
+  input        bon_brj
 
 `define BONETTO_OUTPUTS \
   output [7:0]  pin_ui_in, \
@@ -100,7 +122,15 @@
   output        ev_end_hdr, \
   output        ev_end_write, \
   output        ev_end_bytes, \
-  output [2:0]  ev_end_bit
+  output [2:0]  ev_end_bit, \
+  output [15:0] ev_end_addr, \
+  output [9:0]  ev_end_nbits, \
+  output        ev_end_region, \
+  output        ev_end_mixed, \
+  output        bon_region_ret, \
+  output        bon_fetch_touch, \
+  output        bon_stopped, \
+  output        bon_brj
 
 `define BONETTO_WIRES \
   (* keep *) wire [7:0]  pin_ui_in; \
@@ -133,7 +163,15 @@
   (* keep *) wire        ev_end_hdr; \
   (* keep *) wire        ev_end_write; \
   (* keep *) wire        ev_end_bytes; \
-  (* keep *) wire [2:0]  ev_end_bit;
+  (* keep *) wire [2:0]  ev_end_bit; \
+  (* keep *) wire [15:0] ev_end_addr; \
+  (* keep *) wire [9:0]  ev_end_nbits; \
+  (* keep *) wire        ev_end_region; \
+  (* keep *) wire        ev_end_mixed; \
+  (* keep *) wire        bon_region_ret; \
+  (* keep *) wire        bon_fetch_touch; \
+  (* keep *) wire        bon_stopped; \
+  (* keep *) wire        bon_brj;
 
 `define BONETTO_CONN \
   .pin_ui_in(pin_ui_in), .pin_uo_out(pin_uo_out), .pin_uio_in(pin_uio_in), \
@@ -144,7 +182,10 @@
   .ev_rd_bit(ev_rd_bit), .ev_rd_addr(ev_rd_addr), .ev_rd_idx(ev_rd_idx), .ev_rd_val(ev_rd_val), \
   .ev_byte(ev_byte), .ev_byte_wr(ev_byte_wr), .ev_byte_addr(ev_byte_addr), \
   .ev_byte_data(ev_byte_data), .ev_end(ev_end), .ev_end_hdr(ev_end_hdr), \
-  .ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit)
+  .ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit), \
+  .ev_end_addr(ev_end_addr), .ev_end_nbits(ev_end_nbits), .ev_end_region(ev_end_region), \
+  .ev_end_mixed(ev_end_mixed), .bon_region_ret(bon_region_ret), \
+  .bon_fetch_touch(bon_fetch_touch), .bon_stopped(bon_stopped), .bon_brj(bon_brj)
 
 // The uniform checker interface: clock, checker reset, the free check input
 // (RISCV_FORMAL_UNBOUNDED: the solver picks the check cycle), RVFI, pins, monitor.
@@ -152,6 +193,9 @@
   input clock, input reset, input check, \
   `RVFI_INPUTS, \
   `BONETTO_INPUTS
+
+// A fully compared retirement: not at or after the first region-touching retirement.
+`define BONETTO_FULL (!bon_stopped && !bon_region_ret)
 
 `define BONETTO_CHECKER_CONN(_clock, _reset, _check) \
   .clock(_clock), .reset(_reset), .check(_check), \

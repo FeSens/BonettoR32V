@@ -11,8 +11,13 @@
 //   - rvfi_halt must equal the spec's trap (fatal traps halt; nothing else halts).
 //   - A trapping retirement (contract section 6) is compared only on rvfi_trap,
 //     rvfi_halt and the absence of side effects: rd_addr = 0 and wmask = 0. Its
-//     register-read fields, rd_wdata, rmask and pc_wdata are not compared (insn and
-//     pc_rdata are checked by the pc and bus checks).
+//     rd_wdata, rmask and pc_wdata are not compared (insn and pc_rdata are checked by
+//     the pc and bus checks). Its register-read fields are compared only for a
+//     branch or JALR, whose operands decide the trap: rs1_addr / rs2_addr equal the
+//     spec's and x0 reads 0 (the reg check covers the values).
+//   - Up to the first region-touching retirement (contract section 3). At that
+//     retirement only mem_addr is compared, for a data access (its spec address
+//     decided the stop, so a core can't escape by misreporting it).
 //   - Register fields of a non-trapping retirement: rs1_addr / rs2_addr equal the
 //     spec's (unused fields report 0).
 //   - Memory masks are exact (LSB-aligned 1/3/15 for the access size, 0 otherwise);
@@ -51,6 +56,7 @@ module bonetto_insn_check (
 		.rvfi_rs1_rdata (rs1_rdata_or_zero),
 		.rvfi_rs2_rdata (rs2_rdata_or_zero),
 		.rvfi_mem_rdata (rvfi_mem_rdata   ),
+		.chk            (`BONETTO_FULL    ),
 		.spec_valid     (spec_valid       ),
 		.spec_trap      (spec_trap        ),
 		.spec_rs1_addr  (spec_rs1_addr    ),
@@ -69,15 +75,26 @@ module bonetto_insn_check (
 		// The triggers (one per instruction, plus a trapping retirement where the
 		// spec can trap) are in the instruction model, bonetto_insn_group, which
 		// run_formal.py generates per task.
-		if (!reset && check) begin
+		if (!reset && check && !bon_stopped) begin
 			assume (spec_valid);
-
+		end
+		if (!reset && check && !bon_stopped && bon_region_ret) begin
+			if ((spec_mem_rmask || spec_mem_wmask) && !bon_fetch_touch)
+				insn_region_mem_addr: assert (rvfi_mem_addr == spec_mem_addr);
+		end
+		if (!reset && check && `BONETTO_FULL) begin
 			insn_trap: assert (rvfi_trap == spec_trap);
 			insn_halt: assert (rvfi_halt == spec_trap);
 
 			if (spec_trap) begin
 				insn_trap_rd_addr: assert (rvfi_rd_addr == 0);
 				insn_trap_wmask: assert (rvfi_mem_wmask == 0);
+				if (bon_brj) begin
+					if (rvfi_rs1_addr == 0) insn_trap_rs1_zero: assert (rvfi_rs1_rdata == 0);
+					if (rvfi_rs2_addr == 0) insn_trap_rs2_zero: assert (rvfi_rs2_rdata == 0);
+					insn_trap_rs1_addr: assert (rvfi_rs1_addr == spec_rs1_addr);
+					insn_trap_rs2_addr: assert (rvfi_rs2_addr == spec_rs2_addr);
+				end
 			end else begin
 				if (rvfi_rs1_addr == 0) insn_rs1_zero: assert (rvfi_rs1_rdata == 0);
 				if (rvfi_rs2_addr == 0) insn_rs2_zero: assert (rvfi_rs2_rdata == 0);
