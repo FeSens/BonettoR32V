@@ -1,37 +1,49 @@
 #!/usr/bin/env python3
-"""Generate a deterministic random RV32E instruction stream for the cosim.
+"""Generate a deterministic random RV32E instruction stream for the cosim (contract v3).
 
 Usage: gen_random.py SEED N [-o OUT.S]
 
-The program has N random instructions (valid RV32E only, never a reserved encoding, never a trap)
-between a prologue and an epilogue:
+The program runs from flash (link.ld). Its prologue copies the data window's initial bytes from
+flash to PSRAM (CPU 0x0100_8000-0x0100_83FF: PSRAM starts arbitrary, contract 3) and fills the 16
+bytes below the core region (0x017F_FF70-0x017F_FF7F), then gives every register a value. Then
+come N random instructions (valid RV32E only, never a reserved encoding, never a trap):
   - ALU ops: register, immediate and shift forms, LUI, AUIPC, edge-value constants, on all of
     x1..x15 (and x0 as a source or destination);
-  - loads and stores of every width, misaligned included. Effective addresses carry random alias
-    bits (addr[30:16]); RAM stores go to the data window 0x8000-0x8FFF (which starts with random
-    bytes) or to 0xFF70-0xFF7F, up to the last byte below the core region; RAM loads may read
-    anywhere in 0x0000-0xFF7F. No access touches the core region 0xFF80-0xFFFF (contract v2
-    section 3: programs never do), so none wraps at 64 KB either;
-  - GPIO loads and stores anywhere in the addr[31] = 1 space, on every byte lane (accesses wider
-    than a byte only at addr[1:0] = 0: other IO accesses wider than a byte are unspecified);
+  - PSRAM loads and stores of every width, misaligned included, in the data window or the 16
+    bytes below the core region (up to its last byte below the region), with random PSRAM alias
+    bits (addr[30:25] and addr[23]). Nothing touches the core region;
+  - flash loads (the .fwindow block of random bytes at 0x0001_0000, and the first 8 KiB of code)
+    with random alias bits addr[30:25], and a few flash stores, which change nothing (contract 3);
+  - IO loads and stores on slots without side effects, with random address bits addr[30:7]
+    (the slot is addr[6:2]), naturally aligned on every byte lane: loads from GPIO_OUT, ALTFN,
+    TIMER_CMP, TIMER_CTRL, PWM_CTRL, PWM_DUTY0-2, IRQ_EN, GPIO_EDGE and the unimplemented slots
+    19-31; stores to GPIO_OUT, TIMER_CMP, PWM_DUTY0-2, IRQ_PEND and GPIO_EPEND (W1C, nothing
+    pending) and slots 19-31. No volatile slot is read and nothing starts a counter or transfer;
   - the base register is either loaded just before the access (li) or a register whose value the
     generator still knows (it forgets everything at each branch target);
   - forward branches (every condition, taken and not taken), forward JAL and JALR (with bit 0 of
     the target set, negative offsets, rd == rs1), x0 as a destination, FENCE variants;
   - bounded loops: a backward branch closing 1-4 iterations of a short random body; the counter
     register is written only by the loop itself, and no branch from outside enters the body.
-The epilogue stores x1..x15 to 0x0000..0x003B (over the prologue, so the pins-mode RAM comparison
-sees every register), then EBREAK, then a guard that writes GPIO and RAM if a core ever runs past
-the EBREAK.
+The epilogue stores x1..x15 to 0x0100_9000..0x0100_903B (x15 through mscratch), so the pins-mode
+PSRAM comparison sees every register, then writes GPIO_OUT = 0x5A and self-loops (contract 4
+program end). The `_psram_window` table names the window, the dump and the top 16 bytes.
+GPIO_OUT takes random values on the way, so a random stream may show 0xA5, 0xC0 or 0xC1.
 """
 import argparse
 import random
 import sys
 
-WIN_LO, WIN_HI = 0x8000, 0x8FFF
-REGION_LO = 0xFF80  # contract v2 section 3: the core region 0xFF80-0xFFFF
-TOP_LO = 0xFF70     # RAM stores here end at or below 0xFF7F
-GPIO = 0x80000000
+PSRAM = 0x01000000        # CPU address of PSRAM byte 0
+WIN_LO, WIN_HI = 0x8000, 0x8400   # PSRAM byte ranges, half-open: the data window
+REGION_LO = 0x7FFF80      # contract 3: the core region 0x7F_FF80-0x7F_FFFF
+TOP_LO = 0x7FFF70         # the 16 bytes below it
+DUMP = 0x01009000         # register dump (CPU address)
+FW_LO, FW_HI = 0x10000, 0x11000   # flash .fwindow
+CODE_HI = 0x2000          # flash loads may also read the first 8 KiB of code
+IO = 0x80000000
+IO_LOAD_SLOTS = [0, 2, 4, 6, 7, 8, 9, 10, 15, 17] + list(range(19, 32))
+IO_STORE_SLOTS = [0, 4, 8, 9, 10, 16, 18] + list(range(19, 32))
 M32 = 0xFFFFFFFF
 
 EDGE = [0, 1, 2, 0xFFFFFFFF, 0xFFFFFFFE, 0x7FFFFFFF, 0x80000000, 0x80000001, 0x55555555,
@@ -150,35 +162,49 @@ class Gen:
         self.emit(self.li(self.wreg(), v), n=2)
 
     # -- memory -----------------------------------------------------------------------------
+    # kind: "psram", "flash" or "io"
     @staticmethod
-    def valid(ea: int, n: int, io: bool, store: bool) -> bool:
-        if io:
-            return ea >> 31 == 1 and (n == 1 or ea & 3 == 0)
+    def valid(ea: int, n: int, kind: str, store: bool) -> bool:
+        if kind == "io":
+            slots = IO_STORE_SLOTS if store else IO_LOAD_SLOTS
+            return ea >> 31 == 1 and ea % n == 0 and (ea >> 2) & 31 in slots
         if ea >> 31:
             return False
-        lo = ea & 0xFFFF
-        if lo + n > REGION_LO:  # touches the region (or wraps at 64 KB through it)
+        if kind == "flash":
+            lo = ea & 0xFFFFFF
+            if (ea >> 24) & 1 or lo + n > 1 << 24:
+                return False
+            return FW_LO <= lo and lo + n <= FW_HI or (not store and lo + n <= CODE_HI)
+        if not (ea >> 24) & 1:
             return False
-        return not store or WIN_LO <= lo <= WIN_HI - (n - 1) or lo >= TOP_LO
+        lo = ea & 0x7FFFFF
+        return WIN_LO <= lo and lo + n <= WIN_HI or TOP_LO <= lo and lo + n <= REGION_LO
 
-    def pick_ea(self, n: int, io: bool, store: bool) -> int:
+    def pick_ea(self, n: int, kind: str, store: bool) -> int:
         r = self.r
-        if io:
-            if r.random() < 0.5:
-                ea = GPIO | r.randrange(0, 16)  # the canonical lanes, so uo_out changes often
+        if kind == "io":
+            slots = IO_STORE_SLOTS if store else IO_LOAD_SLOTS
+            slot = 0 if r.random() < 0.4 else r.choice(slots)  # GPIO_OUT often: uo_out changes
+            lane = r.randrange(0, 4) & ~(n - 1)
+            high = 0 if r.random() < 0.5 else r.getrandbits(24) << 7
+            return IO | high | slot << 2 | lane
+        if kind == "flash":
+            alias = 0 if r.random() < 0.5 else r.getrandbits(6) << 25
+            if store or r.random() < 0.8:
+                lo = r.randint(FW_LO, FW_HI - n)
             else:
-                ea = GPIO | r.getrandbits(31)
-            return ea & ~3 if n > 1 else ea
-        alias = 0 if r.random() < 0.4 else r.getrandbits(15)
+                lo = r.randint(0, CODE_HI - n)
+            return alias | lo
+        alias = 0 if r.random() < 0.4 else (r.getrandbits(6) << 25) | (r.getrandbits(1) << 23)
         if r.random() < 0.85:
-            lo = r.randint(WIN_LO, WIN_HI - (n - 1))
+            lo = r.randint(WIN_LO, WIN_HI - n)
         elif r.random() < 0.5:
-            lo = REGION_LO - n  # ends at 0xFF7F, the last byte below the core region
+            lo = REGION_LO - n  # ends at 0x7F_FF7F, the last byte below the core region
         else:
             lo = r.randint(TOP_LO, REGION_LO - n)
-        return alias << 16 | lo
+        return PSRAM | alias | lo
 
-    def mem_base(self, n: int, io: bool, store: bool) -> tuple[list[str], str, int]:
+    def mem_base(self, n: int, kind: str, store: bool) -> tuple[list[str], str, int]:
         """Base register and offset for one access, plus setup instructions (emitted in the same
         unit as the access)."""
         r = self.r
@@ -188,32 +214,39 @@ class Gen:
             for reg, v in regs:
                 for _ in range(8):
                     off = r.randint(-2048, 2047)
-                    if self.valid((v + off) & M32, n, io, store):
+                    if self.valid((v + off) & M32, n, kind, store):
                         return [], f"x{reg}", off
-        ea = self.pick_ea(n, io, store)
+        ea = self.pick_ea(n, kind, store)
+        assert self.valid(ea, n, kind, store), (hex(ea), n, kind, store)
         off = r.randint(-2048, 2047)
         rb = self.wreg()
         return [self.li(rb, ea - off)], f"x{rb}", off
 
-    def access(self, io: bool, store: bool) -> None:
+    def access(self, kind: str, store: bool) -> None:
         op, n = self.r.choice(STORES if store else LOADS)
-        setup, base, off = self.mem_base(n, io, store)
+        setup, base, off = self.mem_base(n, kind, store)
         if store:
             self.emit(*setup, f"{op} {self.src()}, {off}({base})", n=2 * len(setup) + 1)
         else:
             self.emit(*setup, f"{op} {self.dst()}, {off}({base})", n=2 * len(setup) + 1)
 
     def load(self) -> None:
-        self.access(io=False, store=False)
+        self.access("psram", store=False)
 
     def store(self) -> None:
-        self.access(io=False, store=True)
+        self.access("psram", store=True)
+
+    def flash_load(self) -> None:
+        self.access("flash", store=False)
+
+    def flash_store(self) -> None:
+        self.access("flash", store=True)
 
     def io_load(self) -> None:
-        self.access(io=True, store=False)
+        self.access("io", store=False)
 
     def io_store(self) -> None:
-        self.access(io=True, store=True)
+        self.access("io", store=True)
 
     # -- control flow -----------------------------------------------------------------------
     def branch(self) -> None:
@@ -269,9 +302,10 @@ class Gen:
     # -- program ----------------------------------------------------------------------------
     def kinds(self):
         kinds = [(self.alu_r, 15), (self.shift_r, 6), (self.alu_i, 14), (self.shift_i, 6),
-                 (self.upper, 3), (self.const, 4), (self.load, 12), (self.store, 10),
-                 (self.io_load, 4), (self.io_store, 4), (self.branch, 11), (self.jal, 2),
-                 (self.jalr, 2), (self.fence, 1), (self.loop, 2)]
+                 (self.upper, 3), (self.const, 4), (self.load, 9), (self.store, 10),
+                 (self.flash_load, 4), (self.flash_store, 1), (self.io_load, 3),
+                 (self.io_store, 4), (self.branch, 11), (self.jal, 2), (self.jalr, 2),
+                 (self.fence, 1), (self.loop, 2)]
         return [k for k, _ in kinds], [w for _, w in kinds]
 
     def body(self) -> None:
@@ -281,36 +315,63 @@ class Gen:
 
     def program(self, seed: int) -> str:
         r = self.r
-        head = [
+        top = [r.getrandbits(32) for _ in range(4)]
+        self.out = [
             f"# Random RV32E stream: seed {seed}, {self.n} instructions. Generated by gen_random.py.",
             "    .section .text.start, \"ax\"",
             "    .global _start",
             "_start:",
+            "    # the data window's initial bytes: flash -> PSRAM (PSRAM starts arbitrary)",
+            "    lui x1, %hi(_window_lma)",
+            "    addi x1, x1, %lo(_window_lma)",
+            "    lui x2, %hi(_window_start)",
+            "    addi x2, x2, %lo(_window_start)",
+            "    lui x3, %hi(_window_end)",
+            "    addi x3, x3, %lo(_window_end)",
+            "1:  lw x4, 0(x1)",
+            "    sw x4, 0(x2)",
+            "    addi x1, x1, 4",
+            "    addi x2, x2, 4",
+            "    bltu x2, x3, 1b",
+            "    # the 16 bytes below the core region",
+            f"    li x1, {PSRAM + TOP_LO:#x}",
         ]
-        self.out = head
+        for k, v in enumerate(top):
+            self.out += [f"    li x2, {v:#x}", f"    sw x2, {4 * k}(x1)"]
         # every register gets a value before any read (the core's registers start unknown)
         for i in REGS:
             v = r.choice(EDGE) if r.random() < 0.3 else r.getrandbits(32)
             self.out.append("    " + self.li(i, v))
         self.body()
         self.flush_labels()
-        # register dump over the prologue (0x0000..0x003B), which never runs again
-        for i in range(1, 16):
-            self.out.append(f"    sw x{i}, {4 * (i - 1)}(x0)")
+        # register dump: x15 goes through mscratch, then x15 is the base
+        self.out += ["    csrw mscratch, x15", f"    lui x15, {DUMP >> 12:#x}"]
+        for i in range(1, 15):
+            self.out.append(f"    sw x{i}, {4 * (i - 1)}(x15)")
         self.out += [
-            "    ebreak",
-            "    # guard: never executes",
+            "    csrr x14, mscratch",
+            "    sw x14, 56(x15)",
             "    lui x1, 0x80000",
-            "    li x2, 0x5e",
-            "    sb x2, 0(x1)",
-            "    li x2, 0xe5",
-            "    sb x2, 0(x1)",
-            "    sw x2, 0x40(x0)",
-            "1:  j 1b",
+            "    li x2, 0x5a",
+            "    sw x2, 0(x1)          # GPIO_OUT = 0x5A: the end (ALTFN is still 0)",
+            "2:  j 2b",
+            "",
+            "    .section .rodata",
+            "    .align 2",
+            "    .global _psram_window",
+            "_psram_window:",
+            f"    .word {PSRAM + WIN_LO:#x}, {PSRAM + WIN_HI:#x}",
+            f"    .word {DUMP:#x}, {DUMP + 60:#x}",
+            f"    .word {PSRAM + TOP_LO:#x}, {PSRAM + REGION_LO:#x}",
+            "    .word 0, 0",
             "",
             "    .section .window, \"aw\"",
         ]
-        data = [r.getrandbits(8) for _ in range(WIN_HI - WIN_LO + 1)]
+        data = [r.getrandbits(8) for _ in range(WIN_HI - WIN_LO)]
+        for i in range(0, len(data), 16):
+            self.out.append("    .byte " + ", ".join(f"{b:#04x}" for b in data[i:i + 16]))
+        self.out += ["", "    .section .fwindow, \"a\""]
+        data = [r.getrandbits(8) for _ in range(FW_HI - FW_LO)]
         for i in range(0, len(data), 16):
             self.out.append("    .byte " + ", ".join(f"{b:#04x}" for b in data[i:i + 16]))
         return "\n".join(self.out) + "\n"
