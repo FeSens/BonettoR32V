@@ -1,7 +1,11 @@
 // BonettoR32V reference ISS: RV32E with the exact memory map and trap rules of docs/contract.md
-// (sections 3 and 4). Header-only, so the cosim harness and the standalone runner share one model.
+// (v2, sections 3 and 4). Header-only, so the cosim harness and the standalone runner share one
+// model.
 //
 // Memory map (contract section 3):
+//   - RAM bytes 0xFF80-0xFFFF (in every 64 KB alias) are the core region: the core's private
+//     state. A fetch or RAM data access that touches a region byte is unspecified: step() flags it
+//     with Retire::reserved and Retire::region and changes no state. Test programs never do it.
 //   - fetch reads RAM at pc[15:0] (the RAM aliases every 64 KB);
 //   - data with addr[31] = 0: byte k of an n-byte access is RAM[(addr[15:0] + k) mod 2^16];
 //   - data with addr[31] = 1: GPIO. Reading the byte at X with X[1:0] = 0 returns ui_in, every other
@@ -26,10 +30,22 @@ struct Retire {
   uint32_t maddr;            // exact address of the first byte (valid when a mask is set)
   uint8_t rmask, wmask;      // LSB-aligned: 0x1, 0x3 or 0xF
   uint32_t mrdata, mwdata;   // byte lane k is the byte at maddr + k; lanes outside the mask are 0
-  // The behavior is unspecified by the contract: a reserved encoding, or a misaligned IO access.
-  // The checkers treat it as an error in the test program.
+  // The behavior is unspecified by the contract: a reserved encoding, a misaligned IO access, or
+  // a fetch or RAM access touching the core region (then region is set too). The checkers treat
+  // it as an error in the test program.
   bool reserved;
+  bool region;
 };
+
+// Contract v2 section 3: the core region, RAM bytes 0xFF80-0xFFFF in every 64 KB alias.
+constexpr uint32_t REGION_LO = 0xFF80;
+static inline bool in_region(uint32_t a) { return (a & 0xFFFF) >= REGION_LO; }
+// Does an n-byte RAM access (fetch, or data with addr[31] = 0) at addr touch the region?
+static inline bool touches_region(uint32_t addr, unsigned n) {
+  for (unsigned k = 0; k < n; k++)
+    if (in_region(addr + k)) return true;
+  return false;
+}
 
 // Deterministic GPIO input sequence shared by the harness, the runner and the gate-level test.
 // The k-th value for a given seed. Kept simple so other languages can reproduce it:
@@ -111,7 +127,8 @@ class Iss {
   }
 
   // Byte k of an access at effective address ea. The access goes to IO or RAM as a whole,
-  // decided by ea[31] (contract section 3): LW at 0x7FFFFFFE reads RAM 0xFFFE..0x0001.
+  // decided by ea[31] (contract section 3). (An access whose bytes cross from bit 31 = 0 into bit
+  // 31 = 1 always touches the core region, so it is unspecified.)
   uint8_t data_read_byte(uint32_t ea, unsigned k, uint8_t ui_in) const {
     uint32_t a = ea + k;
     if (ea >> 31) {
@@ -148,6 +165,10 @@ inline Retire Iss::step(uint8_t ui_in) {
   r.pc = pc;
   r.insn = insn;
   r.npc = pc + 4;
+  if (touches_region(pc, 4)) {  // a fetch from the core region: unspecified
+    r.reserved = r.region = true;
+    return r;
+  }
 
   const uint32_t opcode = insn & 0x7F;
   const uint32_t rd = (insn >> 7) & 0x1F;
@@ -167,6 +188,10 @@ inline Retire Iss::step(uint8_t ui_in) {
     // No state change. npc stays pc + 4, but nothing may rely on it.
     r.reserved = true;
     return r;
+  };
+  auto region = [&]() {  // a RAM data access touching the core region: unspecified
+    r.region = true;
+    return reserved();
   };
   auto trap = [&]() {
     r.trap = r.halt = true;
@@ -248,6 +273,7 @@ inline Retire Iss::step(uint8_t ui_in) {
       uint32_t ea = r.rs1v + imm_i;
       unsigned n = (f3 & 3) == 0 ? 1 : (f3 & 3) == 1 ? 2 : 4;
       if ((ea >> 31) && n > 1 && (ea & 3) && !io_compat_) return reserved();
+      if (!(ea >> 31) && touches_region(ea, n)) return region();
       uint32_t v = 0;
       for (unsigned k = 0; k < n; k++) v |= (uint32_t)data_read_byte(ea, k, ui_in) << (8 * k);
       r.maddr = ea;
@@ -268,6 +294,7 @@ inline Retire Iss::step(uint8_t ui_in) {
       uint32_t ea = r.rs1v + imm_s;
       unsigned n = 1u << f3;
       if ((ea >> 31) && n > 1 && (ea & 3) && !io_compat_) return reserved();
+      if (!(ea >> 31) && touches_region(ea, n)) return region();
       uint32_t v = n == 4 ? r.rs2v : r.rs2v & ((1u << (8 * n)) - 1);
       for (unsigned k = 0; k < n; k++) data_write_byte(ea, k, (uint8_t)(v >> (8 * k)));
       r.maddr = ea;

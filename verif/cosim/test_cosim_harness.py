@@ -4,8 +4,10 @@
    checks, the output-stability check and random power-up state, through `harness --spi-only`.
 2. The design in src/ must pass the cosim (both modes, several seeds), and --timing-json and
    --dump-ram must produce what Tasks 5 and 6 consume.
-3. Mutants of the seed (mutants/<name>/, listed in mutants/MANIFEST.json) must each fail with
-   their specific error; the legal variants (legal_*) must pass.
+3. Mutants (mutants/<name>/, listed in mutants/MANIFEST.json; copies of the seed or of the
+   contract v2 designs of hyp/002) must each fail with their specific error; the legal variants
+   (legal_*) must pass. 3b: the core region of contract v2 (random at reset; both hyp/002
+   designs pass the full matrix).
 4. The TT test (test/, RTL) passes on the seed and the legal variants and fails on pin-visible
    mutants.
 
@@ -150,7 +152,10 @@ def test_dump_ram_matches_reference(programs, tmp_path):
         subprocess.run([str(ROOT / "build/cosim/iss_main"), str(PROGS / "selftest.hex"), "--ui",
                         "rvfi" if mode == "rvfi" else "pins", "--seed", "2", "--dump-ram",
                         str(ref)], capture_output=True, check=True)
-        assert out.read_bytes() == ref.read_bytes() and len(out.read_bytes()) == 65536
+        # the whole 64 KB as the design left it; the core region 0xFF80-0xFFFF is the core's own
+        # (random at reset, contract v2 section 3), so only the program RAM below it is compared
+        got = out.read_bytes()
+        assert len(got) == 65536 and got[:0xFF80] == ref.read_bytes()[:0xFF80]
 
 
 def test_build_key_covers_every_src_file_and_the_tools(tmp_path, monkeypatch):
@@ -263,18 +268,23 @@ def test_latency_cap_boundary(programs, tmp_path):
 def test_core_at_the_cap_passes_as_eval_runs_it(programs, mode):
     """A legal core retiring every instruction exactly 1,024 cycles after the previous one passes
     a ui_in-dependent program, run the way tools/eval.py runs the cosim (no --max-cycles, so the
-    harness budget is 1,024 x (its own ISS count for this mode's ui_in schedule + 16)). random_4
-    retires a different number of instructions in rvfi mode than its expect file's pins count."""
-    exp = json.loads((PROGS / "random_4.expect.json").read_text())
-    assert exp["rvfi"]["retired"] != exp["retired"], "random_4 is no longer ui_in-dependent"
+    harness budget is 1,024 x (its own ISS count for this mode's ui_in schedule + 16)), on every
+    random program that retires a different number of instructions in rvfi mode than its expect
+    file's pins count (random_3 and random_6 since the contract v2 generator; random_4 before)."""
+    dep = []
+    for n in range(1, 7):
+        exp = json.loads((PROGS / f"random_{n}.expect.json").read_text())
+        if exp["rvfi"]["retired"] != exp["retired"]:
+            dep.append(f"random_{n}")
+    assert dep, "no random program depends on the ui_in schedule any more"
     src = COSIM / "mutants" / "stall_gap"
-    for seed in (1, 2, 3):
+    for prog, seed in ((p, s) for p in dep for s in (1, 2, 3)):
         p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--mode", mode, "--prog",
-                            str(PROGS / "random_4.hex"), "--seed", str(seed), "--src", str(src),
+                            str(PROGS / f"{prog}.hex"), "--seed", str(seed), "--src", str(src),
                             "--vflags", "+define+STALL_GAP=1024 +define+STALL_SKIP_FIRST"],
                            capture_output=True, text=True)
         s = json.loads(p.stdout.strip().splitlines()[-1])
-        assert p.returncode == 0 and s["pass"], f"{mode} seed {seed}: {s['error']}"
+        assert p.returncode == 0 and s["pass"], f"{prog} {mode} seed {seed}: {s['error']}"
         if mode == "rvfi":
             assert s["max_cycles_per_insn"] == 1024
 
@@ -351,9 +361,44 @@ def test_every_required_mutant_class_is_present():
     m = manifest()
     required = {"miso_sck_low", "mosi_on_rise", "cs_sck_high", "write_midbyte", "rvfi_rd_wrong",
                 "rvfi_hidden", "zero_init", "latency", "stall_gap", "ui_at_retire", "uo_glitch",
-                "load_own_fetch"}
+                "load_own_fetch",
+                # contract v2 (section 6): region and program transaction rules
+                "region_wrap", "region_straddle", "store_twice", "store_extra_byte",
+                "fetch_extra_byte", "load_skip_byte", "region_zero_init"}
     assert required <= set(m), required - set(m)
     assert m["rvfi_hidden"]["pass"] == ["rvfi"] and "pins" in m["rvfi_hidden"]["fail"]
+    for legal in ("legal_split_store", "legal_h002_rf", "legal_h002_pcram"):
+        assert m[legal]["pass"] == ["rvfi", "pins"] and not m[legal]["fail"], legal
+
+
+# ------------------------------------------------------------------------------------------------
+# 3b. contract v2: the core region
+def test_region_starts_random(programs):
+    """Contract section 3: the region's contents at reset are arbitrary. region_zero_init (the
+    pcram design without its boot write) takes its pc from the region at reset: it passes when the
+    region starts zero (the harness's --region-zero test hook) and fails with the random fill."""
+    src = COSIM / "mutants" / "region_zero_init"
+    exe = run_cosim.ensure_built("rvfi", src)
+    for seed in (1, 2, 3):
+        runs = {}
+        for flag in ([], ["--region-zero"]):
+            p = subprocess.run([str(exe), str(PROGS / "selftest.hex"), "--seed", str(seed), *flag],
+                               capture_output=True, text=True)
+            runs[bool(flag)] = json.loads(p.stdout.strip().splitlines()[-1])
+        assert runs[True]["pass"], f"seed {seed}, zero region: {runs[True]['error']}"
+        assert not runs[False]["pass"] and "retirement #0" in runs[False]["error"], runs[False]
+
+
+@pytest.mark.parametrize("name", ["legal_h002_rf", "legal_h002_pcram"])
+def test_v2_designs_pass_the_full_matrix(programs, name):
+    """The two real contract v2 designs (hyp/002-rf-in-ram fc07cc3: x1..x15 in the region;
+    hyp/002-rf-in-ram-pcram b9a5211: the pc too, read before the fetch, SW split in two) pass
+    every program in both modes with seeds 1-3, as tools/eval.py's cosim gate runs them."""
+    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--all", "--src",
+                        str(COSIM / "mutants" / name)], capture_output=True, text=True)
+    s = json.loads(p.stdout.strip().splitlines()[-1])
+    assert p.returncode == 0 and s["pass"] and s["runs"] == 90 and s["failed"] == 0, (
+        s, p.stderr[-2000:])
 
 
 # ------------------------------------------------------------------------------------------------
@@ -366,6 +411,9 @@ TT_CASES = {
     "(seed)": None,
     "legal_mosi_echo": None,    # MOSI = X when no bit is due: legal
     "legal_trap_fields": None,
+    "legal_split_store": None,  # contract v2: a store split over two WRITEs
+    "legal_h002_rf": None,      # contract v2: registers in the core region
+    "legal_h002_pcram": None,   # contract v2: registers and pc in the core region
     "mosi_on_rise": "spiram: MOSI changed on a rising SCK edge",
     "cs_sck_high": "spiram: CS_n changed while SCK was high",
     "write_midbyte": "spiram: WRITE ended mid-byte",  # needs gpio_demo's RAM stores

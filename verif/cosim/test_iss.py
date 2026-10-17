@@ -3,11 +3,12 @@
 1. Cross-check against spike on selftest, gpio_demo and coremark: every retirement's pc, insn,
    register write, store and load address must match spike's commit log. The programs are the
    spike builds from `make -C verif/programs spike` (linked at 0x10000, because spike's debug
-   module sits at [0, 0x1000); selftest built with -DSPIKE_XCHECK skips its wrap, alias and GPIO
-   sections). The ISS starts at pc 0x10000 (aliases RAM 0) with IO modeled as a RAM page, which is
-   what spike does with -m0x80000000:0x1000.
-2. Unit cases for what spike can't check: the fatal traps, the 64 KB wrap and aliasing, the GPIO
-   byte lanes, reserved encodings, FENCE, register-field conventions and the ui_in schedules.
+   module sits at [0, 0x1000); selftest built with -DSPIKE_XCHECK skips its top-of-RAM, alias and
+   GPIO sections). The ISS starts at pc 0x10000 (aliases RAM 0) with IO modeled as a RAM page,
+   which is what spike does with -m0x80000000:0x1000.
+2. Unit cases for what spike can't check: the fatal traps, the core region of contract v2
+   (accesses touching 0xFF80-0xFFFF are unspecified), aliasing, the GPIO byte lanes, reserved
+   encodings, FENCE, register-field conventions and the ui_in schedules.
 
 Run: pytest verif/cosim/test_iss.py -v
 """
@@ -245,62 +246,47 @@ def test_illegal_words_trap(built, word):
     assert t["rs1"] == 0 and t["rs2"] == 0 and t["rd"] == 0
 
 
-def test_wrap_at_64k(built):
+REGION_ACCESSES = {
+    # contract v2 section 3: a fetch or RAM data access touching 0xFF80-0xFFFF is unspecified
+    "sw_ff80": "li x1, 0xff80\n sw x0, 0(x1)",
+    "lb_ffff": "li x1, 0xffff\n lb x2, 0(x1)",
+    "lw_ff7d": "li x1, 0xff7d\n lw x2, 0(x1)",             # 0xff7d..0xff80: its last byte
+    "sh_ff7f": "li x1, 0xff7f\n sh x0, 0(x1)",             # 0xff7f, 0xff80
+    "sw_wrap": "li x1, 0xffff\n sw x0, 0(x1)",             # 0xffff, 0x0000.. (the 64 KB wrap)
+    "lw_7ffffffe": "li x1, 0x7ffffffe\n lw x2, 0(x1)",     # RAM 0xfffe..0x0001 (bit 31 = 0)
+    "lhu_alias": "li x1, 0x1234ffc0\n lhu x2, 0(x1)",      # alias bits: still the region
+    "fetch_ff80": "li x1, 0xff80\n jalr x0, 0(x1)",        # the fetch at 0xff80
+}
+
+
+@pytest.mark.parametrize("name", sorted(REGION_ACCESSES))
+def test_region_accesses_are_unspecified(built, name):
+    rc, log, s = run_iss(asm(f"region_{name}", REGION_ACCESSES[name] + "\n ebreak"))
+    assert rc == 2 and s["halt"] == "reserved" and s["region"] is True, s
+    if name == "fetch_ff80":
+        assert s["halt_pc"] == 0xFF80 and log[-1]["npc"] == 0xFF80
+
+
+def test_accesses_up_to_ff7f_are_ram(built):
+    # The last program byte is 0xFF7F: accesses ending there are plain RAM.
     body = """
-    li x1, 0xffff
+    li x1, 0xff7c
     li x2, 0x44332211
-    sw x2, 0(x1)          # 0xffff, 0x0000, 0x0001, 0x0002
-    lw x3, 0(x1)
-    lw x4, -1(x1)         # 0xfffe (image byte 0), 0xffff, 0x0000, 0x0001
-    lh x5, 0(x1)
-    li x2, 0xbeef
-    sh x2, 0(x1)          # 0xffff, 0x0000
-    lhu x6, 0(x1)
-    ebreak
-"""
-    h = asm("wrap", body)
-    rc, log, s = run_iss(h)
-    assert rc == 0
-    sw, sh = [r for r in log if r["wmask"]]
-    lw3, lw4, lh5, lhu6 = [r for r in log if r["rmask"]]
-    assert (sw["maddr"], sw["wmask"], sw["mwdata"]) == (0xFFFF, 0xF, 0x44332211)
-    assert (lw3["maddr"], lw3["mrdata"], lw3["rdv"]) == (0xFFFF, 0x44332211, 0x44332211)
-    assert (lw4["maddr"], lw4["rdv"]) == (0xFFFE, 0x33221100)
-    assert (lh5["rmask"], lh5["rdv"]) == (3, 0x2211)
-    assert (sh["maddr"], sh["wmask"], sh["mwdata"]) == (0xFFFF, 3, 0xBEEF)
-    assert lhu6["rdv"] == 0xBEEF
-    ram = dump_ram(h)
-    assert (ram[0xFFFF], ram[0x0000], ram[0x0001], ram[0x0002]) == (0xEF, 0xBE, 0x33, 0x44)
-
-
-def test_wrap_lw_fffe_reads_reset_code_bytes(built):
-    # LW at 0xfffe returns 0xfffe, 0xffff, then RAM 0x0000, 0x0001 (the first instruction).
-    h = asm("wrap2", "li x1, 0xfffe\n lw x2, 0(x1)\n ebreak")
-    rc, log, s = run_iss(h)
-    first_insn = log[0]["insn"]
-    assert log[-2]["rdv"] == (first_insn & 0xFFFF) << 16
-
-
-def test_access_class_follows_first_byte(built):
-    # addr[31] of the effective address picks RAM for the whole access, even when addr + k has
-    # bit 31 set: LW at 0x7ffffffe reads RAM 0xfffe, 0xffff, 0x0000, 0x0001 (contract section 3).
-    body = """
-    li x1, 0xfffe
-    li x2, 0x11223344
     sw x2, 0(x1)
-    li x3, 0x7ffffffe
-    lw x4, 0(x3)
-    li x5, 0x55667788
-    sw x5, 0(x3)
+    lw x3, 0(x1)
+    lh x4, 2(x1)          # 0xff7e, 0xff7f
+    lbu x5, 3(x1)         # 0xff7f
+    li x6, 0x7fffff7c     # bit 31 = 0, alias bits set
+    lw x7, 0(x6)
     ebreak
 """
-    h = asm("class", body)
-    rc, log, s = run_iss(h, "--ui", "const:0xab")
-    assert rc == 0 and s["uo_trace"] == []
-    lw = [r for r in log if r["rmask"]][0]
-    assert (lw["maddr"], lw["rdv"]) == (0x7FFFFFFE, 0x11223344)
+    h = asm("top", body)
+    rc, log, s = run_iss(h)
+    assert rc == 0 and s["region"] is False
+    loads = [r for r in log if r["rmask"]]
+    assert [r["rdv"] for r in loads] == [0x44332211, 0x4433, 0x44, 0x44332211]
     ram = dump_ram(h)
-    assert (ram[0xFFFE], ram[0xFFFF], ram[0], ram[1]) == (0x88, 0x77, 0x66, 0x55)
+    assert ram[0xFF7C:0xFF80] == bytes([0x11, 0x22, 0x33, 0x44])
 
 
 def test_data_alias(built):
@@ -569,13 +555,14 @@ def test_selftest_covers_rv32e(built):
     taken = {mnemonic(r["insn"]) for r in log if r["npc"] != r["pc"] + 4}
     not_taken = {mnemonic(r["insn"]) for r in log if r["npc"] == r["pc"] + 4}
     assert BRANCHES <= taken and BRANCHES <= not_taken
-    # misaligned loads/stores and the 64 KB wrap
+    # misaligned loads/stores, and accesses that end at 0xFF7F, the last byte below the core
+    # region (contract v2 section 3; the 64 KB wrap touches the region, so it is untestable)
     mem = [r for r in log if (r["rmask"] or r["wmask"]) and not r["maddr"] >> 31]
     mis = {mnemonic(r["insn"]) for r in mem if r["maddr"] & 1}
     assert {"lw", "lh", "lhu", "sw", "sh"} <= mis
-    wraps = {mnemonic(r["insn"]) for r in mem
-             if (r["maddr"] & 0xFFFF) + bin(r["rmask"] | r["wmask"]).count("1") > 0x10000}
-    assert {"lw", "lh", "sw", "sh"} <= wraps
+    top = {mnemonic(r["insn"]) for r in mem
+           if (r["maddr"] & 0xFFFF) + bin(r["rmask"] | r["wmask"]).count("1") - 1 == 0xFF7F}
+    assert {"lw", "lh", "lb", "sw", "sh"} <= top, top
     # x0 writes, JALR with bit 0 set
     assert any((r["insn"] >> 7) & 31 == 0 and mnemonic(r["insn"]) == "addi" and r["insn"] != 0x13
                for r in log)
@@ -608,14 +595,16 @@ def test_random_programs_are_valid_and_varied(built, seed):
     for x in (14, 15):
         assert any(r["rd"] == x and mnemonic(r["insn"]) in alu for r in log), f"x{x} as rd"
         assert any(x in (r["rs1"], r["rs2"]) and mnemonic(r["insn"]) in alu for r in log)
-    # RAM addresses with alias bits, the 64 KB wrap (loads and stores), any IO address
+    # RAM addresses with alias bits, accesses up to 0xFF7F (loads and stores) and none into the
+    # core region (contract v2 section 3), any IO address
     ram = [r for r in log if (r["rmask"] or r["wmask"]) and not r["maddr"] >> 31]
     io = [r for r in log if (r["rmask"] or r["wmask"]) and r["maddr"] >> 31]
     assert any(r["maddr"] >> 16 for r in ram if r["rmask"]) and any(r["maddr"] >> 16 for r in ram
                                                                      if r["wmask"])
-    crosses = [r for r in ram
-               if (r["maddr"] & 0xFFFF) + bin(r["rmask"] | r["wmask"]).count("1") > 0x10000]
-    assert any(r["rmask"] for r in crosses) and any(r["wmask"] for r in crosses)
+    last = [((r["maddr"] & 0xFFFF) + bin(r["rmask"] | r["wmask"]).count("1") - 1, r) for r in ram]
+    assert all(end < 0xFF80 for end, _ in last)
+    top = [r for end, r in last if end == 0xFF7F]
+    assert any(r["rmask"] for r in top) and any(r["wmask"] for r in top)
     assert any(r["maddr"] & 0x7FFFFFF0 for r in io if r["rmask"])
     assert any(r["maddr"] & 0x7FFFFFF0 for r in io if r["wmask"])
     for m in ("rmask", "wmask"):

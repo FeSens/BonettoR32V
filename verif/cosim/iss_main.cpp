@@ -4,7 +4,9 @@
 //            [--start-pc A] [--io-ram] [--dump-ram PATH] [--expect PATH] [--check-init]
 //
 // --log prints one JSON line per retirement. The last stdout line is always a summary
-// ({"summary": true, ...}). Exit codes: 0 halted on EBREAK, 2 reserved/unspecified instruction,
+// ({"summary": true, ...}). Exit codes: 0 halted on EBREAK, 2 reserved/unspecified instruction
+// (a reserved encoding, a misaligned IO access, or a fetch or RAM access touching the core region
+// 0xFF80-0xFFFF: then the summary has "region": true),
 // 3 halted on another fatal trap, 4 --max reached, 5 --check-init and a register was read before
 // any write, 1 usage or I/O error.
 //
@@ -32,6 +34,7 @@ struct RunResult {
   uint8_t uo_final = 0;
   bool uninit = false;
   uint32_t uninit_pc = 0;
+  bool region = false;  // the unspecified step was a fetch or RAM access touching 0xFF80-0xFFFF
   uint32_t min_sp = 0xFFFFFFFFu;
 };
 
@@ -53,6 +56,7 @@ RunResult run(const uint8_t* img, uint64_t max, UiMode mode, uint32_t seed, uint
     Retire r = iss.step(ui);
     if (r.reserved) {
       res.halt = "reserved";
+      res.region = r.region;
       res.halt_pc = r.pc;
       res.halt_insn = r.insn;
       break;
@@ -160,9 +164,11 @@ int main(int argc, char** argv) {
   RunResult res = run(img, max, mode, seed, ui_const, set_pc, start_pc, io_ram, log, &final_iss);
   std::printf(
       "{\"summary\":true,\"retired\":%llu,\"halt\":\"%s\",\"halt_pc\":%u,\"halt_insn\":%u,"
-      "\"uo_final\":%u,\"uo_trace\":%s,\"uninit_read\":%s,\"uninit_pc\":%u,\"min_sp\":%u}\n",
+      "\"uo_final\":%u,\"uo_trace\":%s,\"uninit_read\":%s,\"uninit_pc\":%u,\"min_sp\":%u,"
+      "\"region\":%s}\n",
       (unsigned long long)res.retired, res.halt.c_str(), res.halt_pc, res.halt_insn, res.uo_final,
-      trace_json(res.uo_trace).c_str(), res.uninit ? "true" : "false", res.uninit_pc, res.min_sp);
+      trace_json(res.uo_trace).c_str(), res.uninit ? "true" : "false", res.uninit_pc, res.min_sp,
+      res.region ? "true" : "false");
   if (dump) {
     FILE* f = std::fopen(dump, "wb");
     if (!f || std::fwrite(final_iss.ram(), 1, Iss::RAM_SIZE, f) != Iss::RAM_SIZE) {
@@ -198,8 +204,14 @@ int main(int argc, char** argv) {
   }
   if (res.halt == "ebreak") return 0;
   if (res.halt == "reserved") {
-    std::fprintf(stderr, "reserved/unspecified instruction 0x%08x (%s) at pc 0x%08x\n",
-                 res.halt_insn, iss_disasm(res.halt_insn).c_str(), res.halt_pc);
+    if (res.region)
+      std::fprintf(stderr,
+                   "unspecified: 0x%08x (%s) at pc 0x%08x touches the core region 0xFF80-0xFFFF "
+                   "(contract section 3; test programs never do)\n",
+                   res.halt_insn, iss_disasm(res.halt_insn).c_str(), res.halt_pc);
+    else
+      std::fprintf(stderr, "reserved/unspecified instruction 0x%08x (%s) at pc 0x%08x\n",
+                   res.halt_insn, iss_disasm(res.halt_insn).c_str(), res.halt_pc);
     return 2;
   }
   if (res.halt == "max") return 4;
