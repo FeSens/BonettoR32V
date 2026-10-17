@@ -152,7 +152,6 @@ module tt_um_fesens_r32v (
     wire sW4  = fW &  sl[1] & ~sl[0];
     wire hi   = sl[1] & (fO | fM);                 // BH2, M2
     wire winc = fW & (sl[1] ^ sl[0]);              // WP4, W4
-    wire wpln = fW & ~(sl[1] & sl[0]);             // WP, WP4, W4
     wire shB  = sB & c_sh;
     wire e_cd = ep[2] & ~ep[1];                    // CMD or DATA: SCK runs
     // CS_n is low in CMD, GAP, DATA and END (ep[2]) unless the slot is masked
@@ -162,8 +161,8 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Bit index of the current strobe in the ALU slots (family 00): bit k meets phase 2k.
     // ------------------------------------------------------------------------------------
-    wire [4:0] kb = ph[0] ? {1'b1, ph[4:1] + 4'd1} : ph[5:1];
-    wire       k0 = (ph == 6'd0);
+    wire [4:0] kb = {~ph[0], ph[4:1]};
+    wire       k0 = (ph == 6'd1);
 
     // Three shared selectors: insn[20 + i] (i = k for k < 12, k - 20 for the U-type k >= 20),
     // insn[7 + k] (k < 5) and insn[k] (k = 12..19).
@@ -196,7 +195,7 @@ module tt_um_fesens_r32v (
     wire a_bit  = (sB | (sA & c_pcrel)) ? bfr[0] : miso_m;
     wire b_raw  = sA ? (bimm_a & imm_bit) :
                   sB ? ((c_sh & ~c_op) ? imm_bit : miso_m) :
-                  (sPX & c_br & (taken ? imm_bit : (ph == 6'd4)));
+                  (sPX & c_br & (taken ? imm_bit : (ph == 6'd5)));
     wire sub    = sA ? c_slt : (sB & ((c_op & insn[30] & (f3 == 3'b000)) | c_slt | c_br));
     wire b_x    = b_raw ^ sub;
     wire cin    = k0 ? sub : cy;
@@ -218,46 +217,45 @@ module tt_um_fesens_r32v (
     // the even phases (bfm), store data bit 7 - a of each byte from the odd phases (bfo), load
     // data bit a of each byte (reversed, bfm), or select 0 for a forward emission.
     // ------------------------------------------------------------------------------------
-    wire       fwd  = fW & ~(sW & c_ld);
-    wire [2:0] msel = j[2:0] & {3{~fwd}};
     reg bfm, bfo;
     always @(*) begin
-        case (msel)
-            3'd0: bfm = bfr[13];
-            3'd1: bfm = bfr[9];
-            3'd2: bfm = bfr[5];
-            3'd3: bfm = bfr[1];
-            3'd4: bfm = bfr[30];
-            3'd5: bfm = bfr[26];
-            3'd6: bfm = bfr[22];
-            default: bfm = bfr[18];
+        case (j[2:0])
+            3'd0: bfm = bfr[32];
+            3'd1: bfm = bfr[28];
+            3'd2: bfm = bfr[24];
+            3'd3: bfm = bfr[20];
+            3'd4: bfm = bfr[16];
+            3'd5: bfm = bfr[12];
+            3'd6: bfm = bfr[8];
+            default: bfm = bfr[4];
         endcase
         case (j[2:0])
-            3'd0: bfo = bfr[31];
-            3'd1: bfo = bfr[27];
-            3'd2: bfo = bfr[23];
-            3'd3: bfo = bfr[19];
-            3'd4: bfo = bfr[15];
-            3'd5: bfo = bfr[11];
-            3'd6: bfo = bfr[7];
-            default: bfo = bfr[3];
+            3'd0: bfo = bfr[17];
+            3'd1: bfo = bfr[13];
+            3'd2: bfo = bfr[9];
+            3'd3: bfo = bfr[5];
+            3'd4: bfo = bfr[1];
+            3'd5: bfo = bfr[30];
+            3'd6: bfo = bfr[26];
+            default: bfo = bfr[22];
         endcase
     end
+    wire       wtap = bfr[2];   // W family forward emission: bit k at its emission clock
 
     // ------------------------------------------------------------------------------------
     // W family data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
     // ------------------------------------------------------------------------------------
     wire wem    = fW & sck & ~j[5] & e_cd;
-    wire sh_evt = (ph == {3'b010, sh_left, ~sh_left, 1'b0});  // 18: source 32 passes; 20: source 0
+    wire sh_evt = (ph == {sh_left, ~sh_left, ~sh_left, ~sh_left, ~sh_left, 1'b0});  // 30: source 32 passes; 32: source 0
     wire shfill = sh_left ? ~(cmp | sh_evt) : (cmp | sh_evt);
     wire ldfill = (j[4:3] > nm1);
     wire io_w   = (j[4:3] == 2'b00) ? (cmp & ui_in[j[2:0]]) : ((f3 == 3'b000) & cmp & ui_in[7]);
     wire wfill  = c_sh ? shfill : ldfill;
     wire wd     = c_ld  ? (mem ? (ldfill ? (~f3[2] & cy) : bfm) : io_w) :
                   c_slt ? ((j[4:0] == 5'd0) & cmp) :
-                  c_sh  ? (shfill ? (insn[30] & cy) : bfm) :
-                          bfm;
-    wire wpl    = bfr[0] ^ (c4 & winc);           // WP, WP4, W4
+                  c_sh  ? (shfill ? (insn[30] & cy) : wtap) :
+                          wtap;
+    wire wpl    = wtap ^ (c4 & winc);             // WP, WP4, W4
     wire wdo    = sW ? wd : wpl;
 
     // BH2: address + 2 on the even phases, in the SCK-low clocks between the data strobes
@@ -291,8 +289,6 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Slot control
     // ------------------------------------------------------------------------------------
-    // the slot starts (CS_n falls) after the IDLE clock at this phase: 15, 16, 1, 4 (W), 17
-    wire [5:0] tgt = {1'b0, fO | wpln, fR, fR | sW, fR, fR | fM | wpln};
     wire mask = (sA & (c_u | c_jal | (rs1_f == 4'd0))) |
                 (sB & ~(c_op | c_br)) |
                 ((sB | fO) & (rs2_f == 4'd0)) |
@@ -303,7 +299,7 @@ module tt_um_fesens_r32v (
     wire [5:0] dlen = (fM & ~sF) ? {c_ld & (nm1 == 2'b11), (nm1 == 2'b01) | (c_st & (nm1 == 2'b11)),
                                     nm1 == 2'b00, 3'b000} :
                       fO ? {~(f3[1] & mem), f3[1] & mem, 4'b0000} : 6'd32;
-    wire dend = shB ? (ph == 6'd29) : (j == dlen);
+    wire dend = shB ? (ph == 6'd30) : (j == dlen);
 
     // next slot after END
     reg [3:0] nsl;
@@ -367,11 +363,17 @@ module tt_um_fesens_r32v (
     wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & (f3 != 3'b000));
     wire alu_w  = useb ? boolr : (sum & ~(k0 & c_jalr));
     wire lo16   = ~j[5] & (~j[4] | (j[3:0] == 4'd0));   // data bits 0..15 (j = bit + 1)
-    wire bfr_we = inc2 | (stb & (fR ? ~shB : fO ? lo16 : (sMM & c_ld)));
-    wire bfr_w  = inc2 ? (bfr[0] ^ cin2) : fR ? alu_w : miso_m;
+    // Three write ports, one per data placement: the ring input (ALU results, bit k at phase
+    // 2k + 1), position 0 (store data at the even phases; BH2's address + 2) and position 15 (load
+    // data, so that the W load emission shares the address taps).
+    wire we32   = stb & fR & ~shB;
+    wire we0    = inc2 | (stb & fO & lo16);
+    wire w0     = inc2 ? (bfr[1] ^ cin2) : miso_m;
+    wire we15   = stb & sMM & c_ld;
 
     always @(posedge clk) begin
-        bfr <= {bfr_we ? bfr_w : bfr[0], bfr[32:1]};
+        bfr <= {we32 ? alu_w : bfr[0], bfr[32:17], we15 ? miso_m : bfr[16], bfr[15:2],
+                we0 ? w0 : bfr[1]};
         // the tail (insn[7:2]) skips the last strobe, so insn[1] (the strobe before) drops out
         if (sF & stb) begin
             irs[24:0] <= {irs[23:0], uio_in[2]};
@@ -386,16 +388,16 @@ module tt_um_fesens_r32v (
     always @(posedge clk) begin
         if (sW) begin
             if (wem & ~wfill)
-                cy <= bfm;
+                cy <= c_ld ? bfm : wtap;
         end else if (stb)
             cy <= cout;
 
         if (stb & sA) begin
             if (c_slt)
                 cmp <= ocmp;
-            else if (c_jalr & (ph == 6'd2))
+            else if (c_jalr & (ph == 6'd3))
                 cmp <= sum;                                 // target[1]
-            else if (c_mem & ((ph == 6'd0) | (ph == 6'd2)))
+            else if (c_mem & ((ph == 6'd1) | (ph == 6'd3)))
                 cmp <= eqacc;                               // address[1:0] == 0
         end else if (stb & sB & (c_slt | c_br))
             cmp <= ocmp;
@@ -407,20 +409,20 @@ module tt_um_fesens_r32v (
         end
 
         if (wem)
-            c4 <= (j[4:0] == 5'd1) | (c4 & bfr[0]);
+            c4 <= (j[4:0] == 5'd1) | (c4 & wtap);
         else if (inc2)
-            c4 <= bfr[0] & cin2;
+            c4 <= bfr[1] & cin2;
         else if (ep == E_CMD)
             c4 <= 1'b0;
 
         // bit counter
-        if (((ep == E_IDLE) & (ph == tgt)) | ((ep == E_PC) & (j == 6'd63)))
+        if (((ep == E_IDLE) & (ph == 6'd16)) | ((ep == E_PC) & (j == 6'd63)))
             j <= 6'd40;
         else if (((ep == E_CMD) | ((ep == E_DATA) & ~shB)) & ~sck)
             j <= j + 6'd1;
         else if (ep == E_PC)
             j <= j + 6'd1;
-        else if (stb & shB & ~ph[0] & (ph < 6'd10))
+        else if (stb & shB & ph[0] & (ph < 6'd10))
             j <= {b_raw ^ ~sh_left, j[5:1]};
 
         // MOSI changes only where SCK stays low or falls
@@ -439,17 +441,17 @@ module tt_um_fesens_r32v (
         if (!rst_n) begin
             sl   <= SL_P;
             ep   <= E_IDLE;
-            ph   <= 6'd15;                                // the first P starts at once
+            ph   <= 6'd16;                                // the first P starts at once
             sck  <= 1'b0;
             mem  <= 1'b1;
             gpo  <= 8'd0;
         end else begin
             ph  <= (ph == 6'd32) ? 6'd0 : ph + 6'd1;
             sck <= e_cd & ~sck;
-            if (stb & sA & c_mem & (ph == 6'd29))
+            if (stb & sA & c_mem & (ph == 6'd30))
                 mem <= ~sum;                                // address bit 31 = 0: RAM
             case (ep)
-                E_IDLE: if (ph == tgt) begin
+                E_IDLE: if (ph == 6'd16) begin
                     ep   <= E_CMD;
                 end
                 E_CMD: if (sck) begin
@@ -466,10 +468,10 @@ module tt_um_fesens_r32v (
                     if (nret) begin
                         mem <= 1'b0;
                         if (c_st & ~mem & cmp & ~trap)
-                            gpo <= {bfr[17], bfr[15], bfr[13], bfr[11], bfr[9], bfr[7], bfr[5], bfr[3]};
+                            gpo <= {bfr[18], bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4]};
                     end
                 end
-                E_PW: if (ph == {3'b000, sh_left, 2'b10}) ep <= E_PC;
+                E_PW: if (ph == {1'b0, sh_left, ~sh_left, ~sh_left, 1'b1, 1'b0}) ep <= E_PC;
                 E_PC: if (j == 6'd63) ep <= E_CMD;
                 default: ;                                  // E_HALT
             endcase
