@@ -423,32 +423,74 @@ Levers if a candidate is slower than 9a39f1d (none is in the gate today):
 
 ## Mutants
 
-`mutants/make_mutants.py` generates them: each is the seed with one bug, plus `expect.json`.
-`test_mutant_fails` runs each one on the seed's timing (cosim: first retirement at cycle 115,
-so fast depths 234 and 348, deep D = 463), with `--only` its checks and `--deep` when a check is
-deep-only. A FAIL must be a counterexample: a failed assertion (or the pins equivalence), never
-a timeout or an error. The `_1024` stall mutants must PASS.
+Each mutant is a design with one bug, plus `expect.json`. `mutants/make_mutants.py` generates
+the seed-based ones (the seed with one change). The ones marked "cosim" in the table are shared
+with the cosim gate: their `expect.json` points at `verif/cosim/mutants/<name>` (`"rtl"`), so both
+gates test the same designs. That includes main's frozen copies of the two hyp/002 cores
+(`legal_h002_rf` = fc07cc3, `legal_h002_pcram` = b9a5211, each unchanged below a 3-line header)
+and three mutants of them.
 
-Measured at commit 738a135 on hwe-bench. "Proof" is the check's proof task, in seconds.
+`test_mutant_fails` runs each one with `--only` its checks (`--deep` when a check is deep-only),
+on the seed's timing (cosim, max over 14 programs: first retirement at cycle 115, so fast depths
+234 and 348, deep D = 463), or on the timing of the design its `"timing"` names. A FAIL must be a
+counterexample: a failed assertion (or the pins equivalence), never a timeout or an error. The
+legal variants (`"expect": "pass"`, `"checks": "all"`) must pass the whole fast suite, and the
+`_1024` stall mutants must PASS their check. Mutants marked `"slow"` (the hyp/002 cores, hours
+each) run only with `BONETTO_FORMAL_SLOW=1`.
 
-| mutant | bug | check | result: failed assertions | proof |
+Results, on hwe-bench unless marked Mac:
+
+| mutant | RTL | bug | checks | result: failed assertions |
 |---|---|---|---|---|
-| cs_sck_high | CS_n rises with SCK still high | spi | FAIL: `spi_rule1_prev` | 9 s |
-| gpio_any_byte | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold`, `gpio_uo_cause`, `gpio_uo_value` | 62 s |
-| load_half_swap | LH/LHU bytes swapped | bus_dmem | FAIL: `bus_dmem_load_value` | 92 s |
-| miso_low | samples MISO while SCK is low | bus_imem | FAIL: `bus_imem_value` | 10 s |
-| mosi_rise | MOSI changes while SCK is high | spi | FAIL: `spi_rule2`, `spi_rule4_cmd` | 10 s |
-| norvfi_diff | uo_out inverted in the plain build only | equiv | FAIL (pre-pass) | 5 s (whole run) |
-| reg_wrong_index | even rd writes one register up | reg | FAIL: `reg_rs1` | 50 s |
-| rvfi_rd | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` | 15 s |
-| sub_decode | SUB decoded as ADD | insn_sub | FAIL: `insn_rd_wdata` | 14 s |
-| trap_continues | fetches again after a fatal trap | silent | FAIL: `silent_write`, `silent_retire` | 37 s |
-| write_midbyte | store WRITE one bit short | bus_dmem, spi | FAIL: `bus_dmem_store_once`, `bus_dmem_store_value`; `spi_rule5_write` | 94 s, 42 s |
-| hang_reserved | custom-0 opcode hangs | liveness (deep) | FAIL: `liveness` (retirements at steps 230 and 460, then none) | 1,832 s |
-| stall_first_1024 | first retirement at edge 1,024 | liveness (deep) | PASS | 87 s |
-| stall_first_1025 | first retirement at edge 1,025 | liveness (deep) | FAIL: `liveness` (first retirement at step 1,026) | 296 s |
-| stall_later_1024 | a gap of 1,024 edges | liveness (deep) | PASS | 309 s |
-| stall_later_1025 | a gap of 1,025 edges | liveness (deep) | FAIL: `liveness` (retirements at steps 230 and 1,255) | 1,348 s |
+| cs_sck_high | seed | CS_n rises with SCK still high | spi | FAIL: `spi_rule1_prev` |
+| mosi_rise | seed | MOSI changes while SCK is high | spi | FAIL: `spi_rule2`, `spi_rule4_cmd` |
+| cs_open_at_retire | cosim | CS_n still low in the retirement cycle | spi | FAIL: `spi_cs_at_valid` |
+| write_midbyte | seed | store WRITE one bit short | spi, bus_dmem | FAIL: `spi_rule5_write`; `bus_dmem_store_once`, `bus_dmem_store_value` |
+| miso_low | seed | samples MISO while SCK is low | bus_imem | FAIL: `bus_imem_value` |
+| refetch | seed | every instruction fetched twice | bus_imem | FAIL (Mac): `bus_imem_refetch` |
+| fetch_extra_byte | cosim | the fetch READ clocks a fifth byte | bus_imem, bus_dmem | FAIL: `bus_imem_fetch`; `bus_dmem_read_claimed` |
+| zero_init | cosim | pc not reset (relies on power-up 0) | rvfi, bus_imem | FAIL: `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
+| load_half_swap | seed | LH/LHU bytes swapped | bus_dmem | FAIL: `bus_dmem_load_value` |
+| load_own_fetch | cosim | an LW at its own pc reuses the fetch, no READ | bus_dmem | FAIL: `bus_dmem_load_read` |
+| load_skip_byte | cosim | LW reads 3 bytes, takes the 4th from the shift register | bus_dmem | FAIL: `bus_dmem_load_value` |
+| store_twice | cosim | every store WRITE sent twice | bus_dmem | FAIL: `bus_dmem_store_once` |
+| store_extra_byte | cosim | SB writes a second byte | bus_dmem | FAIL: `bus_dmem_write_claimed` |
+| trap_program_write | seed | a program WRITE (0x0100) before a trap retires | bus_dmem | FAIL: `bus_dmem_write_claimed` |
+| trap_region_wrap | seed | a READ at 0xFFFE before a trap: 0xFFFE-0x0001 | bus_dmem | FAIL: `bus_region_mixed` |
+| trap_region_straddle | seed | a READ at 0xFF7E before a trap: 0xFF7E-0xFF81 | bus_dmem | FAIL: `bus_region_mixed` |
+| region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | REGION_WRAP_RESULT |
+| region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | REGION_STRADDLE_RESULT |
+| region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | REGION_ZERO_INIT_RESULT |
+| reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1`, `reg_rs2` |
+| rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
+| sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
+| trap_fields_brj | seed | junk rs fields on every trap | insn_jalr | FAIL: `insn_trap_rs1_addr`, `insn_trap_rs2_addr` |
+| trap_writes_rd | cosim | a trapping JAL writes rd | insn_jal, rvfi | FAIL: `insn_trap_rd_addr`; `conv_trap_rd_addr` |
+| trap_continues | seed | fetches again after a misaligned-target trap | silent | FAIL: `silent_retire` |
+| no_halt | cosim | EBREAK traps but the core keeps running | silent | FAIL: `silent_retire` |
+| region_write_after_halt | seed | a region WRITE (0xFF80) after the halt | silent | FAIL: `silent_write` |
+| gpio_any_byte | seed | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold`, `gpio_uo_cause`, `gpio_uo_value` |
+| uo_glitch | cosim | uo_out shows the value, restores the old one, then sets it again | gpio | FAIL: `gpio_uo_once` |
+| uo_late | cosim | uo_out set two cycles after the store retires | gpio | FAIL: `gpio_uo_hold` |
+| norvfi_diff | seed | uo_out inverted in the plain build only | equiv | FAIL (pre-pass) |
+| hang_reserved | seed | custom-0 opcode hangs | liveness (deep) | FAIL (Mac): `liveness` (the first instruction hangs, no retirement) |
+| stall_first_1024 | seed | first retirement at edge 1,024 | liveness (deep) | PASS (Mac) |
+| stall_first_1025 | seed | first retirement at edge 1,025 | liveness (deep) | FAIL (Mac): `liveness` |
+| stall_later_1024 | seed | a gap of 1,024 edges | liveness (deep) | PASS (Mac) |
+| stall_later_1025 | seed | a gap of 1,025 edges | liveness (deep) | FAIL (Mac): `liveness` |
+| legal_mosi_echo | cosim | MOSI carries noise after the last bit (CS_n still low) | all (fast) | PASS, 56 checks |
+| legal_split_store | cosim | SW as two 2-byte WRITEs | all (fast) | PASS, 56 checks |
+| legal_trap_fields_nb | seed | junk rs fields, rd_wdata and pc_wdata on non-branch traps | all (fast) | PASS, 56 checks |
+| legal_uo_early | seed | uo_out set on the edge into the retirement cycle | all (fast) | PASS, 56 checks |
+| legal_trap_region | seed | a region READ (0xFF80) before a trap | all (fast) | PASS, 56 checks |
+| legal_null_read | seed | a null READ (0x1234, header only) before a trap | all (fast) | PASS, 56 checks |
+| legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | H002RF_RESULT |
+| legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | H002PC_RESULT |
+
+On the seed's timing, every FAIL above came within 210 s of proof time (the slowest: the
+`stall_first_1025` liveness counterexample, 208 s on the Mac; on hwe-bench `write_midbyte`'s
+`bus_dmem`, 181 s, with other runs sharing the host). A legal variant's whole fast run took
+215 to 253 s with 10 jobs. MUTANT_TIMES_H002
 
 ## Fail fast, scheduling, remote runs
 
@@ -476,7 +518,11 @@ the gate on another machine. The verdict is the same on any host:
 4. `formal.json`, the task logs and any counterexample traces come back to
    `build/formal/remote-<run id>/`.
 5. The remote run dir is always deleted afterwards. During a run, each task's model files and
-   each reach task's traces are deleted as soon as the task finishes.
+   each reach task's traces are deleted as soon as the task finishes. A runner killed with
+   SIGKILL cannot clean up, so each remote run first deletes this machine's remote run dirs
+   whose local runner is gone (`reap_remote_stale`), and each run deletes the local work dirs
+   and `build/formal/remote-*` logs of dead runs (`reap_stale`). Any other exception in the
+   runner stops every SBY task before it exits.
 
 SIGTERM, SIGINT or SIGHUP on the local runner hangs up the ssh session, which stops the remote SBY
 runs, and then cleans up. `BONETTO_FORMAL_REMOTE_DIR` changes the remote base dir (and so the

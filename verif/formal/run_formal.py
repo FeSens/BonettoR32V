@@ -1022,6 +1022,28 @@ def run_remote(args, host):
         return 130
 
 
+def reap_remote_stale(ssh, node):
+    """Delete this machine's earlier run dirs on the remote host whose local runner is
+    gone (a runner killed with SIGKILL cannot clean up; the host's disk is shared). Run
+    dirs of live runners, and other machines' run dirs, stay."""
+    p = subprocess.run(ssh + [f"ls -1 {shlex.quote(REMOTE_BASE)} 2>/dev/null"],
+                       capture_output=True, text=True)
+    stale = []
+    for d in p.stdout.split():
+        m = re.fullmatch(rf"run-{re.escape(node)}-(\d+)-\d+", d)
+        if not m:
+            continue
+        try:
+            os.kill(int(m.group(1)), 0)
+        except ProcessLookupError:
+            stale.append(f"{REMOTE_BASE}/{d}")
+        except PermissionError:
+            pass
+    if stale:
+        subprocess.run(ssh + ["rm -rf " + " ".join(shlex.quote(s) for s in stale)])
+        log(f"remote: removed {len(stale)} stale run dir(s) of dead runners")
+
+
 def _run_remote(args, host, tempfile):
     reap_stale(os.path.join(ROOT, "build", "formal"))
     run_id = f"run-{os.uname().nodename.split('.')[0]}-{os.getpid()}-{int(time.time())}"
@@ -1061,6 +1083,7 @@ def _run_remote(args, host, tempfile):
             cfg_arg = ["--config", "config.cfg"]
         ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", host]
         try:
+            reap_remote_stale(ssh, os.uname().nodename.split('.')[0])
             rc = subprocess.run(ssh + [f"mkdir -p {shlex.quote(rdir)}"]).returncode
             if rc != 0:
                 log(f"remote: cannot reach {host}")

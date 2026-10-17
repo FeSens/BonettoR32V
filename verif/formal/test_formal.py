@@ -195,6 +195,20 @@ def test_aggregate_skipped():
     assert sorted(skipped) == ["gpio", "reg"]
 
 
+def test_reap_remote_stale(tmp_path, monkeypatch):
+    """Remote run dirs of this machine's dead runners are deleted; a live runner's dirs
+    and other machines' dirs stay. The 'ssh' here runs the commands locally."""
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    names = [f"run-mac-{dead.pid}-1", f"run-mac-{os.getpid()}-2", f"run-other-{dead.pid}-3",
+             "formal.lock"]
+    for n in names:
+        (tmp_path / n).mkdir()
+    monkeypatch.setattr(run_formal, "REMOTE_BASE", str(tmp_path))
+    run_formal.reap_remote_stale(["sh", "-c"], "mac")
+    assert sorted(os.listdir(tmp_path)) == sorted(names[1:])
+
+
 def test_stage_takes_every_top_level_v(tmp_path):
     """Contract section 1: every top-level src/*.v is design, test_*.v included;
     subdirectories are not."""
