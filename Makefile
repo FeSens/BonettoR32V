@@ -2,7 +2,9 @@
 #
 # Every gate's command lives in tools/eval.py, one adapter per gate; the gate targets below only
 # call it, so `make cosim` and the cosim step of `make eval` are the same command.
-# Gate order in `make eval`: lint, cosim, equiv, formal, arch, area, gl (stops at the first FAIL).
+# Gate order in `make eval`: lint, area, cosim, arch, equiv, gl, then formal only with FORMAL=1
+# (stops at the first FAIL). MIN_IPS=<champion coremark_ips> retires a candidate that isn't faster
+# right after cosim (exit 3). MAX_AREA is gone: the score is CoreMark/s (contract v3 section 7).
 # `make gates` is the same command under another name, for agent sandboxes that block commands
 # containing the word "eval".
 # Only formal, harden and tilefit take `lockf -k /tmp/bonetto-heavy.lock` (one heavy job at a
@@ -44,6 +46,7 @@ help:
 	@echo "make area         sky130 cell area (build/area.json)"
 	@echo "make gl           gate-level cocotb test on the area netlist"
 	@echo "make eval         all gates in order, stop at first FAIL, write build/eval.json (V=1 streams logs)"
+	@echo "                  FORMAL=1 adds formal last; MIN_IPS=<champion coremark_ips> stops a slower candidate after cosim"
 	@echo "make gates        exactly the same as make eval (for sandboxes that block the word)"
 	@echo "make harden       TT 1x1 hardening with LibreLane (heavy lock)"
 	@echo "make tilefit      smallest signoff-clean fraction of the 1x1 tile (heavy lock)"
@@ -54,7 +57,8 @@ $(GATE_TARGETS):
 	$(EVAL) --gate $@
 
 eval gates:
-	$(EVAL) $(if $(V),-v) $(if $(MAX_AREA),--max-area $(MAX_AREA))
+	$(if $(MAX_AREA),$(error MAX_AREA was replaced by MIN_IPS=<champion coremark_ips> (contract v3 section 7)))
+	$(EVAL) $(if $(V),-v) $(if $(FORMAL),--formal) $(if $(MIN_IPS),--min-ips $(MIN_IPS))
 
 harden:
 	@test -f tools/harden_tt.sh || { echo "harden: runner missing (tools/harden_tt.sh)"; exit 1; }

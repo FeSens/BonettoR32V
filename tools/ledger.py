@@ -6,27 +6,36 @@ Commands:
                 --verdict {merged,rejected,failed,rolled_back}
                 [--eval build/eval.json] [--notes "..."] [--parent-sha SHA]
                 [--tile-fraction F] [--formal-deep pass|fail]
-      Appends one entry. Fields: id, ts, branch, sha, parent_sha, idea, verdict, area_um2,
-      cells, delta_um2, gates, notes, tile_fraction, formal_deep. area_um2, cells and gates come
-      from --eval. parent_sha defaults to the current champion's sha; delta_um2 is area_um2 minus
-      the champion's area_um2 (negative is smaller, which is better). tile_fraction (from
-      `make tilefit`, 0 < F <= 1) and formal_deep (pass, fail) are optional, null by default.
-      A `merged` entry needs --eval with pass: true, a clean tree (dirty: false) and the same sha.
-      An --eval whose sha differs from --sha is refused for every verdict.
+      Appends one entry. Fields: id, ts, branch, sha, parent_sha, idea, verdict, coremark_ips,
+      delta_ips, area_um2, cells, delta_um2, gates, formal, notes, tile_fraction, formal_deep.
+      coremark_ips, area_um2, cells, gates and formal ("pass", "fail" or "skipped") come from
+      --eval. parent_sha defaults to the current champion's sha; delta_ips is coremark_ips minus
+      the champion's (positive is faster, which is better) and delta_um2 is area_um2 minus the
+      champion's (negative is smaller). tile_fraction (from `make tilefit`, 0 < F <= 1) and
+      formal_deep (pass, fail) are optional, null by default.
+      A `merged` entry needs --eval with pass: true, a clean tree (dirty: false), the same sha,
+      a coremark_ips and an area_um2; formal may be "skipped" (contract v3 section 7) but not
+      "fail". An --eval whose sha differs from --sha is refused for every verdict.
       A `rolled_back` entry names the current champion's sha (for example after formal-deep
-      fails); the champion becomes the previous merged entry again.
+      fails); the champion becomes the best remaining standing merged entry. Without --eval it
+      copies the champion's coremark_ips, formal, area_um2 and cells.
   ledger.py annotate --id NNN [--tile-fraction F] [--formal-deep pass|fail] [--notes-append T]
       Records champion-round results on an existing entry (rewrites that one line).
   ledger.py board     regenerates loop/LEADERBOARD.md (champion history, last 20 hypotheses)
   ledger.py show      prints the current champion; --json for raw
   ledger.py next-id   prints the next sequential id
 
-Champion: the latest merged entry that no later rolled_back entry names.
-Lines that are blank or start with '#' are skipped.
+Champion: among the merged entries that no later rolled_back entry names, the one with the
+highest coremark_ips (contract v3 section 7); ties go to the smaller area_um2, then the later
+entry. Entries from before v3 have no coremark_ips: while no standing entry has one, the latest
+standing merged entry is the champion (the v2 rule), and any scored entry outranks them.
+Lines that are blank or start with '#' are skipped. Entries written before v3 (LEGACY_FIELDS)
+read as they are; `annotate` rewrites one in the v3 field order with the new fields null.
 """
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -37,8 +46,12 @@ LEDGER = os.path.join(REPO, "loop", "ledger.jsonl")
 BOARD = os.path.join(REPO, "loop", "LEADERBOARD.md")
 VERDICTS = ("merged", "rejected", "failed", "rolled_back")
 FORMAL_DEEP = ("pass", "fail")
-FIELDS = ("id", "ts", "branch", "sha", "parent_sha", "idea", "verdict", "area_um2", "cells",
-          "delta_um2", "gates", "notes", "tile_fraction", "formal_deep")
+FORMAL = ("pass", "fail", "skipped")    # eval.json "formal" (formal runs only with --formal)
+FIELDS = ("id", "ts", "branch", "sha", "parent_sha", "idea", "verdict", "coremark_ips",
+          "delta_ips", "area_um2", "cells", "delta_um2", "gates", "formal", "notes",
+          "tile_fraction", "formal_deep")
+LEGACY_FIELDS = ("id", "ts", "branch", "sha", "parent_sha", "idea", "verdict", "area_um2",
+                 "cells", "delta_um2", "gates", "notes", "tile_fraction", "formal_deep")   # v2
 RECENT = 20
 
 
@@ -81,9 +94,22 @@ def replay(entries):
     return standing, rolled
 
 
+def is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def champion(entries):
     standing, _ = replay(entries)
-    return standing[-1] if standing else None
+    scored = [(i, e) for i, e in enumerate(standing) if is_num(e.get("coremark_ips"))]
+    if not scored:
+        return standing[-1] if standing else None
+
+    def rank(item):
+        i, e = item
+        area = e.get("area_um2")
+        return e["coremark_ips"], -area if is_num(area) else -math.inf, i
+
+    return max(scored, key=rank)[1]
 
 
 def check_tile_fraction(value):
@@ -120,7 +146,7 @@ def make_entry(entries, args, ts=None):
     if args.verdict not in VERDICTS:
         raise LedgerError(f"verdict must be one of {', '.join(VERDICTS)}")
     sha = resolve_sha(args.sha)
-    area = cells = None
+    area = cells = ips = formal = None
     gates = {}
     if args.eval:
         with open(args.eval) as f:
@@ -129,7 +155,11 @@ def make_entry(entries, args, ts=None):
             raise LedgerError(f"{args.eval} is for sha {ev.get('sha')}, not {sha}: re-run "
                               f"make eval on the exact sha")
         area, cells = ev.get("area_um2"), ev.get("cells")
+        ips, formal = ev.get("coremark_ips"), ev.get("formal")
         gates = {name: g.get("pass") for name, g in (ev.get("gates") or {}).items()}
+        if formal is not None and formal not in FORMAL:
+            raise LedgerError(f"{args.eval} has formal: {formal!r}; expected one of "
+                              f"{', '.join(FORMAL)}")
         if args.verdict == "merged":
             if ev.get("pass") is not True:
                 raise LedgerError(f"{args.eval} has pass: {ev.get('pass')}; a merged entry "
@@ -137,12 +167,18 @@ def make_entry(entries, args, ts=None):
             if ev.get("dirty") is not False:
                 raise LedgerError(f"{args.eval} has dirty: {ev.get('dirty')}; evaluate a clean "
                                   f"checkout of the sha")
-            if not isinstance(area, (int, float)):
+            if formal == "fail":
+                raise LedgerError(f"{args.eval} has formal: fail; a merged entry may skip "
+                                  f"formal, never fail it")
+            if not (is_num(ips) and ips > 0):
+                raise LedgerError(f"{args.eval} has no coremark_ips (got {ips!r}); a merged "
+                                  f"entry needs the CoreMark score (contract v3 section 7)")
+            if not is_num(area):
                 raise LedgerError(f"{args.eval} has no area_um2")
     elif args.verdict == "merged":
         raise LedgerError("a merged entry needs --eval")
     champ = champion(entries)
-    delta = None
+    delta = delta_ips = None
     if args.verdict == "rolled_back":
         if not champ or not same_sha(champ["sha"], sha):
             raise LedgerError(f"rolled_back must name the current champion's sha "
@@ -150,11 +186,13 @@ def make_entry(entries, args, ts=None):
         parent = args.parent_sha or champ.get("parent_sha")
         if not args.eval:
             area, cells = champ.get("area_um2"), champ.get("cells")
+            ips, formal = champ.get("coremark_ips"), champ.get("formal")
     else:
         parent = args.parent_sha if args.parent_sha else (champ["sha"] if champ else None)
-        if (champ and isinstance(area, (int, float))
-                and isinstance(champ.get("area_um2"), (int, float))):
+        if champ and is_num(area) and is_num(champ.get("area_um2")):
             delta = round(area - champ["area_um2"], 3)
+        if champ and is_num(ips) and is_num(champ.get("coremark_ips")):
+            delta_ips = round(ips - champ["coremark_ips"], 6)
     entry = {
         "id": args.id,
         "ts": ts or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -163,10 +201,13 @@ def make_entry(entries, args, ts=None):
         "parent_sha": parent,
         "idea": args.idea,
         "verdict": args.verdict,
+        "coremark_ips": ips,
+        "delta_ips": delta_ips,
         "area_um2": area,
         "cells": cells,
         "delta_um2": delta,
         "gates": gates,
+        "formal": formal,
         "notes": args.notes or "",
         "tile_fraction": check_tile_fraction(args.tile_fraction),
         "formal_deep": args.formal_deep,
@@ -181,16 +222,16 @@ def annotate(entries, args):
         raise LedgerError(f"no entry with id {args.id}")
     if args.tile_fraction is None and args.formal_deep is None and not args.notes_append:
         raise LedgerError("annotate needs --tile-fraction, --formal-deep or --notes-append")
-    e = hits[0]
+    # The v3 field order, new fields null on a v2 entry; any unknown keys are kept after them.
+    old = hits[0]
+    e = {**{k: old.get(k) for k in FIELDS}, **{k: v for k, v in old.items() if k not in FIELDS}}
     if args.tile_fraction is not None:
         e["tile_fraction"] = check_tile_fraction(args.tile_fraction)
     if args.formal_deep is not None:
         e["formal_deep"] = args.formal_deep
     if args.notes_append:
         e["notes"] = (e.get("notes") + "; " if e.get("notes") else "") + args.notes_append
-    for k in FIELDS:
-        e.setdefault(k, None)
-    return entries
+    return [e if x is old else x for x in entries]
 
 
 def fmt_tile(v):
@@ -209,6 +250,14 @@ def fmt_delta(v):
     return "-" if v is None else f"{v:+,.1f}"
 
 
+def fmt_ips(v):
+    return f"{v:,.4f}" if is_num(v) else "-"
+
+
+def fmt_delta_ips(v):
+    return f"{v:+,.4f}" if is_num(v) else "-"
+
+
 def cell(text, limit=90):
     s = " ".join(str(text or "").split()).replace("|", "\\|")
     return s if len(s) <= limit else s[:limit - 3] + "..."
@@ -223,15 +272,20 @@ def render_board(entries):
     out = ["# BonettoR32V leaderboard", "",
            "Generated by `python3 tools/ledger.py board` from `loop/ledger.jsonl`. Don't edit by "
            "hand.", "",
-           "Score: `area_um2`, the sky130_fd_sc_hd cell area from `make area` (lower wins). "
-           "Delta is against the champion at the time of the entry.", ""]
+           "Score: `coremark_ips`, CoreMark iterations per second from `make eval` "
+           "(f_clk / cycles per iteration, contract v3 section 7; higher wins, ties go to the "
+           "smaller `area_um2`). Deltas are against the champion at the time of the entry; "
+           "history `delta %` is the score change against the previous standing merged entry. "
+           "Entries from before v3 have no score (`-`); they were ranked by area.", ""]
     champ = champion(entries)
     _, rolled = replay(entries)
     out.append("## Current champion")
     out.append("")
     if champ:
         out.append(f"**{champ['id']}** `{champ['sha'][:12]}` ({champ['branch']}): "
-                   f"{fmt_num(champ['area_um2'])} µm², {fmt_num(champ['cells'])} cells, "
+                   f"{fmt_ips(champ.get('coremark_ips'))} CoreMark iterations/s, "
+                   f"{fmt_num(champ.get('area_um2'))} µm², {fmt_num(champ.get('cells'))} cells, "
+                   f"formal {champ.get('formal') or '-'}, "
                    f"tile fraction {fmt_tile(champ.get('tile_fraction'))}, deep formal "
                    f"{champ.get('formal_deep') or '-'}. {cell(champ['idea'], 200)}")
     else:
@@ -241,23 +295,24 @@ def render_board(entries):
     out.append("")
     merged = [e for e in entries if e.get("verdict") == "merged"]
     if merged:
-        out.append("| # | id | date | sha | area µm² | cells | delta µm² | delta % | tile fraction "
-                   "| deep formal | status | idea |")
-        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        out.append("| # | id | date | sha | CoreMark/s | delta % | area µm² | cells | delta µm² "
+                   "| formal | tile fraction | deep formal | status | idea |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         prev = None
         for i, e in enumerate(merged):
             pct = "-"
-            if prev is not None and isinstance(e.get("area_um2"), (int, float)) and prev:
-                pct = f"{100.0 * (e['area_um2'] - prev) / prev:+.2f}%"
+            if prev and is_num(e.get("coremark_ips")):
+                pct = f"{100.0 * (e['coremark_ips'] - prev) / prev:+.2f}%"
             status = f"rolled back by {rolled[e['id']]}" if e["id"] in rolled else (
                 "champion" if champ and e["id"] == champ["id"] else "-")
             out.append(f"| {i} | {e['id']} | {e['ts'][:10]} | `{e['sha'][:10]}` | "
+                       f"{fmt_ips(e.get('coremark_ips'))} | {pct} | "
                        f"{fmt_num(e.get('area_um2'))} | {fmt_num(e.get('cells'))} | "
-                       f"{fmt_delta(e.get('delta_um2'))} | {pct} | "
+                       f"{fmt_delta(e.get('delta_um2'))} | {e.get('formal') or '-'} | "
                        f"{fmt_tile(e.get('tile_fraction'))} | {e.get('formal_deep') or '-'} | "
                        f"{status} | {cell(e.get('idea'))} |")
-            if isinstance(e.get("area_um2"), (int, float)) and e["id"] not in rolled:
-                prev = e["area_um2"]
+            if is_num(e.get("coremark_ips")) and e["id"] not in rolled:
+                prev = e["coremark_ips"]
     else:
         out.append("No merged entries yet.")
     out.append("")
@@ -265,13 +320,15 @@ def render_board(entries):
     out.append("")
     recent = entries[-RECENT:][::-1]
     if recent:
-        out.append("| id | date | branch | verdict | area µm² | delta µm² | failed gates | idea | "
-                   "notes |")
-        out.append("|---|---|---|---|---|---|---|---|---|")
+        out.append("| id | date | branch | verdict | CoreMark/s | delta CoreMark/s | area µm² | "
+                   "delta µm² | formal | failed gates | idea | notes |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for e in recent:
             out.append(f"| {e['id']} | {e['ts'][:10]} | {cell(e.get('branch'), 40)} | "
-                       f"{e['verdict']} | {fmt_num(e.get('area_um2'))} | "
-                       f"{fmt_delta(e.get('delta_um2'))} | {failed_gates(e)} | "
+                       f"{e['verdict']} | {fmt_ips(e.get('coremark_ips'))} | "
+                       f"{fmt_delta_ips(e.get('delta_ips'))} | {fmt_num(e.get('area_um2'))} | "
+                       f"{fmt_delta(e.get('delta_um2'))} | {e.get('formal') or '-'} | "
+                       f"{failed_gates(e)} | "
                        f"{cell(e.get('idea'), 70)} | {cell(e.get('notes'), 70)} |")
     else:
         out.append("No entries yet.")
@@ -312,8 +369,10 @@ def main(argv=None):
             os.makedirs(os.path.dirname(os.path.abspath(args.ledger)), exist_ok=True)
             with open(args.ledger, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            print(f"ledger: added {entry['id']} ({entry['verdict']}), area "
-                  f"{fmt_num(entry['area_um2'])} µm², delta {fmt_delta(entry['delta_um2'])}")
+            print(f"ledger: added {entry['id']} ({entry['verdict']}), CoreMark "
+                  f"{fmt_ips(entry['coremark_ips'])} iterations/s, delta "
+                  f"{fmt_delta_ips(entry['delta_ips'])}, area {fmt_num(entry['area_um2'])} µm², "
+                  f"delta {fmt_delta(entry['delta_um2'])}")
             print("ledger: run `python3 tools/ledger.py board` and commit loop/")
         elif args.cmd == "annotate":
             entries = annotate(entries, args)
@@ -346,8 +405,10 @@ def main(argv=None):
                 print("No champion yet (no merged entry in the ledger).")
             else:
                 print(f"champion {champ['id']}: {champ['sha']} ({champ['branch']})")
-                print(f"  area {fmt_num(champ['area_um2'])} um2, {fmt_num(champ['cells'])} cells, "
-                      f"merged {champ['ts']}")
+                print(f"  CoreMark {fmt_ips(champ.get('coremark_ips'))} iterations/s, formal "
+                      f"{champ.get('formal') or '-'}")
+                print(f"  area {fmt_num(champ.get('area_um2'))} um2, "
+                      f"{fmt_num(champ.get('cells'))} cells, merged {champ['ts']}")
                 print(f"  tile fraction {fmt_tile(champ.get('tile_fraction'))}, deep formal "
                       f"{champ.get('formal_deep') or '-'}")
                 print(f"  idea:  {champ['idea']}")
