@@ -1,7 +1,8 @@
 // BonettoR32V reference ISS for contract v3 (docs/contract-v3.md sections 3, 4, 5 and 8): RV32E
 // plus the Zicsr subset, traps to mtvec, the external interrupt, the flash / PSRAM / IO memory
 // map and a register-level model of the peripherals. Header-only: the v3 cosim harness and
-// iss_main share one model. The RV32E decode and execute are v2's (iss.h), unchanged.
+// iss_main share one model. The RV32E decode and execute are copied from v2's iss.h, with traps
+// to mtvec instead of halts.
 //
 // Memory map (contract 3), for an address a:
 //   - a[31] = 0, a[24] = 0: flash byte a[23:0] (16 MiB, read-only: stores change nothing);
@@ -398,11 +399,12 @@ inline Retire Iss3::step(const IoHooks& io) {
   const uint32_t rs2 = (insn >> 20) & 0x1F;
   const uint32_t f7 = insn >> 25;
   const uint32_t imm_i = (uint32_t)((int32_t)insn >> 20);
-  const uint32_t imm_s = (uint32_t)(((int32_t)insn >> 25) << 5) | ((insn >> 7) & 0x1F);
-  const uint32_t imm_b = (uint32_t)(((int32_t)insn >> 31) << 12) | ((insn & 0x80) << 4) |
+  // Sign bits are shifted as uint32_t: a left shift of a negative int32_t is UB before C++20.
+  const uint32_t imm_s = ((uint32_t)((int32_t)insn >> 25) << 5) | ((insn >> 7) & 0x1F);
+  const uint32_t imm_b = ((uint32_t)((int32_t)insn >> 31) << 12) | ((insn & 0x80) << 4) |
                          ((insn >> 20) & 0x7E0) | ((insn >> 7) & 0x1E);
   const uint32_t imm_u = insn & 0xFFFFF000u;
-  const uint32_t imm_j = (uint32_t)(((int32_t)insn >> 31) << 20) | (insn & 0xFF000) |
+  const uint32_t imm_j = ((uint32_t)((int32_t)insn >> 31) << 20) | (insn & 0xFF000) |
                          ((insn >> 9) & 0x800) | ((insn >> 20) & 0x7FE);
 
   const bool first_of_handler = pending_intr_;
@@ -719,11 +721,11 @@ inline std::string iss_disasm(uint32_t insn) {
   uint32_t op = insn & 0x7F, rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7, rs1 = (insn >> 15) & 31,
            rs2 = (insn >> 20) & 31, f7 = insn >> 25;
   int32_t ii = (int32_t)insn >> 20;
-  int32_t is = (int32_t)((((int32_t)insn >> 25) << 5) | ((insn >> 7) & 0x1F));
-  int32_t ib = (int32_t)((((int32_t)insn >> 31) << 12) | ((insn & 0x80) << 4) |
+  int32_t is = (int32_t)(((uint32_t)((int32_t)insn >> 25) << 5) | ((insn >> 7) & 0x1F));
+  int32_t ib = (int32_t)(((uint32_t)((int32_t)insn >> 31) << 12) | ((insn & 0x80) << 4) |
                          ((insn >> 20) & 0x7E0) | ((insn >> 7) & 0x1E));
-  int32_t ij = (int32_t)((((int32_t)insn >> 31) << 20) | (insn & 0xFF000) | ((insn >> 9) & 0x800) |
-                         ((insn >> 20) & 0x7FE));
+  int32_t ij = (int32_t)(((uint32_t)((int32_t)insn >> 31) << 20) | (insn & 0xFF000) |
+                         ((insn >> 9) & 0x800) | ((insn >> 20) & 0x7FE));
   static const char* br[8] = {"beq", "bne", "?", "?", "blt", "bge", "bltu", "bgeu"};
   static const char* ld[8] = {"lb", "lh", "lw", "?", "lbu", "lhu", "?", "?"};
   static const char* st[8] = {"sb", "sh", "sw", "?", "?", "?", "?", "?"};

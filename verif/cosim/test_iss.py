@@ -1086,6 +1086,54 @@ def test_io_byte_lanes_reset_and_write_masks(built3):
     assert loads[32:] == [IO_ONES.get(n, 0) for n in range(32)], "write masks"
 
 
+# The volatile bits of each slot for loads (the brief: GPIO_IN, TIMER_CNT, TIMER_CAP, UART_DATA
+# read, UART_CTRL[15:13], SPI_DATA read, SPI_CTRL[4], IRQ_PEND, GPIO_EPEND), and mip.MEIP.
+VOLATILE3 = {1: 0xFF, 3: 0xFFFF, 5: 0xFFFF, 11: 0xFF, 12: 0xE000, 13: 0xFF, 14: 0x10, 16: 0x1F,
+             18: 0xFF}
+
+
+def test_io_volatile_mask_table(built3):
+    # The DUT answers all ones for every slot: a load takes exactly the volatile bits from it, and
+    # the hook fires only where there are volatile bits.
+    body = ["lui a5, 0x80000"] + [f"lw a0, {4 * n}(a5)" for n in range(32)]
+    body += ["csrr a0, mip", "j ."]
+    vreads = [a for n in range(33) for a in ("--vread", f"{n}=0xffffffff")]
+    rc, log, _, s = run3(asm3("io_volatile", "\n    ".join([""] + body))[0], *vreads)
+    assert rc == 0 and s["end"] == "selfloop", s
+    loads = [r for r in log if r["rmask"]]
+    assert len(loads) == 32
+    for n, r in enumerate(loads):
+        mask = VOLATILE3.get(n, 0)
+        assert r["rdv"] == (IO_RESET.get(n, 0) & ~mask) | mask, f"slot {n}: {r['rdv']:#x}"
+        assert ("vslot" in r) == bool(mask), f"slot {n}: the hook fires only for volatile slots"
+        if mask:
+            assert (r["vslot"], r["vdut"]) == (n, 0xFFFFFFFF), f"slot {n}"
+    mip = next(r for r in log if is_csr(r))
+    assert (mip["rdv"], mip["vslot"], mip["vdut"]) == (0x800, 32, 0xFFFFFFFF)
+
+
+def test_jalr_odd_target_does_not_trap_v3(built3):
+    # JALR clears bit 0 first; only target[1] = 1 traps (contract 4)
+    body = """
+    auipc t0, 0
+    jalr  ra, 9(t0)           # (t0 + 9) & ~1 = t0 + 8: the next instruction
+    auipc t0, 0
+    jalr  ra, 13(t0)          # (t0 + 13) & ~1 = t0 + 12: over the ecall
+    ecall
+    li    a0, 1
+    j .
+"""
+    rc, log, _, s = run3(asm3("jalr_odd3", body)[0])
+    assert rc == 0 and s["end"] == "selfloop" and s["traps"] == 0, s
+    jalrs = [i for i, r in enumerate(log) if (r["insn"] & 0x7F) == 0x67]
+    assert len(jalrs) == 2
+    for i, off in zip(jalrs, (9, 13)):
+        j = log[i]
+        assert j["trap"] == 0 and j["rs1"] == 5 and j["rs1v"] == log[i - 1]["rdv"]
+        assert j["npc"] == j["rs1v"] + off - 1 and log[i + 1]["pc"] == j["npc"]
+        assert (j["rd"], j["rdv"]) == (1, j["pc"] + 4)
+
+
 def test_selfloop_end(built3):
     h, _ = asm3("selfloop3", "li a0, 1\n j .")
     rc, log, _, s = run3(h)
