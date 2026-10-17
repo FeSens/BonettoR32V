@@ -920,6 +920,21 @@ def run_task(name, path, timeout):
     return name, status, dt, detail
 
 
+def task_line(name, status, secs, failed, required=None):
+    """One progress line per finished task. A reach task's reach_* labels are asserted as
+    assert(!trigger), so its SBY status is FAIL exactly when triggers were reached: the
+    line says REACHED k/n (all required triggers hit) or UNREACHED with the missing ones,
+    never the raw FAIL, which reads like a failure."""
+    if required is not None:
+        got = [l for l in required if l in failed]
+        miss = [l for l in required if l not in failed]
+        word = ("REACHED" if not miss else "UNREACHED") if status in ("PASS", "FAIL") else status
+        return (f"  {name:<22} {word:<9} {len(got)}/{len(required)} triggers {secs:7.1f}s"
+                + (f" missing: {', '.join(miss)}" if miss else ""))
+    extra = f" failed assertions: {', '.join(failed[:6])}" if failed else ""
+    return f"  {name:<22} {status:<9} {secs:7.1f}s{extra}"
+
+
 def aggregate(units, results):
     """Per-check verdicts from the task results. units: [(task, [(check, labels)])];
     results: {task name: run_task result}. Returns (checks, runtimes, failures, reached,
@@ -1438,8 +1453,8 @@ def main():
             if res[1] == "SKIPPED":
                 continue
             failed = [l for l in res[3]["failed"]]
-            extra = f" failed: {', '.join(failed[:6])}" if failed else ""
-            log(f"  {res[0]:<22} {res[1]:<8} {res[2]:7.1f}s{extra}")
+            log(task_line(res[0], res[1], res[2], failed,
+                          unit_req.get(res[0][:-6]) if res[0].endswith("_reach") else None))
             if args.keep_going or first_fail:
                 continue
             # Fail fast: a proof that did not PASS, or a reach task that finished without

@@ -191,7 +191,15 @@ same assumptions, same depth):
 
 A check is `PASS` only if its proof task passed and every required trigger was reached,
 `UNREACHED` if the proof passed but a required trigger was not reached, and `FAIL` otherwise
-(a counterexample, or a task that timed out or errored).
+(a counterexample, or a task that timed out or errored). `UNREACHED` fails the gate (and stops
+a fail-fast run).
+
+Because the triggers are assertions, SBY reports a reach task as FAIL exactly when it reached
+them. The runner's progress line translates that: `insn_group2_reach REACHED 5/5 triggers`, or
+`UNREACHED 3/5 ... missing: <labels>`. (Before this line existed it printed the raw
+`insn_group2_reach FAIL ... failed: reach_insn_addi, ...`, which means the same as REACHED 5/5
+and was misread as a failure.) `formal.json` lists the reached triggers per check
+(`reached`).
 
 The two queries are kept apart on purpose. One solver call that mixes easy satisfiable goals (the
 triggers) with a hard unsatisfiable one (the proof) can stall: on the seed, `bus_imem` at D = 232

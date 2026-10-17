@@ -128,6 +128,20 @@ def test_check_verdicts():
     assert run_formal.insn_reach("add") == ["reach_insn_add"]
 
 
+def test_task_line():
+    """Progress lines: a reach task whose SBY status is FAIL with every required label is
+    REACHED (the reach labels are assert(!trigger)); a missing label, or a reach task that
+    "passed" (nothing reached), is UNREACHED and names what is missing."""
+    t = run_formal.task_line
+    req = ["reach_insn_add", "reach_insn_sub"]
+    assert "REACHED   2/2 triggers" in t("insn_group0_reach", "FAIL", 9.0, req[::-1], req)
+    line = t("insn_group0_reach", "FAIL", 9.0, ["reach_insn_add"], req)
+    assert "UNREACHED 1/2" in line and "missing: reach_insn_sub" in line
+    assert "UNREACHED 0/2" in t("insn_group0_reach", "PASS", 9.0, [], req)
+    assert "TIMEOUT" in t("insn_group0_reach", "TIMEOUT", 9.0, [], req)
+    assert "failed assertions: insn_rd_wdata" in t("insn_group0", "FAIL", 9.0, ["insn_rd_wdata"])
+
+
 def test_timing_merge():
     """The timing is the max over the cosim programs, per class too."""
     a = {"first_retire_cycle": 115, "max_cycles_per_insn": 230,
