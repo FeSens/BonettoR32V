@@ -328,8 +328,8 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
   - A write to UART_DATA while TX_BUSY = 0 sets TX_BUSY = 1. TX_BUSY reads 1 from that write
     until the stop bit ends, so a read during the frame returns 1 even if the frame is shorter
     than an instruction.
-  - The start bit begins within `DIV+2` cycles. Then come the start bit, 8 data bits and the
-    stop bit, each exactly DIV+1 cycles.
+  - The start bit begins within `DIV+2` cycles after the store retires. Then come the start
+    bit, 8 data bits and the stop bit, each exactly DIV+1 cycles.
   - TX_BUSY clears when the stop bit ends.
   - A write while TX_BUSY = 1 is ignored.
 - **Receive.**
@@ -352,6 +352,8 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
      after it (synchronizer delay allowed).
 - BUSY clears after the eighth high phase ends with SCK low. SPI_DATA then reads the received
   byte.
+- D ≥ 1 is required (D = 0 is UNSPECIFIED): the harness's device holds each MISO bit from the
+  rising edge through the 3 cycles after it, which needs a high phase of at least 2 cycles.
 - A write while BUSY is ignored.
 - CS_n (`uo[4]`) is just SPI_CTRL[0].
 
