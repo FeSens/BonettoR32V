@@ -191,14 +191,15 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Serial ALU (strobe = SCK-high clock of a data bit)
     // ------------------------------------------------------------------------------------
-    wire stb    = (ep == E_DATA) & sck;
+    wire stb    = ep[0] & sck;                       // SCK is high only in CMD and DATA
     wire taken  = cmp ^ f3[0];
     wire bimm_a = ~(c_op | c_br | c_sh);
     wire a_bit  = (sB | (sA & c_pcrel)) ? bfr[0] : miso_m;
     wire b_raw  = sA ? (bimm_a & imm_bit) :
                   sB ? ((c_sh & ~c_op) ? imm_bit : miso_m) :
                   (sPX & c_br & (taken ? imm_bit : (ph[4:0] == 5'd5)));
-    wire sub    = sA ? c_slt : (sB & ((c_op & insn[30] & (f3 == 3'b000)) | c_slt | c_br));
+    // B holds only OP, shifts (sub unused) and branches: SUB, SLT, SLTU and every branch subtract
+    wire sub    = sA ? c_slt : (sB & (c_br | (~f3[2] & (f3[1] | insn[30]))));
     wire b_x    = b_raw ^ sub;
     wire cin    = k0 ? sub : cy;
     // propagate and generate, shared by the sum, the carry, the logic ops (sub = 0) and the
@@ -248,7 +249,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // W family data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
     // ------------------------------------------------------------------------------------
-    wire wem    = fW & sck & ~j[5] & e_cd;
+    wire wem    = fW & sck & ~j[5];
     wire sh_evt = sh_left ? ph[5] : (ph[4:0] == 5'd30);  // 30: source 32 passes; 32: source 0
     wire shfill = sh_left ? ~(cmp | sh_evt) : (cmp | sh_evt);
     wire ldfill = (j[4:3] > nm1);
@@ -364,7 +365,8 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Ring (no reset: nothing reads it before it is written)
     // ------------------------------------------------------------------------------------
-    wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & (f3 != 3'b000));
+    // logic ops: XORI, ORI, ANDI in A; XOR, OR, AND in B (a B result with f3 = 001..011 is unused)
+    wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & f3[2]);
     wire alu_w  = useb ? boolr : sumj;
     wire lo16   = ~j[5] & (~j[4] | (j[3:0] == 4'd0));   // data bits 0..15 (j = bit + 1)
     // Three write ports, one per data placement: the ring input (ALU results, bit k at phase
@@ -390,7 +392,7 @@ module tt_um_fesens_r32v (
     // Datapath flags (no reset)
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
-        if ((ep == E_CMD) & j[5])
+        if (~ep[2])                                     // between transactions
             cy <= 1'b0;
         else if (sW) begin
             if (wem & ~wfill)
@@ -407,14 +409,10 @@ module tt_um_fesens_r32v (
                 cmp <= ocmp;
             else if ((ph[4:2] == 3'd0) & ph[0])             // bits 0 and 1
                 cmp <= eqacc;                               // address[1:0] == 0; JALR target[1] == 0
-        end else if (stb & sB & (c_slt | c_br))
-            cmp <= ocmp;
-        else if (sW & c_sh) begin
-            if ((ep == E_CMD) & j[5])
-                cmp <= 1'b0;
-            else if (wem & sh_evt)
-                cmp <= 1'b1;
-        end
+        end else if (stb & sB)                          // SLT, branches; a shift starts its
+            cmp <= ocmp & ~c_sh;                        // W fill state at 0
+        else if (sW & c_sh & wem & sh_evt)
+            cmp <= 1'b1;
 
 
         // bit counter
@@ -457,7 +455,7 @@ module tt_um_fesens_r32v (
                     ep   <= E_CMD;
                 end
                 E_CMD: if (sck) begin
-                    if (j == 6'd56)
+                    if (j[4:0] == 5'd24)                // j = 56 (CMD has j >= 41 or 0)
                         ep <= E_GAP;
                     else if (~j[5])                         // j wrapped to 0
                         ep <= E_DATA;
