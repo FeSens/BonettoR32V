@@ -188,8 +188,8 @@ variants (must pass) and on pin-visible mutants (must fail with their message: t
 model's rule, or the uo_out sequence). The TT test checks gpio_demo's uo_out sequence,
 `uio_oe`, CS_n and SCK known, `uio_out[7:4]` and `[2]` zero, and the RAM model's waveform
 rules; MOSI is left to the model's rising-edge checks. Bugs that only show against RVFI or
-the retirement timing (`rvfi_hidden`, `uo_late`, `cs_open_at_retire`, `load_own_fetch`)
-pass it by design; the cosim catches them.
+the retirement timing (`uo_late`, `cs_open_at_retire`, `load_own_fetch`) pass it by design, and so
+does `rvfi_hidden` (gpio_demo runs no SLTU/SLTIU); the cosim catches them.
 
 ## Speed
 

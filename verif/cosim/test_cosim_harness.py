@@ -359,8 +359,9 @@ def test_every_required_mutant_class_is_present():
 # ------------------------------------------------------------------------------------------------
 # 4. the TT test (test/test.py with the 23LC512 model) on legal variants and on mutants
 # It sees only the pins: gpio_demo's uo_out sequence and the RAM model's waveform rules. Mutants
-# whose bug only shows against RVFI or the retirement timing (rvfi_hidden, uo_late,
-# cs_open_at_retire, load_own_fetch) pass it by design; the cosim catches those.
+# whose bug only shows against RVFI or the retirement timing (uo_late, cs_open_at_retire,
+# load_own_fetch) pass it by design, and so does rvfi_hidden (gpio_demo runs no SLTU/SLTIU); the
+# cosim catches those.
 TT_CASES = {
     "(seed)": None,
     "legal_mosi_echo": None,    # MOSI = X when no bit is due: legal
