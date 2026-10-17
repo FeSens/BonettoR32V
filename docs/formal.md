@@ -5,34 +5,44 @@ Tapeout top module, `tt_um_fesens_r32v`, at its pins. It is a fixed gate: hypoth
 edit it, and every candidate core in the area loop must pass it.
 
 ```
-lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py          # per candidate
-lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py --deep   # champions
+lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py          # fast: per candidate
+lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py --deep   # deep: champions
+BONETTO_FORMAL_HOST=hwe-bench python3 verif/formal/run_formal.py [--deep]    # same, on hwe-bench
 pytest verif/formal/test_formal.py -v                                        # the gate's own tests
 ```
 
 The runner writes `build/formal.json`:
-`{"pass", "checks": {name: "PASS|FAIL|UNREACHED"}, "depth", "runtime_s", ...}`. It exits 0 only
-when every check is `PASS`. `UNREACHED` (a check whose trigger the solver cannot reach within the
-depth) counts as a failure.
+`{"pass", "checks": {name: "PASS|FAIL|UNREACHED|SKIPPED"}, "depth", "runtime_s", ...}`. It exits
+0 only when every check is `PASS`. `UNREACHED` (a check whose trigger the solver cannot reach
+within the depth) counts as a failure. By default the run stops at the first `FAIL` or
+`UNREACHED` and marks the checks it did not finish `SKIPPED` (`first_failure` names the check);
+`--keep-going` runs everything.
 
 ## How it works
 
 1. **Staging.** `src/*.v` and `src/*.sv` are copied into `build/formal/work-<pid>/`. Stale work
    dirs of dead processes are removed.
-2. **Pre-pass.** yosys elaborates the `RISCV_FORMAL` build. It fails on latches, on flip-flops
-   that are not on the rising edge of `clk`, and on formal-only cells (`$anyconst`, `$initstate`,
-   ...) in the core. Formal multiclock is off, so anything but posedge-`clk` flip-flops would be
-   modelled wrongly. It removes the core's own assert/assume/cover statements and every initial
-   value, so no check can rely on power-up values (contract section 1). The core is written to
-   `core.il` and read separately from the checkers, so its macros cannot reach them.
+2. **Pre-pass.** yosys elaborates the `RISCV_FORMAL` build, reading `src/` with that one define
+   and no other (contract section 6). It fails on latches, on flip-flops that are not on the
+   rising edge of `clk`, and on formal-only cells (`$anyconst`, `$initstate`, ...) in the core.
+   Formal multiclock is off, so anything but posedge-`clk` flip-flops would be modelled wrongly.
+   It removes the core's own assert/assume/cover statements and every initial value, so no check
+   can rely on power-up values (contract section 1). The core is written to `core.il` and read
+   separately from the checkers, so its macros cannot reach them.
 3. **Pins equivalence** (`equiv`). The `RISCV_FORMAL` build with its `rvfi_*` ports removed must
    be equivalent to the plain build (yosys `equiv_make`, `equiv_simple -seq 5`, `equiv_induct`).
    The checks run on the RVFI build; this is what makes them speak for the design that ships. It
    overlaps with the equivalence gate (`make equiv`) on purpose, so the formal result stands on
    its own.
-4. **Depth.** See below.
-5. **Tasks.** One SBY task per check (each one proves its own triggers reachable, see below),
-   run in parallel (at most 8).
+4. **Timing and depth.** See "Depth policy".
+5. **Tasks.** Each check runs as a proof task and a reach task (see "Non-vacuity"). The 40
+   instruction checks run in groups: one task checks several instructions through one muxed
+   model (`bonetto_insn_group`, generated per task; the members' encodings are disjoint), with
+   one trigger per instruction. A group shares one unrolling of the core, which roughly halves
+   the cost per instruction. A group counterexample is attributed to the instruction in the
+   trace; the other members are reported `FAIL` as not proven.
+6. **Scheduling.** At most 8 tasks in parallel on the Mac (`BONETTO_FORMAL_MAX_JOBS` raises the
+   cap on a bigger host), longest first. SIGTERM, SIGINT and SIGHUP stop every SBY run.
 
 ### Environment (assumptions)
 
@@ -61,11 +71,11 @@ and a WRITE ending mid-byte, an incomplete header, MISO noise while SCK is low).
 | Fork | Why |
 |---|---|
 | `rvfi_testbench.sv` | 16-bit cycle counter (stock: 8 bits, saturating at 255); free `check` (unbounded style); pins and monitor events for the checkers; free reset length for the `reset` check. |
-| `bonetto_insn_check` | Stock semantics plus: halt equals the spec's trap; a trapping retirement is compared only on trap, halt, `rd_addr = 0` and `wmask = 0` (contract section 6); register fields of other retirements exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM. |
+| `bonetto_insn_check` | Checks a group of instructions (model `bonetto_insn_group`). Stock semantics plus: halt equals the spec's trap; a trapping retirement is compared only on trap, halt, `rd_addr = 0` and `wmask = 0` (contract section 6); register fields of other retirements exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM. |
 | `bonetto_reg_check` | Stock (reads return the last write) plus: a register not yet written reads the same value every time. |
 | `bonetto_pc_bwd_check` | Stock pc_bwd only fires when order N+1 retires before N, never true in order (unreachable). The fork checks the time-adjacent pair: order + 1 and pc chaining. |
 | `bonetto_unique_check` | Stock unique fails on any core with a free trig. The fork counts retirements per order. |
-| `bonetto_liveness_check` | Counter since the last retirement: the 1,024-cycle window must close with a retirement unless halted. Stock fires check right after trig in unbounded mode. |
+| `bonetto_liveness_check` | Edge counter since edge 0 or the last retirement (contract section 4 count, see "Liveness"): a retirement by edge 1,024 unless halted. Stock fires check right after trig in unbounded mode. |
 | `bonetto_ill_check` | 0x00000000 and 0xFFFFFFFF. Stock only covers 0x00000000. |
 | `bonetto_bus_checks.sv` | Byte shadow at a 16-bit pin address, misaligned and wrap aware; GPIO is not RAM. Stock shadows aligned words at 32-bit addresses and only on `mem_addr == addr`. |
 | new: `fence`, `ecall`, `ebreak` models, `silent`, `rvfi`, `spi`, `gpio`, `reset`, reach | See the property table. |
@@ -100,8 +110,8 @@ minutes with both in one run (stopped). SBY's cover mode would solve step by ste
 
 ## Properties and the contract clauses they encode
 
-Every assertion, by check (one SBY task each; `insn_<name>` is 40 tasks). Each check also has
-the triggers listed under "reach", which must be reached (see "Non-vacuity").
+Every assertion, by check. Each check also has the triggers listed under "reach", which must be
+reached (see "Non-vacuity").
 
 | Check | Assertions | Contract clause |
 |---|---|---|
@@ -112,7 +122,7 @@ the triggers listed under "reach", which must be reached (see "Non-vacuity").
 | | `insn_rs1_zero`, `insn_rs2_zero`, `insn_rs1_addr`, `insn_rs2_addr` (non-trapping) | 6: register fields report the index read, unused fields 0 with rdata 0; 4: x0 reads 0 |
 | | `insn_rd_addr`, `insn_rd_wdata`, `insn_pc_wdata` (non-trapping) | 4: RV32E semantics (riscv-formal's rv32i model, E filter), FENCE a no-op; 6: a write to x0 reports rd 0, wdata 0 |
 | | `insn_rmask`, `insn_wmask`, `insn_mem_addr`, store data per lane | 6: exact first-byte address, LSB-aligned masks, lane k = byte at mem_addr + k; 3/4: misaligned accesses never trap |
-| | reach: `reach_insn`; also `reach_insn_trap` for JAL, JALR, branches, ECALL, EBREAK | non-vacuity |
+| | reach: `reach_insn_<name>`; also `reach_insn_<name>_trap` for JAL, JALR, branches, ECALL, EBREAK | non-vacuity |
 | reg | `reg_rs1`, `reg_rs2`, `reg_rs1_rs2` | 4: reads return the last value written (every encoding); 1: registers start unknown but do not change by themselves |
 | pc_fwd | `pc_fwd` | 4: PCs chain (order N's pc_rdata = order N-1's pc_wdata) |
 | pc_bwd | `pc_bwd_order`, `pc_bwd_pc` | 6: one instruction per pulse, order counts retirements; 4: PCs chain |

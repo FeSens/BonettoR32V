@@ -947,9 +947,21 @@ def run_remote(args, host):
                     f"--out out/formal.json --jobs {jobs} --keep "
                     + " ".join(cfg_arg + [f"'{a}'" for a in fwd]))
             log(f"remote: {host}:{rdir} (jobs={jobs})")
-            # -tt: closing this ssh (Ctrl-C, kill) hangs up the remote run, which then
-            # stops its SBY tasks (SIGHUP handler).
-            rc = subprocess.run(ssh[:1] + ["-tt"] + ssh[1:] + [rcmd]).returncode
+            # -tt: closing this ssh hangs up the remote run, which then stops its SBY tasks
+            # (SIGHUP handler). On SIGTERM/SIGINT/SIGHUP here: close it, then clean up.
+            sshp = subprocess.Popen(ssh[:1] + ["-tt"] + ssh[1:] + [rcmd])
+
+            def _stop(*_):
+                raise KeyboardInterrupt
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, _stop)
+            try:
+                rc = sshp.wait()
+            except KeyboardInterrupt:
+                sshp.terminate()
+                sshp.wait()
+                log("remote: interrupted; the remote run was hung up")
+                return 130
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
             os.makedirs(local_logs, exist_ok=True)
             subprocess.run(["rsync", "-a", f"{host}:{rdir}/out/formal.json", args.out])
