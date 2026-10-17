@@ -206,7 +206,8 @@ def gate_cosim(ctx):
         raise GateFail(f"gate cosim: program build failed: {first_problem(lines)} "
                        f"(log {ctx.log_rel('cosim_programs')})")
     hexes = sorted(glob.glob(ctx.path("build", "programs", "*.hex")))
-    first = {"selftest": 0, "gpio_demo": 1}
+    # Fail fast: the short directed programs first, CoreMark (the longest run) last.
+    first = {"selftest": 0, "gpio_demo": 1, "coremark": 3}
     hexes.sort(key=lambda h: (first.get(os.path.basename(h)[:-4], 2), h))
     if not hexes:
         raise GateFail("gate cosim: no build/programs/*.hex after make -C verif/programs")
