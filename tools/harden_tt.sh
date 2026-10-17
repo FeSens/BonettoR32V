@@ -178,6 +178,11 @@ if [ "$(uname -s)" = Darwin ]; then
       break
     fi
   done
+elif [ -f "${BONETTO_LL_HOME:-$HOME/bonetto-librelane}/lib/libcairo.so.2" ]; then
+  # Linux host without a system libcairo (hwe-bench): tools/hwe_harden_setup.sh puts Ubuntu's
+  # libcairo2 and libpixman there (nothing else, so no other library is shadowed). It also
+  # installs the docker and lockf shims this script uses there (docs/physical.md).
+  export LD_LIBRARY_PATH="${BONETTO_LL_HOME:-$HOME/bonetto-librelane}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 # ---------------------------------------------------------------- setup (idempotent)
