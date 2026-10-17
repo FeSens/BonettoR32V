@@ -33,7 +33,9 @@
 //     is the value written.
 // All of it is checked at each compared retirement (not at or after the first
 // region-touching one, contract section 3), per byte X; X is free, so every byte is
-// covered.
+// covered. The fetch itself (bus_imem_pc, _fetch, _value) is also checked at the
+// region-touching retirement unless its fetch touched the region: its instruction word
+// decided the stop.
 
 `include "bonetto_macros.vh"
 
@@ -240,21 +242,24 @@ endmodule
 		.store_byte(store_byte) \
 	); \
 	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
+	// The fetch is checked at the stop retirement too, unless the fetch itself touched
+	// the region: its insn decided the stop.
+	wire fvalid = !reset && rvfi_valid && !bon_stopped && !bon_fetch_touch;
 
 module bonetto_bus_imem_check (
 	`BONETTO_CHECKER_PORTS
 );
 	`BONETTO_BUS_COMMON
 	always @* begin
-		if (valid && check) begin
-			// Exactly one fetch: a program READ of exactly the 4 instruction bytes.
+		if (fvalid && check) begin
+			// A fetch: a program READ of exactly the 4 instruction bytes, at the pc.
 			bus_imem_pc: assert (pc16 == rvfi_pc_rdata[15:0]);
 			bus_imem_fetch: assert (n_fetch != 2'd0);
-			if (fetch_hit) begin
-				bus_imem_value: assert (fetch_byte == mstart);
-				// A second fetch-shaped READ is only allowed as a load READ.
-				if (n_fetch[1]) bus_imem_refetch: assert (load_hit);
-			end
+			if (fetch_hit) bus_imem_value: assert (fetch_byte == mstart);
+		end
+		if (valid && check && fetch_hit && n_fetch[1]) begin
+			// Exactly one: a second fetch-shaped READ is only allowed as a load READ.
+			bus_imem_refetch: assert (load_hit);
 		end
 		if (!reset) `BONETTO_REACH(reach_bus_imem, valid && fetch_hit)
 	end

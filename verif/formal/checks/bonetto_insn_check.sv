@@ -16,8 +16,10 @@
 //     branch or JALR, whose operands decide the trap: rs1_addr / rs2_addr equal the
 //     spec's and x0 reads 0 (the reg check covers the values).
 //   - Up to the first region-touching retirement (contract section 3). At that
-//     retirement only mem_addr is compared, for a data access (its spec address
-//     decided the stop, so a core can't escape by misreporting it).
+//     retirement (unless its fetch touched the region) only what decided the stop and
+//     what reports the access is compared: rs1_addr (its value is the reg check's) and
+//     mem_addr, plus rmask / wmask unless the core trapped (section 3 lets a
+//     region-touching access trap and halt, and a trapping retirement reports wmask 0).
 //   - Register fields of a non-trapping retirement: rs1_addr / rs2_addr equal the
 //     spec's (unused fields report 0).
 //   - Memory masks are exact (LSB-aligned 1/3/15 for the access size, 0 otherwise);
@@ -78,9 +80,14 @@ module bonetto_insn_check (
 		if (!reset && check && !bon_stopped) begin
 			assume (spec_valid);
 		end
-		if (!reset && check && !bon_stopped && bon_region_ret) begin
-			if ((spec_mem_rmask || spec_mem_wmask) && !bon_fetch_touch)
+		if (!reset && check && !bon_stopped && bon_region_ret && !bon_fetch_touch) begin
+			insn_region_rs1_addr: assert (rvfi_rs1_addr == spec_rs1_addr);
+			if (spec_mem_rmask || spec_mem_wmask)
 				insn_region_mem_addr: assert (rvfi_mem_addr == spec_mem_addr);
+			if (!rvfi_trap) begin
+				insn_region_rmask: assert (rvfi_mem_rmask == spec_mem_rmask);
+				insn_region_wmask: assert (rvfi_mem_wmask == spec_mem_wmask);
+			end
 		end
 		if (!reset && check && `BONETTO_FULL) begin
 			insn_trap: assert (rvfi_trap == spec_trap);

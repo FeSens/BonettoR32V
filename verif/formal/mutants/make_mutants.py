@@ -119,6 +119,23 @@ MUTANTS = {
         [("                2'b01:   swap_n = {16'd0, x[7:0], x[15:8]};",
           "                2'b01:   swap_n = {16'd0, x[15:8], x[7:0]};")],
     ),
+    "claim_region_stop": (
+        "claims a region access to escape the checks",
+        ["insn_add"],
+        "On an OP instruction with rs1 == rs2 the result has bit 0 flipped (in the register "
+        "and in RVFI), and RVFI claims a 1-byte read at 0xFF80 (rmask 0001). The region stop "
+        "comes from the spec's address only (contract section 3), so the claim must not stop "
+        "the checks.",
+        [("                           is_load             ? load_val : alu_res;",
+          "                           is_load             ? load_val : "
+          "(alu_res ^ {31'd0, is_op & (rs1 == rs2)});"),
+         ("assign rvfi_mem_rmask = (r_mem & is_load) ? r_mask : 4'd0;",
+          "assign rvfi_mem_rmask = ((r_mem & is_load) ? r_mask : 4'd0) | "
+          "{3'd0, is_op & (rs1 == rs2)};"),
+         ("assign rvfi_mem_addr  = r_mem ? mem_addr : 32'd0;",
+          "assign rvfi_mem_addr  = (is_op & (rs1 == rs2)) ? 32'h0000ff80 : "
+          "(r_mem ? mem_addr : 32'd0);")],
+    ),
     "refetch": (
         "fetches every instruction twice",
         ["bus_imem"],

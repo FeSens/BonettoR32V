@@ -36,6 +36,7 @@ Steps:
 import argparse
 import configparser
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -869,6 +870,44 @@ def kill_running(*_):
     os._exit(130)
 
 
+# Memory per SBY task (bitwuzla plus yosys-smtbmc), linear in the depth: measured about
+# 1.4 GB at depth 348 (the seed) and 6.1 GB at depth 1,623 (V2, hyp/002 b9a5211) for
+# bitwuzla, plus about 0.4 GB for smtbmc. A run uses at most budget / per-task jobs, so
+# it cannot push a shared host into swap.
+GB_BASE = 0.4
+GB_PER_STEP = 0.0037
+
+
+def mem_budget_gb():
+    """Memory the run may use: $BONETTO_FORMAL_MEM_GB if set; on Linux 85 % of what is
+    available now (MemAvailable: other users' jobs count); on macOS half the RAM (the Mac
+    is shared with other agents)."""
+    env = os.environ.get("BONETTO_FORMAL_MEM_GB")
+    if env:
+        return float(env)
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1e6 * 0.85
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                             text=True).stdout
+        return int(out) / 1e9 * 0.5
+    except (OSError, ValueError):
+        return 16.0
+
+
+def mem_jobs(depth, jobs, budget=None):
+    """(jobs, GB per task, budget GB): at most `jobs`, at least 1, and no more than the
+    memory budget holds at this depth."""
+    per = GB_BASE + GB_PER_STEP * depth
+    budget = mem_budget_gb() if budget is None else budget
+    return max(1, min(jobs, int(budget // per))), per, budget
+
+
 # Relative cost of each task (measured on the seed, see docs/formal.md), for ordering.
 TASK_COST = {"liveness": 900, "bus_dmem": 500, "reg": 450, "insn_group": 300, "reset": 300,
              "bus_imem": 180, "gpio": 100, "rvfi": 90, "pc_bwd": 80, "pc_fwd": 70,
@@ -943,7 +982,7 @@ def aggregate(units, results):
       FAIL, whatever the reach task did (SKIPPED included).
     - A check whose proof was not run (fail-fast), or passed with its reach task not
       run, is SKIPPED, unless its finished reach task shows a missing trigger
-      (UNREACHED).
+      (UNREACHED) or timed out or errored (FAIL).
     - In a group, a counterexample belongs to the instruction it retires; the other
       members are FAIL "not proven" (with the group's trace and timings)."""
     checks, runtimes, failures, reached, skipped = {}, {}, {}, {}, []
@@ -960,6 +999,14 @@ def aggregate(units, results):
                     checks[cname] = "UNREACHED"
                     failures[cname] = {"proof": pres[1], "reach": rres[1], "reached": got,
                                        "unreached": [l for l in labels if l not in got],
+                                       "proof_s": round(pres[2], 1),
+                                       "reach_s": round(rres[2], 1)}
+                elif rres[1] not in ("PASS", "FAIL", "SKIPPED"):
+                    # The reach task timed out or errored: not a skip.
+                    checks[cname] = "FAIL"
+                    failures[cname] = {"proof": pres[1], "reach": rres[1],
+                                       "why": f"reach task {rres[1]}",
+                                       "errors": rres[3].get("errors", []),
                                        "proof_s": round(pres[2], 1),
                                        "reach_s": round(rres[2], 1)}
                 else:
@@ -1052,16 +1099,21 @@ def _node():
     return os.uname().nodename.split('.')[0]
 
 
-def remote_orphans(ssh, node):
-    """[(run dir name, state)] for this machine's run dirs on the host whose local runner
-    is gone. state: "running" (the detached remote run is still alive), "done" (it
+# This checkout (worktrees on one machine share its hostname and pid space): run ids
+# carry it, so a runner only ever reaps its own checkout's orphans.
+CHECKOUT_TAG = hashlib.sha1(ROOT.encode()).hexdigest()[:6]
+
+
+def remote_orphans(ssh, node, tag=None):
+    """[(run dir name, state)] for this checkout's run dirs on the host whose local
+    runner is gone. state: "running" (the detached remote run is still alive), "done" (it
     finished: `done` holds its exit code, out/formal.json its result) or "dead" (killed,
     or never started)."""
     p = subprocess.run(ssh + [f"ls -1 {shlex.quote(REMOTE_BASE)} 2>/dev/null"],
                        capture_output=True, text=True)
     cands = []
     for d in p.stdout.split():
-        m = re.fullmatch(rf"run-{re.escape(node)}-(\d+)-\d+", d)
+        m = re.fullmatch(rf"run-{re.escape(node)}-{tag or CHECKOUT_TAG}-(\d+)-\d+", d)
         if not m:
             continue
         try:
@@ -1086,13 +1138,14 @@ def remote_orphans(ssh, node):
     return [tuple(l.split()) for l in p.stdout.splitlines() if len(l.split()) == 2]
 
 
-def reap_remote(ssh, host, node, dest):
-    """Earlier remote runs of this machine whose local runner died: a finished one's
-    formal.json and task logs are fetched into <dest>/orphan-<run id>/ and its dir is
-    deleted; a dead one's dir is deleted; a running one is left alone (it holds the
-    host's lock until it finishes). Returns the fetched formal.json paths."""
+def reap_remote(ssh, host, node, dest, tag=None):
+    """Earlier remote runs of this checkout whose local runner died: a finished one's
+    formal.json and task logs are fetched into <dest>/orphan-<run id>/, and its dir is
+    deleted once that worked; a dead one's dir is deleted; a running one is left alone
+    (it holds the host's lock until it finishes). Returns the fetched formal.json
+    paths."""
     fetched = []
-    for d, state in remote_orphans(ssh, node):
+    for d, state in remote_orphans(ssh, node, tag):
         rdir = f"{REMOTE_BASE}/{d}"
         if state == "running":
             log(f"remote: orphan {host}:{rdir} is still running (its runner here is gone); "
@@ -1100,10 +1153,12 @@ def reap_remote(ssh, host, node, dest):
             continue
         if state == "done":
             out = os.path.join(dest, f"orphan-{d}", "formal.json")
-            if fetch_remote(host, rdir, out, os.path.dirname(out)):
-                fetched.append(out)
-                log(f"remote: fetched the result of orphan {host}:{rdir} -> "
-                    f"{os.path.relpath(out, ROOT)}")
+            if not fetch_remote(host, rdir, out, os.path.dirname(out)):
+                log(f"remote: could not fetch the result of orphan {host}:{rdir}; left there")
+                continue
+            fetched.append(out)
+            log(f"remote: fetched the result of orphan {host}:{rdir} -> "
+                f"{os.path.relpath(out, ROOT)}")
         subprocess.run(ssh + [f"rm -rf {shlex.quote(rdir)}"])
     return fetched
 
@@ -1141,7 +1196,7 @@ def fetch_remote(host, rdir, out, local_logs):
 
 def _run_remote(args, host, tempfile):
     reap_stale(os.path.join(ROOT, "build", "formal"))
-    run_id = f"run-{_node()}-{os.getpid()}-{int(time.time())}"
+    run_id = f"run-{_node()}-{CHECKOUT_TAG}-{os.getpid()}-{int(time.time())}"
     rdir = f"{REMOTE_BASE}/{run_id}"
     qd = shlex.quote(rdir)
     local_logs = os.path.join(ROOT, "build", "formal", f"remote-{run_id}")
@@ -1247,9 +1302,10 @@ def _run_remote(args, host, tempfile):
             return rc
         finally:
             if launched and not finished:
-                # Interrupted here: stop the remote run (its runner stops its SBY tasks
-                # on SIGTERM), wait for it, then remove the dir.
-                subprocess.run(ssh + [f"cd {qd} && p=$(cat remote.pid 2>/dev/null) && "
+                # Interrupted here: stop the remote run unless it already finished (its
+                # pid may be reused then; its runner stops its SBY tasks on SIGTERM), wait
+                # for it, then remove the dir.
+                subprocess.run(ssh + [f"cd {qd} && [ ! -f done ] && p=$(cat remote.pid 2>/dev/null) && "
                                       f"kill -TERM -- -$p 2>/dev/null; n=0; while kill -0 $p "
                                       f"2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n+1)); "
                                       f"done; true"])
@@ -1438,6 +1494,13 @@ def main():
     reaches = [t for t in jobs_todo if t[0].endswith("_reach")]
     jobs_todo = [t for pair in zip(proofs, reaches) for t in pair] + \
         proofs[len(reaches):] + reaches[len(proofs):]
+    # Memory: as many tasks as the host's memory holds at the deepest task's depth.
+    max_tdepth = max(task_depths.values()) if task_depths else deepest
+    jobs, per_gb, budget_gb = mem_jobs(max_tdepth, jobs)
+    result["jobs"] = {"used": jobs, "gb_per_task": round(per_gb, 1),
+                      "budget_gb": round(budget_gb, 1), "max_task_depth": max_tdepth}
+    log(f"jobs={jobs}: about {per_gb:.1f} GB per task at depth {max_tdepth}, memory budget "
+        f"{budget_gb:.1f} GB")
     log(f"running {len(jobs_todo)} SBY task(s) for {sum(len(r) for _, r in units)} check(s), "
         f"jobs={jobs}, base depth <= {deepest}" + ("" if args.keep_going else ", stop at the first FAIL"))
     unit_req = {}

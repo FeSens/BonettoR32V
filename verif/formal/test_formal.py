@@ -128,6 +128,17 @@ def test_check_verdicts():
     assert run_formal.insn_reach("add") == ["reach_insn_add"]
 
 
+def test_mem_jobs(monkeypatch):
+    """Jobs are capped by memory at the deepest task's depth: the seed (348) fits 18 jobs
+    in 50 GB, V2 (1,623, about 6.4 GB per task) only 7, the Mac's 16 GB 2; at least 1."""
+    assert run_formal.mem_jobs(348, 18, budget=50.0)[0] == 18
+    assert run_formal.mem_jobs(1623, 18, budget=50.0)[0] == 7
+    assert run_formal.mem_jobs(1623, 8, budget=16.0)[0] == 2
+    assert run_formal.mem_jobs(5000, 8, budget=4.0)[0] == 1
+    monkeypatch.setenv("BONETTO_FORMAL_MEM_GB", "13")
+    assert run_formal.mem_budget_gb() == 13.0
+
+
 def test_task_line():
     """Progress lines: a reach task whose SBY status is FAIL with every required label is
     REACHED (the reach labels are assert(!trigger)); a missing label, or a reach task that
@@ -186,7 +197,7 @@ def test_aggregate_group_failure(tmp_path):
 def test_aggregate_skipped():
     """Fail-fast: a proof that FAILed stays FAIL even if its reach task was skipped; a
     check whose proof did not run is SKIPPED, or UNREACHED if its finished reach task
-    misses a trigger."""
+    misses a trigger, or FAIL if its reach task timed out or errored."""
     det = lambda *l: {"failed": list(l), "traces": {}, "errors": []}
     res = {
         "spi": ("spi", "FAIL", 9.0, det("spi_rule2")),
@@ -197,46 +208,56 @@ def test_aggregate_skipped():
         "reg_reach": ("reg_reach", "SKIPPED", 0.0, det()),
         "ill": ("ill", "SKIPPED", 0.0, det()),
         "ill_reach": ("ill_reach", "PASS", 5.0, det("reach_ill_zero")),
+        "rvfi": ("rvfi", "SKIPPED", 0.0, det()),
+        "rvfi_reach": ("rvfi_reach", "TIMEOUT", 99.0, det()),
     }
     units = [("spi", [("spi", ["reach_spi_end_read"])]),
              ("gpio", [("gpio", ["reach_gpio_load", "reach_gpio_store"])]),
              ("reg", [("reg", ["reach_reg"])]),
-             ("ill", [("ill", ["reach_ill_zero", "reach_ill_ones"])])]
+             ("ill", [("ill", ["reach_ill_zero", "reach_ill_ones"])]),
+             ("rvfi", [("rvfi", ["reach_rvfi"])])]
     checks, _, failures, _, skipped = run_formal.aggregate(units, res)
-    assert checks == {"spi": "FAIL", "gpio": "SKIPPED", "reg": "SKIPPED", "ill": "UNREACHED"}
+    assert checks == {"spi": "FAIL", "gpio": "SKIPPED", "reg": "SKIPPED", "ill": "UNREACHED",
+                      "rvfi": "FAIL"}
+    assert failures["rvfi"]["why"] == "reach task TIMEOUT"
     assert failures["spi"]["assertions"] == ["spi_rule2"]
     assert failures["ill"]["unreached"] == ["reach_ill_ones"]
     assert sorted(skipped) == ["gpio", "reg"]
 
 
 def test_reap_remote_orphans(tmp_path, monkeypatch):
-    """Orphaned remote runs (this machine's run dirs whose local runner is dead): a
-    finished one's result is fetched and its dir deleted, a dead one's dir is deleted, a
-    running one stays. A live runner's dirs and other machines' dirs are never touched.
+    """Orphaned remote runs (this checkout's run dirs whose local runner is dead): a
+    finished one's result is fetched and its dir deleted (kept if the fetch fails), a
+    dead one's dir is deleted, a running one stays. A live runner's dirs, another
+    checkout's dirs on the same machine and other machines' dirs are never touched.
     The 'ssh' here runs the commands locally."""
     dead = subprocess.Popen(["true"])
     dead.wait()
     base = tmp_path / "remote"
-    done, gone, running = (f"run-mac-{dead.pid}-{i}" for i in (1, 4, 5))
-    keep = [f"run-mac-{os.getpid()}-2", f"run-other-{dead.pid}-3", "formal.lock", running]
+    done, gone, running, nofetch = (f"run-mac-abc123-{dead.pid}-{i}" for i in (1, 4, 5, 6))
+    keep = [f"run-mac-abc123-{os.getpid()}-2", f"run-other-abc123-{dead.pid}-3",
+            f"run-mac-def456-{dead.pid}-7", "formal.lock", running, nofetch]
     for n in [done, gone] + keep:
         (base / n).mkdir(parents=True)
-    (base / done / "done").write_text("0\n")
+    for n in (done, nofetch):
+        (base / n / "done").write_text("0\n")
     (base / running / "remote.pid").write_text(f"{os.getpid()}\n")
     monkeypatch.setattr(run_formal, "REMOTE_BASE", str(base))
     ssh = ["sh", "-c"]
-    assert sorted(run_formal.remote_orphans(ssh, "mac")) == sorted(
-        [(done, "done"), (gone, "dead"), (running, "running")])
+    assert sorted(run_formal.remote_orphans(ssh, "mac", "abc123")) == sorted(
+        [(done, "done"), (gone, "dead"), (running, "running"), (nofetch, "done")])
     calls = []
 
     def fake_fetch(host, rdir, out, logs):
         calls.append(rdir)
+        if rdir.endswith(nofetch):
+            return False
         os.makedirs(os.path.dirname(out), exist_ok=True)
         open(out, "w").write("{}")
         return True
     monkeypatch.setattr(run_formal, "fetch_remote", fake_fetch)
-    got = run_formal.reap_remote(ssh, "host", "mac", str(tmp_path / "local"))
-    assert calls == [f"{base}/{done}"]
+    got = run_formal.reap_remote(ssh, "host", "mac", str(tmp_path / "local"), "abc123")
+    assert sorted(calls) == sorted([f"{base}/{done}", f"{base}/{nofetch}"])
     assert got == [str(tmp_path / "local" / f"orphan-{done}" / "formal.json")]
     assert sorted(os.listdir(base)) == sorted(keep)
 

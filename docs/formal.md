@@ -2,12 +2,13 @@
 
 `verif/formal` proves the contract (`docs/contract.md`, sections 2-4 and 6) on the real Tiny
 Tapeout top module, `tt_um_fesens_r32v`, at its pins. It is a fixed gate: hypothesis agents never
-edit it, and every candidate core in the area loop must pass it.
+edit it. It runs at the final sign-off and at every 10th merged improvement of the area loop
+(the user's policy), not per candidate.
 
 ```
-lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py          # fast: per candidate
-lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py --deep   # deep: champions
-BONETTO_FORMAL_HOST=hwe-bench python3 verif/formal/run_formal.py [--deep]    # same, on hwe-bench
+BONETTO_FORMAL_HOST=hwe-bench python3 verif/formal/run_formal.py [--deep]    # on hwe-bench (use this)
+BONETTO_FORMAL_HOST=hwe-bench python3 verif/formal/run_formal.py --fetch-orphans   # after a crash
+lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py [--deep] # on the Mac (seed-sized only)
 pytest verif/formal/test_formal.py -v                                        # the gate's own tests
 ```
 
@@ -100,30 +101,34 @@ waveform rules apply after it. `wrapper.sv` computes, at each retirement:
 
 - `bon_fetch_touch`: the fetch touches the region, `pc_rdata[15:0] >= 0xFF7D` (one of
   `pc[15:0] + k`, k < 4, is a region byte);
-- the data access touches the region, from the specification's address (contract ruling: the
-  spec-model address, so a core cannot dodge the stop by misreporting `mem_addr`). For a load or
-  store, `addr = rs1_rdata + imm` (`rs1 = x0` reads 0), with `n` bytes; it touches the region
-  iff `addr[31] = 0` and `addr[15:0] >= 0xFF80 - (n - 1)`. That covers an access inside the
-  region, one that straddles 0xFF7F/0xFF80, one that wraps at 64 KB (touching 0xFFFD-0xFFFF),
-  and one that crosses 0x7FFFFFFF into `addr[31] = 1` (its first bytes are 0xFFFD-0xFFFF of the
-  RAM). The claimed access (`rvfi_mem_*`, non-trapping) is OR'ed in, so a core whose claim
-  touches the region also stops;
+- the data access touches the region, from the specification's address only, never from
+  what the core claims (`rvfi_mem_*`), so a core can neither dodge the stop nor trigger it by
+  misreporting. For an RV32E load or store, `addr = rs1_rdata + imm` (`rs1 = x0` reads 0), with
+  `n` bytes; it touches the region iff `addr[31] = 0` and `addr[15:0] >= 0xFF80 - (n - 1)`.
+  That covers an access inside the region, one that straddles 0xFF7F/0xFF80, one that wraps at
+  64 KB (touching 0xFFFD-0xFFFF), and one that crosses 0x7FFFFFFF into `addr[31] = 1` (its first
+  bytes are 0xFFFD-0xFFFF of the RAM). A reserved encoding (a used register field x16-x31) has
+  no spec address and never stops the checks: its `rs1_rdata` is unconstrained, so it must not
+  pick the stop;
 - `bon_region_ret`: either, at this retirement; `bon_stopped`: a region retirement has happened
   before this step. `BONETTO_FULL` = neither.
 
-At a region retirement only two things are still compared: `insn_region_mem_addr` (the claimed
-`mem_addr` equals the spec's, unless the fetch itself touched the region), and the register reads
-in `reg` that happened before the touch (rs1, which the address came from, unless the fetch
-touched the region). Every other instruction, bus, gpio, causal, rvfi, ill and silent assertion
-is gated by `BONETTO_FULL`, and reg, pc_fwd, pc_bwd and unique by `!bon_stopped`. `spi` (minus
-`spi_cs_at_valid`, which is a retirement rule) and liveness never stop. Like the full checks,
-`insn_region_mem_addr` applies to the group's own instructions (`spec_valid`), so reserved
-encodings are not compared there either.
+Everything that decides the stop is itself checked at the region retirement (unless the fetch
+touched the region): the instruction word (`bus_imem_pc`, `bus_imem_fetch`, `bus_imem_value`:
+the fetched bytes), `rs1_addr` (`insn_region_rs1_addr`), and the `rs1` value (`reg`). Also
+compared there: `insn_region_mem_addr`, and `insn_region_rmask` / `insn_region_wmask` unless the
+core trapped (contract section 3 lets a region-touching access trap and halt, and a trapping
+retirement reports `wmask = 0`), plus rvfi's first-pc and order rules, pc_fwd, pc_bwd and
+unique. Every other instruction, bus, gpio, causal, rvfi, ill and silent assertion is gated by
+`BONETTO_FULL`, and reg, pc_fwd, pc_bwd and unique by `!bon_stopped`. `spi` (minus
+`spi_cs_at_valid`, which is a retirement rule) and liveness never stop. The `insn_region_*`
+assertions apply to the group's own instructions (`spec_valid`), like the full checks.
 
 The stop only removes traces from the comparison after a region-touching instruction. Formal
 picks the instruction stream, so every program that never touches the region (as every test
-program, contract section 3) is still checked in full: the touch is the trace's choice, not the
-core's.
+program, contract section 3) is still checked in full: the touch is the trace's choice, and the
+core cannot fake one. (An earlier version also stopped on a claimed region access; the mutant
+`claim_region_stop`, an ADD with a wrong result that claims a read at 0xFF80, passed it.)
 
 ### The bus checks (transaction identity)
 
@@ -218,7 +223,7 @@ reached (see "Non-vacuity").
 | `insn_<name>` | `insn_trap`, `insn_halt` (trap and halt equal the spec's trap) | 4: fatal traps (ECALL, EBREAK, misaligned jump/branch target), trap = halt; nothing else traps |
 | | `insn_trap_rd_addr`, `insn_trap_wmask` (on a spec trap) | 4: no register write and no memory write; 6: only these are compared on a trapping retirement |
 | | `insn_trap_rs1_zero`, `insn_trap_rs2_zero`, `insn_trap_rs1_addr`, `insn_trap_rs2_addr` (trapping branch or JALR) | 6: there the trap depends on the operands, so the rs fields are truthful |
-| | `insn_region_mem_addr` (at the region retirement, unless the fetch touched the region) | 3: the stop uses the spec's address; the claimed `mem_addr` must still be right |
+| | `insn_region_rs1_addr`, `insn_region_mem_addr`, `insn_region_rmask`, `insn_region_wmask` (at the region retirement, unless the fetch touched the region; the masks only if it did not trap) | 3: the stop uses the spec's address, so what decides it and what reports the access must be right |
 | | `insn_rs1_zero`, `insn_rs2_zero`, `insn_rs1_addr`, `insn_rs2_addr` (non-trapping) | 6: register fields report the index read, unused fields 0 with rdata 0; 4: x0 reads 0 |
 | | `insn_rd_addr`, `insn_rd_wdata`, `insn_pc_wdata` (non-trapping) | 4: RV32E semantics (riscv-formal's rv32i model, E filter), FENCE a no-op; 6: a write to x0 reports rd 0, wdata 0 |
 | | `insn_rmask`, `insn_wmask`, `insn_mem_addr`, store data per lane | 6: exact first-byte address, LSB-aligned masks, lane k = byte at mem_addr + k; 3/4: misaligned accesses never trap |
@@ -235,13 +240,13 @@ reached (see "Non-vacuity").
 | ill | `ill_trap`, `ill_halt`, `ill_rd_addr`, `ill_wmask` for `0x00000000` and `0xFFFFFFFF` | 4: fatal traps |
 | silent | `silent_retire`, `silent_write`, `silent_uo` (after a halting retirement) | 4: never retires again, never starts another SPI WRITE (a region WRITE included); 3: uo_out changes only on an IO store |
 | liveness (deep only) | `liveness` (first retirement by edge 1,024, then at most 1,024 edges apart, unless halted; see "Liveness") | 4: latency cap |
-| bus_imem | `bus_imem_pc`, `bus_imem_fetch`, `bus_imem_refetch`, `bus_imem_value` | 6: exactly one fetch, a READ of exactly the 4 instruction bytes, before retirement, no caching; 3: fetch reads RAM at pc[15:0] (64 KB alias); 2: memory semantics |
+| bus_imem | `bus_imem_pc`, `bus_imem_fetch`, `bus_imem_value` (also at the region retirement unless its fetch touched the region), `bus_imem_refetch` | 6: exactly one fetch, a READ of exactly the 4 instruction bytes, before retirement, no caching; 3: fetch reads RAM at pc[15:0] (64 KB alias); 2: memory semantics |
 | bus_dmem | `bus_dmem_load_read`, `bus_dmem_load_value` (non-trapping) | 6: load completeness, the fetch never counts; 3: RAM bytes (addr[15:0] + k) mod 2^16, misaligned and wrapping |
 | | `bus_dmem_store_once`, `bus_dmem_store_value` | 3: store bytes; 2 rule 5: every byte sent is written; 6: each store byte exactly once, traffic finishes before retirement |
 | | `bus_dmem_write_claimed`, `bus_dmem_read_claimed` | 6: program transactions are the fetch, the load's READs and the store's WRITEs, nothing else (no program write on a trap); 3: an IO access never appears on the pins |
 | | `bus_region_mixed` | 6: a transaction is region, program or a null READ; a partial last byte counts as addressed |
 | gpio | IO load lanes (unnamed, one per byte lane) | 3: byte X with X[1:0] = 0 reads `ui_in`, other IO bytes read 0 (misaligned multi-byte IO unspecified) |
-| | `gpio_uo_hold`, `gpio_uo_once`, `gpio_uo_cause`, `gpio_uo_value` | 3: uo_out changes only from an IO store writing byte 0, at most once per instruction (it may move early, within the store's own window), holds the new value no later than one cycle after it retires; 1: 0 after reset. Not compared from a misaligned IO store on (unspecified, its own retirement included) |
+| | `gpio_uo_hold`, `gpio_uo_once`, `gpio_uo_cause`, `gpio_uo_value` | 3: uo_out changes only from an IO store writing byte 0, at most once per instruction (it may move early, within the store's own window), holds the new value no later than one cycle after it retires; 1: 0 after reset. Not compared from a misaligned IO load or store on (unspecified, its own retirement included) |
 | spi | `spi_uio_oe`, `spi_uio_out_hi`, `spi_uio_out_2` | 1: uio_oe constant, unused outputs 0 |
 | | `spi_reset_cs`, `spi_reset_sck`, `spi_reset_uo`, `spi_reset_valid` | 1: reset state of the pins; nothing retires in reset |
 | | `spi_rule1_prev`, `spi_rule1_now`, `spi_rule2` | 2: rules 1 and 2 |
@@ -336,25 +341,41 @@ first few instructions fails, because its window closes within the depth. An unb
 
 ## Fast and deep
 
-| | fast (`checks.cfg`, every candidate) | deep (`checks-deep.cfg`, champions) |
+| | fast (`checks.cfg`) | deep (`checks-deep.cfg`) |
 |---|---|---|
 | checks | every check except liveness | every check, liveness included |
 | depth | short depth, per class group | full depth D; liveness D + 1,024 |
 | instruction tasks | 9 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
-| task timeout | 21,600 s (V2-class cores, see "Measured runtimes") | 21,600 s |
+| task timeout | 21,600 s, provisional (see "Measured runtimes") | 21,600 s |
 | depth cap | 2,048 | 4,096 |
+| jobs | at most 8 on the Mac, `BONETTO_FORMAL_REMOTE_JOBS` (18) on a remote host, and never more than memory holds (below) | same |
+
+Project policy (the user's): formal runs at the final sign-off and at every 10th merged
+improvement, not per candidate.
+
+**Memory and jobs.** Each SBY task (bitwuzla plus yosys-smtbmc) needs about
+0.4 GB + 3.7 MB per step of its depth: measured about 1.4 GB of bitwuzla at depth 348 (the
+seed) and 6.1 GB at depth 1,623 (V2). The runner caps the job count at the memory budget
+divided by that need at the deepest task's depth (`mem_jobs`; `formal.json` records `jobs`).
+The budget is `$BONETTO_FORMAL_MEM_GB` if set, else 85 % of `MemAvailable` on Linux (so other
+users' jobs on a shared host count), else half the RAM on macOS (the Mac is shared with other
+agents). On hwe-bench with about 55 GB available that is 18 jobs for the seed but 7 for V2; on
+the Mac 8 for the seed and 2 for V2. Before this cap, 10 V2 jobs pushed hwe-bench 11 GB into
+swap.
 
 Fast keeps every instruction check and every bus, SPI, GPIO and RVFI-consistency check. It does
 not cover:
 
-1. **Liveness** (the 1,024-edge retirement cap, invariant 8). The cosim watchdog covers it on
-   every candidate. Formal checks it in deep.
+1. **Liveness** (the 1,024-edge retirement cap, invariant 8). The lead ruled that fast needs no
+   liveness; deep checks it. Outside formal, cosim covers it two ways: its watchdog on the test
+   programs (which contain no reserved encodings and no region accesses), and its random-image
+   liveness fuzz (`run_cosim.py --fuzz-liveness`, in the eval cosim gate), which is what catches
+   a hang on a reserved encoding or an unspecified access per candidate. The fuzz is
+   probabilistic (random images), not a proof.
 2. **Retirements after step d_short.** That is the second retirement when the first one was
    slow (on the seed, a load or store first, then a load or store), and every third or later
    retirement. Deep adds the slow-then-slow pair. Neither config covers a third retirement of
    the slowest class.
-3. **Liveness on any candidate.** The lead ruled that formal fast needs no liveness (cosim's
-   1,024-cycle watchdog covers it on every candidate); deep keeps it.
 
 **Ruling R9 (the lead's).** The fast depth policy is accepted as it stands. It is below the
 original brief's floor of 2 x max_cpi: an instruction group runs at reset + first + the slowest
@@ -540,7 +561,9 @@ A failing BMC proof stops at its counterexample, so a long proof that fails stil
 the gate on another machine. The verdict is the same on any host:
 
 1. The pre-pass and the timing run locally, where the cosim lives.
-2. Exactly the inputs are copied (rsync) into a fresh `~/bonetto-formal/run-<host>-<pid>-<time>`:
+2. Exactly the inputs are copied (rsync) into a fresh
+   `~/bonetto-formal/run-<machine>-<checkout tag>-<pid>-<time>` (the tag is a hash of the
+   checkout's path: worktrees on one machine share its name and pid space):
    the candidate's `src`, `verif/formal` (without the mutants), riscv-formal's `rvfi_macros.vh`
    and instruction models, and the timing JSON.
 3. The remote run holds the host's own lock (`flock ~/bonetto-formal/formal.lock`), not the Mac's
@@ -553,8 +576,8 @@ the gate on another machine. The verdict is the same on any host:
    `build/formal/remote-<run id>/`, and the remote run dir is deleted. During a run, each task's
    model files and each reach task's traces are deleted as soon as the task finishes.
 
-SIGTERM, SIGINT or SIGHUP on the local runner stops the remote run (SIGTERM to its process group;
-its runner stops every SBY task) and deletes its dir. Any other exception in a runner stops every
+SIGTERM, SIGINT or SIGHUP on the local runner stops the remote run (SIGTERM to its process group,
+unless it has already written `done`; its runner stops every SBY task) and deletes its dir. Any other exception in a runner stops every
 SBY task before it exits.
 
 **Orphans.** A local runner that dies without cleaning up (the Mac crashes or runs out of
@@ -564,16 +587,17 @@ hung up whenever sshd noticed the dead connection, possibly hours later, and its
 was lost: that is what happened to the first 7-job V2 run below.) Recovery:
 
 - `run_formal.py --host <host> --fetch-orphans` fetches the result of every finished orphan of
-  this machine (run dirs `run-<this machine>-<pid>-<time>` whose local pid is gone) into
-  `build/formal/orphan-<run id>/formal.json` with its logs, deletes those dirs and dirs of dead
-  orphans, and lists the orphans still running (left alone);
+  this checkout (its run dirs whose local pid is gone) into
+  `build/formal/orphan-<run id>/formal.json` with its logs, deletes a finished orphan's dir only
+  once that fetch worked, deletes the dirs of dead orphans, and lists the orphans still running
+  (left alone);
 - every remote run does the same first (`reap_remote`), so orphans never pile up on the host's
   shared disk;
 - each run also deletes the local work dirs and `build/formal/remote-*` logs of dead runs
   (`reap_stale`).
 
 `test_formal.py::test_reap_remote_orphans` checks the classification (finished, dead, running,
-live runner, other machine); the SIGKILL, `--fetch-orphans` and SIGTERM paths were exercised on
+live runner, another checkout, another machine, a failed fetch); the SIGKILL, `--fetch-orphans` and SIGTERM paths were exercised on
 hwe-bench. `BONETTO_FORMAL_REMOTE_DIR` changes the remote base dir (and so the lock). With the
 host set, `test_formal.py` sends every formal run there and skips the local heavy lock.
 

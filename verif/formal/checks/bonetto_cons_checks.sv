@@ -7,7 +7,8 @@
 // encodings included (contract section 4: the RVFI trace stays consistent), up to
 // the first region-touching retirement (contract section 3: bon_region_ret, then
 // bon_stopped). At that retirement only the fields that decide the stop are checked:
-// its pc_rdata (pc_fwd, pc_bwd, order) and, for a data access, its rs1 read (reg).
+// its pc_rdata and order (pc_fwd, pc_bwd, unique, rvfi's first-pc and order rules) and,
+// for a data access, its rs1 read (reg). bus_imem checks its instruction word.
 
 `include "bonetto_macros.vh"
 
@@ -276,6 +277,8 @@ module bonetto_rvfi_check (
 	reg seen;
 	reg [63:0] last_order;
 	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
+	// The order and first-pc rules hold at the stop retirement too (it may be the first).
+	wire live = !reset && rvfi_valid && !bon_stopped;
 
 	function mask_ok(input [3:0] m);
 		mask_ok = m == 4'b0000 || m == 4'b0001 || m == 4'b0011 || m == 4'b1111;
@@ -284,7 +287,7 @@ module bonetto_rvfi_check (
 	always @(posedge clock) begin
 		if (reset) begin
 			seen <= 1'b0;
-		end else if (valid) begin
+		end else if (live) begin
 			seen <= 1'b1;
 			last_order <= rvfi_order;
 		end
@@ -314,6 +317,8 @@ module bonetto_rvfi_check (
 				conv_trap_wmask: assert (rvfi_mem_wmask == 0);
 			end
 			conv_wmask: assert (mask_ok(rvfi_mem_wmask));
+		end
+		if (live && check) begin
 			// rvfi_order counts retirements from 0; execution starts at pc = 0.
 			if (!seen) begin
 				conv_first_order: assert (rvfi_order == 64'd0);

@@ -144,12 +144,15 @@ module rvfi_wrapper (
 			rmem[ev_byte_addr[6:0]] <= ev_byte_data;
 	end
 
-	// Region-touching retirements (contract section 3), from the spec-model address.
-	// Fetch: bytes pc16 + k, k < 4, reach 0xFF80 (or wrap through 0xFFFF) iff
-	// pc16 >= 0xFF7D. Data: an RV32I load/store at rs1 + imm (rs1 = x0 reads 0), RAM
-	// (addr[31] = 0), n bytes touch the region iff addr16 >= 0xFF80 - (n - 1). Any RAM
-	// access the retirement claims (rvfi_mem_*) counts too: a reserved encoding has no
-	// spec address, and a spec instruction's mem_addr is compared by the insn check.
+	// Region-touching retirements (contract section 3), from the spec-model address
+	// only, never from what the core claims (rvfi_mem_*), so a core cannot stop the
+	// checks by misreporting. Fetch: bytes pc16 + k, k < 4, reach 0xFF80 (or wrap
+	// through 0xFFFF) iff pc16 >= 0xFF7D. Data: an RV32E load/store at rs1 + imm (rs1 = x0
+	// reads 0), RAM (addr[31] = 0), n bytes touch the region iff
+	// addr16 >= 0xFF80 - (n - 1). Its inputs are checked at that retirement: rvfi_insn
+	// by bus_imem (the fetched bytes), rs1_addr by the insn check, rs1_rdata by reg. A
+	// reserved encoding (a used register field x16-x31) has no spec address and never
+	// stops the checks (its rs1_rdata is unconstrained).
 	wire [6:0] r_op = rvfi_insn[6:0];
 	wire [2:0] r_f3 = rvfi_insn[14:12];
 	wire r_ld = r_op == 7'b0000011 && (r_f3 == 3'd0 || r_f3 == 3'd1 || r_f3 == 3'd2 ||
@@ -160,14 +163,12 @@ module rvfi_wrapper (
 	wire [31:0] r_imm = r_st ? {{20{rvfi_insn[31]}}, rvfi_insn[31:25], rvfi_insn[11:7]}
 	                         : {{20{rvfi_insn[31]}}, rvfi_insn[31:20]};
 	wire [31:0] r_addr = r_rs1 + r_imm;
-	wire spec_touch = (r_ld || r_st) && !r_addr[31] && r_addr[15:0] >= 16'hff80 - r_nm1;
-	wire [3:0] c_mask = rvfi_mem_rmask | rvfi_mem_wmask;
-	wire [15:0] c_nm1 = (c_mask == 4'b0001) ? 16'd0 : (c_mask == 4'b0011) ? 16'd1 : 16'd3;
-	wire claim_touch = !rvfi_trap && c_mask != 4'b0 && !rvfi_mem_addr[31] &&
-	                   rvfi_mem_addr[15:0] >= 16'hff80 - c_nm1;
+	wire r_e = !rvfi_insn[19] && (r_ld ? !rvfi_insn[11] : !rvfi_insn[24]);   // E filter
+	wire spec_touch = (r_ld || r_st) && r_e && !r_addr[31] &&
+	                  r_addr[15:0] >= 16'hff80 - r_nm1;
 	wire fetch_touch = rvfi_pc_rdata[15:0] >= 16'hff7d;
 	assign bon_fetch_touch = fetch_touch;
-	assign bon_region_ret = fetch_touch || spec_touch || claim_touch;
+	assign bon_region_ret = fetch_touch || spec_touch;
 	reg stopped_r = 1'b0;
 	always @(posedge clock) begin
 		if (reset) stopped_r <= 1'b0;
@@ -380,6 +381,8 @@ module bonetto_gpio_check (
 	wire ld_spec = valid && io && rm != 4'b0 && (rm == 4'b0001 || a10 == 2'd0);
 	wire st_spec = valid && io && wm != 4'b0 && (wm == 4'b0001 || a10 == 2'd0);
 	wire st_unspec = valid && io && wm != 4'b0 && !(wm == 4'b0001 || a10 == 2'd0);
+	wire ld_unspec = valid && io && rm != 4'b0 && !(rm == 4'b0001 || a10 == 2'd0);
+	wire io_unspec = st_unspec || ld_unspec;   // either may do anything to uo_out
 
 	// The store lane that writes the IO byte at an address X with X[1:0] = 0.
 	reg wr0;
@@ -418,8 +421,8 @@ module bonetto_gpio_check (
 	// "+1" step, up to its own rvfi_valid) uo_out may move once, from uo_ref to the
 	// store's value, and must stay there; that is checked at the retirement, so the
 	// window of a region-touching retirement is not compared. After a misaligned IO
-	// store (unspecified) uo_out is not compared again: `unspec` from the next step,
-	// st_unspec at its own retirement step (it may change uo_out in or before it).
+	// store or load (unspecified) uo_out is not compared again: `unspec` from the next
+	// step, io_unspec at its own retirement step (it may change uo_out in or before it).
 	reg [7:0] uo_ref;
 	reg dev;            // uo_out left uo_ref in this window
 	reg [7:0] dev_val;  // ... to this value
@@ -440,7 +443,7 @@ module bonetto_gpio_check (
 				dev <= 1'b0;
 				twice <= 1'b0;
 				if (upd) uo_ref <= wr0_val;
-				if (st_unspec) unspec <= 1'b1;
+				if (io_unspec) unspec <= 1'b1;
 			end else if (!strict) begin
 				if (deviates && !dev) begin
 					dev <= 1'b1;
@@ -454,7 +457,7 @@ module bonetto_gpio_check (
 	wire live = !reset && !unspec && !bon_stopped;
 	always @* begin
 		if (live && strict) gpio_uo_hold: assert (!deviates);
-		if (live && full && !st_unspec) begin
+		if (live && full && !io_unspec) begin
 			gpio_uo_once: assert (!twice && (!dev || pin_uo_out == dev_val));
 			if (dev || deviates) begin
 				gpio_uo_cause: assert (upd);
