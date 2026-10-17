@@ -214,7 +214,7 @@ The sequence counts toward the first instruction's latency (section 4).
 
 - **CSR instructions** follow the spec: CSRRW with rd = x0 does not need to read, and CSRRS/C
   with rs1 = x0 (or zimm = 0) do not write. The reset values of `mtvec`, `mepc`, `mscratch` and
-  `mcause` are arbitrary. `mstatus.MIE` and `mie.MEIE` reset to 0.
+  `mcause` are arbitrary. `mstatus.MIE`, `mstatus.MPIE` and `mie.MEIE` reset to 0.
 - **Synchronous traps** (the instruction has no other effect):
   - ECALL: `mcause = 11`.
   - EBREAK: `mcause = 3`.
@@ -254,7 +254,8 @@ The sequence counts toward the first instruction's latency (section 4).
   - Reading byte 0 of UART_DATA clears RX_FULL and RX_OVR.
   - A W1C (write-1-to-clear) bit clears when 1 is written to it.
   - Writing byte 0 of UART_DATA or SPI_DATA starts a transfer.
-- Misaligned IO accesses are UNSPECIFIED.
+- IO accesses that aren't naturally aligned (`addr % n != 0`) are UNSPECIFIED. A halfword at slot byte
+  2 is legal and covers bytes 2-3.
 
 **Timing:**
 - Peripheral inputs pass through synchronizers. An input change becomes visible to the logic
@@ -324,10 +325,11 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 ### 5.5 UART (8N1, LSB first)
 
 - **Transmit.**
-  - A write to UART_DATA while TX_BUSY = 0 sets TX_BUSY = 1, and the next instruction reads it
-    as 1.
-  - The start bit begins within `DIV+2` cycles. Then come the start bit, 8 data bits and the
-    stop bit, each exactly DIV+1 cycles.
+  - A write to UART_DATA while TX_BUSY = 0 sets TX_BUSY = 1. TX_BUSY reads 1 from that write
+    until the stop bit ends, so a read during the frame returns 1 even if the frame is shorter
+    than an instruction.
+  - The start bit begins within `DIV+2` cycles after the store retires. Then come the start
+    bit, 8 data bits and the stop bit, each exactly DIV+1 cycles.
   - TX_BUSY clears when the stop bit ends.
   - A write while TX_BUSY = 1 is ignored.
 - **Receive.**
@@ -346,9 +348,12 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 - **Each bit:**
   1. MOSI (`uo[6]`) is set while SCK (`uo[5]`) is low.
   2. SCK stays low for `2^D` cycles, then high for `2^D` cycles.
-  3. MISO (`ui[3]`, synchronized) is sampled at the rising SCK edge, or up to 3 cycles later.
+  3. The bit shifted in is the MISO pin value (`ui[3]`) at the rising SCK edge, or up to 3 cycles
+     after it (synchronizer delay allowed).
 - BUSY clears after the eighth high phase ends with SCK low. SPI_DATA then reads the received
   byte.
+- D ≥ 1 is required (D = 0 is UNSPECIFIED): the harness's device holds each MISO bit from the
+  rising edge through the 3 cycles after it, which needs a high phase of at least 2 cycles.
 - A write while BUSY is ignored.
 - CS_n (`uo[4]`) is just SPI_CTRL[0].
 
@@ -373,14 +378,16 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 - **Signoff clock: 40 MHz** (T = 25 ns, `CLOCK_PERIOD` in `src/config.json`), the user's target.
   - STA closes at every TT corner. The lead may move it in the performance phase, up to the
     memory limits of section 2 and a 50 MHz IO ceiling, unless a measurement proves more.
-- **Physical:** the flow is TT's (LibreLane 3.0.14, sky130A, `sky130_fd_sc_hd`), in a 1x1 tile.
+- **Physical:** the flow is TT's (LibreLane 3.0.14, sky130A, `sky130_fd_sc_hd`), in a **1x2 tile**.
+  The user chose it on 2026-10-17: the full peripheral set measured about 20k µm² against about
+  11.5k for a 1x1.
   Results count only when clean: DRC, LVS, antenna, setup and hold at every corner, and the
   precheck.
-- **Build phase:** the MCU passes every gate and hardens clean in 1x1.
+- **Build phase:** the MCU passes every gate and hardens clean in 1x2.
 - **Performance phase:**
   - **Score:** CoreMark iterations per second, which is `f_clk / cycles per iteration`. Cycles
     come from the cosim CoreMark run (code in flash, data in PSRAM, the real chip models).
-  - **Constraints:** every gate passes, the candidate hardens clean in 1x1, and every peripheral
+  - **Constraints:** every gate passes, the candidate hardens clean in 1x2, and every peripheral
     stays.
   - **Tiebreak:** synthesized area.
   - **Formal** runs at final signoff and on every tenth merged improvement. Every other gate runs
