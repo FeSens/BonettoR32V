@@ -1,0 +1,11 @@
+{
+  "class": "trap_writes_rd",
+  "checks": [
+    "insn_jal",
+    "rvfi"
+  ],
+  "description": "A JAL whose target has bit 1 set traps but still writes rd.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/trap_writes_rd"
+}

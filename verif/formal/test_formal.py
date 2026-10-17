@@ -6,8 +6,12 @@
 - The SPI monitor decodes a hand-written SPI waveform (a stub driver with MISO noise
   while SCK is low) into exactly the expected events.
 - The depth policy and timing summary.
-- Every mutant in mutants/ (the seed with one bug) FAILS the checks its expect.json
-  names, at the seed's depth.
+- The verdict aggregation (a group counterexample, SKIPPED tasks).
+- Every mutant in mutants/ FAILS the checks its expect.json names, with a
+  counterexample, at the seed's depth (or the depth of the design its "timing" names);
+  the legal variants ("expect": "pass") PASS ("checks": "all": the whole fast suite).
+  Mutants marked "slow" (the hyp/002 cores, hours each) run only with
+  BONETTO_FORMAL_SLOW=1.
 - The seed (src/) PASSES the fast suite (checks.cfg). Set BONETTO_SKIP_SEED=1 to skip.
 
 With BONETTO_FORMAL_HOST set, every formal run goes to that host (its own lock).
@@ -124,6 +128,87 @@ def test_check_verdicts():
     assert run_formal.insn_reach("add") == ["reach_insn_add"]
 
 
+def test_timing_merge():
+    """The timing is the max over the cosim programs, per class too."""
+    a = {"first_retire_cycle": 115, "max_cycles_per_insn": 230,
+         "per_class": {"alu": 116, "load": 230}}
+    b = {"first_retire_cycle": 993, "max_cycles_per_insn": 893,
+         "per_class": {"alu": 700, "store": 893}}
+    m = run_formal.merge_timings([a, b])
+    assert m["first_retire_cycle"] == 993 and m["max_cycles_per_insn"] == 893
+    assert m["per_class"] == {"alu": 700, "load": 230, "store": 893}
+
+
+def _cex_vcd(path, insn):
+    """A minimal counterexample trace: one retirement of `insn` in step 1."""
+    path.write_text("$scope module rvfi_testbench $end\n"
+                    "$var wire 1 ! rvfi_valid $end\n$var wire 32 \" rvfi_insn $end\n"
+                    "$upscope $end\n$enddefinitions $end\n"
+                    f"#0\n0!\nb0 \"\n#10\n1!\nb{insn:032b} \"\n#20\n0!\n")
+    return str(path)
+
+
+def test_aggregate_group_failure(tmp_path):
+    """A counterexample in a two-member group: the culprit FAILs with its assertion
+    and trace, the other member FAILs as not proven, and nothing crashes (review I2)."""
+    vcd = _cex_vcd(tmp_path / "trace.vcd", 0x40000033)   # sub x0, x0, x0
+    proof = ("insn_group0", "FAIL", 12.3,
+             {"failed": ["insn_rd_wdata"], "traces": {"insn_rd_wdata": vcd}, "errors": []})
+    reach = ("insn_group0_reach", "FAIL", 4.5,
+             {"failed": ["reach_insn_add", "reach_insn_sub"], "traces": {}, "errors": []})
+    units = [("insn_group0", [("insn_add", ["reach_insn_add"]),
+                              ("insn_sub", ["reach_insn_sub"])])]
+    checks, runtimes, failures, reached, skipped = run_formal.aggregate(
+        units, {"insn_group0": proof, "insn_group0_reach": reach})
+    assert checks == {"insn_add": "FAIL", "insn_sub": "FAIL"}
+    assert failures["insn_sub"]["assertions"] == ["insn_rd_wdata"]
+    assert failures["insn_sub"]["trace"] == vcd
+    assert "not proven" in failures["insn_add"]["why"] and "assertions" not in failures["insn_add"]
+    assert failures["insn_add"]["trace"] == vcd
+    assert runtimes["insn_add"] == {"proof": 12.3, "reach": 4.5, "task": "insn_group0"}
+    assert skipped == []
+
+
+def test_aggregate_skipped():
+    """Fail-fast: a proof that FAILed stays FAIL even if its reach task was skipped; a
+    check whose proof did not run is SKIPPED, or UNREACHED if its finished reach task
+    misses a trigger."""
+    det = lambda *l: {"failed": list(l), "traces": {}, "errors": []}
+    res = {
+        "spi": ("spi", "FAIL", 9.0, det("spi_rule2")),
+        "spi_reach": ("spi_reach", "SKIPPED", 0.0, det()),
+        "gpio": ("gpio", "SKIPPED", 0.0, det()),
+        "gpio_reach": ("gpio_reach", "FAIL", 3.0, det("reach_gpio_load", "reach_gpio_store")),
+        "reg": ("reg", "PASS", 20.0, det()),
+        "reg_reach": ("reg_reach", "SKIPPED", 0.0, det()),
+        "ill": ("ill", "SKIPPED", 0.0, det()),
+        "ill_reach": ("ill_reach", "PASS", 5.0, det("reach_ill_zero")),
+    }
+    units = [("spi", [("spi", ["reach_spi_end_read"])]),
+             ("gpio", [("gpio", ["reach_gpio_load", "reach_gpio_store"])]),
+             ("reg", [("reg", ["reach_reg"])]),
+             ("ill", [("ill", ["reach_ill_zero", "reach_ill_ones"])])]
+    checks, _, failures, _, skipped = run_formal.aggregate(units, res)
+    assert checks == {"spi": "FAIL", "gpio": "SKIPPED", "reg": "SKIPPED", "ill": "UNREACHED"}
+    assert failures["spi"]["assertions"] == ["spi_rule2"]
+    assert failures["ill"]["unreached"] == ["reach_ill_ones"]
+    assert sorted(skipped) == ["gpio", "reg"]
+
+
+def test_stage_takes_every_top_level_v(tmp_path):
+    """Contract section 1: every top-level src/*.v is design, test_*.v included;
+    subdirectories are not."""
+    src = tmp_path / "src"
+    (src / "test_unit").mkdir(parents=True)
+    for n in ("tt_um_fesens_r32v.v", "test_helper.v", "r32v_alu.v"):
+        (src / n).write_text("// x\n")
+    (src / "test_unit" / "tb.v").write_text("// x\n")
+    (src / "notes.md").write_text("x\n")
+    _, rtl = run_formal.stage(str(src), str(tmp_path / "work"))
+    assert [os.path.basename(f) for f in rtl] == ["r32v_alu.v", "test_helper.v",
+                                                  "tt_um_fesens_r32v.v"]
+
+
 def test_reach_and_proof_tasks_are_separate(tmp_path):
     """The proof task has no reach statements; the reach task keeps only them."""
     run_formal.setup_path()
@@ -195,6 +280,14 @@ def _stub_waveform():
         end = put(1, 0, 0, 1)
         data = max(0, nbits - 24)
         events.setdefault(end, {})["end"] = (int(nbits >= 24), int(write), int(data >= 8), data % 8)
+        if nbits >= 24:
+            # Section 6 classes: the bytes with at least one data bit (a partial last byte
+            # counts); none: a region transaction iff A is in the region.
+            byts = {(addr + k) & 0xffff for k in range((data + 7) // 8)}
+            reg = {b for b in byts if b >= 0xff80}
+            region = int(bool(reg) and reg == byts) if byts else int(addr >= 0xff80)
+            mixed = int(bool(reg) and reg != byts)
+            events[end]["cls"] = (addr, min(data, 1023), region, mixed)
 
     idle(3)
     txn(0x03, 0xfffe, None, False, half=1, mem=[0x5a, 0xc3, 0x81])          # READ wraps to 0x0000
@@ -207,6 +300,16 @@ def _stub_waveform():
     txn(0x02, 0x0010, [1] * 16, True, half=1, stop_bits=24 + 11)             # WRITE ends mid-byte
     idle(1)
     txn(0x03, 0x0000, None, False, half=1, mem=[0], stop_bits=10)            # header incomplete
+    idle(1)
+    txn(0x03, 0xff80, None, False, half=1, mem=[0x11, 0x22])                 # region READ
+    idle(1)
+    txn(0x03, 0xfff0, None, False, half=1, mem=[0], stop_bits=24)            # null READ, region
+    idle(1)
+    txn(0x03, 0x4000, None, False, half=1, mem=[0], stop_bits=24)            # null READ, program
+    idle(1)
+    txn(0x03, 0xffff, None, False, half=1, mem=[0x33, 0x44], stop_bits=24 + 9)  # one bit past 0xFFFF
+    idle(1)
+    txn(0x02, 0xfffe, [0, 1] * 8, True, half=1)                              # region WRITE
     idle(2)
     return steps, events
 
@@ -225,13 +328,16 @@ def _stub_verilog(steps, events):
               "  wire mon_en, mon_pair, mon_cs, mon_sck, mon_mosi, mon_miso, mon_pcs, mon_psck, mon_pmosi, mon_rise;",
               "  wire ev_cmd_done, ev_rd_bit, ev_rd_val, ev_byte, ev_byte_wr, ev_end, ev_end_hdr, ev_end_write, ev_end_bytes;",
               "  wire [7:0] ev_cmd, ev_byte_data; wire [15:0] ev_rd_addr, ev_byte_addr; wire [2:0] ev_rd_idx, ev_end_bit;",
+              "  wire [15:0] ev_end_addr; wire [9:0] ev_end_nbits; wire ev_end_region, ev_end_mixed;",
               "  bonetto_spi_monitor m (.clock(clock), .reset(step == 16'd0), .cs(cs), .mosi(mosi), .sck(sck), .miso(miso),",
               "    .mon_en(mon_en), .mon_pair(mon_pair), .mon_cs(mon_cs), .mon_sck(mon_sck), .mon_mosi(mon_mosi),",
               "    .mon_miso(mon_miso), .mon_pcs(mon_pcs), .mon_psck(mon_psck), .mon_pmosi(mon_pmosi), .mon_rise(mon_rise),",
               "    .ev_cmd_done(ev_cmd_done), .ev_cmd(ev_cmd), .ev_rd_bit(ev_rd_bit), .ev_rd_addr(ev_rd_addr),",
               "    .ev_rd_idx(ev_rd_idx), .ev_rd_val(ev_rd_val), .ev_byte(ev_byte), .ev_byte_wr(ev_byte_wr),",
               "    .ev_byte_addr(ev_byte_addr), .ev_byte_data(ev_byte_data), .ev_end(ev_end), .ev_end_hdr(ev_end_hdr),",
-              "    .ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit));",
+              "    .ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit),",
+              "    .ev_end_addr(ev_end_addr), .ev_end_nbits(ev_end_nbits), .ev_end_region(ev_end_region),",
+              "    .ev_end_mixed(ev_end_mixed));",
               "  always @* begin",
               "    if (step > 16'd0) case (step)"]
     for st in sorted(events):
@@ -249,6 +355,12 @@ def _stub_verilog(steps, events):
         if "end" in ev:
             h, w, b, bit = ev["end"]
             a += [f"ev_end_hdr == {h}", f"ev_end_write == {w}", f"ev_end_bytes == {b}", f"ev_end_bit == {bit}"]
+        if "cls" in ev:
+            addr, nb, region, mixed = ev["cls"]
+            a += [f"ev_end_addr == 16'h{addr:04x}", f"ev_end_nbits == {nb}",
+                  f"ev_end_region == {region}", f"ev_end_mixed == {mixed}"]
+        elif "end" in ev:
+            a += ["!ev_end_region"]
         lines.append(f"      {st}: assert ({' && '.join(a)});")
     lines += ["      default: assert (!ev_cmd_done && !ev_rd_bit && !ev_byte && !ev_end);",
               "    endcase",
@@ -260,7 +372,7 @@ def _stub_verilog(steps, events):
 def test_monitor_decodes_stub(tmp_path):
     run_formal.setup_path()
     steps, events = _stub_waveform()
-    assert sum(1 for e in events.values() if "byte" in e) == 3 + 2 + 0 + 1
+    assert sum(1 for e in events.values() if "byte" in e) == 3 + 2 + 0 + 1 + 2 + 1 + 2
     (tmp_path / "stub_tb.v").write_text(_stub_verilog(steps, events))
     depth = len(steps) + 2
     (tmp_path / "stub.sby").write_text(f"""[options]
@@ -295,12 +407,35 @@ prep -flatten -nordff -top stub_tb
 # ---------------------------------------------------------------------------
 # Mutants and the seed.
 
+def _src_with(tmp_path, rtl_dir):
+    """A copy of src/ with the top-level design files of rtl_dir on top."""
+    src = tmp_path / "src"
+    shutil.copytree(os.path.join(ROOT, "src"), src)
+    for f in os.listdir(rtl_dir):
+        if f.endswith((".v", ".sv", ".vh")):
+            shutil.copy(os.path.join(rtl_dir, f), src / f)
+    return src
+
+
+TIMINGS = {}
+
+
+def design_timing(name, tmp_path_factory):
+    """The cosim timing of the seed (name None) or of verif/cosim/mutants/<name>."""
+    if name not in TIMINGS:
+        d = tmp_path_factory.mktemp("timing")
+        args = ["--timing-only", str(d / "timing.json")]
+        if name:
+            args += ["--src", str(_src_with(d, os.path.join(ROOT, "verif", "cosim", "mutants", name)))]
+        rc, text = formal(args, timeout=7200)
+        assert rc == 0, text[-3000:]
+        TIMINGS[name] = str(d / "timing.json")
+    return TIMINGS[name]
+
+
 @pytest.fixture(scope="session")
 def seed_timing(tmp_path_factory, heavy_lock):
-    out = tmp_path_factory.mktemp("timing") / "seed_timing.json"
-    rc, text = formal(["--timing-only", str(out)], timeout=3600)
-    assert rc == 0, text[-3000:]
-    return str(out)
+    return design_timing(None, tmp_path_factory)
 
 
 def fast_checks():
@@ -311,40 +446,52 @@ def fast_checks():
     return names | {"structure", "equiv"}
 
 
-@pytest.mark.parametrize("mutant", mutants())
-def test_mutant_fails(mutant, tmp_path, seed_timing, heavy_lock):
+def _expect(mutant):
+    return json.load(open(os.path.join(MUT_DIR, mutant, "expect.json")))
+
+
+@pytest.mark.parametrize("mutant", [
+    pytest.param(m, marks=pytest.mark.skipif(
+        _expect(m).get("slow") and os.environ.get("BONETTO_FORMAL_SLOW") != "1",
+        reason="slow (hours): BONETTO_FORMAL_SLOW=1")) for m in mutants()])
+def test_mutant_fails(mutant, tmp_path, tmp_path_factory, seed_timing, heavy_lock):
     """Each mutant FAILS (a counterexample) in the checks its expect.json names, at the
-    seed's depth; the liveness boundary mutants marked "pass" PASS. A check that is only
-    in the deep config runs with --deep."""
+    seed's depth (or its "timing" design's); the legal variants and the liveness boundary
+    mutants marked "pass" PASS ("checks": "all": the whole fast suite). A check that is
+    only in the deep config runs with --deep. "rtl" points at a shared cosim mutant."""
     mdir = os.path.join(MUT_DIR, mutant)
-    expect = json.load(open(os.path.join(mdir, "expect.json")))
-    src = tmp_path / "src"
-    shutil.copytree(os.path.join(ROOT, "src"), src)
-    for f in os.listdir(mdir):
-        if f.endswith((".v", ".sv", ".vh")):
-            shutil.copy(os.path.join(mdir, f), src / f)
+    expect = _expect(mutant)
+    src = _src_with(tmp_path, os.path.join(ROOT, expect["rtl"]) if expect.get("rtl") else mdir)
+    timing = design_timing(expect["timing"], tmp_path_factory) if expect.get("timing") else seed_timing
     out = tmp_path / "formal.json"
-    regex = "^(" + "|".join(expect["checks"]) + ")$"
-    deep = expect.get("deep") or not set(expect["checks"]) <= fast_checks()
-    rc, text = formal(["--src", str(src), "--timing", seed_timing, "--only", regex,
-                       "--out", str(out), "--keep-going"] + (["--deep"] if deep else []))
+    args = ["--src", str(src), "--timing", timing, "--out", str(out), "--keep-going"]
+    if expect["checks"] != "all":
+        args += ["--only", "^(" + "|".join(expect["checks"]) + ")$"]
+        if expect.get("deep") or not set(expect["checks"]) <= fast_checks():
+            args.append("--deep")
+    rc, text = formal(args, timeout=12 * 3600)
     res = json.load(open(out))
     if expect.get("expect") == "pass":
-        assert rc == 0 and all(res["checks"].get(c) == "PASS" for c in expect["checks"]), \
-            f"{mutant}: expected PASS in {expect['checks']}, got {res['checks']}\n" \
-            f"{res.get('failures')}\n{text[-2000:]}"
-        print(f"{mutant}: PASS in {expect['checks']} (depth {res.get('per_check_depth')})")
+        ok = rc == 0 and (res["pass"] if expect["checks"] == "all" else
+                          all(res["checks"].get(c) == "PASS" for c in expect["checks"]))
+        assert ok, f"{mutant}: expected PASS in {expect['checks']}, got " \
+                   f"{ {c: v for c, v in res['checks'].items() if v != 'PASS'} }\n" \
+                   f"{res.get('failures')}\n{text[-2000:]}"
+        print(f"{mutant}: PASS in {expect['checks']} ({len(res['checks'])} checks, "
+              f"depths {sorted(set(res.get('per_check_depth', {}).values()))}, "
+              f"{res.get('runtime_s')} s)")
         return
     # A FAIL must be a counterexample (a failed assertion), not a timeout or an error;
     # equiv fails in the pre-pass and has no SBY task.
+    fails = res.get("failures", {})
     failed = [c for c, v in res["checks"].items() if v == "FAIL" and
-              (c == "equiv" or res.get("failures", {}).get(c, {}).get("assertions"))]
+              (c == "equiv" or fails.get(c, {}).get("assertions"))]
     assert rc != 0, f"{mutant} passed formal:\n{text[-3000:]}"
     assert set(expect["checks"]) & set(failed), \
         f"{mutant}: expected a counterexample in {expect['checks']}, got {res['checks']}\n" \
-        f"{res.get('failures')}\n{text[-2000:]}"
+        f"{fails}\n{text[-2000:]}"
     print(f"{mutant}: FAIL in {sorted(set(expect['checks']) & set(failed))}: "
-          f"{ {c: res.get('failures', {}).get(c, {}).get('assertions') for c in failed} }")
+          f"{ {c: fails.get(c, {}).get('assertions') for c in failed} }")
 
 
 @pytest.mark.skipif(os.environ.get("BONETTO_SKIP_SEED") == "1", reason="BONETTO_SKIP_SEED=1")

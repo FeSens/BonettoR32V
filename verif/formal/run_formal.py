@@ -39,6 +39,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -261,10 +262,13 @@ def load_config(path):
 # ---------------------------------------------------------------------------
 
 def reap_stale(base):
+    """Remove work dirs (work-<pid>) and the logs of earlier remote runs
+    (remote-run-<host>-<pid>-<time>) whose process is gone. A live run's dirs stay, so
+    parallel runs don't delete each other's."""
     if not os.path.isdir(base):
         return
     for d in os.listdir(base):
-        m = re.fullmatch(r"work-(\d+)", d)
+        m = re.fullmatch(r"work-(\d+)", d) or re.fullmatch(r"remote-run-.*-(\d+)-\d+", d)
         if not m:
             continue
         pid = int(m.group(1))
@@ -277,6 +281,9 @@ def reap_stale(base):
 
 
 def stage(src_dir, work):
+    """Copy the design: every top-level src/*.v (contract section 1: whatever its name,
+    test_*.v included; unit tests live in subdirectories), in sorted order, plus *.sv
+    and include files."""
     sdir = os.path.join(work, "src")
     os.makedirs(sdir, exist_ok=True)
     rtl = []
@@ -284,7 +291,7 @@ def stage(src_dir, work):
         p = os.path.join(src_dir, name)
         if not os.path.isfile(p):
             continue
-        if name.endswith((".v", ".sv")) and not name.startswith("test_"):
+        if name.endswith((".v", ".sv")):
             shutil.copy(p, sdir)
             rtl.append(os.path.join(sdir, name))
         elif name.endswith((".vh", ".svh")):
@@ -487,27 +494,75 @@ def build_timing_prog(work):
     return hexf, "verif/formal/timing_prog.S"
 
 
+# Cosim programs for the timing: every built program but CoreMark, whose instruction
+# classes the selftest and the random programs cover, and which is by far the slowest.
+TIMING_SKIP = ("coremark",)
+
+
+def merge_timings(ts):
+    """Max over several cosim timings (first retirement, slowest instruction, and each
+    class of the cosim's per_class)."""
+    out = {"first_retire_cycle": max(int(t["first_retire_cycle"]) for t in ts),
+           "max_cycles_per_insn": max(int(t["max_cycles_per_insn"]) for t in ts),
+           "per_class": {}}
+    for t in ts:
+        for k, v in (t.get("per_class") or {}).items():
+            if isinstance(v, int):
+                out["per_class"][k] = max(v, out["per_class"].get(k, 0))
+    return out
+
+
+def cosim_timing(work, sdir):
+    """The candidate's timing from the cosim (rvfi mode, --timing-json), as the max over
+    every program in build/programs except TIMING_SKIP. A failing run still reports its
+    numbers up to the failure; runs without numbers are ignored. (None, []) if no run
+    gave numbers."""
+    cosim = os.path.join(ROOT, "verif", "cosim", "run_cosim.py")
+    pdir = os.path.join(ROOT, "build", "programs")
+    if not os.path.isfile(cosim) or not os.path.isdir(pdir):
+        return None, []
+    progs = sorted(f[:-4] for f in os.listdir(pdir)
+                   if f.endswith(".hex") and f[:-4] not in TIMING_SKIP)
+    if "selftest" not in progs:
+        return None, []
+
+    def one(prog):
+        out = os.path.join(work, f"cosim_timing_{prog}.json")
+        # The cosim measures the staged candidate (--src), from reset release.
+        cmd = [sys.executable, cosim, "--mode", "rvfi", "--prog",
+               os.path.join(pdir, prog + ".hex"), "--src", sdir, "--timing-json", out]
+        try:
+            run(cmd, cwd=ROOT, timeout=3600,
+                log_path=os.path.join(work, f"cosim_timing_{prog}.log"))
+        except subprocess.TimeoutExpired:
+            return prog, None
+        if not os.path.isfile(out):
+            return prog, None
+        with open(out) as f:
+            t = json.load(f)
+        if t.get("first_retire_cycle") is None or t.get("max_cycles_per_insn") is None:
+            return prog, None
+        return prog, t
+
+    first = one("selftest")   # builds the cosim model once; the other runs reuse it
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        got = [first] + list(ex.map(one, [p for p in progs if p != "selftest"]))
+    got = [(p, t) for p, t in got if t is not None]
+    if not got:
+        return None, []
+    return merge_timings([t for _, t in got]), [p for p, _ in got]
+
+
 def get_timing(args, work, sdir, rtl):
     if args.timing:
         with open(args.timing) as f:
             return json.load(f), args.timing
-    cosim = os.path.join(ROOT, "verif", "cosim", "run_cosim.py")
-    selftest = os.path.join(ROOT, "build", "programs", "selftest.hex")
-    if os.path.isfile(cosim) and os.path.isfile(selftest):
-        out = os.path.join(work, "cosim_timing.json")
-        # The cosim measures the staged candidate (--src), from reset release.
-        cmd = [sys.executable, cosim, "--mode", "rvfi", "--prog", selftest, "--src", sdir,
-               "--timing-json", out]
-        try:
-            rc = run(cmd, cwd=ROOT, timeout=1800, log_path=os.path.join(work, "cosim_timing.log"))
-        except subprocess.TimeoutExpired:
-            rc = -1
-        if rc == 0 and os.path.isfile(out):
-            with open(out) as f:
-                t = json.load(f)
-            if t.get("first_retire_cycle") is not None and t.get("max_cycles_per_insn") is not None:
-                return t, "run_cosim.py --timing-json (selftest)"
-        log("cosim timing unavailable (rc=%s); falling back to timing_tb.v" % rc)
+    t, progs = cosim_timing(work, sdir)
+    if t is not None:
+        t["programs"] = progs
+        return t, f"run_cosim.py --timing-json, max over {len(progs)} programs"
+    if os.path.isfile(os.path.join(ROOT, "verif", "cosim", "run_cosim.py")):
+        log("cosim timing unavailable; falling back to timing_tb.v")
     prog, prog_src = build_timing_prog(work)
     if prog is None:
         return None, prog_src
@@ -850,6 +905,8 @@ def run_task(name, path, timeout):
     RUNNING.pop(pr.pid, None)
     dt = time.time() - t0
     status, detail = parse_task(tdir, name)
+    if STOP.is_set() and status not in ("PASS", "FAIL"):
+        status = "SKIPPED"   # stopped by fail-fast before it finished
     # Disk: drop the task's model files (large, never read back), and the traces of a
     # reach task (only its failed labels matter). A proof's counterexample trace stays.
     d = os.path.join(tdir, name)
@@ -861,6 +918,59 @@ def run_task(name, path, timeout):
                 os.remove(os.path.join(eng, f))
         detail["traces"] = {}
     return name, status, dt, detail
+
+
+def aggregate(units, results):
+    """Per-check verdicts from the task results. units: [(task, [(check, labels)])];
+    results: {task name: run_task result}. Returns (checks, runtimes, failures, reached,
+    skipped).
+    - A proof that did not pass (a counterexample, a timeout, an error) makes its checks
+      FAIL, whatever the reach task did (SKIPPED included).
+    - A check whose proof was not run (fail-fast), or passed with its reach task not
+      run, is SKIPPED, unless its finished reach task shows a missing trigger
+      (UNREACHED).
+    - In a group, a counterexample belongs to the instruction it retires; the other
+      members are FAIL "not proven" (with the group's trace and timings)."""
+    checks, runtimes, failures, reached, skipped = {}, {}, {}, {}, []
+    missing_res = (None, "ERROR", 0.0, {"failed": [], "traces": {}, "errors": ["no result"]})
+    for tname, req in units:
+        pres = results.get(tname, missing_res)
+        rres = results.get(tname + "_reach", missing_res)
+        not_run = pres[1] == "SKIPPED" or (pres[1] == "PASS" and rres[1] == "SKIPPED")
+        culprit = None
+        for cname, labels in req:
+            if not_run:
+                got = [l for l in rres[3]["failed"] if l in labels]
+                if rres[1] in ("PASS", "FAIL") and len(got) < len(labels):
+                    checks[cname] = "UNREACHED"
+                    failures[cname] = {"proof": pres[1], "reach": rres[1], "reached": got,
+                                       "unreached": [l for l in labels if l not in got],
+                                       "proof_s": round(pres[2], 1),
+                                       "reach_s": round(rres[2], 1)}
+                else:
+                    checks[cname] = "SKIPPED"
+                    skipped.append(cname)
+                continue
+            verdict, info = combine(pres, rres, labels)
+            if len(req) > 1:
+                info["task"] = tname
+                info["reached"] = [l for l in info["reached"] if l in labels]
+                if verdict == "FAIL" and info.get("cex_retirements"):
+                    culprit = culprit or insn_name(int(info["cex_retirements"][-1]["insn"], 16))
+                    if culprit != cname[5:]:
+                        info = {"task": tname, "proof": info["proof"], "reach": info["reach"],
+                                "why": f"not proven: the group's proof stopped at a "
+                                       f"counterexample of insn_{culprit}",
+                                "reached": info["reached"], "trace": info.get("trace"),
+                                "proof_s": info["proof_s"], "reach_s": info["reach_s"]}
+            checks[cname] = verdict
+            runtimes[cname] = {"proof": info["proof_s"], "reach": info["reach_s"]}
+            if len(req) > 1:
+                runtimes[cname]["task"] = tname
+            reached[cname] = info["reached"]
+            if verdict != "PASS":
+                failures[cname] = info
+    return checks, runtimes, failures, reached, skipped
 
 
 def combine(proof, reach, required):
@@ -913,6 +1023,7 @@ def run_remote(args, host):
 
 
 def _run_remote(args, host, tempfile):
+    reap_stale(os.path.join(ROOT, "build", "formal"))
     run_id = f"run-{os.uname().nodename.split('.')[0]}-{os.getpid()}-{int(time.time())}"
     rdir = f"{REMOTE_BASE}/{run_id}"
     local_logs = os.path.join(ROOT, "build", "formal", f"remote-{run_id}")
@@ -950,7 +1061,7 @@ def _run_remote(args, host, tempfile):
             cfg_arg = ["--config", "config.cfg"]
         ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", host]
         try:
-            rc = subprocess.run(ssh + [f"mkdir -p {rdir}"]).returncode
+            rc = subprocess.run(ssh + [f"mkdir -p {shlex.quote(rdir)}"]).returncode
             if rc != 0:
                 log(f"remote: cannot reach {host}")
                 return 1
@@ -962,11 +1073,12 @@ def _run_remote(args, host, tempfile):
             fwd += ["--only", args.only] if args.only else []
             fwd += ["--keep-going"] if args.keep_going else []
             jobs = args.jobs or REMOTE_JOBS
-            rcmd = (f"cd {rdir} && flock ../formal.lock env BONETTO_OSS_CAD={REMOTE_OSS} "
+            rcmd = (f"cd {shlex.quote(rdir)} && flock ../formal.lock env "
+                    f"BONETTO_OSS_CAD={shlex.quote(REMOTE_OSS)} "
                     f"BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
                     f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
                     f"--out out/formal.json --jobs {jobs} --keep "
-                    + " ".join(cfg_arg + [f"'{a}'" for a in fwd]))
+                    + " ".join(shlex.quote(a) for a in cfg_arg + fwd))
             log(f"remote: {host}:{rdir} (jobs={jobs})")
             # -tt: closing this ssh hangs up the remote run, which then stops its SBY tasks
             # (SIGHUP handler). On SIGTERM/SIGINT/SIGHUP here: close it, then clean up.
@@ -1006,7 +1118,7 @@ def _run_remote(args, host, tempfile):
                 rc = rc or 1
             return rc
         finally:
-            subprocess.run(ssh + [f"rm -rf {rdir}"])
+            subprocess.run(ssh + [f"rm -rf {shlex.quote(rdir)}"])
 
 
 # ---------------------------------------------------------------------------
@@ -1201,36 +1313,8 @@ def main():
                 stop_all()
     result["first_failure"] = first_fail
 
-    checks = dict(result["checks"])  # structure, equiv
-    runtimes, failures, reached = {}, {}, {}
-    missing_res = (None, "ERROR", 0.0, {"failed": [], "traces": {}, "errors": ["no result"]})
-    skipped = []
-    for tname, req in units:
-        culprit = None
-        statuses = [results.get(t, missing_res)[1] for t in (tname, tname + "_reach")]
-        if first_fail and "SKIPPED" in statuses and first_fail not in (tname, tname + "_reach"):
-            for cname, _ in req:
-                checks[cname] = "SKIPPED"
-                skipped.append(cname)
-            continue
-        for cname, labels in req:
-            verdict, info = combine(results.get(tname, missing_res),
-                                    results.get(tname + "_reach", missing_res), labels)
-            if len(req) > 1:
-                info["task"] = tname
-                info["reached"] = [l for l in info["reached"] if l in labels]
-                if verdict == "FAIL" and info.get("cex_retirements"):
-                    culprit = culprit or insn_name(int(info["cex_retirements"][-1]["insn"], 16))
-                    if culprit != cname[5:]:
-                        info = {"task": tname, "why": f"not proven: the group's proof stopped at a "
-                                f"counterexample of insn_{culprit}", "reached": info["reached"]}
-            checks[cname] = verdict
-            runtimes[cname] = {"proof": info["proof_s"], "reach": info["reach_s"]}
-            if len(req) > 1:
-                runtimes[cname]["task"] = tname
-            reached[cname] = info["reached"]
-            if verdict != "PASS":
-                failures[cname] = info
+    checks, runtimes, failures, reached, skipped = aggregate(units, results)
+    checks = dict(result["checks"], **checks)  # structure, equiv first
     result["checks"] = checks
     result["skipped"] = skipped
     result["per_check_runtime_s"] = runtimes
@@ -1249,4 +1333,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        stop_all()   # no orphaned SBY solvers after an unexpected exception
+        raise

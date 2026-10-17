@@ -1,0 +1,10 @@
+{
+  "class": "cs_open_at_retire",
+  "checks": [
+    "spi"
+  ],
+  "description": "After a data access CS_n stays low until the retirement edge (open during rvfi_valid).",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/cs_open_at_retire"
+}

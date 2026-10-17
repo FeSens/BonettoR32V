@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Regenerate verif/formal/mutants/<name>/ from the seed (src/tt_um_fesens_r32v.v).
 
-Each mutant is a full copy of the seed's top file with exactly one bug, plus
-expect.json naming the formal check(s) that must FAIL on it. test_formal.py runs
-those checks on each mutant at the seed's depth and expects a FAIL. The liveness
-boundary pairs (stall_*) are not bugs on one side: a core whose worst-case retirement
-comes exactly 1,024 edges after reset or after the previous retirement must PASS
-(expect "pass"), one edge later must FAIL (contract section 4, latency cap). They run
-in the deep config, where liveness lives.
+Each mutant is a full copy of the seed's top file with exactly one change, plus
+expect.json naming the formal check(s) that must FAIL on it ("expect": "fail"), or that
+must PASS ("expect": "pass": the legal variants; "checks": "all" is the whole fast
+suite). test_formal.py runs those checks on each mutant at the seed's depth. The
+liveness boundary pairs (stall_*) are not bugs on one side: a core whose worst-case
+retirement comes exactly 1,024 edges after reset or after the previous retirement must
+PASS, one edge later must FAIL (contract section 4, latency cap). They run in the deep
+config, where liveness lives.
+
+SHARED lists the mutants whose RTL is the cosim's (verif/cosim/mutants/<name>/), so
+both gates test the same designs: their expect.json has "rtl" and no copy of the RTL.
+"timing" names a design whose cosim timing sets the depth (for mutants of the hyp/002
+cores), "slow" marks the runs of hours (skipped unless BONETTO_FORMAL_SLOW=1).
 
   python3 verif/formal/mutants/make_mutants.py [seed.v]
 
@@ -75,7 +81,7 @@ MUTANTS = {
     ),
     "sub_decode": (
         "a decoder bug in SUB",
-        ["insn_sub"],
+        ["insn_sub", "insn_add"],   # a two-member group: the counterexample is SUB's
         "SUB (funct3 000) is decoded as ADD.",
         [("wire        alu_sub = is_op & ir[30];", "wire        alu_sub = is_op & ir[30] & funct3[0];")],
     ),
@@ -113,6 +119,163 @@ MUTANTS = {
         [("                2'b01:   swap_n = {16'd0, x[7:0], x[15:8]};",
           "                2'b01:   swap_n = {16'd0, x[15:8], x[7:0]};")],
     ),
+}
+
+
+
+def _trap_txn(cmd, addr, bits):
+    """A trapping instruction makes one SPI transaction before it retires: the given
+    command and address, `bits` + 1 bits in all (24 header bits + data)."""
+    return [("                    if (trap) begin\n                        state <= S_WB;",
+             "                    if (trap) begin\n                        cs_n  <= 1'b0;\n"
+             "                        state <= S_MSPI;   // MUTANT: a transaction on a trap"),
+            ("            S_EXEC: begin\n                if (is_load | is_store) begin",
+             "            S_EXEC: begin\n                if (trap) begin\n"
+             f"                    sr     <= {{8'h{cmd:02x}, 16'h{addr:04x}, 32'd0}};\n"
+             f"                    bitcnt <= 6'd{bits};\n"
+             "                end else if (is_load | is_store) begin")]
+
+
+def _junk_trap_fields(cond):
+    return [("    assign rvfi_rs1_addr  = r_rs1 ? rs1 : 5'd0;",
+             f"    assign rvfi_rs1_addr  = ({cond}) ? 5'd7 : r_rs1 ? rs1 : 5'd0;"),
+            ("    assign rvfi_rs2_addr  = r_rs2 ? rs2 : 5'd0;",
+             f"    assign rvfi_rs2_addr  = ({cond}) ? 5'd9 : r_rs2 ? rs2 : 5'd0;"),
+            ("    assign rvfi_rs1_rdata = r_rs1 ? rs1_val : 32'd0;",
+             f"    assign rvfi_rs1_rdata = ({cond}) ? 32'hdeadbeef : r_rs1 ? rs1_val : 32'd0;"),
+            ("    assign rvfi_rs2_rdata = r_rs2 ? rs2_val : 32'd0;",
+             f"    assign rvfi_rs2_rdata = ({cond}) ? 32'h0badf00d : r_rs2 ? rs2_val : 32'd0;"),
+            ("    assign rvfi_rd_wdata  = rd_we ? rd_wdata : 32'd0;",
+             "    assign rvfi_rd_wdata  = trap ? 32'h00001234 : rd_we ? rd_wdata : 32'd0;"),
+            ("    assign rvfi_pc_wdata  = npc;",
+             "    assign rvfi_pc_wdata  = trap ? 32'h00000002 : npc;")]
+
+
+MUTANTS.update({
+    "trap_fields_brj": (
+        "junk register fields on a trapping branch or JALR",
+        ["insn_jalr"],
+        "Every trapping retirement reports arbitrary rs1/rs2 fields (the cosim's v1 "
+        "legal_trap_fields). Contract v2 section 6: a trapping branch or JALR must report its "
+        "operands truthfully.",
+        _junk_trap_fields("trap"),
+    ),
+    "legal_trap_fields_nb": (
+        "legal: junk fields on non-branch traps",
+        "all",
+        "Trapping retirements other than a branch or JALR report arbitrary rs1/rs2 fields, "
+        "rd_wdata and pc_wdata; contract section 6 compares none of them. Expect PASS.",
+        _junk_trap_fields("trap & ~(is_branch | is_jalr)"),
+        {"expect": "pass"},
+    ),
+    "legal_uo_early": (
+        "legal: uo_out changes in the retirement cycle",
+        "all",
+        "An IO store sets uo_out on the edge that enters its retirement cycle (allowed: "
+        "section 3 only bounds it by one cycle after the retirement), misaligned IO stores "
+        "included (unspecified). The review's variant. Expect PASS.",
+        [("                    end else begin\n                        state <= S_WB;\n"
+          "                    end\n                end\n                S_MEND: begin",
+          "                    end else begin\n                        if (io_write)\n"
+          "                            gpio_out <= io_wbyte;   // MUTANT: in the retirement cycle\n"
+          "                        state <= S_WB;\n"
+          "                    end\n                end\n                S_MEND: begin"),
+         ("                    pc <= npc;\n                    if (io_write)\n"
+          "                        gpio_out <= io_wbyte;\n",
+          "                    pc <= npc;\n")],
+        {"expect": "pass"},
+    ),
+    "trap_program_write": (
+        "a program WRITE on a trapping instruction",
+        ["bus_dmem"],
+        "Before a trapping instruction retires, the core WRITEs one byte at 0x0100 (contract "
+        "section 4: no program-memory write on a trap).",
+        _trap_txn(0x02, 0x0100, 31),
+    ),
+    "trap_region_wrap": (
+        "a region READ that wraps out of the region",
+        ["bus_dmem"],
+        "Before a trapping instruction retires, the core READs 4 bytes at 0xFFFE: 0xFFFE, "
+        "0xFFFF, 0x0000, 0x0001 (contract section 6: a region transaction may not wrap out of "
+        "the region).",
+        _trap_txn(0x03, 0xfffe, 55),
+    ),
+    "trap_region_straddle": (
+        "a READ that straddles into the region",
+        ["bus_dmem"],
+        "Before a trapping instruction retires, the core READs 4 bytes at 0xFF7E: two program "
+        "bytes and two region bytes in one transaction.",
+        _trap_txn(0x03, 0xff7e, 55),
+    ),
+    "legal_trap_region": (
+        "legal: a region READ on a trap",
+        "all",
+        "Before a trapping instruction retires, the core READs 4 bytes at 0xFF80 (contract "
+        "section 4: a trapping instruction may make core-region transactions). Expect PASS.",
+        _trap_txn(0x03, 0xff80, 55),
+        {"expect": "pass"},
+    ),
+    "legal_null_read": (
+        "legal: a null READ",
+        "all",
+        "Before a trapping instruction retires, the core sends a READ header for 0x1234 and "
+        "raises CS_n with no data bit (contract section 6: null READs are allowed anywhere). "
+        "Expect PASS.",
+        _trap_txn(0x03, 0x1234, 23),
+        {"expect": "pass"},
+    ),
+    "region_write_after_halt": (
+        "a region WRITE after the halt",
+        ["silent"],
+        "After the halting retirement the core WRITEs one byte at 0xFF80 (contract section 4: "
+        "never another SPI WRITE after the halt, core region included).",
+        [("                     S_HALT  = 4'd8;   // after a fatal trap: never leaves (until reset)",
+          "                     S_HALT  = 4'd8,   // after a fatal trap: never leaves (until reset)\n"
+          "                     S_HW = 4'd9, S_HSPI = 4'd10, S_HEND = 4'd11;   // MUTANT"),
+         ("                S_FSPI, S_MSPI: begin\n                    sck <= ~sck;\n"
+          "                    if (sck && bitcnt == 6'd0)\n"
+          "                        state <= (state == S_FSPI) ? S_FEND : S_MEND;",
+          "                S_FSPI, S_MSPI, S_HSPI: begin\n                    sck <= ~sck;\n"
+          "                    if (sck && bitcnt == 6'd0)\n"
+          "                        state <= (state == S_FSPI) ? S_FEND :\n"
+          "                                 (state == S_MSPI) ? S_MEND : S_HEND;"),
+         ("state <= trap ? S_HALT : S_FETCH;", "state <= trap ? S_HW : S_FETCH;"),
+         ("                default: state <= state;   // S_HALT",
+          "                S_HW: begin\n                    cs_n  <= 1'b0;\n"
+          "                    state <= S_HSPI;\n                end\n"
+          "                S_HEND: begin\n                    cs_n  <= 1'b1;\n"
+          "                    state <= S_HALT;\n                end\n"
+          "                default: state <= state;   // S_HALT"),
+         ("            S_FSPI, S_MSPI: begin\n                if (sck) begin",
+          "            S_FSPI, S_MSPI, S_HSPI: begin\n                if (sck) begin"),
+         ("            S_FEND: ir <= fetch_word;",
+          "            S_HW: begin\n                sr     <= {8'h02, 16'hff80, 32'd0};\n"
+          "                bitcnt <= 6'd31;\n            end\n"
+          "            S_FEND: ir <= fetch_word;")],
+    ),
+})
+
+# The cosim's mutants (verif/cosim/mutants/<name>/tt_um_fesens_r32v.v), shared:
+# name: (expected checks, options)
+SHARED = {
+    "cs_open_at_retire": (["spi"], {}),
+    "fetch_extra_byte": (["bus_imem", "bus_dmem"], {}),
+    "load_own_fetch": (["bus_dmem"], {}),
+    "zero_init": (["rvfi", "bus_imem"], {}),
+    "trap_writes_rd": (["insn_jal", "rvfi"], {}),
+    "uo_glitch": (["gpio"], {}),
+    "uo_late": (["gpio"], {}),
+    "no_halt": (["silent"], {}),
+    "store_twice": (["bus_dmem"], {}),
+    "store_extra_byte": (["bus_dmem"], {}),
+    "load_skip_byte": (["bus_dmem"], {}),
+    "legal_mosi_echo": ("all", {"expect": "pass"}),
+    "legal_split_store": ("all", {"expect": "pass"}),
+    "region_wrap": (["bus_dmem"], {"timing": "legal_h002_rf", "slow": True}),
+    "region_straddle": (["bus_dmem"], {"timing": "legal_h002_rf", "slow": True}),
+    "region_zero_init": (["rvfi", "bus_imem"], {"timing": "legal_h002_pcram", "slow": True}),
+    "legal_h002_rf": ("all", {"expect": "pass", "timing": "legal_h002_rf", "slow": True}),
+    "legal_h002_pcram": ("all", {"expect": "pass", "timing": "legal_h002_pcram", "slow": True}),
 }
 
 # Liveness boundary (contract section 4 edge count, as the cosim counts it). Measured
@@ -201,7 +364,30 @@ def main():
                       f, indent=2)
             f.write("\n")
         print(f"wrote mutants/{name} (expect {opts.get('expect', 'fail').upper()} in "
-              f"{', '.join(checks)})")
+              f"{checks if isinstance(checks, str) else ', '.join(checks)})")
+    cosim = os.path.join(ROOT, "verif", "cosim", "mutants")
+    with open(os.path.join(cosim, "MANIFEST.json")) as f:
+        manifest = json.load(f)
+    for name, (checks, opts) in SHARED.items():
+        rtl = os.path.join(cosim, name)
+        if not os.path.isfile(os.path.join(rtl, TOPFILE)):
+            sys.exit(f"{name}: no {TOPFILE} in verif/cosim/mutants/{name}")
+        d = os.path.join(HERE, name)
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            if f.endswith((".v", ".sv")):
+                os.remove(os.path.join(d, f))   # the RTL is the cosim's
+        exp = {"class": name, "checks": checks,
+               "description": manifest.get(name, {}).get("desc", ""),
+               "expect": opts.get("expect", "fail"), "deep": opts.get("deep", False),
+               "rtl": f"verif/cosim/mutants/{name}"}
+        for k in ("timing", "slow"):
+            if k in opts:
+                exp[k] = opts[k]
+        with open(os.path.join(d, "expect.json"), "w") as f:
+            json.dump(exp, f, indent=2)
+            f.write("\n")
+        print(f"wrote mutants/{name} (shared RTL, expect {exp['expect'].upper()})")
 
 
 if __name__ == "__main__":

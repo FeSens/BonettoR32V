@@ -1,0 +1,10 @@
+{
+  "class": "uo_late",
+  "checks": [
+    "gpio"
+  ],
+  "description": "uo_out takes the IO store's value two cycles after the store retires.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/uo_late"
+}

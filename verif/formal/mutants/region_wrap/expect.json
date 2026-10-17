@@ -1,0 +1,12 @@
+{
+  "class": "region_wrap",
+  "checks": [
+    "bus_dmem"
+  ],
+  "description": "hyp/002-rf-in-ram with register slots at 0xFFC2 + 4r: x15's 4-byte transactions run 0xFFFE..0x0001, out of the core region.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/region_wrap",
+  "timing": "legal_h002_rf",
+  "slow": true
+}

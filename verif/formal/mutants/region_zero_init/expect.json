@@ -1,0 +1,13 @@
+{
+  "class": "region_zero_init",
+  "checks": [
+    "rvfi",
+    "bus_imem"
+  ],
+  "description": "hyp/002-rf-in-ram-pcram without its boot write: the first slot after reset keeps CS_n high, so the pc comes from whatever the region held at reset. It works only if the region starts zero (contract section 3: its contents at reset are arbitrary; the cosim fills it with random bytes).",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/region_zero_init",
+  "timing": "legal_h002_pcram",
+  "slow": true
+}

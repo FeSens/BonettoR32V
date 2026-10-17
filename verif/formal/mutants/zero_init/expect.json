@@ -1,0 +1,11 @@
+{
+  "class": "zero_init",
+  "checks": [
+    "rvfi",
+    "bus_imem"
+  ],
+  "description": "pc has no reset: the core relies on it powering up as 0.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/zero_init"
+}

@@ -1,0 +1,9 @@
+{
+  "class": "junk register fields on a trapping branch or JALR",
+  "checks": [
+    "insn_jalr"
+  ],
+  "description": "Every trapping retirement reports arbitrary rs1/rs2 fields (the cosim's v1 legal_trap_fields). Contract v2 section 6: a trapping branch or JALR must report its operands truthfully.",
+  "expect": "fail",
+  "deep": false
+}
