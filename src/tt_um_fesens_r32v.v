@@ -67,20 +67,21 @@ module tt_um_fesens_r32v (
 `endif
 );
 
-    // Slot types
-    localparam [2:0] SL_F = 3'd0, SL_A = 3'd1, SL_B = 3'd2, SL_S = 3'd3,
-                     SL_M = 3'd4, SL_R = 3'd5, SL_W = 3'd6, SL_U = 3'd7;
-    // Engine phases
-    localparam [3:0] E_IDLE = 4'd0,   // CS_n high, wait for the slot's start phase
-                     E_CMD  = 4'd1,   // command and address bits
-                     E_GAP  = 4'd2,   // one clock between the address bytes
-                     E_DATA = 4'd3,   // data bits
-                     E_END  = 4'd4,   // SCK low, then CS_n high
-                     E_PW   = 4'd5,   // shift pre-roll: wait for the reference phase
-                     E_PC   = 4'd6,   // shift pre-roll: count j up to 63
-                     E_RET  = 4'd7,   // retire
-                     E_HALT = 4'd8,
-                     E_CLR  = 4'd9;   // after reset: pc <- 0
+    // Slot types. Binary codes, used bitwise below (which also keeps synthesis from
+    // re-encoding the register one-hot): 0xx READ slots, A/B/U = 0 with a bit in [1:0].
+    localparam [2:0] SL_F = 3'b000, SL_A = 3'b001, SL_U = 3'b010, SL_B = 3'b011,
+                     SL_S = 3'b100, SL_W = 3'b101, SL_M = 3'b110, SL_R = 3'b111;
+    // Engine phases: 01x0 = command/address or data (SCK runs)
+    localparam [3:0] E_IDLE = 4'b0000,   // CS_n high, wait for the slot's start phase
+                     E_PW   = 4'b0001,   // shift pre-roll: wait for the reference phase
+                     E_PC   = 4'b0010,   // shift pre-roll: count j up to 63
+                     E_RET  = 4'b0011,   // retire
+                     E_CMD  = 4'b0100,   // command and address bits
+                     E_DATA = 4'b0101,   // data bits
+                     E_GAP  = 4'b0110,   // one clock between the address bytes
+                     E_END  = 4'b0111,   // SCK low, then CS_n high
+                     E_CLR  = 4'b1000,   // after reset: pc <- 0
+                     E_HALT = 4'b1001;
 
     reg  [2:0]  sl;
     reg  [3:0]  ep;
@@ -166,6 +167,8 @@ module tt_um_fesens_r32v (
     wire sW = (sl == SL_W);
     wire sS = (sl == SL_S);
     wire shB = sB & c_sh;
+    wire s_abu = ~sl[2] & (sl[1] | sl[0]);     // A, B or U
+    wire e_cd  = ~ep[3] & ep[2] & ~ep[1];      // CMD or DATA: SCK runs
 
     // ------------------------------------------------------------------------------------
     // Bit index of the current strobe in the aligned slots (A, B, U): bit k meets phase 2k.
@@ -248,7 +251,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // W data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
     // ------------------------------------------------------------------------------------
-    wire wem    = sW & sck & ~j[5] & ((ep == E_CMD) | (ep == E_DATA));
+    wire wem    = sW & sck & ~j[5] & e_cd;
     wire sh_evt = (ph == {3'b010, sh_left, ~sh_left, 1'b0});  // 18: source 32 passes; 20: source 0
     wire shfill = sh_left ? ~(cmp | sh_evt) : (cmp | sh_evt);
     wire ldfill = (j[4:3] > nm1);
@@ -415,7 +418,7 @@ module tt_um_fesens_r32v (
                 cmp <= 1'b1;
         end
 
-        if (stb & (sA | sB | sU))
+        if (stb & s_abu)
             c4 <= (ph == 6'd2) | (c4 & pcr[0]);
 
         // bit counter
@@ -429,9 +432,9 @@ module tt_um_fesens_r32v (
             j <= {b_raw ^ ~sh_left, j[5:1]};
 
         // MOSI changes only where SCK stays low or falls
-        if (((ep == E_CMD) | (ep == E_DATA)) & ~sck)
+        if (e_cd & ~sck)
             mosi <= mosi;
-        else if ((ep == E_CMD) | (ep == E_DATA) | (ep == E_GAP))
+        else if (e_cd | (ep == E_GAP))
             mosi <= mosi_nx;
         else
             mosi <= 1'b0;
@@ -451,7 +454,7 @@ module tt_um_fesens_r32v (
             gpo  <= 8'd0;
         end else begin
             ph  <= (ph == 6'd32) ? 6'd0 : ph + 6'd1;
-            sck <= ((ep == E_CMD) | (ep == E_DATA)) & ~sck;
+            sck <= e_cd & ~sck;
             if (stb & sA & c_mem & (ph == 6'd29))
                 mem <= ~sum;                                // address bit 31 = 0: RAM
             case (ep)
