@@ -1,9 +1,10 @@
 /*
- * 23LC512-compatible SPI RAM model for the Tiny Tapeout test (docs/contract.md section 2).
+ * 23LC512-compatible SPI RAM model for the Tiny Tapeout test (docs/contract.md v2, section 2).
  *
  * 64 KB, SPI mode 0, sequential mode: READ 0x03 and WRITE 0x02 with a 16-bit address, then data
  * bytes at (A + k) mod 2^16. The contents come from a $readmemh file (one byte per line), the HEX
- * parameter or +SPIRAM_HEX=<path>.
+ * parameter or +SPIRAM_HEX=<path>; the core region 0xFF80-0xFFFF (contract section 3) then gets
+ * random bytes (REGION_SEED or +SPIRAM_REGION_SEED=<n>).
  *
  * The rules are defined at the core's rising clk edges, so the model samples CS_n, SCK and MOSI at
  * every rising clk edge (in RTL and in gate-level simulation the outputs have settled by then)
@@ -26,7 +27,8 @@
 `timescale 1ns / 1ps
 
 module spiram_23lc512 #(
-    parameter HEX = "gpio_demo.hex"
+    parameter HEX = "gpio_demo.hex",
+    parameter REGION_SEED = 1    // the core region's random reset contents (+SPIRAM_REGION_SEED=)
 ) (
     input  wire clk,     // the core's clock: the rules are stated at its rising edges
     input  wire rst_n,
@@ -51,10 +53,17 @@ module spiram_23lc512 #(
     reg        next_bit;   // MISO value for the next rising SCK edge (X when none)
 
     integer i;
+    integer seed;
     initial begin
         for (i = 0; i < 65536; i = i + 1) mem[i] = 8'h00;
         if (!$value$plusargs("SPIRAM_HEX=%s", path)) path = HEX;
         $readmemh(path, mem);
+        // Contract v2 section 3: the core region 0xFF80-0xFFFF holds the core's private state and
+        // starts arbitrary, like on-die registers; programs never touch it. Random bytes, so a
+        // core that relies on its reset contents fails. Region transactions are plain memory
+        // traffic here: the model needs nothing else for them.
+        if (!$value$plusargs("SPIRAM_REGION_SEED=%d", seed)) seed = REGION_SEED;
+        for (i = 16'hFF80; i < 65536; i = i + 1) mem[i] = $random(seed);
         miso     = 1'bx;
         next_bit = 1'bx;
         in_txn   = 1'b0;
