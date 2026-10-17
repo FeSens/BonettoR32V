@@ -13,7 +13,8 @@
  * phase 32 unused. Register traffic streams straight into and out of the ring with no per-bit
  * enables. 33 is odd, so a time offset of 2s clocks is a shift by s bits: shifts are a delayed
  * emission. A store keeps its 16-bit RAM address on the odd phases (bit k at 2k + 1) and 16 data
- * bits on the even phases (bit k at 2k + 2).
+ * bits on the even phases (bit k at 2k); its WRITE waits 16 clocks between the address and the
+ * data (inside the slot's third lap), which lines the data up with the address taps.
  *
  * Transactions (slots). Every SPI transaction has the same frame: 8 command bits, the address
  * high byte, a one-clock gap, the low byte, then data, all at SCK = clk/2. Every slot starts at
@@ -25,8 +26,7 @@
  *   B   READ  rs2 -> serial ALU with the buffer
  *   BH  READ  rs2 (BH2: rs2 + 2, and address + 2 in place) -> buffer even phases (store data)
  *   F   READ  pc[15:0] (buffer tap mux)                -> instruction register
- *   M   READ/WRITE address from the buffer taps, store data from the even-phase taps (M2: high
- *       half)
+ *   M   READ/WRITE address, then store data, from the same buffer taps (M2: high half)
  *   WP  WRITE x0 <- buffer;  WP4: x0 <- buffer + 4;  W4: rd (JAL) or scratch (JALR) <- buffer + 4
  *   W   WRITE rd <- buffer (forward, load-reversed, or shifted)
  * A slot whose register is x0 (or that has no register) keeps CS_n high and runs the same timing.
@@ -88,7 +88,8 @@ module tt_um_fesens_r32v (
                      E_HALT = 3'b011,    // after a trap
                      E_CMD  = 3'b100,    // command and address bits
                      E_DATA = 3'b101,    // data bits
-                     E_GAP  = 3'b110,    // one clock between the address bytes
+                     E_GAP  = 3'b110,    // one clock between the address bytes; a store
+                                         // WRITE's 16 clocks before its data
                      E_END  = 3'b111;    // SCK low, then CS_n high
 
     reg  [3:0]  sl;
@@ -217,11 +218,11 @@ module tt_um_fesens_r32v (
     wire trap   = trap_dec | (c_br & taken & insn[8]) | (c_jalr & ~cmp);
 
     // ------------------------------------------------------------------------------------
-    // Ring tap muxes for MSB-first emission, select a = j[2:0]: address bit 15 - a / 7 - a from
-    // the odd phases (bfm), store data bit 7 - a of each byte from the even phases (bfo), and
-    // load data bit a of each byte (reversed, bfm; the load lands at ring position 15).
+    // Ring tap mux for MSB-first emission, select a = j[2:0]: address bit 15 - a / 7 - a (odd
+    // phases), store data bit 7 - a of each byte (even phases, 16 clocks later: the same taps),
+    // and load data bit a of each byte (reversed; the load lands at ring position 15).
     // ------------------------------------------------------------------------------------
-    reg bfm, bfo;
+    reg bfm;
     always @(*) begin
         case (j[2:0])
             3'd0: bfm = bfr[32];
@@ -232,16 +233,6 @@ module tt_um_fesens_r32v (
             3'd5: bfm = bfr[12];
             3'd6: bfm = bfr[8];
             default: bfm = bfr[4];
-        endcase
-        case (j[2:0])
-            3'd0: bfo = bfr[17];
-            3'd1: bfo = bfr[13];
-            3'd2: bfo = bfr[9];
-            3'd3: bfo = bfr[5];
-            3'd4: bfo = bfr[1];
-            3'd5: bfo = bfr[30];
-            3'd6: bfo = bfr[26];
-            default: bfo = bfr[22];
         endcase
     end
     wire       wtap = bfr[2];   // W family forward emission: bit k at its emission clock
@@ -287,7 +278,7 @@ module tt_um_fesens_r32v (
     end
     wire cmdbit  = (j[2:1] == 2'b11) & ~(j[0] & wr);
     wire mosi_ca = (j[4:3] == 2'b01) ? cmdbit : fM ? bfm : (~j[3] | ra_bit);
-    wire mosi_d  = fM ? bfo : wdo;
+    wire mosi_d  = fM ? bfm : wdo;
     wire mosi_nx = j[5] ? mosi_ca : mosi_d;
 
     // ------------------------------------------------------------------------------------
@@ -369,17 +360,18 @@ module tt_um_fesens_r32v (
     wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & f3[2]);
     wire alu_w  = useb ? boolr : sumj;
     wire lo16   = ~j[5] & (~j[4] | (j[3:0] == 4'd0));   // data bits 0..15 (j = bit + 1)
-    // Three write ports, one per data placement: the ring input (ALU results, bit k at phase
-    // 2k + 1), position 0 (store data at the even phases; BH2's address + 2) and position 15 (load
-    // data, so that the W load emission shares the address taps).
+    // Write ports, one per data placement: the ring input (ALU results, bit k at phase 2k + 1),
+    // position 31 (store data, bit k at phase 2k), position 15 (load data, so that the W load
+    // emission shares the address taps) and position 0 (BH2's address + 2 in place).
     wire we32   = stb & fR & ~shB;
-    wire we0    = inc2 | (stb & fO & lo16);
-    wire w0     = inc2 ? (bfr[1] ^ cin2) : miso_m;
+    wire we31   = stb & fO & lo16;
     wire we15   = stb & sMM & c_ld;
+    wire we0    = inc2;
+    wire w0     = bfr[1] ^ cin2;
 
     always @(posedge clk) begin
-        bfr <= {we32 ? alu_w : bfr[0], bfr[32:17], we15 ? miso_m : bfr[16], bfr[15:2],
-                we0 ? w0 : bfr[1]};
+        bfr <= {we32 ? alu_w : bfr[0], we31 ? miso_m : bfr[32], bfr[31:17],
+                we15 ? miso_m : bfr[16], bfr[15:2], we0 ? w0 : bfr[1]};
         // the tail (insn[7:2]) skips the last strobe, so insn[1] (the strobe before) drops out
         if (sF & stb) begin
             irs[24:0] <= {irs[23:0], uio_in[2]};
@@ -458,9 +450,12 @@ module tt_um_fesens_r32v (
                     if (j[4:0] == 5'd24)                // j = 56 (CMD has j >= 41 or 0)
                         ep <= E_GAP;
                     else if (~j[5])                         // j wrapped to 0
-                        ep <= E_DATA;
+                        ep <= (sMM & c_st) ? E_GAP : E_DATA;
                 end
-                E_GAP:  ep <= E_CMD;
+                E_GAP: if (j[5])                            // between the address bytes
+                    ep <= E_CMD;
+                else if (&ph[3:0])                          // from 0: data starts at 16
+                    ep <= E_DATA;
                 E_DATA: if (sck & dend) ep <= E_END;
                 E_END: begin                                // retires if nret
                     sl   <= nret ? SL_P : nsl;
@@ -468,7 +463,7 @@ module tt_um_fesens_r32v (
                     if (nret) begin
                         mem <= 1'b0;
                         if (c_st & ~mem & cmp & ~trap)
-                            gpo <= {bfr[18], bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4]};
+                            gpo <= {bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4], bfr[2]};
                     end
                 end
                 E_PW: if (ph[1] & (sh_left ? ph[4] : (ph[3] & ph[2]))) ep <= E_PC;  // from 32: 18 (left), 14
