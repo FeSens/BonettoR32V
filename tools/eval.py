@@ -8,8 +8,9 @@ Gate order (docs/eval.md): cheapest first, so a bad candidate retires early.
 The score is coremark_ips = f_clk / CoreMark cycles per iteration (contract v3 section 7): the
 cosim gate reads the cycles from the CoreMark runs and f_clk from src/config.json CLOCK_PERIOD.
 The area gate includes the `fits` pre-filter: synth area above 11,500 um2 fails (harden confirms).
-With --min-ips X, a candidate whose coremark_ips is not above X stops right after the cosim gate
-("NO_GAIN", exit 3): it cannot win, so the rest of its gates are not worth running.
+With --min-ips X, a candidate whose coremark_ips is below X (or null) stops right after the cosim
+gate ("NO_GAIN", exit 3): it cannot win, so the rest of its gates are not worth running. A tie
+continues through every gate: the contract's tiebreak (smaller synth area) may still make it win.
 
 Each gate is one adapter function below (gate_<name>). An adapter runs the gate's runner and
 judges the result from the runner's exit code AND its output json, which it deletes before the run
@@ -22,7 +23,7 @@ Usage:
   eval.py --formal        the same, then formal last
   eval.py --gate NAME     one gate (lint cosim equiv formal formal-deep arch area gl);
                           writes build/gates/NAME.json; exit 0 iff it passes
-  eval.py --min-ips X     stop after the cosim gate unless coremark_ips > X (the champion's)
+  eval.py --min-ips X     stop after the cosim gate if coremark_ips < X (the champion's) or null
   eval.py -v              also stream runner output to the console (always on with --gate)
 
 Runner output goes to build/logs/<gate>*.log. Formal runs under `lockf -k /tmp/bonetto-heavy.lock`.
@@ -543,7 +544,8 @@ def main(argv=None):
     ap.add_argument("--formal", action="store_true",
                     help="also run the formal gate, last (contract v3 section 7 cadence)")
     ap.add_argument("--min-ips", type=float, metavar="IPS",
-                    help="retire the candidate after the cosim gate unless coremark_ips > IPS")
+                    help="retire the candidate after the cosim gate if coremark_ips < IPS "
+                         "(a tie continues: the area tiebreak may win)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -583,9 +585,9 @@ def main(argv=None):
             break
         if name == "cosim" and args.min_ips is not None:
             ips = ctx.notes.get("coremark_ips")
-            if not (ips is not None and ips > args.min_ips):
+            if ips is None or ips < args.min_ips:
                 doc["stopped_at"], doc["no_gain"] = name, True
-                skip_why = f"not run (coremark_ips {ips} is not above --min-ips {args.min_ips})"
+                skip_why = f"not run (coremark_ips {ips} is below --min-ips {args.min_ips})"
                 break
     for name in order:
         doc["gates"].setdefault(name, {"pass": None, "detail": skip_why})
@@ -597,7 +599,7 @@ def main(argv=None):
         doc[k] = ctx.notes.get(k)
     doc["runtime_s"] = round(time.time() - t0, 1)
     write_json(out, doc)
-    verdict = ("PASS" if doc["pass"] else "NO_GAIN (not faster than --min-ips)"
+    verdict = ("PASS" if doc["pass"] else "NO_GAIN (slower than --min-ips)"
                if doc["no_gain"] else f"FAIL at {doc['stopped_at']}")
     print(f"[eval] {verdict}: sha {sha[:12]}{' (dirty)' if dirty else ''}, "
           f"coremark_ips {doc['coremark_ips']}, area {doc['area_um2']} um2, "

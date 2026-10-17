@@ -166,9 +166,10 @@ def test_stops_at_first_failure(repo, monkeypatch):
 
 
 @pytest.mark.parametrize("bar,ips,rc,calls_after_cosim", [
-    (2.5, 2.5, 3, []),                   # equal speed is no gain
+    (2.5, 2.5, 0, ["arch", "equiv", "gl"]),   # a tie continues: the area tiebreak may win (R17)
+    (2.5000001, 2.5, 3, []),
     (3.0, 2.5, 3, []),
-    (0.0, None, 3, []),                  # no CoreMark score: cannot be shown faster
+    (0.0, None, 3, []),                  # no CoreMark score: cannot be shown at least as fast
     (2.4, 2.5, 0, ["arch", "equiv", "gl"]),
 ])
 def test_min_ips_stops_after_cosim(repo, monkeypatch, bar, ips, rc, calls_after_cosim):
@@ -189,10 +190,19 @@ def test_min_ips_stops_after_cosim(repo, monkeypatch, bar, ips, rc, calls_after_
 
 def test_min_ips_with_formal_stops_before_formal(repo, monkeypatch):
     calls = fake_gates(monkeypatch, ips=1.0)
-    assert ev.main(["--repo", str(repo), "--formal", "--min-ips", "1.0"]) == 3
+    assert ev.main(["--repo", str(repo), "--formal", "--min-ips", "1.5"]) == 3
     assert calls == ["lint", "area", "cosim"]
     doc = eval_doc(repo)
     assert doc["formal"] == "skipped" and "--min-ips" in doc["gates"]["formal"]["detail"]
+    assert "coremark_ips 1.0 is below --min-ips 1.5" in doc["gates"]["formal"]["detail"]
+
+
+def test_min_ips_tie_runs_every_gate_including_formal(repo, monkeypatch):
+    calls = fake_gates(monkeypatch, ips=1.0)
+    assert ev.main(["--repo", str(repo), "--formal", "--min-ips", "1.0"]) == 0
+    assert calls == V3_ORDER + ["formal"]
+    doc = eval_doc(repo)
+    assert doc["pass"] is True and doc["no_gain"] is False and doc["formal"] == "pass"
 
 
 def test_failing_cosim_gate_beats_bar_check(repo, monkeypatch):
@@ -286,6 +296,18 @@ def test_make_eval_formal_and_min_ips_flags():
         assert bare.endswith("tools/eval.py") and "--formal" not in bare
     p = dry("eval", "MAX_AREA=4000")                 # replaced by MIN_IPS: refuse, don't ignore
     assert p.returncode != 0 and "MIN_IPS" in p.stderr
+
+
+@pytest.mark.parametrize("value,formal", [("1", True), ("0", False), ("", False),
+                                          ("yes", False), ("no", False)])
+def test_make_formal_only_when_formal_is_1(value, formal):
+    import subprocess
+    for target in ("eval", "gates"):
+        p = subprocess.run(["make", "-n", "-C", REPO, target, f"FORMAL={value}"],
+                           capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        cmd = " ".join(p.stdout.split())
+        assert cmd.endswith("tools/eval.py --formal" if formal else "tools/eval.py"), cmd
 
 
 # --- missing runners fail loudly ---------------------------------------------------------------
@@ -710,7 +732,8 @@ def test_coremark_ips_reaches_eval_json(cosim_repo, monkeypatch):
     assert ev.main(["--repo", str(cosim_repo), "--min-ips", "39.99"]) == 0
     doc = eval_doc(cosim_repo)
     assert doc["coremark_ips"] == 40.0 and doc["cpi"] == 90.0 and doc["pass"] is True
-    assert ev.main(["--repo", str(cosim_repo), "--min-ips", "40"]) == 3
+    assert ev.main(["--repo", str(cosim_repo), "--min-ips", "40"]) == 0     # a tie continues
+    assert ev.main(["--repo", str(cosim_repo), "--min-ips", "40.000001"]) == 3
 
 
 def test_coremark_ips_uses_the_slowest_seed(cosim_repo, monkeypatch):

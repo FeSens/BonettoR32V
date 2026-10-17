@@ -16,7 +16,7 @@ HYP3 = "d" * 40
 
 
 def eval_json(tmp_path, sha, area, cells, ok=True, dirty=False, name="eval.json", ips=1.0,
-              formal="skipped"):
+              formal="skipped", clock=25):
     """A v3 build/eval.json: formal is in `gates` only when it ran (eval.py --formal)."""
     names = ["lint", "area", "cosim", "arch", "equiv", "gl"] + ([] if formal == "skipped"
                                                                else ["formal"])
@@ -24,7 +24,7 @@ def eval_json(tmp_path, sha, area, cells, ok=True, dirty=False, name="eval.json"
                  "detail": ""} for g in names}
     doc = {"sha": sha, "dirty": dirty, "pass": ok, "gates": gates, "area_um2": area,
            "cells": cells, "coremark_ips": ips, "cpi": 90.0, "formal": formal,
-           "timestamp": "2026-10-16T00:00:00Z"}
+           "clock_period_ns": clock, "timestamp": "2026-10-16T00:00:00Z"}
     p = tmp_path / name
     p.write_text(json.dumps(doc))
     return str(p)
@@ -45,12 +45,12 @@ def entries(paths):
 
 
 def add(paths, tmp_path, id_, sha, verdict, area=None, cells=None, ok=True, dirty=False,
-        idea="idea", notes="", ips=1.0, formal="skipped"):
+        idea="idea", notes="", ips=1.0, formal="skipped", clock=25, force=False):
     args = ["add", "--id", id_, "--branch", f"hyp/{id_}-x", "--sha", sha, "--idea", idea,
-            "--verdict", verdict, "--notes", notes]
+            "--verdict", verdict, "--notes", notes] + (["--force-merge"] if force else [])
     if area is not None:
         args += ["--eval", eval_json(tmp_path, sha, area, cells, ok, dirty, f"eval{id_}.json",
-                                     ips, formal)]
+                                     ips, formal, clock)]
     return cli(paths, *args)
 
 
@@ -94,7 +94,9 @@ def test_seed_then_hypotheses(paths, tmp_path, capsys):
     assert cli(paths, "show") == 0
     out = capsys.readouterr().out
     assert "champion 002" in out and HYP2 in out and "15,000.5" in out
-    assert "CoreMark 1.5000 iterations/s" in out
+    assert "CoreMark 1.5 iterations/s at 25 ns" in out
+    assert e[2]["clock_period_ns"] == 25 and e[2]["forced"] is False
+    assert e[3]["clock_period_ns"] is None
     assert cli(paths, "show", "--json") == 0
     assert json.loads(capsys.readouterr().out)["id"] == "002"
     assert cli(paths, "next-id") == 0
@@ -326,17 +328,28 @@ def test_bad_formal_value_refused(paths, tmp_path, capsys):
     assert "formal" in capsys.readouterr().err
 
 
+def v3_line(id_, sha, ips, area, forced=False, verdict="merged", idea="idea"):
+    """A v3 ledger line written by hand (add refuses merges that would not become champion)."""
+    e = {k: None for k in ledger.FIELDS}
+    e.update({"id": id_, "ts": "2026-10-17T12:00:00Z", "branch": f"hyp/{id_}-x", "sha": sha,
+              "idea": idea, "verdict": verdict, "coremark_ips": ips, "clock_period_ns": 25,
+              "area_um2": area, "cells": 900, "gates": {}, "formal": "skipped",
+              "forced": forced, "notes": ""})
+    return json.dumps(e) + "\n"
+
+
 def test_champion_is_max_ips(paths, tmp_path, capsys):
-    add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=1.0, idea="mcu seed")
-    add(paths, tmp_path, "101", HYP1, "merged", 11400.0, 950, ips=3.0, idea="quad fetch")
-    add(paths, tmp_path, "102", HYP2, "merged", 10000.0, 850, ips=2.0, idea="smaller, slower")
-    e = entries(paths)
-    assert ledger.champion(e)["id"] == "101"              # highest score, not the latest
-    assert e[2]["delta_ips"] == -1.0 and e[2]["parent_sha"] == HYP1
+    with open(paths[0], "w") as f:
+        f.write(v3_line("100", SEED, 1.0, 11000.0, idea="mcu seed")
+                + v3_line("101", HYP1, 3.0, 11400.0, idea="quad fetch")
+                + v3_line("102", HYP2, 2.0, 10000.0, idea="smaller, slower"))
+    assert ledger.champion(entries(paths))["id"] == "101"  # highest score, not the latest
     # Tiebreak (contract v3 section 7): the smaller synthesized area.
-    add(paths, tmp_path, "103", HYP3, "merged", 11500.0, 960, ips=3.0, idea="same, bigger")
+    with open(paths[0], "a") as f:
+        f.write(v3_line("103", HYP3, 3.0, 11500.0, idea="same, bigger"))
     assert ledger.champion(entries(paths))["id"] == "101"
-    add(paths, tmp_path, "104", "e" * 40, "merged", 11300.0, 940, ips=3.0, idea="same, smaller")
+    assert add(paths, tmp_path, "104", "e" * 40, "merged", 11300.0, 940, ips=3.0,
+               idea="same, smaller") == 0
     assert ledger.champion(entries(paths))["id"] == "104"
     capsys.readouterr()
     assert cli(paths, "show") == 0
@@ -388,3 +401,101 @@ def test_legacy_area_only_entries_still_read(paths, tmp_path, capsys):
     e5 = next(x for x in entries(paths) if x["id"] == "005")
     assert list(e5) == list(ledger.FIELDS) and e5["coremark_ips"] is None
     assert e5["tile_fraction"] == 0.3 and e5["area_um2"] == 4780.0
+
+
+# --- review fix round 1: a merge must become the champion; full-precision show; clock ------------
+
+@pytest.mark.parametrize("ips,area,ok", [
+    (1.9, 10000.0, False),               # slower, even though smaller
+    (2.0, 11001.0, False),               # tie, bigger area
+    (2.0, 11000.0, False),               # tie, same area: not smaller
+    (2.0, 10999.0, True),                # tie, smaller area: the contract's tiebreak
+    (2.1, 11400.0, True),                # faster, even though bigger
+], ids=["slower", "tie-bigger", "tie-same-area", "tie-smaller", "faster"])
+def test_merged_must_become_champion(paths, tmp_path, capsys, ips, area, ok):
+    assert add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=2.0) == 0
+    capsys.readouterr()
+    assert add(paths, tmp_path, "101", HYP1, "merged", area, 900, ips=ips) == (0 if ok else 1)
+    if ok:
+        assert ledger.champion(entries(paths))["id"] == "101"
+        assert entries(paths)[1]["forced"] is False
+    else:
+        err = capsys.readouterr().err
+        assert "would not become the champion" in err and "--force-merge" in err
+        assert [e["id"] for e in entries(paths)] == ["100"]
+    # Non-merged verdicts are never ranked.
+    assert add(paths, tmp_path, "102", HYP2, "rejected", 12000.0, 999, ips=0.5) == 0
+
+
+def test_force_merge_is_recorded_and_takes_over(paths, tmp_path, capsys):
+    assert add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=2.0) == 0
+    assert add(paths, tmp_path, "101", HYP1, "merged", 11000.0, 900, ips=1.5, force=True,
+               idea="timing repair costs speed") == 0
+    e = entries(paths)
+    assert e[1]["forced"] is True and e[1]["delta_ips"] == -0.5
+    # The forced merge is what main now holds, so it is the champion and the next bar.
+    assert ledger.champion(e)["id"] == "101"
+    assert add(paths, tmp_path, "102", HYP2, "merged", 11000.0, 900, ips=1.75) == 0
+    assert ledger.champion(entries(paths))["id"] == "102"
+    assert entries(paths)[2]["parent_sha"] == HYP1
+    capsys.readouterr()
+    cli(paths, "board")
+    text = open(paths[1]).read()
+    history = text.split("## Champion history")[1].split("## Last")[0]
+    assert "| - (forced) |" in history
+    recent = text.split("## Last 20 hypotheses")[1]
+    assert "| merged (forced) |" in recent
+
+
+def test_force_merge_rollback_restores_the_earlier_best(paths, tmp_path):
+    add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=2.0)
+    add(paths, tmp_path, "101", HYP1, "merged", 11000.0, 900, ips=1.5, force=True)
+    assert cli(paths, "add", "--id", "102", "--branch", "b", "--sha", HYP1, "--idea", "r",
+               "--verdict", "rolled_back") == 0
+    assert ledger.champion(entries(paths))["id"] == "100"
+
+
+def test_force_merge_only_with_merged(paths, tmp_path, capsys):
+    assert add(paths, tmp_path, "100", SEED, "rejected", 11000.0, 900, force=True) == 1
+    assert "--force-merge" in capsys.readouterr().err
+    assert entries(paths) == []
+
+
+def test_force_merge_does_not_skip_the_other_checks(paths, tmp_path, capsys):
+    assert add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=2.0) == 0
+    assert add(paths, tmp_path, "101", HYP1, "merged", 11000.0, 900, ips=1.0, ok=False,
+               force=True) == 1
+    assert "pass: False" in capsys.readouterr().err
+
+
+def test_show_prints_the_full_precision_score(paths, tmp_path, capsys):
+    ips = 2 / 3
+    assert add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=ips) == 0
+    capsys.readouterr()
+    assert cli(paths, "show") == 0
+    assert f"CoreMark {ips!r} iterations/s" in capsys.readouterr().out
+    assert cli(paths, "show", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["coremark_ips"] == ips     # exact, for MIN_IPS
+
+
+def test_clock_period_is_stored_and_shown(paths, tmp_path, capsys):
+    assert add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=1.0, clock=25) == 0
+    assert add(paths, tmp_path, "101", HYP1, "merged", 11000.0, 900, ips=1.2, clock=20) == 0
+    e = entries(paths)
+    assert (e[0]["clock_period_ns"], e[1]["clock_period_ns"]) == (25, 20)
+    cli(paths, "board")
+    text = open(paths[1]).read()
+    assert "clock 20 ns" in text                                  # the champion line
+    history = text.split("## Champion history")[1].split("## Last")[0]
+    assert "| clock ns |" in history and "| 25 |" in history and "| 20 |" in history
+    assert "| clock ns |" in text.split("## Last 20 hypotheses")[1]
+    # A rollback without --eval copies the champion's clock.
+    assert cli(paths, "add", "--id", "102", "--branch", "b", "--sha", HYP1, "--idea", "r",
+               "--verdict", "rolled_back") == 0
+    assert entries(paths)[2]["clock_period_ns"] == 20
+
+
+@pytest.mark.parametrize("clock", [None, 0, "25"])
+def test_merged_needs_a_clock_period(paths, tmp_path, capsys, clock):
+    assert add(paths, tmp_path, "100", SEED, "merged", 11000.0, 900, ips=1.0, clock=clock) == 1
+    assert "clock_period_ns" in capsys.readouterr().err

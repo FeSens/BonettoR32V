@@ -3,8 +3,10 @@
 # Every gate's command lives in tools/eval.py, one adapter per gate; the gate targets below only
 # call it, so `make cosim` and the cosim step of `make eval` are the same command.
 # Gate order in `make eval`: lint, area, cosim, arch, equiv, gl, then formal only with FORMAL=1
-# (stops at the first FAIL). MIN_IPS=<champion coremark_ips> retires a candidate that isn't faster
-# right after cosim (exit 3). MAX_AREA is gone: the score is CoreMark/s (contract v3 section 7).
+# (exactly 1; FORMAL=0 or empty skips it). Stops at the first FAIL. MIN_IPS=<champion
+# coremark_ips, full precision from `tools/ledger.py show --json`> retires a slower candidate right
+# after cosim (exit 3); a tie continues. MAX_AREA is gone: the score is CoreMark/s (contract v3
+# section 7).
 # `make gates` is the same command under another name, for agent sandboxes that block commands
 # containing the word "eval".
 # Only formal, harden and tilefit take `lockf -k /tmp/bonetto-heavy.lock` (one heavy job at a
@@ -58,7 +60,7 @@ $(GATE_TARGETS):
 
 eval gates:
 	$(if $(MAX_AREA),$(error MAX_AREA was replaced by MIN_IPS=<champion coremark_ips> (contract v3 section 7)))
-	$(EVAL) $(if $(V),-v) $(if $(FORMAL),--formal) $(if $(MIN_IPS),--min-ips $(MIN_IPS))
+	$(EVAL) $(if $(V),-v) $(if $(filter 1,$(FORMAL)),--formal) $(if $(MIN_IPS),--min-ips $(MIN_IPS))
 
 harden:
 	@test -f tools/harden_tt.sh || { echo "harden: runner missing (tools/harden_tt.sh)"; exit 1; }
