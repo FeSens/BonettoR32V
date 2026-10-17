@@ -251,8 +251,8 @@ Neither config is an unbounded proof (see "What is and is not proven").
 
 ### Measured runtimes
 
-Every run below passed every check (56 in fast, 57 in deep: 40 instructions, 14 or 15 SBY
-checks, structure and equiv). Times are wall clock for the whole runner (timing given, so no
+Every completed run below passed every check (56 in fast, 57 in deep: 40 instructions, 14 or
+15 SBY checks, structure and equiv). Times are wall clock for the whole runner (timing given, so no
 cosim), with `--keep-going` (a passing run is the same either way). Mac: Apple M5, 10 cores,
 8 jobs, shared with other agents' jobs (load average 14.7 at the end of the fast bit-serial
 run). hwe-bench: Intel Core Ultra 7 265 (8 P + 12 E cores, 62 GB). The fast runs used a trial config
