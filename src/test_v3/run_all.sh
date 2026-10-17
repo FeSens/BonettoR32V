@@ -35,6 +35,7 @@ run csr csr
 for t in ecall ebreak jal jalr branch zero ones; do run "trap_$t" "trap_$t"; done
 run irq_timer irq_timer
 run irq_gpio irq_gpio --loop
+run irq_latency irq_latency
 # periph_regs and the peripheral pin behavior
 run periph_regs periph_regs --loop
 run uart_loop uart_loop --loop
@@ -54,6 +55,16 @@ for s in 1 2 3 4; do
             *) fails=$((fails + 1)); echo "FAIL random_$s rvfi $out" ;;
         esac
     done
+done
+# liveness fuzz: random flash images (unspecified encodings included), Pmod rules and the cap
+for seed in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    case "fuzz" in *$FILTER*) ;; *) continue ;; esac
+    total=$((total + 1))
+    out=$("$TB/harness_rvfi" --fuzz 400000 --seed "$seed" 2>/dev/null | tail -1)
+    case "$out" in
+        *'"pass":true'*) echo "PASS fuzz rvfi $out" ;;
+        *) fails=$((fails + 1)); echo "FAIL fuzz rvfi $out" ;;
+    esac
 done
 echo "runs: $total, failures: $fails"
 [ "$fails" = 0 ]

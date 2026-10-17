@@ -17,6 +17,8 @@
 //     --pwm CH:PER:Q:DUTY[,...]  after the program raises uo0 (GPIO marker) measure channel CH
 //                       (uo pin) period and high time; must be (PER+1)*2^Q and min(DUTY,PER+1)*2^Q
 //     --end-ebreak      (rvfi mode) a retired EBREAK ends the run (random streams)
+//     --fuzz N          (rvfi mode) liveness fuzz: random flash bytes (from --seed) instead of
+//                       the program, N cycles, no ISS: only the Pmod rules and the 2,048 cap
 //     --quiet, --trace-retire, --vcd FILE (trace builds only)
 // rvfi build (-DRISCV_FORMAL): every retirement is compared with the ISS (all RVFI fields; IO
 // volatile bits from the DUT), interrupts must be allowed in the ISS, the 2,048-cycle cap holds,
@@ -94,6 +96,7 @@ int main(int argc, char** argv) {
   double ppm = 0;
   std::vector<PwmSpec> pwm;
   const char* vcd = nullptr;
+  uint64_t fuzz = 0;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
@@ -119,17 +122,32 @@ int main(int argc, char** argv) {
       }
     }
     else if (a == "--end-ebreak") end_ebreak = true;
+    else if (a == "--fuzz") fuzz = strtoull(next().c_str(), nullptr, 0);
     else if (a == "--quiet") quiet = true;
     else if (a == "--trace-retire") trace_ret = true;
     else if (a == "--vcd") vcd = argv[++i];
     else if (a[0] != '-') bin = argv[i];
   }
-  if (!bin) {
+  if (!bin && !fuzz) {
     fprintf(stderr, "usage: harness flash.bin [options]\n");
     return 2;
   }
   std::vector<uint8_t> flash(FLASH_SIZE, 0xFF), psram(PSRAM_SIZE);
-  {
+  if (fuzz) {
+    // 7 of 8 words carry a real opcode (any other fields: reserved funct3/funct7, x16-x31,
+    // any CSR number, misaligned targets), the rest are fully random
+    static const uint8_t ops[] = {0x03, 0x0F, 0x13, 0x17, 0x23, 0x33, 0x37, 0x63, 0x67, 0x6F, 0x73};
+    uint64_t fs = seed * 0x9E3779B97F4A7C15ull + 3;
+    for (size_t i = 0; i < FLASH_SIZE; i += 4) {
+      fs ^= fs << 13;
+      fs ^= fs >> 7;
+      fs ^= fs << 17;
+      uint32_t w = (uint32_t)(fs >> 16);
+      if ((fs & 7) != 0) w = (w & ~0x7Fu) | ops[(fs >> 3) % sizeof ops];
+      memcpy(&flash[i], &w, 4);
+    }
+    max_cycles = fuzz;
+  } else {
     FILE* f = fopen(bin, "rb");
     if (!f) {
       fprintf(stderr, "cannot open %s\n", bin);
@@ -261,6 +279,10 @@ int main(int argc, char** argv) {
       }
       if (gap > max_gap) max_gap = gap;
       last_ret_t = t;
+      if (fuzz) {
+        retired++;
+        goto fuzz_next;
+      }
       if (top->rvfi_intr) {
         if (!iss.irq_allowed()) fail("interrupt while masked", t);
         iss.take_interrupt();
@@ -328,8 +350,9 @@ int main(int argc, char** argv) {
       last_pc = r.pc;
       last_insn = r.insn;
     }
+  fuzz_next:
     // GPIO-mode uo pins follow the ISS's GPIO_OUT (ALTFN = 0) from one cycle after each store
-    if (retired && err.empty() && !ended && t > gpio_settle) {
+    if (retired && err.empty() && !ended && t > gpio_settle && !fuzz) {
       uint8_t alt = iss.altfn(), g = iss.gpio_out();
       if ((uo & ~alt) != (g & ~alt)) {
         char b[128];
@@ -424,13 +447,19 @@ int main(int argc, char** argv) {
     }
     if (ended && t >= end_t + 2048) break;
     if (t >= max_cycles) {
-      fail("max cycles reached", t);
+      if (fuzz) {
+        if (t - last_ret_t > 2048) fail("no retirement in the last 2048 cycles", t);
+        ended = true;
+        passed = err.empty();
+      } else {
+        fail("max cycles reached", t);
+      }
       break;
     }
   }
 
 #ifdef RISCV_FORMAL
-  if (err.empty()) {
+  if (err.empty() && !fuzz) {
     for (uint32_t a = 0; a < REGION_LO; a++)
       if (psram[a] != iss.psram(a)) {
         char b[96];

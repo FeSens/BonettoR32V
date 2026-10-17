@@ -14,7 +14,7 @@ ARCH="-march=rv32e_zicsr -mabi=ilp32e"
 LDF="-nostdlib -nostartfiles -static -Wl,--no-warn-rwx-segments"
 CF="$ARCH -Os -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-common -I$P -Wall"
 cd "$P"
-for s in boot csr; do
+for s in boot csr irq_latency; do
     $CC $ARCH $LDF -T link.ld $s.S -o "$OUT/$s.elf"
 done
 k=1

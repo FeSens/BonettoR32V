@@ -277,32 +277,38 @@ module r32v_periph (
     end
 
     // ------------------------------------------------------------------------------------
-    // SPI master, mode 0, MSB first: 2^D cycles low, 2^D high per bit
+    // SPI master, mode 0, MSB first: 2^D cycles low, 2^D high per bit. MOSI shifts out of sdr at
+    // the falling SCK edges. MISO (synchronized, so 2 cycles late) is captured into srx three
+    // cycles after each rising edge (srp is that delay line): the value the pin had in the first
+    // high cycle. BUSY stays 1 until the eighth capture.
     // ------------------------------------------------------------------------------------
-    reg  [7:0] sdr;
-    reg        sbusy, ssck, sbit;
-    reg  [2:0] sbc;
+    reg  [7:0] sdr, srx;
+    reg        sbusy, ssck;
+    reg  [2:0] sbc, srp;
     reg  [6:0] sdc;
-    wire       s_go   = be0 & s_sdat & ~sbusy;
+    wire       s_busy  = sbusy | (|srp);
+    wire       s_go    = be0 & s_sdat & ~s_busy;
     wire [7:0] sdc_run = {&sdc[6:0], &sdc[5:0], &sdc[4:0], &sdc[3:0], &sdc[2:0], &sdc[1:0], sdc[0], 1'b1};
-    wire       s_half = sbusy & sdc_run[sd];
+    wire       s_half  = sbusy & sdc_run[sd];
     always @(posedge clk) begin
         sdc <= s_go ? 7'd0 : sdc + 7'd1;
-        if (s_half & ~ssck)
-            sbit <= s2[3];                               // MISO at the rising SCK edge
         if (s_go)
             sbc <= 3'd0;
         else if (s_half & ssck)
             sbc <= sbc + 3'd1;
+        if (s_go)
+            sdr <= d0;
+        else if (s_half & ssck)
+            sdr <= {sdr[6:0], 1'b0};
         if (!rst_n) begin
-            sdr   <= 8'd0;
+            srx   <= 8'd0;
             sbusy <= 1'b0;
             ssck  <= 1'b0;
+            srp   <= 3'd0;
         end else begin
-            if (s_go)
-                sdr <= d0;
-            else if (s_half & ssck)
-                sdr <= {sdr[6:0], sbit};
+            srp <= {srp[1:0], s_half & ~ssck};
+            if (srp[2])
+                srx <= {srx[6:0], s2[3]};
             if (s_go)
                 sbusy <= 1'b1;
             else if (s_half & ssck & (sbc == 3'd7))
@@ -349,8 +355,8 @@ module r32v_periph (
             5'd10: rdata = {6'd0, duty2};
             5'd11: rdata = {8'd0, rdat};
             5'd12: rdata = {rovr, rfull, tx_busy, div};
-            5'd13: rdata = {8'd0, sdr};
-            5'd14: rdata = {11'd0, sbusy, sd, scs};
+            5'd13: rdata = {8'd0, srx};
+            5'd14: rdata = {11'd0, s_busy, sd, scs};
             5'd15: rdata = {11'd0, ien};
             5'd16: rdata = {11'd0, pend};
             5'd17: rdata = {epol, een};
