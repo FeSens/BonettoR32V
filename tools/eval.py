@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """BonettoR32V evaluation: run every gate in order, stop at the first failure, write build/eval.json.
 
-Gate order (CLAUDE.md, docs/eval.md): lint, cosim, equiv, formal, arch, area, gl.
+Gate order (docs/eval.md): cheapest first, so a bad candidate retires early.
+  lint (~1 s), area (~10 s), cosim (minutes), arch (minutes), equiv, gl (minutes), formal (longest).
+With --max-area X, a candidate whose area_um2 is not below X stops right after the area gate
+("NO_GAIN", exit 3): it cannot win, so its correctness is not worth the formal run.
 
 Each gate is one adapter function below (gate_<name>). An adapter runs the gate's runner and
 judges the result from the runner's exit code AND its output json, which it deletes before the run
@@ -12,6 +15,7 @@ Usage:
   eval.py                 every gate in order; writes build/eval.json; exit 0 iff all pass
   eval.py --gate NAME     one gate (lint cosim equiv formal formal-deep arch area gl);
                           writes build/gates/NAME.json; exit 0 iff it passes
+  eval.py --max-area X    stop after the area gate unless area_um2 < X (the champion's area)
   eval.py -v              also stream runner output to the console (always on with --gate)
 
 Runner output goes to build/logs/<gate>*.log. Formal runs under `lockf -k /tmp/bonetto-heavy.lock`.
@@ -35,7 +39,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9_./+-]+$")
 TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
 TOP = "tt_um_fesens_r32v"
-ORDER = ["lint", "cosim", "equiv", "formal", "arch", "area", "gl"]
+ORDER = ["lint", "area", "cosim", "arch", "equiv", "gl", "formal"]
 # One heavy job at a time on the Mac. The path is overridable only so tests don't queue behind a
 # real formal run; it changes scheduling, never a verdict.
 HEAVY_LOCK = ["lockf", "-k", os.environ.get("BONETTO_HEAVY_LOCK", "/tmp/bonetto-heavy.lock")]
@@ -202,7 +206,8 @@ def gate_cosim(ctx):
         raise GateFail(f"gate cosim: program build failed: {first_problem(lines)} "
                        f"(log {ctx.log_rel('cosim_programs')})")
     hexes = sorted(glob.glob(ctx.path("build", "programs", "*.hex")))
-    first = {"selftest": 0, "gpio_demo": 1}
+    # Fail fast: the short directed programs first, CoreMark (the longest run) last.
+    first = {"selftest": 0, "gpio_demo": 1, "coremark": 3}
     hexes.sort(key=lambda h: (first.get(os.path.basename(h)[:-4], 2), h))
     if not hexes:
         raise GateFail("gate cosim: no build/programs/*.hex after make -C verif/programs")
@@ -212,13 +217,15 @@ def gate_cosim(ctx):
         expect = hexpath[:-4] + ".expect.json"
         if not os.path.isfile(expect):
             raise GateFail(f"gate cosim: missing {os.path.relpath(expect, ctx.repo)}")
-        max_cycles = LATENCY_CAP * (expect_retired(expect) + 1)
+        expect_retired(expect)              # the expect file must be well-formed
+        # No --max-cycles: the harness bounds each run by the latency cap times ITS OWN ISS
+        # retirement count for that mode and seed (programs branch on ui_in, so counts differ
+        # from the expect file's), and its watchdog bounds every gap.
         for mode in COSIM_MODES:
             for seed in COSIM_SEEDS:
                 log = f"cosim_{name}_{mode}_{seed}"
                 cmd = [ctx.py, "verif/cosim/run_cosim.py", "--mode", mode,
-                       "--prog", os.path.relpath(hexpath, ctx.repo), "--seed", str(seed),
-                       "--max-cycles", str(max_cycles)]
+                       "--prog", os.path.relpath(hexpath, ctx.repo), "--seed", str(seed)]
                 rc, lines = ctx.run(cmd, log)
                 s = last_json_line(lines) or {}
                 where = f"{name} --mode {mode} --seed {seed}"
@@ -447,6 +454,8 @@ def main(argv=None):
     ap.add_argument("--gate", choices=sorted(GATES), help="run one gate only")
     ap.add_argument("--out", help="eval json path (default build/eval.json)")
     ap.add_argument("--repo", default=REPO, help=argparse.SUPPRESS)
+    ap.add_argument("--max-area", type=float, metavar="UM2",
+                    help="retire the candidate after the area gate unless area_um2 < UM2")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -470,30 +479,41 @@ def main(argv=None):
         os.remove(out)          # a crashed run must not leave a stale passing file behind
     doc = {"sha": sha, "dirty": dirty, "pass": False, "gates": {}, "area_um2": None,
            "cells": None, "cpi": None, "timestamp": now_iso(), "order": ORDER,
-           "stopped_at": None, "tools": tool_versions(ctx.env)}
+           "stopped_at": None, "max_area": args.max_area, "no_gain": False,
+           "tools": tool_versions(ctx.env)}
     interrupted = False
+    skip_why = None
     for name in ORDER:
         res, _ = run_gate(ctx, name)
         doc["gates"][name] = res
         if not res["pass"]:
             doc["stopped_at"] = name
             interrupted = res["detail"] == "interrupted"
+            skip_why = f"not run (stopped after {name} failed)"
+            break
+        if name == "area" and args.max_area is not None \
+                and not ctx.notes["area_um2"] < args.max_area:
+            doc["stopped_at"], doc["no_gain"] = name, True
+            skip_why = f"not run (area {ctx.notes['area_um2']} um2 is not below --max-area " \
+                       f"{args.max_area})"
             break
     for name in ORDER:
-        doc["gates"].setdefault(name, {"pass": None, "detail":
-                                       f"not run (stopped after {doc['stopped_at']} failed)"})
+        doc["gates"].setdefault(name, {"pass": None, "detail": skip_why})
     doc["pass"] = all(doc["gates"][n]["pass"] is True for n in ORDER)
     doc["area_um2"] = ctx.notes.get("area_um2")
     doc["cells"] = ctx.notes.get("cells")
     doc["cpi"] = ctx.notes.get("cpi")
     doc["runtime_s"] = round(time.time() - t0, 1)
     write_json(out, doc)
-    verdict = "PASS" if doc["pass"] else f"FAIL at {doc['stopped_at']}"
+    verdict = ("PASS" if doc["pass"] else "NO_GAIN (not smaller than --max-area)"
+               if doc["no_gain"] else f"FAIL at {doc['stopped_at']}")
     print(f"[eval] {verdict}: sha {sha[:12]}{' (dirty)' if dirty else ''}, "
           f"area {doc['area_um2']} um2, cells {doc['cells']}, cpi {doc['cpi']} -> "
           f"{os.path.relpath(out, ctx.repo)}")
     if interrupted:
         return 130
+    if doc["no_gain"]:
+        return 3
     return 0 if doc["pass"] else 1
 
 

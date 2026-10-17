@@ -152,6 +152,12 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   Cosim programs never contain reserved encodings.
 - **Latency cap.** The first instruction retires within 1,024 cycles of reset release, and every
   later one within 1,024 cycles of the previous retirement. A halted core is exempt.
+  - **Counting:** number the rising clock edges so that edge 0 is the last edge at which `rst_n`
+    is sampled low.
+  - The first retirement (rvfi_valid sampled high) must happen at an edge numbered 1,024 or
+    lower.
+  - Each later retirement must come at most 1,024 edges after the previous one.
+  - Every checker (cosim watchdog, formal liveness) uses this count.
 - **FENCE** is a no-op that retires normally. That covers every MISC-MEM encoding with
   `funct3 = 000`, whatever its fm, pred, succ, rs1 and rd fields hold (x16-x31 included):
   FENCE.TSO, PAUSE and the rest. The spec requires base implementations to ignore those fields.

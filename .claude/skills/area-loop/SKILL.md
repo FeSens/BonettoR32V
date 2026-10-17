@@ -71,9 +71,14 @@ in sequence, not in parallel.
    /Users/bonetto/bonetto/BonettoR32V <champion_sha> <sha>`. It must exit 0. The candidate's
    `tools/`, `verif/` and `test/` are then byte-identical to the champion's, so its `make eval`
    runs the real gates.
-4. Run `make eval` (or its alias `make gates`) in the verify worktree and read
-   `build/eval.json`. Every gate must pass, and
-   `area_um2` must beat the champion's.
+4. Run `make eval MAX_AREA=<champion area_um2>` (or its alias `make gates`) in the verify
+   worktree and read `build/eval.json`. Every gate must pass, and `area_um2` must beat the
+   champion's.
+   - The gates run cheapest first: lint, area, cosim, arch, equiv, gl, formal.
+   - With `MAX_AREA`, a candidate that is not smaller stops right after the 10 s area gate
+     (`no_gain: true`, exit 3). Log it as `rejected`; it never waits for formal.
+   - Formal is the long pole. It runs last, only for candidates that already won on area and
+     passed every cheaper gate.
 5. Read the diff (`git diff <champion_sha> <sha> -- src/`). Look for contract violations no gate
    catches:
    - hard-wired registers;
@@ -84,7 +89,8 @@ in sequence, not in parallel.
 
 ### 4. Merge
 - **Order.** Merge winners one at a time, best first.
-- **Re-evaluate after every merge.** After each merge into main, run `make eval` again. Two wins
+- **Re-evaluate after every merge.** After each merge into main, run `make eval` again, with no
+  `MAX_AREA`, because the merged champion must pass every gate. Two wins
   can conflict or stop adding up.
 - **On a conflict:** resume the agent that owns the second branch (SendMessage) to rebase onto
   the new champion. Don't resolve RTL conflicts yourself.
