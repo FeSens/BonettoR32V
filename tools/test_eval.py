@@ -364,6 +364,8 @@ GOOD_FORMAL = {"pass": True, "checks": {"insn_add": "PASS", "reg": "PASS"}, "dep
     (GOOD_FORMAL, 1, False, "exit 1"),
     ({**GOOD_FORMAL, "pass": False}, 0, False, "formal FAIL"),
     ({**GOOD_FORMAL, "checks": {}}, 0, False, "no checks reported"),
+    ({**GOOD_FORMAL, "checks": {"insn_add": "PASS", "reg": "SKIPPED"}}, 0, False,
+     "reg=SKIPPED"),
     (None, 0, False, "runner wrote no build/formal.json"),
 ])
 def test_formal_adapter(repo, doc, rc, ok, msg):
@@ -376,6 +378,21 @@ def test_formal_stale_json_is_not_trusted(repo):
     put(repo, "build/formal.json", json.dumps(GOOD_FORMAL))
     fake_runner(repo, FORMAL, "build/formal.json", None, 0)
     assert run_gate(repo, "formal")["pass"] is False
+
+
+def test_remote_formal_skips_mac_lock(repo, monkeypatch):
+    import subprocess, time as _t
+    lock = ev.HEAVY_LOCK[-1]                             # the private lock of this test
+    holder = subprocess.Popen(["lockf", "-k", lock, "sleep", "30"])
+    try:
+        _t.sleep(0.5)                                   # the lock is now held by someone else
+        fake_runner(repo, FORMAL, "build/formal.json", GOOD_FORMAL, 0)
+        monkeypatch.setenv("BONETTO_FORMAL_HOST", "example-host")
+        t0 = _t.time()
+        assert run_gate(repo, "formal")["pass"] is True
+        assert _t.time() - t0 < 20                      # did not queue behind the held lock
+    finally:
+        holder.kill()
 
 
 def test_formal_deep_passes_flag(repo):
