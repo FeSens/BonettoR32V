@@ -25,10 +25,14 @@
 // rvfi build (-DRISCV_FORMAL): every retirement is compared with the ISS (all RVFI fields; IO
 // volatile bits from the DUT), interrupts must be allowed in the ISS, rvfi_intr = 1 exactly on
 // the first instruction of a handler (after a synchronous trap's retirement, or an interrupt
-// entry: contract 8), the 2,048-cycle cap holds,
+// entry: contract 8), every UART frame on uo0 (ALTFN[0] = 1) starts at most DIV+2 cycles after
+// the retirement edge of the UART_DATA store that started it (ruling R28), every GPIO_IN load
+// returns ui_in as sampled at some edge in [p-2, t] (p: the previous retirement edge, t: the
+// load's; ruling R30), the 2,048-cycle cap holds,
 // PSRAM writes outside the core region carry the ISS's data, the GPIO-mode uo pins follow the
 // ISS within a cycle, and the final PSRAM image matches. Both builds: the Pmod rules, and the
 // program's verdict on uo_out (0x5A pass, 0xEE fail), written with ALTFN = 0, then a self-loop.
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -245,6 +249,14 @@ int main(int argc, char** argv) {
   int selfloops = 0;
   uint64_t gpio_settle = 0;  // the GPIO compare skips this edge (one cycle after a store)
   bool intr_seen = false, prev_trap = false;
+  // R28: UART_DATA byte-0 store retirements {p, t, DIV} and frame starts {t, DIV} on uo0
+  struct UStore { uint64_t p, t; uint32_t div; };
+  std::vector<UStore> ustores;
+  std::vector<uint64_t> ustarts;
+  uint64_t ufr_end = 0;
+  // R30: ui_in as sampled at each rising edge (changes only), GPIO_IN reads checked
+  std::vector<std::pair<uint64_t, uint8_t>> ui_hist;
+  uint64_t n_gpio_in = 0, gpio_in_oldest = 0;
   uint64_t n_intr = 0, n_trap = 0, n_entries = 0;
   // UART TX decoder
   std::vector<uint8_t> tx_bytes;
@@ -264,6 +276,7 @@ int main(int argc, char** argv) {
 
   for (;;) {
     t++;
+    if (ui_hist.empty() || ui_hist.back().second != top->ui_in) ui_hist.push_back({t, top->ui_in});
     top->clk = 1;
     top->eval();
 #ifdef VCD_TRACE
@@ -284,6 +297,7 @@ int main(int argc, char** argv) {
         fail("retirement gap " + std::to_string(gap) + " > 2048", t);
       }
       if (gap > max_gap) max_gap = gap;
+      uint64_t p_ret = last_ret_t;  // the previous retirement edge
       last_ret_t = t;
       if (fuzz) {
         retired++;
@@ -339,6 +353,28 @@ int main(int argc, char** argv) {
         else if (top->rvfi_rs2_addr != r.rs2) mism("rs2_addr", top->rvfi_rs2_addr, r.rs2);
         else if (top->rvfi_rs2_rdata != r.rs2v) mism("rs2_rdata", top->rvfi_rs2_rdata, r.rs2v);
       }
+      // R28 / R30 bookkeeping
+      if (r.io && (r.wmask & 1) && ((r.maddr >> 2) & 31) == 11 && (r.maddr & 3) == 0)
+        ustores.push_back({p_ret, t, iss.uart_div()});
+      if (r.io && r.rmask && ((r.maddr >> 2) & 31) == 1 && (r.maddr & 3) == 0 && err.empty()) {
+        uint8_t v = (uint8_t)top->rvfi_mem_rdata;
+        uint64_t lo = p_ret >= 2 ? p_ret - 2 : 0, best = 0;
+        bool found = false;
+        for (size_t k = 0; k < ui_hist.size(); k++) {
+          uint64_t s0 = ui_hist[k].first, s1 = k + 1 < ui_hist.size() ? ui_hist[k + 1].first - 1 : t;
+          if (s1 < lo || s0 > t || ui_hist[k].second != v) continue;
+          found = true;
+          best = s1 < t ? s1 : t;  // the latest matching edge in the window
+        }
+        n_gpio_in++;
+        if (!found) {
+          snprintf(b, sizeof b, "GPIO_IN read %02x matches no ui_in sample in [p-2, t] = [%llu, %llu] (R30)", v,
+                   (unsigned long long)lo, (unsigned long long)t);
+          fail(b, t);
+        } else if (t - best > gpio_in_oldest) {
+          gpio_in_oldest = t - best;
+        }
+      }
       if (r.trap) n_trap++;
       intr_seen = false;
       prev_trap = r.trap;
@@ -373,6 +409,13 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#ifdef RISCV_FORMAL
+    // R28: frame starts on uo0 while it carries the UART (a falling edge outside a frame)
+    if (retired && !fuzz && (iss.altfn() & 1) && (prev_uo & 1) && !(uo & 1) && t >= ufr_end) {
+      ustarts.push_back(t);
+      ufr_end = t + 9ull * (iss.uart_div() + 1) + 1;
+    }
+#endif
     // UART TX decoder on uo0
     if (uart_div >= 0) {
       int v = uo & 1;
@@ -507,6 +550,28 @@ int main(int argc, char** argv) {
     }
   }
 #ifdef RISCV_FORMAL
+  // R28: each frame start belongs to the UART_DATA store executing then (start in (p, t]: delay
+  // <= 0) or else to the latest store retired before it; delay = start - retirement edge
+  long long ustart_max = LLONG_MIN, ustart_min = LLONG_MAX;
+  for (uint64_t st : ustarts) {
+    if (!err.empty()) break;
+    const UStore* own = nullptr;
+    for (auto& u : ustores)
+      if (u.p < st && st <= u.t) own = &u;
+    if (!own)
+      for (auto& u : ustores)
+        if (u.t < st) own = &u;
+    if (!own) {
+      fail("UART frame start at cycle " + std::to_string(st) + " with no UART_DATA store before it", st);
+      break;
+    }
+    long long d = (long long)st - (long long)own->t;
+    if (d > ustart_max) ustart_max = d;
+    if (d < ustart_min) ustart_min = d;
+    if (d > (long long)own->div + 2)
+      fail("UART frame start " + std::to_string(d) + " cycles after the UART_DATA store's retirement edge "
+           "(cycle " + std::to_string(own->t) + "), more than DIV+2 = " + std::to_string(own->div + 2) + " (R28)", st);
+  }
   if (err.empty() && expect_entries >= 0 && n_entries != (uint64_t)expect_entries)
     fail("handler entries (rvfi_intr) " + std::to_string(n_entries) + ", expected " +
              std::to_string(expect_entries), t);
@@ -515,6 +580,16 @@ int main(int argc, char** argv) {
 #endif
   if (err.empty() && !ended) fail("no verdict", t);
   bool ok = err.empty() && passed;
+  std::string extra;
+#ifdef RISCV_FORMAL
+  {
+    char e[200];
+    snprintf(e, sizeof e, "\"uart_frames\":%zu,\"uart_start_min\":%lld,\"uart_start_max\":%lld,\"gpio_in_reads\":%llu,"
+             "\"gpio_in_oldest\":%llu,", ustarts.size(), ustarts.empty() ? 0 : ustart_min,
+             ustarts.empty() ? 0 : ustart_max, (unsigned long long)n_gpio_in, (unsigned long long)gpio_in_oldest);
+    extra = e;
+  }
+#endif
   std::string txs;
   for (auto c : tx_bytes) {
     char h[4];
@@ -522,13 +597,13 @@ int main(int argc, char** argv) {
     txs += h;
   }
   printf("{\"pass\":%s,\"seed\":%u,\"pmod\":%d,\"cycles\":%llu,\"retired\":%llu,\"first_retire\":%llu,"
-         "\"max_gap\":%llu,\"cpi\":%.1f,\"intr\":%llu,\"traps\":%llu,\"entries\":%llu,\"uart_tx\":\"%s\","
+         "\"max_gap\":%llu,\"cpi\":%.1f,\"intr\":%llu,\"traps\":%llu,\"entries\":%llu,%s\"uart_tx\":\"%s\","
          "\"error\":\"%s\"}\n",
          ok ? "true" : "false", seed, pmode, (unsigned long long)t, (unsigned long long)retired,
          (unsigned long long)first_ret_t, (unsigned long long)max_gap,
          retired > 1 ? (double)(last_ret_t - first_ret_t) / (double)(retired - 1) : 0.0,
-         (unsigned long long)n_intr, (unsigned long long)n_trap, (unsigned long long)n_entries, txs.c_str(),
-         err.c_str());
+         (unsigned long long)n_intr, (unsigned long long)n_trap, (unsigned long long)n_entries, extra.c_str(),
+         txs.c_str(), err.c_str());
   (void)quiet;
 #ifdef VCD_TRACE
   if (tfp) tfp->close();

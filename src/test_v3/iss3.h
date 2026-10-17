@@ -76,6 +76,7 @@ class Iss3 {
   uint8_t psram(uint32_t a) const { return psram_[a & (PSRAM_SIZE - 1)]; }
   uint8_t gpio_out() const { return (uint8_t)io_[0]; }
   uint8_t altfn() const { return (uint8_t)io_[2]; }
+  uint32_t uart_div() const { return io_[12] & 0x1FFFu; }
   uint64_t retired() const { return retired_; }
 
   Retire take_interrupt() {
