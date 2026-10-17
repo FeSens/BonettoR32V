@@ -1,34 +1,37 @@
 /*
- * BonettoR32V hypothesis 002, variant 2: bit-serial RV32E with the register file AND the pc in
- * the SPI RAM.
+ * BonettoR32V hypothesis 005 (a logic diet on 002, variant 2): bit-serial RV32E with the register
+ * file AND the pc in the SPI RAM.
  *
  * x1..x15 live in the 23LC512 at 0xFFC0 + 4*r, the pc in the x0 slot at 0xFFC0, and 0xFF80 is a
  * scratch word (JALR with rd != 0). The die keeps the instruction register, ONE operand/result
- * buffer, the SPI engine and uo_out. See src/RF_IN_RAM.md, section 8.
+ * buffer, the SPI engine and uo_out. See src/RF_IN_RAM.md, sections 8 and 9.
  *
  * Ring. The buffer (bfr) is a 33-bit ring that rotates right on every clock. A free-running phase
- * counter ph counts 0..32; the bit at ring position i shows phase ph + i (mod 33). Logical bit k
- * of a value sits at phase 2k (mod 33): bits 0..16 at even phases, 17..31 at odd phases, phase 31
- * unused. SPI data at SCK = clk/2 moves one bit every 2 clocks, so a data phase whose first bit
- * meets phase 0 hits bit k at phase 2k: register traffic streams straight into and out of the
- * ring with no per-bit enables. 33 is odd, so a time offset of 2s clocks is a shift by s bits:
- * shifts are a delayed emission. A store keeps its 16-bit RAM address on the even phases and 16
- * data bits on the odd phases (bit k at phase 2k + 1).
+ * counter ph counts 0..32; the bit at ring position i shows phase ph + i (mod 33). Every slot
+ * starts at phase 16, so data bit k of any slot is strobed at phase 2k + 1 (mod 33), and an ALU
+ * result bit k lands at phase 2k + 1: bits 0..15 on the odd phases, 16..31 on the even phases,
+ * phase 32 unused. Register traffic streams straight into and out of the ring with no per-bit
+ * enables. 33 is odd, so a time offset of 2s clocks is a shift by s bits: shifts are a delayed
+ * emission. A store keeps its 16-bit RAM address on the odd phases (bit k at 2k + 1) and 16 data
+ * bits on the even phases (bit k at 2k + 2).
  *
  * Transactions (slots). Every SPI transaction has the same frame: 8 command bits, the address
- * high byte, a one-clock gap, the low byte, then data, all at SCK = clk/2. A slot starts at a
- * phase set by its family (sl[3:2]), so every tap below is a fixed ring position:
+ * high byte, a one-clock gap, the low byte, then data, all at SCK = clk/2. Every slot starts at
+ * phase 16 (a shift's W at a shift-dependent time after its pre-roll), so every tap below is a
+ * fixed ring position:
  *   P   READ  x0 (the pc)                              -> buffer
  *   A   READ  rs1 -> serial ALU (+imm; AUIPC/JAL: buffer + imm) -> buffer
  *   PX  READ  x0 -> buffer + (taken ? imm : 4) (branch); READ scratch -> buffer (JALR)
  *   B   READ  rs2 -> serial ALU with the buffer
- *   BH  READ  rs2 (BH2: rs2 + 2, and address + 2 in place) -> buffer odd phases (store data)
- *   F   READ  pc[15:0] (buffer even-tap mux)           -> instruction register
- *   M   READ/WRITE address from the buffer even taps, store data from the odd taps (M2: high half)
+ *   BH  READ  rs2 (BH2: rs2 + 2, and address + 2 in place) -> buffer even phases (store data)
+ *   F   READ  pc[15:0] (buffer tap mux)                -> instruction register
+ *   M   READ/WRITE address from the buffer taps, store data from the even-phase taps (M2: high
+ *       half)
  *   WP  WRITE x0 <- buffer;  WP4: x0 <- buffer + 4;  W4: rd (JAL) or scratch (JALR) <- buffer + 4
  *   W   WRITE rd <- buffer (forward, load-reversed, or shifted)
  * A slot whose register is x0 (or that has no register) keeps CS_n high and runs the same timing.
- * After reset a boot WP writes pc = 0. A trap halts in the retire state.
+ * Until the first retirement P (and a branch's PX) is masked too, so the first instruction reads
+ * pc = 0 with no boot write. A trap halts in E_HALT.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -71,15 +74,15 @@ module tt_um_fesens_r32v (
 `endif
 );
 
-    // Slot types. sl[3:2] is the family: 00 READ into the serial ALU (start phase 16), 01 READ
-    // into the odd phases (17), 10 address from the buffer (2), 11 WRITE from the buffer (W: 5;
-    // WP, WP4, W4: 18, straight from bfr[0]). Binary codes, used bitwise below.
+    // Slot types. sl[3:2] is the family: 00 READ into the serial ALU, 01 READ into the even
+    // phases (store data), 10 address from the buffer, 11 WRITE from the buffer. Every slot starts
+    // at phase 16. Binary codes, used bitwise below.
     localparam [3:0] SL_P  = 4'b0000, SL_A   = 4'b0001, SL_PX = 4'b0010, SL_B  = 4'b0011,
                      SL_BH = 4'b0100, SL_BH2 = 4'b0110,
                      SL_F  = 4'b1000, SL_M   = 4'b1001, SL_M2 = 4'b1011,
                      SL_WP = 4'b1100, SL_WP4 = 4'b1101, SL_W4 = 4'b1110, SL_W  = 4'b1111;
     // Engine phases: 1x0 = command/address or data (SCK runs)
-    localparam [2:0] E_IDLE = 3'b000,    // CS_n high, wait for the slot's start phase
+    localparam [2:0] E_IDLE = 3'b000,    // CS_n high, wait for phase 16
                      E_PW   = 3'b001,    // shift pre-roll: wait for the reference phase
                      E_PC   = 3'b010,    // shift pre-roll: count j up to 63
                      E_HALT = 3'b011,    // after a trap
@@ -95,7 +98,7 @@ module tt_um_fesens_r32v (
     reg         sck, mosi;
     reg         mem;    // load/store goes to RAM (address bit 31 = 0); 1 until the first retirement
     reg         cy;     // ALU carry; sign latch in W; carry of the + 4 (WP, WP4, W4) and + 2 (BH2)
-    reg         cmp;    // compare; address[1:0] == 0; JALR target[1]; shift fill state
+    reg         cmp;    // compare; address[1:0] == 0; JALR target[1] == 0; shift fill state
     reg  [32:0] bfr;    // operand/result buffer ring
     reg  [30:0] irs;    // instruction register, in SPI order, without insn[1]
     reg  [7:0]  gpo;
@@ -158,7 +161,7 @@ module tt_um_fesens_r32v (
     wire miso_m;
 
     // ------------------------------------------------------------------------------------
-    // Bit index of the current strobe in the ALU slots (family 00): bit k meets phase 2k.
+    // Bit index of the current data strobe: bit k meets phase 2k + 1 in every slot.
     // ------------------------------------------------------------------------------------
     wire [4:0] kb = {~ph[0], ph[4:1]};
     wire       k0 = (ph[4:0] == 5'd1);                // ph <= 32: ph[5] is 1 only at 32
@@ -214,8 +217,8 @@ module tt_um_fesens_r32v (
 
     // ------------------------------------------------------------------------------------
     // Ring tap muxes for MSB-first emission, select a = j[2:0]: address bit 15 - a / 7 - a from
-    // the even phases (bfm), store data bit 7 - a of each byte from the odd phases (bfo), load
-    // data bit a of each byte (reversed, bfm), or select 0 for a forward emission.
+    // the odd phases (bfm), store data bit 7 - a of each byte from the even phases (bfo), and
+    // load data bit a of each byte (reversed, bfm; the load lands at ring position 15).
     // ------------------------------------------------------------------------------------
     reg bfm, bfo;
     always @(*) begin
@@ -258,7 +261,7 @@ module tt_um_fesens_r32v (
     wire wpl    = wtap ^ (cy & winc);             // WP, WP4, W4
     wire wdo    = sW ? wd : wpl;
 
-    // BH2: address + 2 on the even phases, in the SCK-low clocks between the data strobes
+    // BH2: address + 2 in place on the odd phases, in the SCK-low clocks between the data strobes
     wire inc2   = (ep == E_DATA) & ~sck & hi & fO;
     wire cin2   = (ph[4:0] == 5'd2) | cy;
 
