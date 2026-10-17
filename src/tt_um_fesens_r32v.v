@@ -161,7 +161,7 @@ module tt_um_fesens_r32v (
     // Bit index of the current strobe in the ALU slots (family 00): bit k meets phase 2k.
     // ------------------------------------------------------------------------------------
     wire [4:0] kb = {~ph[0], ph[4:1]};
-    wire       k0 = (ph == 6'd1);
+    wire       k0 = (ph[4:0] == 5'd1);                // ph <= 32: ph[5] is 1 only at 32
 
     // Three shared selectors: insn[20 + i] (i = k for k < 12, k - 20 for the U-type k >= 20),
     // insn[7 + k] (k < 5) and insn[k] (k = 12..19).
@@ -194,7 +194,7 @@ module tt_um_fesens_r32v (
     wire a_bit  = (sB | (sA & c_pcrel)) ? bfr[0] : miso_m;
     wire b_raw  = sA ? (bimm_a & imm_bit) :
                   sB ? ((c_sh & ~c_op) ? imm_bit : miso_m) :
-                  (sPX & c_br & (taken ? imm_bit : (ph == 6'd5)));
+                  (sPX & c_br & (taken ? imm_bit : (ph[4:0] == 5'd5)));
     wire sub    = sA ? c_slt : (sB & ((c_op & insn[30] & (f3 == 3'b000)) | c_slt | c_br));
     wire b_x    = b_raw ^ sub;
     wire cin    = k0 ? sub : cy;
@@ -245,7 +245,7 @@ module tt_um_fesens_r32v (
     // W family data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
     // ------------------------------------------------------------------------------------
     wire wem    = fW & sck & ~j[5] & e_cd;
-    wire sh_evt = (ph == {sh_left, ~sh_left, ~sh_left, ~sh_left, ~sh_left, 1'b0});  // 30: source 32 passes; 32: source 0
+    wire sh_evt = sh_left ? ph[5] : (ph[4:0] == 5'd30);  // 30: source 32 passes; 32: source 0
     wire shfill = sh_left ? ~(cmp | sh_evt) : (cmp | sh_evt);
     wire ldfill = (j[4:3] > nm1);
     wire io_w   = (j[4:3] == 2'b00) ? (cmp & ui_in[j[2:0]]) : ((f3 == 3'b000) & cmp & ui_in[7]);
@@ -259,7 +259,7 @@ module tt_um_fesens_r32v (
 
     // BH2: address + 2 on the even phases, in the SCK-low clocks between the data strobes
     wire inc2   = (ep == E_DATA) & ~sck & hi & fO;
-    wire cin2   = (ph == 6'd2) | cy;
+    wire cin2   = (ph[4:0] == 5'd2) | cy;
 
     // ------------------------------------------------------------------------------------
     // MOSI
@@ -299,7 +299,7 @@ module tt_um_fesens_r32v (
     // data phase ends at the first strobe with j >= length (j counts the data bits up from 1)
     wire len8  = sMM & (nm1 == 2'b00);
     wire len16 = (sMM & ((nm1 == 2'b01) | (c_st & nm1[1]))) | (fO & f3[1] & mem);
-    wire dend  = shB ? (ph == 6'd30) : (j[5] | (j[4] & (len16 | len8)) | (j[3] & len8));
+    wire dend  = shB ? (ph[4:0] == 5'd30) : (j[5] | (j[4] & (len16 | len8)) | (j[3] & len8));
 
     // next slot after END
     reg [3:0] nsl;
@@ -401,9 +401,9 @@ module tt_um_fesens_r32v (
         if (stb & sA) begin
             if (c_slt)
                 cmp <= ocmp;
-            else if (c_jalr & (ph == 6'd3))
+            else if (c_jalr & (ph[4:0] == 5'd3))
                 cmp <= sum;                                 // target[1]
-            else if (c_mem & ((ph == 6'd1) | (ph == 6'd3)))
+            else if (c_mem & (ph[4:2] == 3'd0) & ph[0])
                 cmp <= eqacc;                               // address[1:0] == 0
         end else if (stb & sB & (c_slt | c_br))
             cmp <= ocmp;
@@ -422,7 +422,7 @@ module tt_um_fesens_r32v (
             j <= j + 6'd1;
         else if (ep == E_PC)
             j <= j + 6'd1;
-        else if (stb & shB & ph[0] & (ph < 6'd10))
+        else if (stb & shB & k_lo5)                 // bits 0..4
             j <= {b_raw ^ ~sh_left, j[5:1]};
 
         // MOSI changes only where SCK stays low or falls
@@ -446,12 +446,12 @@ module tt_um_fesens_r32v (
             mem  <= 1'b1;
             gpo  <= 8'd0;
         end else begin
-            ph  <= (ph == 6'd32) ? 6'd0 : ph + 6'd1;
+            ph  <= ph[5] ? 6'd0 : ph + 6'd1;
             sck <= e_cd & ~sck;
-            if (stb & sA & c_mem & (ph == 6'd30))
+            if (stb & sA & c_mem & (ph[4:0] == 5'd30))
                 mem <= ~sum;                                // address bit 31 = 0: RAM
             case (ep)
-                E_IDLE: if (ph == 6'd16) begin
+                E_IDLE: if (ph[4:0] == 5'd16) begin
                     ep   <= E_CMD;
                 end
                 E_CMD: if (sck) begin
@@ -471,7 +471,7 @@ module tt_um_fesens_r32v (
                             gpo <= {bfr[18], bfr[16], bfr[14], bfr[12], bfr[10], bfr[8], bfr[6], bfr[4]};
                     end
                 end
-                E_PW: if (ph == {1'b0, sh_left, ~sh_left, ~sh_left, 1'b1, 1'b0}) ep <= E_PC;
+                E_PW: if (ph[1] & (sh_left ? ph[4] : (ph[3] & ph[2]))) ep <= E_PC;  // from 32: 18 (left), 14
                 E_PC: if (j == 6'd63) ep <= E_CMD;
                 default: ;                                  // E_HALT
             endcase
