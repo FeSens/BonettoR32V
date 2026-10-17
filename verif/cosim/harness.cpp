@@ -56,6 +56,8 @@ struct Opts {
   uint64_t spi_only = 0;
   int verbose = 0;
   bool region_zero = false;  // test hook: leave the region as the image has it (zeros)
+  uint32_t fuzz_runs = 0;    // --fuzz-liveness K: the liveness fuzz, K sub-runs (no image file)
+  uint64_t fuzz_cap = 2000;  // retirements per fuzz sub-run before it stops (passing)
 };
 
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
@@ -97,14 +99,16 @@ const char* unspecified(const Retire& r) {
 }
 
 // Contract v2 section 6: every SPI transaction is a region transaction (every byte it addresses
-// is in 0xFF80-0xFFFF, no wrap out) or a program transaction (no region byte). The bytes it
-// addresses: READ, every byte with at least one bit clocked; WRITE, every complete byte; a
-// transaction with no data byte addresses its start address A.
-enum class TxnKind { Region, Program, Mixed };
+// is in 0xFF80-0xFFFF, no wrap out), a program transaction (no region byte), or a null READ (CS_n
+// rises right after the full 24-bit header, no data bit clocked: it touches no byte and is
+// allowed anywhere, 78472fe). The bytes it addresses: READ, every byte with at least one bit
+// clocked (a partly clocked last byte counts); WRITE, every complete byte (a WRITE always has
+// one: spiram.h enforces rule 5, and a header shorter than 24 bits fails there too).
+enum class TxnKind { Region, Program, Null, Mixed };
 
 TxnKind classify(const SpiTxn& x) {
   const size_t n = x.bytes.size();
-  if (n == 0) return in_region(x.addr) ? TxnKind::Region : TxnKind::Program;
+  if (n == 0) return TxnKind::Null;
   bool in = false, out = false;
   for (size_t k = 0; k < n; k++) (in_region(x.at(k)) ? in : out) = true;
   return in && out ? TxnKind::Mixed : in ? TxnKind::Region : TxnKind::Program;
@@ -201,10 +205,6 @@ struct Expect {
       for (size_t k = 0; k < full; k++) load_read[load_index(x.at(k))] = true;
       return "";
     }
-    if (n == 0)
-      return fmt("a program SPI READ (%s) read no data byte: it is neither %s's fetch nor a load "
-                 "READ (contract section 6)",
-                 where.c_str(), who.c_str());
     if (!fetched && x.addr == pc16) {
       if (n > 4)
         return fmt("the fetch READ of %s (%s) read beyond the instruction's 4 bytes (byte "
@@ -493,7 +493,7 @@ int Harness::run(const uint8_t* img) {
     } else if (!in_reset) {
 #ifdef RVFI_MODE
       // SPI transactions completed so far belong to the instruction that retires next. Region
-      // transactions are free (any number, READ or WRITE, any order); program transactions must
+      // transactions and null READs are free (any number, any order); program transactions must
       // be that instruction's fetch, load READs or store WRITEs (contract section 6).
       for (const SpiTxn& x : spi_.done()) {
         const TxnKind kind = classify(x);
@@ -501,8 +501,8 @@ int Harness::run(const uint8_t* img) {
           fail(mixed_error(x, reset_edges_ - 1));
         } else if (halted_) {
           if (x.write) fail("SPI WRITE after the halt");
-        } else if (kind == TxnKind::Region) {
-          // the core's own state: any number, READ or WRITE, in any order
+        } else if (kind == TxnKind::Region || kind == TxnKind::Null) {
+          // the core's own state, or a null READ: any number, in any order
         } else {
           const std::string who = describe(retired_, pend.e);
           const std::string where = txn_where(x, reset_edges_ - 1);
@@ -556,13 +556,16 @@ int Harness::run(const uint8_t* img) {
           if (!pend.store_written[k])
             fail(fmt("%s retired without writing store byte 0x%04x over SPI", who.c_str(),
                      pend.store[k]));
-        // A fatal trap has no memory write on the pins (contract section 4): the ISS reports no
-        // store for it, so any program WRITE already failed above. Region WRITEs of the trapping
-        // instruction are allowed (section 6: any number per instruction; the region is the
-        // core's private state, not program memory). After its retirement no WRITE at all may
-        // start (checked above).
+        // A fatal trap makes no program-memory write on the pins but may make core-region
+        // transactions before it retires (contract section 4 as amended in 8df46d8). The ISS
+        // reports no store for it, so any program WRITE already failed above; nothing may start
+        // after its retirement (checked above).
         if (!error_.empty()) break;
-        // field-by-field comparison
+        // field-by-field comparison. On a trapping branch or JALR the trap depends on the
+        // operands, so rs1/rs2 addr and rdata are compared there too (contract section 6 as
+        // clarified in e321614); the ISS reports the sources those traps read.
+        const uint32_t op = e.insn & 0x7F;
+        const bool trap_reads = e.trap && (op == 0x63 || op == 0x67);
         struct F {
           const char* name;
           uint64_t got, exp;
@@ -580,11 +583,11 @@ int Harness::run(const uint8_t* img) {
             {"rvfi_halt", top_->rvfi_halt, e.halt, true},
             {"rvfi_rd_addr", top_->rvfi_rd_addr, e.rd, true},
             {"rvfi_mem_wmask", top_->rvfi_mem_wmask, e.wmask, true},
-            // everything else only on a normal retirement
-            {"rvfi_rs1_addr", top_->rvfi_rs1_addr, e.rs1, false},
-            {"rvfi_rs1_rdata", top_->rvfi_rs1_rdata, e.rs1v, false},
-            {"rvfi_rs2_addr", top_->rvfi_rs2_addr, e.rs2, false},
-            {"rvfi_rs2_rdata", top_->rvfi_rs2_rdata, e.rs2v, false},
+            // everything else only on a normal retirement (rs fields also on a trapping branch/JALR)
+            {"rvfi_rs1_addr", top_->rvfi_rs1_addr, e.rs1, trap_reads},
+            {"rvfi_rs1_rdata", top_->rvfi_rs1_rdata, e.rs1v, trap_reads},
+            {"rvfi_rs2_addr", top_->rvfi_rs2_addr, e.rs2, trap_reads},
+            {"rvfi_rs2_rdata", top_->rvfi_rs2_rdata, e.rs2v, trap_reads},
             {"rvfi_rd_wdata", top_->rvfi_rd_wdata, e.rdv, false},
             {"rvfi_pc_wdata", top_->rvfi_pc_wdata, e.npc, false},
             {"rvfi_mem_rmask", top_->rvfi_mem_rmask, e.rmask, false},
@@ -693,7 +696,7 @@ int Harness::run(const uint8_t* img) {
       }
       // Program WRITE bytes must follow the reference run's stores, in order: only a store's
       // bytes, each exactly once, with its value (a store may be split over several WRITEs).
-      // Region transactions are the core's own (contract section 6).
+      // Region transactions are the core's own, and null READs touch nothing (contract section 6).
       for (const SpiTxn& x : spi_.done()) {
         const TxnKind kind = classify(x);
         if (kind == TxnKind::Mixed) {
@@ -890,11 +893,364 @@ int Harness::run(const uint8_t* img) {
   return passed ? 0 : 1;
 }
 
+// ---- liveness fuzz (--fuzz-liveness K) ---------------------------------------------------------
+// Contract section 4: a core must retire every instruction within 1,024 cycles of the previous
+// one, or trap and halt, even on a reserved encoding (whatever effect it gives it), and the
+// cosim programs contain none. The fuzz runs K probe sub-runs and then K/256 (at least 1) walk
+// sub-runs, each from reset on its own random image, with no reference: only liveness and the
+// pin rules are checked, since a random program wanders, writes RAM and touches the core region,
+// all of it unspecified.
+//
+// Probe sub-run k (seed S), RAM 0x0000-0xFF7F:
+//   - 0..8 valid, non-trapping, non-control RV32E instructions (random registers x0..x15, so
+//     loads and stores go to random addresses, IO and region included; misaligned ones don't
+//     trap, contract section 4);
+//   - one probe word. Its bits [6:0] are entry k mod 128 of a per-seed shuffle of all 128
+//     values, so every major opcode, low bits != 11 included, is probed once every 128 sub-runs.
+//     On visit v = k / 128 of that opcode: funct3 = (v + a per-seed offset) mod 8; the register
+//     fields rd, rs1, rs2 name x0..x15 when v mod 16 < 8 and are random (x16-x31 included)
+//     otherwise; funct7 is class (2 * (v / 8) + S) mod 4 of {random, 0000000, 0100000, 0000001};
+//     the other bits are random. So K = 2,048 probes every (bits [6:0], funct3) pair twice per
+//     seed, once with each register class, and seeds 1-4 together cover every funct7 class too. It
+//     is never 0x00000000, 0xFFFFFFFF, ECALL or EBREAK, which trap by definition;
+//   - random words to the end: half arbitrary 32-bit values, half with bits [1:0] = 11.
+// A strict-decode core traps at the probe; a core with spec-minimum decode runs on into the
+// random words until it halts or reaches the retirement cap.
+//
+// Walk sub-runs: LUI x15, 0xC at 0, then valid, non-trapping RV32E words everywhere else: the
+// probe prefix's mix plus branches and JALs whose offsets are multiples of 4 (so a taken one never
+// traps), with rd != x15 and every store based on x15 (bytes 0xB800-0xC7FF). The core wanders
+// (loops included) until it reaches the retirement cap, or until a jump lands on a word that a
+// store overwrote or in the core region, where it may trap. These exercise the cap path and long
+// runs (a hang that needs many retirements of state).
+//
+// The core region 0xFF80-0xFFFF starts random in every sub-run.
+//
+// rvfi mode checks: the latency cap at each retirement and by watchdog (contract section 4
+// counting), no retirement and no SPI WRITE start in the 4,096 cycles after a halt, no rvfi_valid
+// during reset, and in both modes the waveform and framing rules of section 2 (spiram.h), constant
+// uio_oe and unused outputs, reset values, outputs that change only at rising clk edges. pins mode
+// can't see retirements or the halt (a hung core and a halted one both go quiet), so it checks
+// only the pin rules, for a fixed 32 x 1,024 cycles per sub-run.
+struct FuzzRng {
+  uint64_t s;
+  explicit FuzzRng(uint64_t seed) : s(seed) {}
+  uint32_t next() {  // splitmix64
+    uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return (uint32_t)((z ^ (z >> 31)) >> 16);
+  }
+};
+
+// A valid, non-trapping RV32E instruction with registers x0..x15. walk = false: no control
+// transfer. walk = true: also branches and JALs to multiple-of-4 offsets, rd != x15, and every
+// store based on x15.
+uint32_t fuzz_valid_word(FuzzRng& g, bool walk) {
+  const uint32_t rd = walk ? g.next() % 15 : g.next() & 15;
+  const uint32_t rs1 = g.next() & 15, rs2 = g.next() & 15;
+  const uint32_t imm12 = g.next() & 0xFFF, cls = g.next() % (walk ? 16 : 13);
+  if (cls == 13 || cls == 14) {  // BEQ BNE BLT BGE BLTU BGEU, offset a multiple of 4 in +-4 KB
+    static const uint32_t f3s[6] = {0, 1, 4, 5, 6, 7};
+    const uint32_t off = (g.next() & 0x1FFCu);  // imm[12:1], imm[1] = 0
+    return ((off >> 12) & 1) << 31 | ((off >> 5) & 0x3F) << 25 | rs2 << 20 | rs1 << 15 |
+           f3s[g.next() % 6] << 12 | ((off >> 1) & 0xF) << 8 | ((off >> 11) & 1) << 7 | 0x63;
+  }
+  if (cls == 15) {  // JAL, offset a multiple of 4 in +-1 MB
+    const uint32_t off = g.next() & 0x1FFFFCu;  // imm[20:1], imm[1] = 0
+    return ((off >> 20) & 1) << 31 | ((off >> 1) & 0x3FF) << 21 | ((off >> 11) & 1) << 20 |
+           ((off >> 12) & 0xFF) << 12 | rd << 7 | 0x6F;
+  }
+  if (cls == 0) return (g.next() & 0xFFFFF000u) | rd << 7 | 0x37;  // LUI
+  if (cls == 1) return (g.next() & 0xFFFFF000u) | rd << 7 | 0x17;  // AUIPC
+  if (cls <= 4) {                                                   // OP-IMM
+    const uint32_t f3 = g.next() & 7;
+    uint32_t imm = imm12;
+    if (f3 == 1) imm = g.next() & 31;
+    if (f3 == 5) imm = (g.next() & 31) | ((g.next() & 1) ? 0x400 : 0);
+    return imm << 20 | rs1 << 15 | f3 << 12 | rd << 7 | 0x13;
+  }
+  if (cls <= 7) {  // OP
+    const uint32_t f3 = g.next() & 7;
+    const uint32_t f7 = ((f3 == 0 || f3 == 5) && (g.next() & 1)) ? 0x20 : 0;
+    return f7 << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | rd << 7 | 0x33;
+  }
+  if (cls <= 9) {  // LOAD: LB LH LW LBU LHU
+    static const uint32_t f3s[5] = {0, 1, 2, 4, 5};
+    return imm12 << 20 | rs1 << 15 | f3s[g.next() % 5] << 12 | rd << 7 | 0x03;
+  }
+  if (cls <= 11)  // STORE: SB SH SW
+    return (imm12 >> 5) << 25 | rs2 << 20 | (walk ? 15 : rs1) << 15 | (g.next() % 3) << 12 |
+           (imm12 & 31) << 7 | 0x23;
+  return (g.next() & 0xFFFF8F80u) | 0x0F;  // FENCE: any MISC-MEM word with funct3 = 0
+}
+
+// Sub-run k's image. k < probes: a probe sub-run (*probe_addr, *probe its probe word); otherwise a
+// walk sub-run (*probe_addr = ~0).
+void fuzz_image(uint32_t seed, uint32_t k, uint32_t probes, uint8_t* img, uint32_t* probe_addr,
+                uint32_t* probe) {
+  // the per-seed opcode order and funct3 offsets, then this sub-run's own generator
+  uint8_t order[128], off[128];
+  for (int i = 0; i < 128; i++) order[i] = (uint8_t)i;
+  FuzzRng og(0xF0221E55ull * seed + 7);
+  for (int i = 127; i > 0; i--) {
+    int j = (int)(og.next() % (uint32_t)(i + 1));
+    uint8_t tmp = order[i];
+    order[i] = order[j];
+    order[j] = tmp;
+  }
+  for (int i = 0; i < 128; i++) off[i] = (uint8_t)(og.next() & 7);
+  FuzzRng g(((uint64_t)seed << 32) ^ (0xC0FFEEull * (k + 1)));
+  std::memset(img, 0, Iss::RAM_SIZE);
+  auto put = [&](uint32_t a, uint32_t w) {
+    for (int b = 0; b < 4; b++) img[a + b] = (uint8_t)(w >> (8 * b));
+  };
+  if (k >= probes) {  // walk
+    put(0, 0x0000C7B7u);  // LUI x15, 0xC
+    for (uint32_t a = 4; a < REGION_LO; a += 4) put(a, fuzz_valid_word(g, true));
+    *probe_addr = ~0u;
+    *probe = 0;
+  } else {
+    const uint32_t prefix = g.next() % 9;
+    uint32_t a = 0;
+    for (uint32_t i = 0; i < prefix; i++, a += 4) put(a, fuzz_valid_word(g, false));
+    const uint32_t op = order[k % 128], v = k / 128, f3 = (v + off[op]) & 7;
+    const bool low_regs = (v & 15) < 8;
+    const uint32_t f7 = (2 * (v / 8) + seed) & 3;  // random, 0000000, 0100000, 0000001
+    uint32_t w;
+    do {
+      w = (g.next() & ~0x707Fu) | f3 << 12 | op;
+      if (f7) w = (w & 0x01FFFFFFu) | (f7 == 2 ? 0x40000000u : f7 == 3 ? 0x02000000u : 0);
+      if (low_regs) w &= ~(1u << 11 | 1u << 19 | 1u << 24);  // rd, rs1, rs2 in x0..x15
+    } while (w == 0 || w == 0xFFFFFFFFu || w == 0x00000073u || w == 0x00100073u);
+    put(a, w);
+    *probe_addr = a;
+    *probe = w;
+    for (a += 4; a < REGION_LO; a += 4) put(a, (g.next() & 1) ? g.next() : (g.next() | 3u));
+  }
+  for (uint32_t r = REGION_LO; r < Iss::RAM_SIZE; r++) img[r] = (uint8_t)g.next();
+}
+
+struct FuzzRun {
+  bool pass = true, halted = false, capped = false, probed = false;
+  uint64_t retired = 0, cycles = 0, max_gap = 0;
+  std::string error;
+};
+
+FuzzRun fuzz_one(uint32_t seed, uint32_t k, const uint8_t* img, uint32_t probe_addr,
+                 uint32_t probe, uint64_t cap) {
+  FuzzRun res;
+  VerilatedContext ctx;
+  ctx.randReset(2);
+  ctx.randSeed((int)(seed * 7919u + k + 1));
+  Vtt_um_fesens_r32v top(&ctx);
+  SpiRam spi(((uint64_t)seed << 20) + k + 1);
+  spi.load(img);
+  const uint64_t reset_edges = 1 + (seed + k) % 9;
+  FuzzRng ug(((uint64_t)k << 32) ^ (seed * 0x51ED27ull));
+  uint8_t ui = (uint8_t)ug.next(), uo_last = 0;
+  uint64_t last_ret = reset_edges - 1, halt_edge = 0;
+  bool halted = false;
+  uint32_t last_pc = 0, last_insn = 0, next_pc = 0;
+  auto failf = [&](uint64_t t, const std::string& why) {
+    res.pass = false;
+    res.error = (t < reset_edges ? fmt("reset edge %llu: ", (unsigned long long)t)
+                                 : fmt("cycle %llu: ", (unsigned long long)(t - (reset_edges - 1)))) +
+                why;
+  };
+  auto next_word = [&](uint32_t pc) {
+    uint32_t w = 0;
+    for (int b = 0; b < 4; b++) w |= (uint32_t)spi.mem()[(uint16_t)(pc + b)] << (8 * b);
+    return w;
+  };
+  top.clk = 0;
+  top.rst_n = 0;
+  top.ena = 1;
+  top.ui_in = ui;
+  top.uio_in = (uint8_t)(spi.noise() & ~4u) | (spi.miso() << 2);
+  top.eval();
+#ifdef RVFI_MODE
+  const uint64_t limit = reset_edges + LAT_CAP * (cap + 16) + HALT_WINDOW;
+#else
+  const uint64_t limit = reset_edges + 32 * LAT_CAP;
+  (void)cap;
+  (void)probe_addr;
+  (void)probe;
+#endif
+  for (uint64_t t = 0;; t++) {
+    top.clk = 1;
+    top.eval();
+    const uint32_t out =
+        (uint32_t)top.uo_out | (uint32_t)top.uio_out << 8 | (uint32_t)top.uio_oe << 16;
+    const bool cs_n = top.uio_out & 1, mosi = (top.uio_out >> 1) & 1, sck = (top.uio_out >> 3) & 1;
+    const bool in_reset = t < reset_edges;
+    if (top.uio_oe != 0x0B) {
+      failf(t, fmt("uio_oe = 0x%02x, must be constant 0x0b", top.uio_oe));
+      break;
+    }
+    if (top.uio_out & 0xF4) {
+      failf(t, fmt("uio_out = 0x%02x: bits [7:4] and [2] must be 0", top.uio_out));
+      break;
+    }
+    if (in_reset && (!cs_n || sck || top.uo_out)) {
+      failf(t, fmt("during reset CS_n = %d, SCK = %d, uo_out = 0x%02x (must be 1, 0, 0)", cs_n, sck,
+                   top.uo_out));
+      break;
+    }
+    if (!spi.edge(t, cs_n, sck, mosi)) {
+      failf(t, spi.error());
+      break;
+    }
+    bool new_ui = false;
+#ifdef RVFI_MODE
+    if (in_reset && top.rvfi_valid) {
+      failf(t, "rvfi_valid during reset");
+      break;
+    }
+    if (!in_reset) {
+      for (const SpiTxn& x : spi.done())
+        if (halted && x.write) failf(t, "SPI WRITE after the halt");
+      spi.done().clear();
+      if (!res.pass) break;
+      if (halted && spi.write_started && spi.write_started_at > halt_edge) {
+        failf(t, "SPI WRITE started after the halt");
+        break;
+      }
+      if (top.rvfi_valid) {
+        if (halted) {
+          failf(t, fmt("retirement after the halt (rvfi_valid %llu cycles after the trap)",
+                       (unsigned long long)(t - halt_edge)));
+          break;
+        }
+        const uint64_t gap = t - last_ret;
+        if (gap > LAT_CAP) {
+          failf(t, fmt("latency cap: retirement #%llu (pc 0x%08x, insn 0x%08x) came %llu cycles "
+                       "after %s (limit %llu)",
+                       (unsigned long long)res.retired, top.rvfi_pc_rdata, top.rvfi_insn,
+                       (unsigned long long)gap,
+                       res.retired ? "the previous retirement" : "reset release",
+                       (unsigned long long)LAT_CAP));
+          break;
+        }
+        if (gap > res.max_gap) res.max_gap = gap;
+        if ((top.rvfi_pc_rdata & 0xFFFF) == probe_addr && top.rvfi_insn == probe) res.probed = true;
+        last_ret = t;
+        last_pc = top.rvfi_pc_rdata;
+        last_insn = top.rvfi_insn;
+        next_pc = top.rvfi_pc_wdata;
+        res.retired++;
+        new_ui = true;
+        if (top.rvfi_halt) {
+          halted = true;
+          halt_edge = t;
+          res.halted = true;
+          res.cycles = t - (reset_edges - 1);
+          spi.write_started = false;
+        } else if (res.retired >= cap) {
+          res.capped = true;
+          res.cycles = t - (reset_edges - 1);
+          break;
+        }
+      }
+      if (!halted && t - last_ret >= LAT_CAP + 1) {
+        if (res.retired)
+          failf(t, fmt("latency cap: no retirement within %llu cycles of retirement #%llu (pc "
+                       "0x%08x, insn 0x%08x); the next pc 0x%08x holds 0x%08x",
+                       (unsigned long long)LAT_CAP, (unsigned long long)(res.retired - 1), last_pc,
+                       last_insn, next_pc, next_word(next_pc)));
+        else
+          failf(t, fmt("latency cap: no retirement within %llu cycles of reset release (pc 0 "
+                       "holds 0x%08x)",
+                       (unsigned long long)LAT_CAP, next_word(0)));
+        break;
+      }
+      if (halted && t - halt_edge >= HALT_WINDOW) break;
+    }
+#else
+    spi.done().clear();
+    if (!in_reset && top.uo_out != uo_last) new_ui = true;
+#endif
+    uo_last = top.uo_out;
+    if (t >= limit) {
+#ifdef RVFI_MODE
+      failf(t, "fuzz budget exhausted without a halt or the retirement cap");
+#else
+      res.cycles = t - (reset_edges - 1);
+#endif
+      break;
+    }
+    // falling edge: outputs must not change between rising edges
+    top.clk = 0;
+    const bool rst_change = (t + 1 == reset_edges);
+    top.rst_n = t + 1 >= reset_edges;
+    if (new_ui) ui = (uint8_t)ug.next();
+    top.ui_in = ui;
+    top.uio_in = (uint8_t)(spi.noise() & ~4u) | (spi.miso() << 2);
+    top.eval();
+    const uint32_t out2 =
+        (uint32_t)top.uo_out | (uint32_t)top.uio_out << 8 | (uint32_t)top.uio_oe << 16;
+    if (!rst_change && out2 != out) {
+      failf(t, fmt("outputs changed between rising clk edges (0x%06x -> 0x%06x)", out, out2));
+      break;
+    }
+  }
+  top.final();
+  return res;
+}
+
+int fuzz_main(const Opts& o) {
+  static uint8_t img[Iss::RAM_SIZE];
+  uint64_t retired = 0, cycles = 0, max_gap = 0, halted = 0, capped = 0, runs = 0, probed = 0;
+  const uint32_t walks = o.fuzz_runs / 256 ? o.fuzz_runs / 256 : 1;
+  std::string error;
+  auto t0 = std::chrono::steady_clock::now();
+  for (uint32_t k = 0; k < o.fuzz_runs + walks; k++) {
+    uint32_t probe_addr = 0, probe = 0;
+    fuzz_image(o.seed, k, o.fuzz_runs, img, &probe_addr, &probe);
+    FuzzRun r = fuzz_one(o.seed, k, img, probe_addr, probe, o.fuzz_cap);
+    runs++;
+    retired += r.retired;
+    cycles += r.cycles;
+    if (r.max_gap > max_gap) max_gap = r.max_gap;
+    halted += r.halted;
+    capped += r.capped;
+    probed += r.probed;
+    if (!r.pass) {
+      error = (k < o.fuzz_runs ? fmt("fuzz sub-run %u (probe word 0x%08x at 0x%04x, opcode 0x%02x, "
+                                     "funct3 %u): ",
+                                     k, probe, probe_addr, probe & 0x7F, (probe >> 12) & 7)
+                               : fmt("fuzz sub-run %u (walk %u): ", k, k - o.fuzz_runs)) +
+              r.error;
+      break;
+    }
+  }
+  double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+#ifdef RVFI_MODE
+  const char* mode = "rvfi";
+  const bool live = true;
+#else
+  const char* mode = "pins";
+  const bool live = false;
+#endif
+  std::printf(
+      "{\"pass\":%s,\"mode\":\"%s\",\"fuzz\":\"liveness\",\"liveness_checked\":%s,\"runs\":%llu,"
+      "\"walks\":%u,\"probes_retired\":%s,\"halted\":%llu,\"capped\":%llu,\"retired\":%llu,\"cycles\":%llu,"
+      "\"max_cycles_per_insn\":%s,\"retire_cap\":%llu,\"sim_seconds\":%.3f,\"error\":%s}\n",
+      error.empty() ? "true" : "false", mode, live ? "true" : "false", (unsigned long long)runs,
+      walks, live ? std::to_string(probed).c_str() : "null",
+      (unsigned long long)halted, (unsigned long long)capped, (unsigned long long)retired,
+      (unsigned long long)cycles, live ? std::to_string(max_gap).c_str() : "null",
+      (unsigned long long)o.fuzz_cap, secs, error.empty() ? "null" : json_str(error).c_str());
+  std::fflush(stdout);
+  return error.empty() ? 0 : 1;
+}
+
 int usage() {
   std::fprintf(stderr,
                "usage: harness <prog.hex> [--seed S] [--max-cycles C] [--dump-ram PATH] "
                "[--trace PATH] [-v] [--region-zero]\n"
-               "       harness --spi-only N [--seed S] [--dump-ram PATH]\n");
+               "       harness --spi-only N [--seed S] [--dump-ram PATH]\n"
+               "       harness --fuzz-liveness K [--fuzz-cap N] [--seed S]\n");
   return 2;
 }
 
@@ -915,9 +1271,18 @@ int main(int argc, char** argv) {
     else if (a == "--spi-only") o.spi_only = std::strtoull(next(), nullptr, 0);
     else if (a == "-v") o.verbose++;
     else if (a == "--region-zero") o.region_zero = true;
+    else if (a == "--fuzz-liveness") o.fuzz_runs = (uint32_t)std::strtoul(next(), nullptr, 0);
+    else if (a == "--fuzz-cap") o.fuzz_cap = std::strtoull(next(), nullptr, 0);
     else if (a.rfind("+verilator", 0) == 0) continue;
     else if (a[0] == '-') return usage();
     else o.hex = argv[i];
+  }
+  if (o.fuzz_runs) {
+    if (o.seed == 0 || o.fuzz_cap == 0) {
+      std::fprintf(stderr, "--seed and --fuzz-cap must be nonzero\n");
+      return 2;
+    }
+    return fuzz_main(o);
   }
   static uint8_t img[Iss::RAM_SIZE];
   if (o.hex) {

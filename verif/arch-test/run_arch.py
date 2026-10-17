@@ -44,7 +44,7 @@ import run_cosim  # noqa: E402
 
 BASE = 0x10000
 REGION_LO = 0xFF80  # contract v2 section 3: RAM 0xFF80-0xFFFF is the core's; tests stay below
-CROSS =os.environ.get("CROSS", "riscv32-unknown-elf-")
+CROSS = os.environ.get("CROSS", "riscv32-unknown-elf-")
 DIRS = ["rv32e_m/E/src", "rv32e_m/privilege/src"]
 TRAP = "needs a trap handler (mtvec, mcause, mepc: CSRs), which the core doesn't have"
 SKIP = {

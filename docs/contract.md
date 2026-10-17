@@ -175,7 +175,9 @@ The memory is 64 KB. Its contents are whatever the test loaded before reset was 
   - A retirement happens at edge e when `rvfi_valid(e) = 1` (the header's notation: the value
     right after edge e). The first retirement must happen at an edge numbered 1,024 or lower.
   - Each later retirement must come at most 1,024 edges after the previous one.
-  - Every checker (cosim watchdog, formal liveness) uses this count.
+  - Every checker (cosim watchdog and liveness fuzz, formal liveness) uses this count.
+  - The cap applies to every instruction, including reserved encodings and accesses whose
+    effect is unspecified (region accesses, misaligned IO): they must retire or trap in time.
 - **FENCE** is a no-op that retires normally. That covers every MISC-MEM encoding with
   `funct3 = 000`, whatever its fm, pred, succ, rs1 and rd fields hold (x16-x31 included):
   FENCE.TSO, PAUSE and the rest. The spec requires base implementations to ignore those fields.

@@ -113,7 +113,7 @@
   }
  },
  "legal_trap_fields": {
-  "desc": "Legal: arbitrary rs1/rs2 fields, rd_wdata and pc_wdata on trapping retirements (contract section 6 compares only trap, halt, insn, pc_rdata, rd_addr = 0 and no memory write).",
+  "desc": "Legal: arbitrary rd_wdata and pc_wdata on trapping retirements, arbitrary rs1/rs2 fields on traps that read no register (contract section 6, e321614: a trapping branch or JALR reports truthful rs fields).",
   "progs": [
    "trap_jalr",
    "trap_branch",
@@ -270,6 +270,61 @@
   "fail": {
    "rvfi": "retirement #0",
    "pins": ""
+  }
+ },
+ "hang_reserved": {
+  "desc": "Custom-0 (opcode 0001011, reserved) stays in EXEC forever instead of trapping; only the liveness fuzz sees it.",
+  "prog": "selftest",
+  "pass": [
+   "rvfi",
+   "pins"
+  ],
+  "fail": {},
+  "fuzz_fail": "opcode 0x0b"
+ },
+ "legal_null_read": {
+  "desc": "Legal: a null READ (header only, at the IO address) before every IO load; contract section 6 (78472fe) allows any number anywhere.",
+  "progs": [
+   "selftest",
+   "gpio_demo",
+   "random_1"
+  ],
+  "pass": [
+   "rvfi",
+   "pins"
+  ],
+  "fail": {}
+ },
+ "trap_rs_garbage": {
+  "desc": "Arbitrary rs1/rs2 fields on every trapping retirement, a trapping branch or JALR included (contract section 6, e321614, checks those).",
+  "progs": [
+   "trap_jalr",
+   "trap_branch"
+  ],
+  "pass": [
+   "pins"
+  ],
+  "fail": {
+   "rvfi": "RVFI mismatch"
+  }
+ },
+ "hang_funct3": {
+  "desc": "LOAD with the reserved funct3 011 and registers x0..x15 stays in EXEC forever instead of trapping; only the liveness fuzz sees it.",
+  "prog": "selftest",
+  "pass": [
+   "rvfi",
+   "pins"
+  ],
+  "fail": {},
+  "fuzz_fail": "latency cap"
+ },
+ "null_read_short": {
+  "desc": "legal_null_read with a 23-bit header: CS_n rises before the 24-bit command and address are complete (rule 4).",
+  "prog": "gpio_demo",
+  "pass": [],
+  "fail": {
+   "rvfi": "before its command and address were complete",
+   "pins": "before its command and address were complete"
   }
  }
 }
