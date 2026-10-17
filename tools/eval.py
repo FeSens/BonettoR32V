@@ -217,13 +217,15 @@ def gate_cosim(ctx):
         expect = hexpath[:-4] + ".expect.json"
         if not os.path.isfile(expect):
             raise GateFail(f"gate cosim: missing {os.path.relpath(expect, ctx.repo)}")
-        max_cycles = LATENCY_CAP * (expect_retired(expect) + 1)
+        expect_retired(expect)              # the expect file must be well-formed
+        # No --max-cycles: the harness bounds each run by the latency cap times ITS OWN ISS
+        # retirement count for that mode and seed (programs branch on ui_in, so counts differ
+        # from the expect file's), and its watchdog bounds every gap.
         for mode in COSIM_MODES:
             for seed in COSIM_SEEDS:
                 log = f"cosim_{name}_{mode}_{seed}"
                 cmd = [ctx.py, "verif/cosim/run_cosim.py", "--mode", mode,
-                       "--prog", os.path.relpath(hexpath, ctx.repo), "--seed", str(seed),
-                       "--max-cycles", str(max_cycles)]
+                       "--prog", os.path.relpath(hexpath, ctx.repo), "--seed", str(seed)]
                 rc, lines = ctx.run(cmd, log)
                 s = last_json_line(lines) or {}
                 where = f"{name} --mode {mode} --seed {seed}"

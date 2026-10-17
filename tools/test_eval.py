@@ -476,11 +476,10 @@ PROGRAMS_MAKEFILE = (
 FAKE_COSIM = """
 import argparse, json, os, sys
 ap = argparse.ArgumentParser()
-for a in ("--mode", "--prog", "--seed", "--max-cycles"):
+for a in ("--mode", "--prog", "--seed"):
     ap.add_argument(a, required=True)
-a = ap.parse_args()
+a = ap.parse_args()   # an unexpected --max-cycles is an argparse error (exit 2)
 retired = 10 if "selftest" in a.prog else 1000
-assert int(a.max_cycles) == 1024 * (retired + 1), a.max_cycles
 fail = os.environ.get("FAKE_COSIM_FAIL") == a.mode
 gap = int(os.environ.get("FAKE_COSIM_GAP", "100"))
 print("building...")
