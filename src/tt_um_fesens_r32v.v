@@ -247,22 +247,32 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     wire       sign = insn[31];
     wire       zi   = c_sys & f3[2];                    // CSR immediate forms: zimm
-    reg  [3:0] imm4;
+    // One instruction nibble select serves every format: nibble 5, 6, 7 for n = 0, 1, 2 (I, and
+    // S, B, J with the bits patched below), nibble n for n >= 3 (U, J)
+    reg  [3:0] inib;
     always @(*) begin
         case (n)
-            3'd0: imm4 = c_u ? 4'd0 : c_jal ? {insn[23:21], 1'b0} : c_sys ? (insn[18:15] & {4{zi}}) :
-                         c_br ? {insn[10:8], 1'b0} : c_st ? insn[10:7] : insn[23:20];
-            3'd1: imm4 = c_u ? 4'd0 : c_sys ? {3'b000, zi & insn[19]} :
-                         (c_br | c_st) ? {insn[27:25], insn[11]} : insn[27:24];
-            3'd2: imm4 = (c_u | c_sys) ? 4'd0 : c_jal ? {insn[20], insn[30:28]} :
-                         c_br ? {insn[7], insn[30:28]} : insn[31:28];
-            3'd3: imm4 = (c_u | c_jal) ? insn[15:12] : {4{sign & ~c_sys}};
-            3'd4: imm4 = (c_u | c_jal) ? insn[19:16] : {4{sign & ~c_sys}};
-            3'd5: imm4 = c_u ? insn[23:20] : {4{sign & ~c_sys}};
-            3'd6: imm4 = c_u ? insn[27:24] : {4{sign & ~c_sys}};
-            default: imm4 = c_u ? insn[31:28] : {4{sign & ~c_sys}};
+            3'd3:       inib = insn[15:12];
+            3'd4:       inib = insn[19:16];
+            3'd0, 3'd5: inib = insn[23:20];
+            3'd1, 3'd6: inib = insn[27:24];
+            default:    inib = insn[31:28];
         endcase
     end
+    wire       lo3  = ~n[2] & ~(n[1] & n[0]);           // n = 0..2
+    wire       n1   = (n == 3'd1);
+    wire       n2   = (n == 3'd2);
+    wire       sb   = c_st | c_br;
+    // n = 0: S insn[10:7], B {insn[10:8], 0}, J {insn[23:21], 0}; n = 1: S, B {insn[27:25],
+    // insn[11]}; n = 2: B {insn[7], insn[30:28]}, J {insn[20], insn[30:28]}; CSR: zimm
+    wire [3:0] lo4  = c_sys ? ({insn[18:16] & {3{n0}}, insn[15] & n0 | insn[19] & n1} & {4{zi}}) :
+                      {n2 & c_jal ? insn[20] : n2 & c_br ? insn[7] : n0 & sb ? insn[10] : inib[3],
+                       n0 & sb ? insn[9:8] : inib[2:1],
+                       n0 ? (sb ? (c_st & insn[7]) : (inib[0] & ~c_jal)) :
+                       (n1 & sb) ? insn[11] : inib[0]};
+    wire [3:0] imm4 = lo3 ? (lo4 & {4{~c_u}}) :
+                      (c_u | (c_jal & ~n[2] & n[1] & n[0]) | (c_jal & n[2] & ~n[1] & ~n[0])) ? inib :
+                      {4{sign & ~c_sys}};
 
     // ------------------------------------------------------------------------------------
     // Nibble ALU (also the pc's arithmetic: F's pc + 4, X, W4 of JAL)
