@@ -6,7 +6,7 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 ## Current champion
 
-**105** `f9a663317ff1` (hyp/105-pc-on-die-nibble): 0.5225 CoreMark iterations/s (clock 20 ns), 21,737.1 µm², 2,248 cells, formal skipped, tile fraction -, deep formal -. pc on die on the nibble core: pcr (32-bit nibble shift register) holds the pc and doubles as the address register (replaces mar); F computes pc+4 with the existing nibble adder; P/WP/WP4/PX gone ex...
+**107** `fa93772c9c7c` (hyp/107-no-x-fast-slots): 0.5451 CoreMark iterations/s (clock 20 ns), 21,804.7 µm², 2,241 cells, formal skipped, tile fraction -, deep formal -. Cut no-transfer slots: branches on x0 run F A (A computes pc+imm into the ring via the AUIPC path and pc+4 into pcr; a taken branch sets tk and the next F fetches from the ring and moves it into pc...
 
 ## Champion history
 
@@ -17,12 +17,14 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 | 2 | 104 | 2026-10-18 | `2293e4a765` | 0.0864 | +0.00% | 20 | 19,690.1 | 1,985 | -752.0 | skipped | - | - | - | Peripheral area diet, contract behavior unchanged: enable flops with reset folded into ... |
 | 3 | 103 | 2026-10-18 | `289a686ba9` | 0.3350 | +287.85% | 20 | 21,146.5 | 2,189 | +1,456.4 | skipped | - | - | - | Quad I/O plus a nibble-serial datapath: flash 0xEB continuous read (no command), PSRAM ... |
 | 4 | 106 | 2026-10-18 | `f777e0fb72` | 0.3350 | +0.00% | 20 | 20,933.8 | 2,118 | -212.7 | skipped | - | - | - | Periph diet 2, contract behavior unchanged: one SPI shift register for TX and RX bytes,... |
-| 5 | 105 | 2026-10-18 | `f9a663317f` | 0.5225 | +55.96% | 20 | 21,737.1 | 2,248 | +803.3 | skipped | - | - | champion | pc on die on the nibble core: pcr (32-bit nibble shift register) holds the pc and doubl... |
+| 5 | 105 | 2026-10-18 | `f9a663317f` | 0.5225 | +55.96% | 20 | 21,737.1 | 2,248 | +803.3 | skipped | - | - | - | pc on die on the nibble core: pcr (32-bit nibble shift register) holds the pc and doubl... |
+| 6 | 107 | 2026-10-18 | `fa93772c9c` | 0.5451 | +4.33% | 20 | 21,804.7 | 2,241 | +67.6 | skipped | - | - | champion | Cut no-transfer slots: branches on x0 run F A (A computes pc+imm into the ring via the ... |
 
 ## Last 20 hypotheses
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 107 | 2026-10-18 | hyp/107-no-x-fast-slots | merged | 0.5451 | +0.0226 | 20 | 21,804.7 | +67.6 | skipped | - | Cut no-transfer slots: branches on x0 run F A (A computes pc+imm in... | Lead re-eval on hwe-bench (fa93772, clean, MIN_IPS=0.52246577765561... |
 | 105 | 2026-10-18 | hyp/105-pc-on-die-nibble | merged | 0.5225 | +0.1875 | 20 | 21,737.1 | +803.3 | skipped | - | pc on die on the nibble core: pcr (32-bit nibble shift register) ho... | Lead re-eval on hwe-bench (f9a6633 = 105 + merge of 106 + one-line ... |
 | 106 | 2026-10-18 | hyp/106-periph-diet-2 | merged | 0.3350 | +0.0000 | 20 | 20,933.8 | -212.7 | skipped | - | Periph diet 2, contract behavior unchanged: one SPI shift register ... | Lead re-eval on hwe-bench (f777e0f, clean, MIN_IPS=0.33500624284133... |
 | 101 | 2026-10-18 | hyp/101-pc-on-die | rejected | 0.1427 | -0.1923 | 20 | 20,713.6 | -432.9 | skipped | - | pc on die (bit-serial core): pc in a 33-bit ring, drop the P/WP/WP4... | Superseded, not refuted: agent-measured (not lead re-verified) on t... |
