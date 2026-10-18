@@ -420,11 +420,15 @@ module tt_um_fesens_r32v (
     wire ring_rot = (dstb & wr) | hrot;
     // pcr writes: A (the ring's pc + 4; a store: its address; JALR: the target unless it traps:
     // target[1] is sumj[1] at nibble 0, then ~cmp; not for branches), B of a register shift
-    // (rs2), P (the spilled pc + 4), X, W4 of JAL, and C in a trap sequence or MRET
+    // (rs2), P (the spilled pc + 4), X, W4 of JAL, and C in a trap sequence or MRET. F and a trap
+    // sequence's WC read the pc nibble by nibble: pcr rotates.
     wire       jtrap = c_jalr & (n0 ? sumj[1] : ~cmp);
-    wire       pwe  = dstb & ((sA & ~c_br & ~jtrap) | (sB & c_sh) | sP | sX | (sW4 & c_jal) |
-                              (sC & (tm | p_mret)));
-    wire [3:0] pin4 = (sA & ~c_st & ~c_jalr) ? ring[3:0] : (sB | sP) ? nib_m : din4;
+    wire       prot = sF | (sWC & tm);
+    wire       pwr  = (sA & ~c_br & ~jtrap) | (sB & c_sh) | sP | sX | (sW4 & c_jal) |
+                      (sC & (tm | p_mret));
+    wire       pwe  = dstb & (pwr | prot);
+    wire [3:0] pin4 = prot ? pcr[3:0] : (sA & ~c_st & ~c_jalr) ? ring[3:0] :
+                      (sB | sP) ? nib_m : din4;
     always @(posedge clk) begin
         if (io_re)
             ring[15:0] <= {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]};
@@ -506,8 +510,8 @@ module tt_um_fesens_r32v (
         .clk(clk), .rst_n(rst_n),
         .cap_a(dstb & sA), .kn(n), .din4(din4),
         .io(io), .ps(ps), .booting(booting),
-        .active(active), .prog(fM),
-        .pa(sF ? pcr[24:0] : {ps, (c_ld ? ring[23:0] : pcr[23:0])}), .fz(sF & first),
+        .active(active), .prog(fM), .fetch(sF),
+        .pa({pcr[24], ((sM & c_ld) ? ring[23:0] : pcr[23:0])}), .fz(sF & first),
         .sck(sck), .gap(gap),
         .hdr_ld((gap & ~booting & ~mask) | (stb & hdr & cn[5])),
         .hidx(gap ? 3'd0 : (cn[2:0] ^ {~wr, 2'b00})),
@@ -564,7 +568,7 @@ module tt_um_fesens_r32v (
         end
         if (e_end & sF)
             r_pc <= {pcr[31:2], 2'b00} & {32{~first}};
-        if (pwe & ~(sA & c_st) & ~sB)                   // every pc write covers nibbles 0..7
+        if (dstb & pwr & ~(sA & c_st) & ~sB)            // every pc write covers nibbles 0..7
             r_npc <= {pin4, r_npc[31:4]};
         if (dstb & sA)
             r_rs1 <= {nib_m, r_rs1[31:4]};

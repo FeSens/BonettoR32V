@@ -12,8 +12,9 @@
  *     w6       PSRAM: 0x35 in SPI form (QPI mode from here on).
  * - Program address: the core supplies `pa` (bit 24 the chip, 1 = PSRAM): the pc for a fetch,
  *   the load or store address for M. `fz` (the first fetch) zeroes the address and picks the
- *   flash. A's data strobes capture a load/store address's bit 24 into `ps` (M's chip, steady
- *   while the ring takes the data) and bit 31 into `io`.
+ *   flash. `ps` holds the chip of the slot's transaction, steady while the pc rotates or the
+ *   ring takes data: a fetch loads it at its gap; A's data strobes load a load/store address's
+ *   bit 24 (and bit 31 into `io`).
  * - Transactions: the core loads `sdo` with a header nibble (hdr_ld, index hidx) or a data
  *   nibble (dat_ld) at the clocks where SCK stays or goes low. Headers:
  *     flash (program access with ps = 0, continuous read): A[23:20] .. A[3:0], 0x2, 0x0 (M);
@@ -40,7 +41,8 @@ module r32v_mem (
     output wire        booting,
     // transaction (from the core's engine)
     input  wire        active,     // a CS_n is low (an unmasked slot past its gap)
-    input  wire        prog,       // program transaction (F, M): address and chip from pa
+    input  wire        prog,       // program transaction (F, M): address from pa
+    input  wire        fetch,      // the slot is F
     input  wire [24:0] pa,
     input  wire        fz,         // the first fetch: address 0 in flash
     input  wire        sck,
@@ -60,8 +62,11 @@ module r32v_mem (
     // Address flags
     // ------------------------------------------------------------------------------------
     wire _unused_din = &{din4[2:1], 1'b0};
+    wire fchip = pa[24] & ~fz;                          // a fetch's chip (pc bit 24)
     always @(posedge clk) begin
-        if (cap_a & (kn == 3'd6))
+        if (gap & fetch)
+            ps <= fchip;
+        else if (cap_a & (kn == 3'd6))
             ps <= din4[0];
         if (cap_a & (kn == 3'd7))
             io <= din4[3];
@@ -70,7 +75,7 @@ module r32v_mem (
     // ------------------------------------------------------------------------------------
     // Header nibbles
     // ------------------------------------------------------------------------------------
-    wire        flash = prog & ~(pa[24] & ~fz);
+    wire        flash = prog & ~((gap & fetch) ? fchip : ps);   // the gap loads header nibble 0
     wire        az    = fz & ~(hidx[2] & hidx[1]);      // the first fetch's address nibbles: 0
     reg  [3:0] hn;
     always @(*) begin
