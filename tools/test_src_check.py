@@ -1,4 +1,5 @@
 """Tests for tools/src_check.py: contract section 1's restricted preprocessor and src/ layout."""
+import glob
 import os
 import shutil
 import subprocess
@@ -730,13 +731,35 @@ def test_function_body_the_walker_cannot_follow_fails(src):
     one(src, "src_check cannot follow its body")
 
 
+SWAP_N = """module tt_um_fesens_r32v;
+    function [31:0] swap_n;
+        input [1:0]  size;   // funct3[1:0]: 00 byte, 01 half, 10 word
+        input [31:0] x;
+        begin
+            case (size)
+                2'b00:   swap_n = {24'd0, x[7:0]};
+                2'b01:   swap_n = {16'd0, x[7:0], x[15:8]};
+                default: swap_n = {x[7:0], x[15:8], x[23:16], x[31:24]};
+            endcase
+        end
+    endfunction
+endmodule
+"""
+
+
 def test_seed_function_passes():
-    # swap_n in the seed: a case with default assigning the result on every branch.
-    if not os.path.isfile(os.path.join(SEED_SRC, "tt_um_fesens_r32v.v")):
-        pytest.skip("no seed in src/")
-    toks, _ = src_check.tokenize(open(os.path.join(SEED_SRC, "tt_um_fesens_r32v.v")).read())
+    # swap_n from the contract v2 seed (main 11890e5, src/tt_um_fesens_r32v.v; the v3 seed has no
+    # function): a case with default assigning the result on every branch.
+    toks, _ = src_check.tokenize(SWAP_N)
     assert any(t[1] == "function" for t in toks)
     assert src_check.check_functions("tt_um_fesens_r32v.v", toks) == []
+
+
+def test_src_functions_pass():
+    # whatever functions the design in src/ has (none, in the v3 seed) pass the rule
+    for f in sorted(glob.glob(os.path.join(SEED_SRC, "*.v"))):
+        toks, _ = src_check.tokenize(open(f).read())
+        assert src_check.check_functions(os.path.basename(f), toks) == [], f
 
 
 # --- metacomments, encoding --------------------------------------------------------------------

@@ -265,6 +265,8 @@ def test_sha_and_dirty_flag(repo, monkeypatch):
     assert run()["dirty"] is True   # untracked file in src/
 
 
+@pytest.mark.skipif(not os.path.exists(os.path.join(REPO, ".git")),
+                    reason="no .git (a tools/hwe_run.sh mirror)")
 def test_real_repo_sha():
     assert len(ev.git(REPO, "rev-parse", "HEAD")) == 40
 
@@ -273,7 +275,7 @@ def test_make_gates_alias_runs_the_same_command():
     import subprocess
 
     def dry(target):
-        return subprocess.run(["make", "-n", "-C", REPO, target], capture_output=True,
+        return subprocess.run(["make", "-n", "--no-print-directory", "-C", REPO, target], capture_output=True,
                               text=True, check=True).stdout.strip()
 
     assert dry("gates") == dry("eval")
@@ -285,7 +287,7 @@ def test_make_eval_formal_and_min_ips_flags():
     import subprocess
 
     def dry(*args):
-        return subprocess.run(["make", "-n", "-C", REPO, *args], capture_output=True, text=True)
+        return subprocess.run(["make", "-n", "--no-print-directory", "-C", REPO, *args], capture_output=True, text=True)
 
     for target in ("eval", "gates"):
         p = dry(target, "FORMAL=1", "MIN_IPS=1.25")
@@ -303,7 +305,7 @@ def test_make_eval_formal_and_min_ips_flags():
 def test_make_formal_only_when_formal_is_1(value, formal):
     import subprocess
     for target in ("eval", "gates"):
-        p = subprocess.run(["make", "-n", "-C", REPO, target, f"FORMAL={value}"],
+        p = subprocess.run(["make", "-n", "--no-print-directory", "-C", REPO, target, f"FORMAL={value}"],
                            capture_output=True, text=True)
         assert p.returncode == 0, p.stderr
         cmd = " ".join(p.stdout.split())
