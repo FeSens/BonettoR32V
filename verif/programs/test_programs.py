@@ -181,7 +181,7 @@ def test_irq_programs_have_no_stimulus(built):
     common = {"prog", "kind", "result_gpio", "psram_window", "final_altfn"}
     assert set(built["irq_timer"]) == common  # the timer interrupts them
     assert set(built["irq_stress"]) == common | {"max_cycles"}
-    assert built["irq_stress"]["max_cycles"] == 200_000_000  # ruling R35
+    assert built["irq_stress"]["max_cycles"] == 800_000_000  # ruling R35
     assert all("max_cycles" not in built[p] for p in ALL if p != "irq_stress")
 
 

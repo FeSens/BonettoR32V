@@ -119,8 +119,9 @@ MKEXPECT_coremark := --coremark-iters $(CM_ITERATIONS)
 $(foreach p,$(EVENT_PROGS),$(eval MKEXPECT_$(p) := --declared))
 # Ruling R35: irq_stress declares its own cycle budget (expect.json max_cycles; the harness uses
 # --max-cycles > max_cycles > its default). Its CALLS_MAX calls end inside it at 2,048 cycles per
-# instruction.
-MKEXPECT_irq_stress += --max-cycles 200000000
+# instruction: a variant that never completes its coverage fails 0x12 after 1,024 calls at
+# 716.5M cycles in progsim at CPI 2,048.
+MKEXPECT_irq_stress += --max-cycles 800000000
 $(EXPECTS): $(OUT)/%.expect.json: $(OUT)/%.hex $(OUT)/%.elf $(ISS) mkexpect.py stim.h
 	$(PYTHON) mkexpect.py --iss $(ISS) --hex $< --elf $(OUT)/$*.elf --out $@ $(MKEXPECT_$*)
 

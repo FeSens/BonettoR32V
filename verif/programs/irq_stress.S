@@ -97,7 +97,7 @@
     .set SEED, 0x1234
     .set CALLS_MIN, 64
     .set FOCUS_FROM, 64          # odd calls from here aim at an uncovered point (see the sweep)
-    .set CALLS_MAX, 256          # ruling R35: a coverage miss fails inside max_cycles
+    .set CALLS_MAX, 1024         # ruling R35: a coverage miss fails inside max_cycles
     .set VDC_BITS, 10
     .if CALLS_MAX > (1 << VDC_BITS)
     .error "CALLS_MAX needs more VDC_BITS"

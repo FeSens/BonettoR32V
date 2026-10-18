@@ -343,7 +343,7 @@ Makefile's header and `mkexpect.py` describe each `expect.json`:
 - **Peripheral programs** (`kind: "declared"`, ruling R13): their outcome depends on peripheral
   timing or interrupts, so expect.json carries the declared stimulus and expectations (`stim.h`):
   UART frames and rates, SPI bytes, PWM settings, GPIO scripts, the `ir_loop` loopback, and for
-  irq_stress its own run budget (`max_cycles` 200,000,000, R35).
+  irq_stress its own run budget (`max_cycles` 800,000,000, R35).
 - **CoreMark** (ITERATIONS = 1, TOTAL_DATA_SIZE = 2000, -O2): timing marks GPIO_OUT 0xC0 / 0xC1
   around the timed region (R21) and `coremark_iters`, and "Correct operation validated" in the
   PSRAM log ring (CPU 0x017F_0000).
