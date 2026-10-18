@@ -15,6 +15,12 @@
  * Inputs pass through a 2-flop synchronizer (s2 is the synchronized value, s3 the previous one
  * for edge detection): an input change reaches the logic 2 cycles later.
  *
+ * Resets: every register a load can read takes its contract reset value. Flops whose reset value
+ * nothing can observe have none: the first synchronizer stage, the prescalers and bit timers,
+ * the shift registers, and the toggle flop (the TIMER_CTRL write that selects toggle mode
+ * clears it). Read/write registers and the timer counter are plain enable flops: the reset is
+ * folded into the shared write data (0 while rst_n is low) and into each write enable.
+ *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -68,12 +74,11 @@ module r32v_periph (
     // ------------------------------------------------------------------------------------
     reg [7:0] s1, s2, s3;
     always @(posedge clk) begin
+        s1 <= ui_in;
         if (!rst_n) begin
-            s1 <= 8'd0;
             s2 <= 8'd0;
             s3 <= 8'd0;
         end else begin
-            s1 <= ui_in;
             s2 <= s1;
             s3 <= s2;
         end
@@ -93,44 +98,34 @@ module r32v_periph (
     reg [2:0]  sd;
     reg [4:0]  ien;
     reg [7:0]  een, epol;
+    // Plain enable flops: the reset is folded into the shared write data z0/z1 (0 while rst_n is
+    // low) and into every write enable, so each bit maps to one enable flop with no logic of its own.
+    wire       rst = ~rst_n;
+    wire [7:0] z0  = d0 & {8{rst_n}};
+    wire [7:0] z1  = d1 & {8{rst_n}};
+    wire       w0  = be0 | rst;
+    wire       w1  = be1 | rst;
     always @(posedge clk) begin
-        if (!rst_n) begin
-            gpo   <= 8'd0;
-            alt   <= 8'd0;
-            tcmp  <= 16'd0;
-            tctl  <= 10'd0;
-            pctl  <= 15'd0;
-            duty0 <= 10'd0;
-            duty1 <= 10'd0;
-            duty2 <= 10'd0;
-            div   <= 13'd0;
-            scs   <= 1'b1;
-            sd    <= 3'd0;
-            ien   <= 5'd0;
-            een   <= 8'd0;
-            epol  <= 8'd0;
-        end else begin
-            if (be0 & s_gpo)  gpo <= d0;
-            if (be0 & s_alt)  alt <= d0;
-            if (be0 & s_tcmp) tcmp[7:0]  <= d0;
-            if (be1 & s_tcmp) tcmp[15:8] <= d1;
-            if (be0 & s_tctl) tctl[7:0]  <= d0;
-            if (be1 & s_tctl) tctl[9:8]  <= d1[1:0];
-            if (be0 & s_pctl) pctl[7:0]  <= d0;
-            if (be1 & s_pctl) pctl[14:8] <= d1[6:0];
-            if (be0 & s_dut0) duty0[7:0] <= d0;
-            if (be1 & s_dut0) duty0[9:8] <= d1[1:0];
-            if (be0 & s_dut1) duty1[7:0] <= d0;
-            if (be1 & s_dut1) duty1[9:8] <= d1[1:0];
-            if (be0 & s_dut2) duty2[7:0] <= d0;
-            if (be1 & s_dut2) duty2[9:8] <= d1[1:0];
-            if (be0 & s_uctl) div[7:0]   <= d0;
-            if (be1 & s_uctl) div[12:8]  <= d1[4:0];
-            if (be0 & s_sctl) {sd, scs}  <= d0[3:0];
-            if (be0 & s_ien)  ien  <= d0[4:0];
-            if (be0 & s_edge) een  <= d0;
-            if (be1 & s_edge) epol <= d1;
-        end
+        if (w0 & (s_gpo | rst))  gpo <= z0;
+        if (w0 & (s_alt | rst))  alt <= z0;
+        if (w0 & (s_tcmp | rst)) tcmp[7:0]  <= z0;
+        if (w1 & (s_tcmp | rst)) tcmp[15:8] <= z1;
+        if (w0 & (s_tctl | rst)) tctl[7:0]  <= z0;
+        if (w1 & (s_tctl | rst)) tctl[9:8]  <= z1[1:0];
+        if (w0 & (s_pctl | rst)) pctl[7:0]  <= z0;
+        if (w1 & (s_pctl | rst)) pctl[14:8] <= z1[6:0];
+        if (w0 & (s_dut0 | rst)) duty0[7:0] <= z0;
+        if (w1 & (s_dut0 | rst)) duty0[9:8] <= z1[1:0];
+        if (w0 & (s_dut1 | rst)) duty1[7:0] <= z0;
+        if (w1 & (s_dut1 | rst)) duty1[9:8] <= z1[1:0];
+        if (w0 & (s_dut2 | rst)) duty2[7:0] <= z0;
+        if (w1 & (s_dut2 | rst)) duty2[9:8] <= z1[1:0];
+        if (w0 & (s_uctl | rst)) div[7:0]   <= z0;
+        if (w1 & (s_uctl | rst)) div[12:8]  <= z1[4:0];
+        if (w0 & (s_sctl | rst)) {sd, scs}  <= {z0[3:1], z0[0] | rst};
+        if (w0 & (s_ien | rst))  ien  <= z0[4:0];
+        if (w0 & (s_edge | rst)) een  <= z0;
+        if (w1 & (s_edge | rst)) epol <= z1;
     end
 
     // ------------------------------------------------------------------------------------
@@ -165,20 +160,18 @@ module r32v_periph (
     wire        match  = (tcnt == tcmp);
     wire        cap_ev = chg[0] & (s2[0] ? t_cap[0] : t_cap[1]);
     wire [15:0] tcnt_i = tcnt + 16'd1;
+    // next count for the enable flops: the written bytes (0 in reset), else the tick's step
+    wire [15:0] t_nx   = wr_cnt ? {z1, z0} : (tcnt_i & {16{~((match & t_ar) | rst)}});
     always @(posedge clk) begin
         tp <= (wr_cnt | ~t_en) ? 15'd0 : tp + 15'd1;
+        if (rst | (wr_cnt ? be0 : tick)) tcnt[7:0]  <= t_nx[7:0];
+        if (rst | (wr_cnt ? be1 : tick)) tcnt[15:8] <= t_nx[15:8];
         if (!rst_n) begin
-            tcnt  <= 16'd0;
             tcap  <= 16'd0;
-            tq    <= 1'b0;
             p_cmp <= 1'b0;
             p_cap <= 1'b0;
         end else begin
-            if (wr_cnt) begin
-                if (be0) tcnt[7:0]  <= d0;
-                if (be1) tcnt[15:8] <= d1;
-            end else if (tick)
-                tcnt <= (match & t_ar) ? 16'd0 : tcnt_i;
+            // no reset: only toggle mode shows tq, and the write that selects it clears tq
             if (be0 & s_tctl)
                 tq <= 1'b0;                                 // the mode is written: restart at 0
             else if (tick & match & (t_mode == 2'b01))
@@ -204,10 +197,8 @@ module r32v_periph (
     wire       ptick  = pq_run[q_sel];
     always @(posedge clk) begin
         pq <= p_en ? pq + 7'd1 : 7'd0;
-        if (!p_en)
-            pcnt <= 10'd0;
-        else if (ptick)
-            pcnt <= (pcnt >= per) ? 10'd0 : pcnt + 10'd1;
+        if (~p_en | ptick)
+            pcnt <= (pcnt + 10'd1) & {10{p_en & (pcnt < per)}};
     end
     wire pwm0 = p_en & (pcnt < duty0);
     wire pwm1 = p_en & (pcnt < duty1);
@@ -257,7 +248,7 @@ module r32v_periph (
             rbc <= 4'd0;
         else if (r_smp)
             rbc <= rbc + 4'd1;
-        if (r_smp & (rbc != 4'd0) & (rbc <= 4'd8))         // data bits 0..7, LSB first
+        if (r_smp)                                         // the start bit drops out
             rsr <= {s2[1], rsr[7:1]};
         if (!rst_n) begin
             ract  <= 1'b0;
