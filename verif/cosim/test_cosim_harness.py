@@ -1038,6 +1038,63 @@ def test_cell_stub_power_up_reliance_fails(tools, tmp_path):
     assert r["pass"], r["error"]
 
 
+def submodule_stub(tmp: Path) -> Path:
+    """The playback stub with its uo_out register built from 8 instances of a design submodule
+    (r32v_ureg, in its own file) whose state is an unreset `output reg`, each connected to a
+    bit-select uo_r[k]: the design relies on that flop's power-up value until the first pin
+    record."""
+    text = (PLAYBACK / "tt_um_fesens_r32v.v").read_text()
+    for old in (UO_REG, UO_LOAD, UO_DECL):
+        assert text.count(old) == 1, old
+    gen = ("    reg [7:0] uio_r, oe_r;\n    wire [7:0] uo_r;\n"
+           "    wire hit = rst_n & (pn[{pi, 1'b0}] == cnt + 32'd1);\n"
+           "    genvar k;\n    generate\n        for (k = 0; k < 8; k = k + 1) begin : g_uo\n"
+           "            r32v_ureg u_q (.clk(clk), .ld(hit), .d(pn[{pi, 1'b1}][k]), "
+           ".q(uo_r[k]));\n        end\n    endgenerate\n")
+    text = (text.replace(UO_REG, "").replace(UO_DECL, gen)
+            .replace(UO_LOAD, "                {oe_r, uio_r} <= pn[{pi, 1'b1}][23:8];\n"))
+    d = tmp / "submodule_outreg"
+    d.mkdir()
+    (d / "tt_um_fesens_r32v.v").write_text(text)
+    (d / "r32v_ureg.v").write_text(
+        "`default_nettype none\n"
+        "module r32v_ureg (input wire clk, input wire ld, input wire d, output reg q);\n"
+        "    always @(posedge clk) if (ld) q <= d;\n"
+        "endmodule\n`default_nettype wire\n")
+    return d
+
+
+def test_submodule_output_reg_power_up_reliance_fails(tools, tmp_path):
+    """Invariant 6 reaches a design submodule's `output reg` tied to a bit-select. Inlined,
+    Verilator makes that port a __Vcellout temporary initialized to 0, not at random, and this
+    stub passed under all four seeds. verif/cosim/noinline.vlt keeps r32v_* modules out of
+    inlining, so the flop is randomized and the reliance fails (uo_out is not 0 during reset).
+    Built with --x-initial 0 it passes, so the failure comes from the randomized submodule state
+    alone; with the inlining forced back (a test-only configuration file) it passes again."""
+    hexf, rets, pins = gpio_scenario(tmp_path)
+    src = submodule_stub(tmp_path)
+    res = [stub("rvfi", hexf, tmp_path, pins, rets, every(5), {"result_gpio": 0x5A}, seed=s,
+                src=src) for s in run_cosim.SEEDS]
+    assert any(not r["pass"] for r in res), "the power-up reliance passed under seeds 1-4"
+    assert all(r["pass"] or "uo_out" in r["error"] for r in res), [r["error"] for r in res]
+    args = (run_cosim.build_dir_for("rvfi", src, "", False) / "verilator.args").read_text()
+    assert "/verif/cosim/noinline.vlt\n" in args
+    inline = tmp_path / "inline.vlt"
+    inline.write_text('`verilator_config\ninline -module "r32v_*"\n')
+    pp, rp, ep = tmp_path / "zp.hex", tmp_path / "zr.hex", tmp_path / "ze.json"
+    pins.write(pp)
+    rvfi_rom(rp, rets, every(5))
+    ep.write_text(json.dumps({"result_gpio": 0x5A}))
+    for vflags, seeds in (("--x-initial 0", (1,)), (str(inline), run_cosim.SEEDS)):
+        exe = run_cosim.ensure_built("rvfi", src, vflags=vflags)
+        for s in seeds:
+            p = subprocess.run([str(exe), str(hexf), "--seed", str(s), "--expect", str(ep),
+                                f"+PINS={pp}", f"+RVFI={rp}"], capture_output=True, text=True,
+                               timeout=900)
+            r = json.loads(p.stdout.strip().splitlines()[-1])
+            assert r["pass"], (vflags, s, r["error"])
+
+
 @pytest.mark.parametrize("v3_flag", [[], ["--v3"]], ids=["default", "v3-no-op"])
 def test_run_cosim_cli(tools, tmp_path, v3_flag):
     """R18: the CLI runs the v3 harness and prints KEYS (coremark_cycles_per_iter included), with

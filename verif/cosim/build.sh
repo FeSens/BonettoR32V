@@ -27,7 +27,10 @@
 #
 # Verilator runs with --x-initial unique and --x-assign unique; the harness randomizes every
 # power-up value at run time from its --seed, so a design that relies on zero-initialized state
-# fails.
+# fails. verif/cosim/noinline.vlt (a Verilator configuration file, read after the cell models)
+# keeps every design submodule (r32v_*) out of inlining: an inlined module's output reg that the
+# parent connects to a bit-select becomes a temporary Verilator initializes to 0, not at random,
+# which hid a design relying on that flop's power-up value (invariant 6).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -69,6 +72,11 @@ if [ ${#CELLS[@]} -eq 0 ]; then
   echo "build.sh: no cell models in $ROOT/verif/cells" >&2
   exit 1
 fi
+VLT="$COSIM/noinline.vlt"
+if [ ! -f "$VLT" ]; then
+  echo "build.sh: missing $VLT" >&2
+  exit 1
+fi
 
 DEFS=()
 CDEFS=""
@@ -101,6 +109,7 @@ ARGS=(--cc --exe --build -j 0 -O3
   ${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"}
   "${FILES[@]}"
   "${CELLS[@]}"
+  "$VLT"
   "$HSRC"
   -CFLAGS "-O2 -std=c++17 -I$COSIM $CDEFS"
   -Mdir "$OUT/obj" -o "$OUT/harness")
