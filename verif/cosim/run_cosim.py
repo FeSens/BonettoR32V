@@ -9,7 +9,7 @@ lines keep working.
 One run:
   run_cosim.py --mode {rvfi,pins} --prog build/programs/<name>.hex [--seed S] [--max-cycles C]
                [--clk-ns 25] [--timing-json PATH] [--dump-ram PATH] [--src DIR] [--vflags ARGS]
-               [--trace PATH]
+               [--trace PATH] [--dump-pins PATH]
 prints one JSON line
   {"prog","mode","seed","pass","retired","cycles","cpi","max_cycles_per_insn",
    "coremark_cycles_per_iter","error"}
@@ -43,7 +43,8 @@ the pin rules), and prints one JSON line with FUZZ_KEYS ({"prog": "fuzz_liveness
 --timing-json (rvfi mode) writes {"pass", "first_retire_cycle", "max_cycles_per_insn",
 "per_class"} on every run; with "pass": false the numbers only cover the run up to the failure.
 --dump-ram writes the final 8 MiB PSRAM image (raw bytes from PSRAM byte 0) as the design left
-it (the harness's --dump-psram).
+it (the harness's --dump-psram). --dump-pins writes every uo_out change as "cycle hex" lines,
+then "cycle end" (the harness's --dump-pins; observation only, for decoders such as sdk/tests).
 Programs whose <name>.expect.json lists "log_contains" must leave those strings in the PSRAM log
 ring at 0x7F_0000-0x7F_07FF (CPU 0x017F_0000, NUL-terminated), e.g. coremark's "Correct operation
 validated".
@@ -174,10 +175,11 @@ def log_ring_text(psram: bytes, lo: int = LOG_RING, hi: int = LOG_RING_END) -> s
 
 def run_one(mode: str, hexfile: Path, seed: int = 1, max_cycles: int = 0, timing_json=None,
             dump_ram=None, src: Path = SRC, vflags: str = "", trace=None,
-            clk_ns: float = CLK_NS):
+            clk_ns: float = CLK_NS, dump_pins=None):
     """Run one cosim. Returns (summary dict with KEYS, full harness result dict); dump_ram
-    receives the 8 MiB PSRAM image."""
-    summary, res = _run(mode, hexfile, seed, max_cycles, dump_ram, src, vflags, trace, clk_ns)
+    receives the 8 MiB PSRAM image, dump_pins the uo_out changes."""
+    summary, res = _run(mode, hexfile, seed, max_cycles, dump_ram, src, vflags, trace, clk_ns,
+                        dump_pins)
     if timing_json:
         # Written on every run, so a stale file can't survive. "pass": false means the numbers
         # stop at the failure (partial) or are null.
@@ -197,7 +199,8 @@ def _harness_json(p):
         return {}
 
 
-def _run(mode, hexfile, seed, max_cycles, dump_psram, src, vflags, trace, clk_ns):
+def _run(mode, hexfile, seed, max_cycles, dump_psram, src, vflags, trace, clk_ns,
+         dump_pins=None):
     hexfile = Path(hexfile)
     prog = hexfile.name[:-len(".hex")] if hexfile.name.endswith(".hex") else hexfile.stem
     summary = {k: None for k in KEYS}
@@ -221,6 +224,8 @@ def _run(mode, hexfile, seed, max_cycles, dump_psram, src, vflags, trace, clk_ns
             cmd += ["--max-cycles", str(max_cycles)]
         if trace:
             cmd += ["--trace", str(trace)]
+        if dump_pins:
+            cmd += ["--dump-pins", str(dump_pins)]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         except subprocess.TimeoutExpired:
@@ -382,6 +387,8 @@ def main() -> int:
     ap.add_argument("--max-cycles", type=int, default=0)
     ap.add_argument("--timing-json", type=Path)
     ap.add_argument("--dump-ram", type=Path, help="write the final 8 MiB PSRAM image")
+    ap.add_argument("--dump-pins", type=Path,
+                    help="write every uo_out change with its cycle (observation only)")
     ap.add_argument("--src", type=Path, default=SRC)
     ap.add_argument("--vflags", default="",
                     help="extra Verilator arguments (harness self-tests on mutant copies)")
@@ -419,7 +426,8 @@ def main() -> int:
     if a.timing_json and a.mode != "rvfi":
         ap.error("--timing-json needs --mode rvfi (pins mode can't see retirements)")
     summary, _ = run_one(a.mode, a.prog, a.seed, a.max_cycles, a.timing_json, a.dump_ram, a.src,
-                         vflags=a.vflags, trace=a.trace, clk_ns=a.clk_ns)
+                         vflags=a.vflags, trace=a.trace, clk_ns=a.clk_ns,
+                         dump_pins=a.dump_pins)
     print(json.dumps({k: summary[k] for k in KEYS}))
     return 0 if summary["pass"] else 1
 

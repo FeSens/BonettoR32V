@@ -50,8 +50,9 @@ C_PROGS     := gpio_demo
 ISS_PROGS   := $(ASM_PROGS) $(C_PROGS) coremark $(addprefix trap_,$(TRAPS)) \
                $(addprefix random_,$(RANDOM_SEEDS))
 EVENT_ASM   := irq_stress wfi
-EVENT_C     := irq_timer uart_echo spi_loop pwm ir_loop gpio_edge
-EVENT_PROGS := irq_timer irq_stress wfi uart_echo uart_echo_fast spi_loop pwm ir_loop gpio_edge
+EVENT_C     := irq_timer uart_echo spi_loop pwm ir_loop gpio_edge pwm10 pwm10q timer16 ir_gate
+EVENT_PROGS := irq_timer irq_stress wfi uart_echo uart_echo_fast spi_loop pwm ir_loop gpio_edge \
+               pwm10 pwm10q timer16 ir_gate
 PROGS       := $(ISS_PROGS) $(EVENT_PROGS)
 
 CM_DIR  := $(HERE)/coremark

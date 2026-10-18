@@ -423,6 +423,116 @@ class PwmMeter {
   }
 };
 
+// ---- IR gate (contract 5.2, 5.4): uo[1] = PWM0 AND the timer output while PWM_CTRL[14] is set --
+// Opt-in (expect.json ir_gate). After `start` (the 0xA6 mark on the GPIO-mode pins) and one
+// carrier period to settle, every cycle u must show uo[1] = C(u) AND uo[7], where uo[7]
+// (ALTFN[7] = 1) is the timer output and C is the PWM0 carrier: period P = (PER+1) 2^Q, high
+// H = min(DUTY, PER+1) 2^Q, 0 < H < P. The PWM counter runs freely (5.4), so the carrier keeps
+// one phase across marks and spaces: the meter learns it from the first rising edge of uo[1]
+// inside a mark (uo[7] steady around it) and holds every later cycle to it. Within SKEW cycles of
+// a uo[7] edge either value of uo[1] is accepted (cycles v - SKEW .. v + SKEW - 1 for an edge at
+// v, where uo[7](v-1) != uo[7](v)), so a design may delay one pin by up to SKEW cycles more than
+// the other. While uo[7] is low, uo[1] is 0. The measurement is done once `marks` complete marks
+// (uo[7] high intervals that start after settling) have passed; it fails at start + within if
+// they haven't, or if no carrier edge was ever seen inside a mark.
+class IrGateMeter {
+ public:
+  static constexpr uint64_t SKEW = 1;
+
+  IrGateMeter(uint64_t period, uint64_t high, uint64_t marks, uint64_t start, uint64_t within)
+      : period_(period), high_(high), marks_(marks), start_(start), within_(within) {}
+
+  // The pins right after rising edge t (t increases by 1 per call).
+  bool step(uint64_t t, bool g, bool tm) {
+    if (done_ || !err_.empty()) return err_.empty();
+    hist_[t % H] = Sample{t, g, tm};
+    n_++;
+    if (t > deadline())
+      return fail(pfmt("IR gate (uo[1] = PWM0 AND timer output uo[7]): saw %llu of %llu complete "
+                       "marks on uo[7] (%llu carrier pulses) by cycle %llu, %llu cycles after the "
+                       "0xa6 mark",
+                       (unsigned long long)complete_, (unsigned long long)marks_,
+                       (unsigned long long)pulses_, (unsigned long long)t,
+                       (unsigned long long)within_));
+    if (n_ < 2 * SKEW + 2 || t < SKEW) return true;
+    const uint64_t u = t - SKEW;  // the cycle judged now: needs the samples u - SKEW - 1 .. u + SKEW
+    if (u <= start_ + period_ + SKEW) return true;  // settling
+    const Sample& cur = at(u);
+    const Sample& prv = at(u - 1);
+    // marks: uo[7] edges at u (uo[7](u-1) != uo[7](u))
+    if (!prv.tm && cur.tm) in_mark_ = true;
+    if (prv.tm && !cur.tm && in_mark_) {
+      in_mark_ = false;
+      if (++complete_ >= marks_) {
+        if (!locked_)
+          return fail(pfmt("IR gate: %llu marks on uo[7] passed, but uo[1] never showed a carrier "
+                           "rising edge inside one (expected period %llu, high %llu cycles)",
+                           (unsigned long long)complete_, (unsigned long long)period_,
+                           (unsigned long long)high_));
+        done_ = true;
+        return true;
+      }
+    }
+    if (near_edge(u)) return true;
+    const bool rising = !prv.g && cur.g && !near_edge(u - 1);
+    if (!cur.tm) {
+      if (cur.g)
+        return fail(pfmt("IR gate: uo[1] is 1 at cycle %llu while the timer output uo[7] is 0 (a "
+                         "space): uo[1] must be PWM0 AND the timer output (contract 5.2)",
+                         (unsigned long long)u));
+      return true;
+    }
+    if (!locked_) {
+      if (rising) {
+        locked_ = true;
+        r0_ = u;
+        pulses_++;
+      }
+      return true;
+    }
+    if (rising) pulses_++;
+    const bool want = ((u - r0_) % period_) < high_;
+    if (cur.g != want)
+      return fail(pfmt("IR gate: uo[1] is %d at cycle %llu inside a mark (uo[7] = 1), expected %d: "
+                       "the PWM0 carrier (period %llu, high %llu cycles) is at phase %llu, locked "
+                       "to its rising edge at cycle %llu (the PWM counter runs freely, so the "
+                       "carrier keeps its phase across marks)",
+                       cur.g, (unsigned long long)u, want, (unsigned long long)period_,
+                       (unsigned long long)high_, (unsigned long long)((u - r0_) % period_),
+                       (unsigned long long)r0_));
+    return true;
+  }
+  bool done() const { return done_; }
+  uint64_t deadline() const { return start_ + within_; }
+  const std::string& error() const { return err_; }
+  uint64_t marks_seen() const { return complete_; }
+  uint64_t pulses() const { return pulses_; }
+
+ private:
+  struct Sample {
+    uint64_t t = 0;
+    bool g = false, tm = false;
+  };
+  static constexpr uint64_t H = 2 * SKEW + 4;
+  uint64_t period_, high_, marks_, start_, within_;
+  Sample hist_[H];
+  uint64_t n_ = 0, complete_ = 0, pulses_ = 0, r0_ = 0;
+  bool in_mark_ = false, locked_ = false, done_ = false;
+  std::string err_;
+
+  const Sample& at(uint64_t u) const { return hist_[u % H]; }
+  // an edge of uo[7] at v (v in u - SKEW + 1 .. u + SKEW) puts cycle u in the tolerance window
+  bool near_edge(uint64_t u) const {
+    for (uint64_t v = u + 1 - SKEW; v <= u + SKEW; v++)
+      if (at(v - 1).tm != at(v).tm) return true;
+    return false;
+  }
+  bool fail(const std::string& w) {
+    if (err_.empty()) err_ = w;
+    return false;
+  }
+};
+
 // ---- loopback and stimulus --------------------------------------------------------------------
 // ui[0] follows uo[7]: the level the design samples at edge t + 1 is uo[7] after edge t.
 struct TimerLoop {
