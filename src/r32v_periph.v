@@ -17,16 +17,19 @@
  * 3 cycles. At 50 MHz the flop has most of a 20 ns cycle to resolve before anything samples it.
  *
  * Resets: every register a load can read takes its contract reset value. Flops whose reset value
- * nothing can observe have none: GPIO_IN's flop (s3 resets, so no edge shows), the prescalers
- * and bit timers, the shift registers, and the toggle flop (the TIMER_CTRL write that selects
- * toggle mode clears it). Read/write registers and the timer counter are plain enable flops:
- * the reset is folded into the shared write data (0 while rst_n is low) and into each write
- * enable.
+ * nothing can observe have none: GPIO_IN's flop, the edge-detect flops of the pins whose edge
+ * users are all disabled at reset (only the UART RX pin's resets, so no false start bit shows),
+ * the prescalers and bit timers, the UART receiver's shift register, and the toggle flop (the
+ * TIMER_CTRL write that selects toggle mode clears it). Read/write registers, the timer counter,
+ * the UART transmitter and the SPI shift register are plain enable flops: the reset is folded
+ * into the shared write data (0 while rst_n is low) and into each write or load enable.
  *
  * Internal counters nothing reads (the timer, PWM and SPI prescalers, the PWM counter) hold
  * the complement of the count: they count down, restart at all ones, and test "low bits all
- * ones" as "low bits all zero". The UART receiver and the SPI master end on a marker bit that
- * walks through their shift register instead of a bit counter.
+ * ones" as "low bits all zero". The UART receiver ends on a marker bit that walks through its
+ * shift register instead of a bit counter. The SPI master keeps the byte it sends and the byte
+ * it receives in one shift register, and one counter holds its BUSY flag, the SCK level and the
+ * bit index.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -79,13 +82,14 @@ module r32v_periph (
     // ------------------------------------------------------------------------------------
     // Input synchronizers
     // ------------------------------------------------------------------------------------
+    // s3 has no reset except for the UART RX pin: an edge on any other pin right after reset
+    // reaches nothing, since every user (GPIO_EDGE enables, the capture edge select) resets to off
     reg [7:0] s2, s3;
     always @(posedge clk) begin
-        s2 <= ui_in;                                   // s3 resets, so no edge shows in reset
+        s2 <= ui_in;
+        s3 <= s2;
         if (!rst_n)
-            s3 <= 8'd0;
-        else
-            s3 <= s2;
+            s3[1] <= 1'b0;                             // no false RX start bit after reset
     end
     wire [7:0] chg = s2 ^ s3;                         // a synchronized edge on each pin
 
@@ -221,11 +225,10 @@ module r32v_periph (
     wire        tx_busy = |tsr;
     wire        tx_go   = be0 & s_udat & ~tx_busy;
     always @(posedge clk) begin
-        if (!rst_n)
-            tsr <= 10'd0;
-        else if (tx_go)
-            tsr <= {1'b1, d0, 1'b0};
-        else if (tx_busy & (tbc == 13'd0))
+        // the reset loads 0 (idle) through the start path; shifting an idle tsr keeps it 0
+        if (tx_go | rst)
+            tsr <= {rst_n, z0, 1'b0};
+        else if (tbc == 13'd0)
             tsr <= {1'b0, tsr[9:1]};
         if (tx_go | (tbc == 13'd0))
             tbc <= div;
@@ -247,9 +250,10 @@ module r32v_periph (
     wire        r_clr   = rd0 & s_udat;
     wire        full_k  = rfull & ~r_clr;                // reading byte 0 comes first
     always @(posedge clk) begin
+        // rcnt reloads at zero whether or not a frame is active (idle, nothing samples it)
         if (r_start)
             rcnt <= {1'b0, div[12:1]};
-        else if (r_smp)
+        else if (rcnt == 13'd0)
             rcnt <= div;
         else
             rcnt <= rcnt - 13'd1;
@@ -276,46 +280,41 @@ module r32v_periph (
     end
 
     // ------------------------------------------------------------------------------------
-    // SPI master, mode 0, MSB first: 2^D cycles low, 2^D high per bit. MOSI shifts out of sdr at
-    // the falling SCK edges. MISO (synchronized, so 1 cycle late) is captured into srx two
-    // cycles after each rising edge (srp is that delay line): the value the pin had in the first
-    // high cycle. The eighth capture comes at the last falling edge (D = 1) or before it, so
-    // BUSY is just sbusy. sdr holds the byte above a marker bit; the falling edge that finds the
-    // marker in bit 7 (bits 6:0 clear) is the eighth and ends the transfer. MOSI is 0 when idle.
+    // SPI master, mode 0, MSB first: 2^D cycles low, 2^D high per bit.
+    // sph = {BUSY, half-period count}: a write loads 1_0000, each half period adds 1, and the
+    // sixteenth (the eighth falling edge) wraps it to 0, which clears BUSY. Bit 0 is SCK.
+    // sdr holds {bits still to send, bits received, the slot for the next MISO sample}: MOSI is
+    // its top bit (0 when idle), every falling SCK edge shifts it left, and the cycle after each
+    // rising edge writes the slot with MISO as synchronized at that rising edge (contract 5.6:
+    // the pin value at the rising edge). After the eighth falling edge sdr[8:1] is the received
+    // byte, which SPI_DATA reads. The sample and the falling edge meet only at D = 0
+    // (unspecified), where the sample goes straight to bit 1.
     // ------------------------------------------------------------------------------------
     reg  [8:0] sdr;
-    reg  [7:0] srx;
-    reg        sbusy, ssck;
-    reg  [1:0] srp;
+    reg  [4:0] sph;
+    reg        srp;                                    // the cycle after a rising SCK edge
     reg  [6:0] sdc;
-    wire       s_busy  = sbusy;
-    wire       s_go    = be0 & s_sdat & ~s_busy;
+    wire       sbusy   = sph[4];
+    wire       ssck    = sph[0];
+    wire       s_go    = be0 & s_sdat & ~sbusy;
     wire [7:0] sdc_run = {~|sdc[6:0], ~|sdc[5:0], ~|sdc[4:0], ~|sdc[3:0], ~|sdc[2:0], ~|sdc[1:0], ~sdc[0], 1'b1};
     wire       s_half  = sbusy & sdc_run[sd];
     always @(posedge clk) begin
         sdc <= s_go ? 7'h7f : sdc - 7'd1;                // inverted count
-        if (s_go)
-            sdr <= {d0, 1'b1};
+        // no reset on srp or sdr[0]: SPI_DATA reads sdr[8:1], and s_go clears sdr[0]
+        srp <= s_half & ~ssck;
+        if (s_go | rst)
+            sdr <= {z0, 1'b0};                           // the reset loads 0 the same way
         else if (s_half & ssck)
-            sdr <= {sdr[7:0], 1'b0};
-        if (!rst_n) begin
-            srx   <= 8'd0;
-            sbusy <= 1'b0;
-            ssck  <= 1'b0;
-            srp   <= 2'd0;
-        end else begin
-            srp <= {srp[0], s_half & ~ssck};
-            if (srp[1])
-                srx <= {srx[6:0], s2[3]};
-            if (s_go)
-                sbusy <= 1'b1;
-            else if (s_half & ssck & ~|sdr[6:0])
-                sbusy <= 1'b0;
-            if (s_go)
-                ssck <= 1'b0;
-            else if (s_half)
-                ssck <= ~ssck;
-        end
+            sdr <= {sdr[7:1], srp ? s2[3] : sdr[0], 1'b0};
+        else if (srp)
+            sdr[0] <= s2[3];
+        if (!rst_n)
+            sph <= 5'd0;
+        else if (s_go)
+            sph <= 5'b10000;
+        else if (s_half)
+            sph <= sph + 5'd1;
     end
 
     // ------------------------------------------------------------------------------------
@@ -353,8 +352,8 @@ module r32v_periph (
             5'd10: rdata = {6'd0, duty2};
             5'd11: rdata = {8'd0, rdat};
             5'd12: rdata = {rovr, rfull, tx_busy, div};
-            5'd13: rdata = {8'd0, srx};
-            5'd14: rdata = {11'd0, s_busy, sd, scs};
+            5'd13: rdata = {8'd0, sdr[8:1]};
+            5'd14: rdata = {11'd0, sbusy, sd, scs};
             5'd15: rdata = {11'd0, ien};
             5'd16: rdata = {11'd0, pend};
             5'd17: rdata = {epol, een};
