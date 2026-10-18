@@ -21,6 +21,7 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 101 | 2026-10-18 | hyp/101-pc-on-die | rejected | 0.1427 | -0.1923 | 20 | 20,713.6 | -432.9 | skipped | - | pc on die (bit-serial core): pc in a 33-bit ring, drop the P/WP/WP4... | Superseded, not refuted: agent-measured (not lead re-verified) on t... |
 | 103 | 2026-10-18 | hyp/103-quad-nibble | merged | 0.3350 | +0.2486 | 20 | 21,146.5 | +1,456.4 | skipped | - | Quad I/O plus a nibble-serial datapath: flash 0xEB continuous read ... | Lead re-eval on hwe-bench (289a686, clean, MIN_IPS=0.08637436259110... |
 | 104 | 2026-10-18 | hyp/104-periph-diet | merged | 0.0864 | +0.0000 | 20 | 19,690.1 | -752.0 | skipped | - | Peripheral area diet, contract behavior unchanged: enable flops wit... | Lead re-eval on hwe-bench (2293e4a, clean): all gates pass at 20 ns... |
 | 102 | 2026-10-18 | hyp/102-clk50 | merged | 0.0864 | +0.0173 | 20 | 20,442.1 | +0.0 | skipped | - | Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead mov... | Eval (hwe-bench, cosim Pmod models at 20 ns: tCEM 400 cycles, SCK 2... |
