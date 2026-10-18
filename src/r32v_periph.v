@@ -225,10 +225,12 @@ module r32v_periph (
     wire        tx_busy = |tsr;
     wire        tx_go   = be0 & s_udat & ~tx_busy;
     always @(posedge clk) begin
-        // the reset loads 0 (idle) through the start path; shifting an idle tsr keeps it 0
+        // the reset loads 0 (idle) through the start path. Only a busy tsr shifts: tbc has no
+        // reset and is unknown until the first start, and an idle tsr must not depend on it
+        // (gate-level X propagation otherwise turns the idle tsr, and TX_BUSY, into X)
         if (tx_go | rst)
             tsr <= {rst_n, z0, 1'b0};
-        else if (tbc == 13'd0)
+        else if (tx_busy & (tbc == 13'd0))
             tsr <= {1'b0, tsr[9:1]};
         if (tx_go | (tbc == 13'd0))
             tbc <= div;
