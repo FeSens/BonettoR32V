@@ -1,12 +1,12 @@
 /*
- * BonettoR32V MCU (contract v3, docs/contract.md): a nibble-serial RV32E core with x1..x15, the
- * pc, mtvec, mscratch and mepc in the PSRAM core region, on TT's QSPI Pmod in quad mode (code
- * runs from flash in continuous read, data in PSRAM in QPI mode), with a minimal Zicsr, traps
- * and one interrupt to mtvec, and the contract-5 peripherals.
+ * BonettoR32V MCU (contract v3, docs/contract.md): a nibble-serial RV32E core with x1..x15,
+ * mtvec, mscratch and mepc in the PSRAM core region and the pc on the die, on TT's QSPI Pmod in
+ * quad mode (code runs from flash in continuous read, data in PSRAM in QPI mode), with a minimal
+ * Zicsr, traps and one interrupt to mtvec, and the contract-5 peripherals.
  *
  * Modules: r32v_mem (reset sequence, the address register, header nibbles, pins), r32v_csr (CSR
  * state and the trap/interrupt flags), r32v_periph (IO slots, the interrupt line). This file:
- * the slot engine, the nibble-serial datapath, decode and sequencing.
+ * the slot engine, the nibble-serial datapath, the pc, decode and sequencing.
  *
  * Slots. Every slot is one quad transaction at SCK = clk/2: E SCK edges take 2E + 2 clocks
  * (a gap clock with CS_n high, the edges, a tail clock with SCK low).
@@ -26,28 +26,33 @@
  * read 4 bytes. Shifts: W rotates the ring by q nibbles (shamt = 4q + r) during its own header,
  * then emits ({ring[7:4], ring[3:0]} >> r) with zero or sign fill.
  *
- *   P   READ  x0 (the pc)                     -> ring, address register
- *   A   READ  rs1 -> ALU (+imm; AUIPC: ring + imm; CSR: rs1 or zimm; branches: rs1 - 0)
- *             -> ring, address register (loads/stores); a branch on x0 only compares (the
- *             ring keeps the pc); an IO load captures the slot into the ring at A's tail
- *   PX  READ  x0 -> ring + (taken ? imm : 4) (branch); READ scratch -> ring (JALR)
+ * pc. pcr is a second 8-nibble shift register: it holds the pc with nibble k at pcr[4k+3:4k],
+ * so the fetch header reads its address nibbles (and bit 24, the chip) straight from it. A slot
+ * that updates the pc shifts the new nibble in at the top at each of its 8 data strobes and
+ * reads the old one at the head (pk4). Until the first retirement every read of it gives 0
+ * (`first`); the first instruction writes all of it.
+ *
+ *   F   READ  pc -> instruction register
+ *   A   READ  rs1 -> ALU (+imm; AUIPC: pc + imm; CSR: rs1 or zimm; branches: rs1 - 0) -> ring,
+ *             address register (loads/stores); at the same strobes pc <- pc + 4 (the nibble
+ *             incrementer), except for branches and JALR; an IO load captures the slot into
+ *             the ring at A's tail
  *   B   READ  rs2 -> ALU with the ring (OP, branches); register shifts: rs2[4:0] -> mar
  *   BS  READ  rs2 -> ring (store data); an IO store writes the slot at BS's tail
- *   C   READ  a CSR: core-region word (masked bits read 0) or the die bits -> ring
+ *   C   READ  a CSR: core-region word (masked bits read 0) or the die bits -> ring; in a trap
+ *             sequence (mtvec) and in MRET (mepc) -> pc
  *   RS  READ  scratch, combined with the ring (CSRRW / CSRRS / CSRRC) -> ring
- *   F   READ  pc -> instruction register
+ *   X   no transaction (masked, 18 clocks): pc <- pc + (taken branch ? imm : 4)
  *   M   READ/WRITE the load/store address (4 bytes / the store's bytes); a store to flash is
  *             masked
- *   WP  WRITE x0 <- ring;  WP4: x0 <- ring + 4 (JAL, taken branch on x0: ring + imm);
- *             W4: rd (JAL) or scratch (JALR) <- ring + 4
+ *   W4  WRITE rd <- pc + 4 (the incrementer); pc <- pc + imm (JAL) or the ring (JALR's target)
  *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT)
- *   WS  WRITE scratch <- ring;  WC: the CSR <- ring
- * Sequences: ALU P F WP4 A [B] W; load P F WP4 A M W (IO: A W); store P F WP4 A BS M (IO: A BS);
- * branch P F A B PX WP, on x0 P F A WP4; JAL P F W4 WP4; JALR P F W4 A WP [PX W];
- * FENCE, WFI P F WP4; CSR P F WP4 A WS C W RS WC; MRET P F C WP. A synchronous trap (decode
- * after F, JALR after A, branch after A or B) runs [P] WC(mepc <- pc) C(mtvec) WP and retires; an
- * interrupt (at a retirement) runs P WC C WP and continues with the handler's P. Until the first
- * retirement P (and a branch's PX) read pc = 0 without a transaction.
+ *   WS  WRITE scratch <- ring;  WC: the CSR <- ring (in a trap sequence: mepc <- pc)
+ * Sequences: ALU F A [B] W; load F A M W (IO: F A W); store F A BS M (IO: F A BS); branch
+ * F A [B] X; JAL F W4; JALR F A W4; FENCE, WFI F X; CSR F A WS C W RS WC; MRET F C. A
+ * synchronous trap (decode after F, JALR after A, branch after A or B) leaves the pc unchanged,
+ * runs WC(mepc <- pc) C(pc <- mtvec) and retires; an interrupt (at a retirement) runs WC C and
+ * continues with the handler's F.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -91,11 +96,11 @@ module tt_um_fesens_r32v (
 );
 
     // Slot types: sl[4:3] = 00 READ into the ring, 01 program address, 1x WRITE from the ring
-    localparam [4:0] SL_P  = 5'b00000, SL_A  = 5'b00001, SL_PX = 5'b00010, SL_B  = 5'b00011,
+    // (X: no transaction, always masked)
+    localparam [4:0] SL_A  = 5'b00001, SL_X  = 5'b00010, SL_B  = 5'b00011,
                      SL_BS = 5'b00100, SL_C  = 5'b00101, SL_RS = 5'b00110,
                      SL_F  = 5'b01000, SL_M  = 5'b01001,
-                     SL_WP = 5'b10000, SL_WP4 = 5'b10001, SL_W4 = 5'b10010, SL_W = 5'b10011,
-                     SL_WS = 5'b10100, SL_WC = 5'b10101;
+                     SL_W4 = 5'b10010, SL_W = 5'b10011, SL_WS = 5'b10100, SL_WC = 5'b10101;
     // Engine phases
     localparam [1:0] E_GAP  = 2'b00,     // CS_n high, SCK low (one clock; waits while booting)
                      E_HDR  = 2'b01,     // header and dummy edges
@@ -106,12 +111,14 @@ module tt_um_fesens_r32v (
     reg  [1:0]  ep;
     reg  [5:0]  c;      // SCK edge counter: 52/56..63 header, 0..7 data
     reg         sck;
-    reg         first;  // until the first retirement: P (and a branch's PX) read pc = 0
+    reg         first;  // until the first retirement: the pc reads 0
     reg         cy;     // ALU carry; sign latch of a load's W
+    reg         icy;    // carry of the pc + 4
     reg         cmp;    // compare; JALR target[1] == 0; a shift's sign bit
     reg         mk;     // the slot is masked (mask, registered at the gap clock)
     reg  [31:0] ring;   // operand/result ring
     reg  [31:0] ir;     // instruction register, in wire nibble order
+    reg  [31:0] pcr;    // the pc
 
     wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[0], 1'b0};
 
@@ -157,17 +164,14 @@ module tt_um_fesens_r32v (
     wire fR   = ~sl[4] & ~sl[3];
     wire fM   = ~sl[4] &  sl[3];
     wire fW   =  sl[4];
-    wire sP   = (sl == SL_P);
     wire sA   = (sl == SL_A);
-    wire sPX  = (sl == SL_PX);
+    wire sX   = (sl == SL_X);
     wire sB   = (sl == SL_B);
     wire sBS  = (sl == SL_BS);
     wire sC   = (sl == SL_C);
     wire sRS  = (sl == SL_RS);
     wire sF   = (sl == SL_F);
     wire sM   = (sl == SL_M);
-    wire sWP  = (sl == SL_WP);
-    wire sWP4 = (sl == SL_WP4);
     wire sW4  = (sl == SL_W4);
     wire sW   = (sl == SL_W);
     wire sWS  = (sl == SL_WS);
@@ -179,7 +183,7 @@ module tt_um_fesens_r32v (
     wire wr   = fW | (sM & c_st);                       // the slot writes
 
     // submodule wires
-    wire        tm, intr, irq, booting;
+    wire        tm, intr, irq, take, booting;
     wire        csr_region, mask_lo2;
     wire [3:0]  rd_die;
     wire [1:0]  csr_idx;
@@ -195,9 +199,9 @@ module tt_um_fesens_r32v (
     wire mask = (sA & (c_u | (rs1_f == 4'd0) | (c_csr & f3[2]))) |
                 ((sB | sBS) & rs2z) |
                 ((sW | sW4) & (rd_f == 4'd0)) |
-                (first & (sP | (sPX & c_br))) |
                 (csr_sl & ~csr_region) |
-                (sM & c_st & ~ps);                      // a store to flash issues nothing
+                (sM & c_st & ~ps) |                     // a store to flash issues nothing
+                sX;
     // every input of mask is constant from a slot's gap to its tail, so the slot uses mk
     wire active = ~gap & ~mk;
     wire wact   = wr & ~mk;                             // the slot drives data on the bus
@@ -212,8 +216,8 @@ module tt_um_fesens_r32v (
     // data strobe: a read samples nibble c; a write (on the bus) loads nibble c + 1 for the
     // next rising edge; a masked slot of either kind steps like a read
     wire       dstb  = wact ? (stb & ~cn[5] & ~dend) : (stb & ~c[5]);
-    wire [2:0] n     = wr ? cn[2:0] : c[2:0];           // data nibble index at dstb (a masked
-                                                        // write's emission is discarded)
+    wire [2:0] n     = wact ? cn[2:0] : c[2:0];         // data nibble index at dstb (a masked
+                                                        // W4 still updates the pc)
     wire       n0    = (n == 3'd0);
 
     // ------------------------------------------------------------------------------------
@@ -239,18 +243,18 @@ module tt_um_fesens_r32v (
     end
 
     // ------------------------------------------------------------------------------------
-    // Nibble ALU (also the + 4 of WP4/W4 and the branch target in PX)
+    // Nibble ALU (also the pc's targets: X, and W4 of JAL and JALR)
     // ------------------------------------------------------------------------------------
     wire       taken  = cmp ^ f3[0];
-    wire       winc   = sWP4 | sW4;
     wire [3:0] four   = {1'b0, n0, 2'b00};
+    wire [3:0] pk4    = pcr[3:0] & {4{~first}};         // pc nibble n (0 until the first retirement)
     wire       bimm_a = ~(c_op | c_br | c_sh);
-    wire [3:0] a4     = (sB | (sA & c_pcrel) | winc) ? ring[3:0] : nib_m;
-    wire       wimm   = sWP4 & (c_jal | (c_br & taken));   // WP4 of JAL / taken x0 branch
+    wire       a_pc   = (sA & c_pcrel) | sX | (sW4 & c_jal);
+    wire [3:0] a4     = a_pc ? pk4 : (sB | sW4) ? ring[3:0] : nib_m;
     wire [3:0] b4     = sA ? (imm4 & {4{bimm_a}}) :
                         sB ? nib_m :
-                        winc ? (wimm ? imm4 : four) :
-                        (sPX & c_br) ? (taken ? imm4 : four) : 4'd0;
+                        sX ? ((c_br & taken) ? imm4 : four) :
+                        (sW4 & c_jal) ? imm4 : 4'd0;
     // A: SLTI/SLTIU, and branches compare rs1 with 0; B: SUB, SLT, SLTU and branches subtract
     wire       sub    = sA ? (c_slt | c_br) : (sB & (c_br | (~f3[2] & (f3[1] | insn[30]))));
     wire [3:0] b_x    = b4 ^ {4{sub}};
@@ -275,6 +279,10 @@ module tt_um_fesens_r32v (
     wire [3:0] c4     = csr_region ? (nib_m & {2'b11, {2{~mask_lo2}}}) : rd_die;
     wire [3:0] rs4    = f3[1] ? (f3[0] ? (ring[3:0] & ~nib_m) : (ring[3:0] | nib_m)) : nib_m;
     wire [3:0] din4   = sC ? c4 : sRS ? rs4 : alu_w;
+
+    // pc + 4, nibble n (A, W4)
+    wire [4:0] inc5   = {1'b0, pk4} + {2'b00, n0, 2'b00} + {4'd0, icy};
+    wire [3:0] inc4   = inc5[3:0];
 
     // ------------------------------------------------------------------------------------
     // Write family emission, nibble n at the data strobe (before the ring rotates)
@@ -312,7 +320,8 @@ module tt_um_fesens_r32v (
                         c_slt ? {3'b000, n0 & cmp} :
                         c_sh  ? fun :
                                 ring[3:0];
-    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : winc ? sum : ring[3:0];
+    // W4: pc + 4; a trap sequence's WC (mepc): the pc; WS, WC: the ring
+    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : sW4 ? inc4 : (sWC & tm) ? pk4 : ring[3:0];
 
     // ------------------------------------------------------------------------------------
     // Next slot after the tail
@@ -324,34 +333,27 @@ module tt_um_fesens_r32v (
         nret = 1'b0;
         tgo  = 1'b0;
         case (sl)
-            SL_P: nsl = tm ? SL_WC : SL_F;
             SL_F: begin
                 if (trap_dec) begin
                     tgo = 1'b1;
                     nsl = SL_WC;
                 end else
-                    nsl = c_br ? SL_A : (c_jal | c_jalr) ? SL_W4 : p_mret ? SL_C : SL_WP4;
+                    nsl = c_jal ? SL_W4 : p_mret ? SL_C : (c_fence | priv) ? SL_X : SL_A;
             end
-            SL_WP4: begin
-                // FENCE, WFI (MRET, ECALL, EBREAK never get here), JAL, a branch on x0
-                nret = c_fence | priv | c_jal | c_br;
-                nsl  = SL_A;
-            end
-            SL_W4: nsl = c_jal ? SL_WP4 : SL_A;
             SL_A: begin
                 if (c_jalr & ~cmp) begin
                     tgo = 1'b1;
-                    nsl = SL_P;
-                end else if (c_jal | c_jalr)
-                    nsl = SL_WP;
+                    nsl = SL_WC;
+                end else if (c_jalr)
+                    nsl = SL_W4;
                 else if (c_br) begin
                     if (~rs2z)
                         nsl = SL_B;
                     else if (taken & insn[8]) begin
                         tgo = 1'b1;
-                        nsl = SL_P;
+                        nsl = SL_WC;
                     end else
-                        nsl = SL_WP4;                   // the ring still holds the pc
+                        nsl = SL_X;
                 end else if (c_op)
                     nsl = SL_B;
                 else if (c_st)
@@ -365,9 +367,9 @@ module tt_um_fesens_r32v (
                 if (c_br) begin
                     if (taken & insn[8]) begin
                         tgo = 1'b1;
-                        nsl = SL_P;
+                        nsl = SL_WC;
                     end else
-                        nsl = SL_PX;
+                        nsl = SL_X;
                 end
             end
             SL_BS: begin
@@ -378,18 +380,13 @@ module tt_um_fesens_r32v (
                 nret = c_st;
                 nsl  = SL_W;
             end
-            SL_PX: nsl = c_br ? SL_WP : SL_W;
-            SL_WP: begin
-                if (tm) begin
-                    nret = ~intr;
-                    nsl  = SL_P;
-                end else begin
-                    nret = ~(c_jalr & (rd_f != 4'd0));
-                    nsl  = SL_PX;
+            SL_WS: nsl = SL_C;
+            SL_C: begin
+                if (tm | p_mret) begin
+                    nret = ~(tm & intr);                // an interrupt entry retires nothing
+                    nsl  = SL_F;
                 end
             end
-            SL_WS: nsl = SL_C;
-            SL_C:  nsl = (tm | p_mret) ? SL_WP : SL_W;
             SL_W: begin
                 nret = ~c_csr;
                 nsl  = SL_RS;
@@ -399,7 +396,7 @@ module tt_um_fesens_r32v (
                 nret = ~tm;
                 nsl  = SL_C;
             end
-            default: nret = 1'b1;
+            default: nret = 1'b1;                       // X, W4
         endcase
     end
 
@@ -417,9 +414,12 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Ring and instruction register (no reset: nothing reads them before they are written)
     // ------------------------------------------------------------------------------------
-    wire ring_in  = dstb & (fR | (sM & c_ld)) & ~shB & ~(sA & c_br & rs2z);
+    wire ring_in  = dstb & (fR | (sM & c_ld)) & ~shB;
     wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] <= rotn);
     wire ring_rot = (dstb & wr) | hrot;
+    // pc writes: A (pc + 4, not for branches or JALR), X, W4, and C in a trap sequence or MRET
+    wire       pwe  = dstb & ((sA & ~c_br & ~c_jalr) | sX | sW4 | (sC & (tm | p_mret)));
+    wire [3:0] pin4 = sA ? inc4 : din4;
     always @(posedge clk) begin
         if (io_re)
             ring[15:0] <= {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]};
@@ -429,6 +429,8 @@ module tt_um_fesens_r32v (
             ring <= {ring[3:0], ring[31:4]};
         if (sF & dstb)
             ir <= {ir[27:0], nib_m};
+        if (pwe)
+            pcr <= {pin4, pcr[31:4]};
     end
 
     // ------------------------------------------------------------------------------------
@@ -441,9 +443,13 @@ module tt_um_fesens_r32v (
             if (sW) begin
                 if (~ldfill)
                     cy <= tap4[3];
-            end else if (fR | winc)
+            end else if (fR | sW4)
                 cy <= cout;
         end
+        if (gap)
+            icy <= 1'b0;
+        else if (dstb)
+            icy <= inc5[4];
 
         if (dstb & sA) begin
             if (c_slt | c_br)
@@ -467,7 +473,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
-            sl    <= SL_P;
+            sl    <= SL_F;
             ep    <= E_GAP;
             sck   <= 1'b0;
             first <= 1'b1;
@@ -478,7 +484,7 @@ module tt_um_fesens_r32v (
                 E_HDR:  if (stb & (c == 6'd63)) ep <= E_DATA;
                 E_DATA: if (dend) ep <= E_TAIL;
                 default: begin
-                    sl <= nret ? SL_P : nsl;
+                    sl <= nret ? (take ? SL_WC : SL_F) : nsl;
                     ep <= E_GAP;
                     if (nret)
                         first <= 1'b0;
@@ -490,16 +496,17 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Submodules
     // ------------------------------------------------------------------------------------
-    wire       scr     = (sPX & ~c_br) | (sW4 & ~c_jal) | sWS | sRS;   // the scratch word 0x80
-    wire       regarea = ~scr & ~csr_sl;                                // x0..x15 at 0xC0 + 4r
-    wire [3:0] rsel    = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | (sW4 & c_jal)) ? rd_f :
+    wire       scr     = sWS | sRS;                     // the scratch word 0x80
+    wire       regarea = ~scr & ~csr_sl;                // x1..x15 at 0xC0 + 4r
+    wire [3:0] rsel    = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | sW4) ? rd_f :
                          csr_sl ? {2'b01, csr_idx} : 4'd0;
 
     r32v_mem u_mem (
         .clk(clk), .rst_n(rst_n),
-        .cap(dstb & (sP | sA | sB)), .cap_a(dstb & sA), .kn(n), .din4(sB ? nib_m : din4),
+        .cap(dstb & (sA | sB)), .cap_a(dstb & sA), .kn(n), .din4(sB ? nib_m : din4),
         .shamt(shamt_r), .mar_lo(mar_lo), .io(io), .ps(ps), .booting(booting),
-        .active(active), .prog(fM), .sck(sck), .gap(gap),
+        .active(active), .prog(fM), .fetch(sF), .pca(pcr[24:0] & {25{~first}}),
+        .sck(sck), .gap(gap),
         .hdr_ld((gap & ~booting & ~mask) | (stb & hdr & cn[5])),
         .hidx(gap ? 3'd0 : (cn[2:0] ^ {~wr, 2'b00})),
         .h_wr(wr), .h_reg({regarea, rsel}),
@@ -515,8 +522,8 @@ module tt_um_fesens_r32v (
         .trap_go(e_end & tgo), .cause(cause), .retire(e_end & nret),
         .wc_end(e_end & sWC & ~tm),
         .wb({ring[31], ring[11], ring[7], ring[3:0]}),
-        .seq_end(e_end & sWP & tm), .irq(irq),
-        .tm(tm), .intr(intr)
+        .seq_end(e_end & sC & tm), .irq(irq),
+        .tm(tm), .intr(intr), .take(take)
     );
 
     r32v_periph u_periph (
@@ -546,22 +553,22 @@ module tt_um_fesens_r32v (
             // a trap or interrupt sequence ends: the next retirement is the handler's first
             // instruction (rvfi_intr = 1 for both, contract 8). A synchronous trap's own
             // retirement comes at this same tail and still reports the old value.
-            if (e_end & sWP & tm)
+            if (e_end & sC & tm)
                 r_ipend <= 1'b1;
             else if (e_end & nret)
                 r_ipend <= 1'b0;
             if (e_end & nret)
                 r_intr <= r_ipend;
         end
-        if (dstb & sP)
-            r_pc <= {nib_m, r_pc[31:4]};
-        if (dstb & (sWP | sWP4))
-            r_npc <= {wdo4, r_npc[31:4]};
+        if (e_end & sF)
+            r_pc <= {pcr[31:2], 2'b00} & {32{~first}};
+        if (pwe)                                        // every pc write covers nibbles 0..7
+            r_npc <= {pin4, r_npc[31:4]};
         if (dstb & sA)
             r_rs1 <= {nib_m, r_rs1[31:4]};
         if (dstb & (sB | sBS))
             r_rs2 <= {nib_m, r_rs2[31:4]};
-        if (dstb & (sW | (sW4 & c_jal)))
+        if (dstb & (sW | sW4))
             r_rd <= {wdo4, r_rd[31:4]};
         // M: byte n/2 of the load, high nibble first
         for (mi = 0; mi < 32; mi = mi + 1)

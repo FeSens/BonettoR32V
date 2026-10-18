@@ -10,10 +10,10 @@
  *     w4-w5    flash: 0xEB, 6 quad address edges, M = 0x20, then CS_n high inside the dummy
  *              field: the flash is in continuous read from here on;
  *     w6       PSRAM: 0x35 in SPI form (QPI mode from here on).
- * - Address register `mar`: the low 24 bits of a program address (the pc during P, a load or
- *   store address during A), shifted in a nibble at a time, LSB nibble first; bit 24 goes to
- *   `ps` (1 = PSRAM, 0 = flash) and bit 31 to `io`. B (register shifts) leaves rs2[4:0] in
- *   mar[4:0].
+ * - Address register `mar`: the low 24 bits of a load or store address (A), shifted in a nibble
+ *   at a time, LSB nibble first; bit 24 goes to `ps` (1 = PSRAM, 0 = flash) and bit 31 to `io`.
+ *   B (register shifts) leaves rs2[4:0] in mar[4:0]. A fetch takes its address and chip from
+ *   the core's pc (`pca`, bit 24 the chip) instead.
  * - Transactions: the core loads `sdo` with a header nibble (hdr_ld, index hidx) or a data
  *   nibble (dat_ld) at the clocks where SCK stays or goes low. Headers:
  *     flash (program access with ps = 0, continuous read): A[23:20] .. A[3:0], 0x2, 0x0 (M);
@@ -44,6 +44,8 @@ module r32v_mem (
     // transaction (from the core's engine)
     input  wire        active,     // a CS_n is low (an unmasked slot past its gap)
     input  wire        prog,       // program transaction (F, M): chip by ps
+    input  wire        fetch,      // ... F: address and chip from pca
+    input  wire [24:0] pca,        // the pc, bits 24:0
     input  wire        sck,
     input  wire        gap,        // the cycle between transactions
     input  wire        hdr_ld,     // load header nibble hidx into sdo
@@ -75,26 +77,27 @@ module r32v_mem (
     // ------------------------------------------------------------------------------------
     // Header nibbles
     // ------------------------------------------------------------------------------------
-    wire       flash = prog & ~ps;
+    wire [24:0] pa    = fetch ? pca : {ps, mar};          // the program address
+    wire        flash = prog & ~pa[24];
     reg  [3:0] hn;
     always @(*) begin
         case ({flash, hidx})
-            4'b1000: hn = mar[23:20];
-            4'b1001: hn = mar[19:16];
-            4'b1010: hn = mar[15:12];
-            4'b1011: hn = mar[11:8];
-            4'b1100: hn = mar[7:4];
-            4'b1101: hn = mar[3:0];
+            4'b1000: hn = pa[23:20];
+            4'b1001: hn = pa[19:16];
+            4'b1010: hn = pa[15:12];
+            4'b1011: hn = pa[11:8];
+            4'b1100: hn = pa[7:4];
+            4'b1101: hn = pa[3:0];
             4'b1110: hn = 4'h2;                         // M = 0x20: stay in continuous read
             4'b1111: hn = 4'h0;
             4'b0000: hn = 4'h0;
             4'b0001: hn = h_wr ? 4'h2 : 4'hB;           // QPI 0x02 write, 0x0B read
-            4'b0010: hn = prog ? mar[23:20] : 4'hF;
-            4'b0011: hn = prog ? mar[19:16] : 4'hF;
-            4'b0100: hn = prog ? mar[15:12] : 4'hF;
-            4'b0101: hn = prog ? mar[11:8]  : 4'hF;
-            4'b0110: hn = prog ? mar[7:4]   : {1'b1, h_reg[4:2]};
-            default: hn = prog ? mar[3:0]   : {h_reg[1:0], 2'b00};
+            4'b0010: hn = prog ? pa[23:20] : 4'hF;
+            4'b0011: hn = prog ? pa[19:16] : 4'hF;
+            4'b0100: hn = prog ? pa[15:12] : 4'hF;
+            4'b0101: hn = prog ? pa[11:8]  : 4'hF;
+            4'b0110: hn = prog ? pa[7:4]   : {1'b1, h_reg[4:2]};
+            default: hn = prog ? pa[3:0]   : {h_reg[1:0], 2'b00};
         endcase
     end
 

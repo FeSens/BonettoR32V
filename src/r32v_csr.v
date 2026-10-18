@@ -13,8 +13,8 @@
  *   numbers may alias a listed CSR: contract 4 leaves them unspecified).
  *
  * Sequencing: a synchronous trap (`trap_go`, at the END of the slot that detects it) or an
- * interrupt (`irq_take`, at a retirement) sets `tm`. The core then runs [P] WC C WP with
- * idx forced: WC writes mepc <- pc, C reads mtvec, WP writes the pc. `seq_end` (the WP's END)
+ * interrupt (`irq_take`, at a retirement; output `take`) sets `tm`. The core then runs WC C
+ * with idx forced: WC writes mepc <- pc, C reads mtvec into the pc. `seq_end` (the C's END)
  * clears tm. MRET's C reads mepc. Entry: MPIE <- MIE, MIE <- 0, mcause <- cause. MRET's
  * retirement: MIE <- MPIE, MPIE <- 1. The interrupt is taken at a retirement where the next
  * MIE, the next MEIE and the line are all 1 (so a CSR write or MRET that changes them counts).
@@ -42,10 +42,11 @@ module r32v_csr (
     input  wire        retire,     // an instruction retires
     input  wire        wc_end,     // a CSR instruction's WC ends: capture the die bits
     input  wire [6:0]  wb,         // ring bits {31, 11, 7, 3, 2, 1, 0} at that END
-    input  wire        seq_end,    // the trap or interrupt sequence's WP ends
+    input  wire        seq_end,    // the trap or interrupt sequence's C ends
     input  wire        irq,        // mip.MEIP
     output reg         tm,         // in a trap or interrupt sequence
-    output reg         intr        // ... entered by an interrupt
+    output reg         intr,       // ... entered by an interrupt
+    output wire        take        // an interrupt is taken at this retirement
 );
 
     reg       mie, mpie, meie, mc31;
@@ -88,6 +89,7 @@ module r32v_csr (
     wire meie_n = (wc_end & c_mie) ? wb[5] : meie;
     wire irq_take = retire & ~tm & mie_n & meie_n & irq;
 
+    assign take = irq_take;
     wire go = trap_go | irq_take;
     always @(posedge clk) begin
         if (!rst_n) begin
