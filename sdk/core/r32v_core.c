@@ -510,7 +510,7 @@ void attachInterrupt(int irq, void (*fn)(void), int mode) {
   } else if (irq == INT_CAPTURE) {
     cap_cb = fn;
     tmr_cap = ((uint32_t)mode & 3u) << 8;
-    R32V_REG8(6 * 4 + 1) = (uint8_t)(tmr_cap >> 8); /* byte 1 only: the toggle output stays */
+    TIMER_CTRL_B1 = (uint8_t)(tmr_cap >> 8); /* byte 1 only: the toggle output stays */
     IRQ_PEND = IRQ_CAP;
     IRQ_EN = IRQ_EN | IRQ_CAP;
   } else if (irq == INT_SERIAL) {
@@ -533,7 +533,7 @@ void detachInterrupt(int irq) {
   } else if (irq == INT_CAPTURE) {
     IRQ_EN = IRQ_EN & ~IRQ_CAP;
     tmr_cap = 0;
-    R32V_REG8(6 * 4 + 1) = 0;
+    TIMER_CTRL_B1 = 0;
     cap_cb = 0;
   } else if (irq == INT_SERIAL) {
     r32v_rx.cb = 0;

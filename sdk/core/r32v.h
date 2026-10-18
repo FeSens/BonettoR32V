@@ -25,6 +25,7 @@
 #define TIMER_CNT R32V_REG(3)   /* [15:0] counter; a write sets it and restarts the prescaler */
 #define TIMER_CMP R32V_REG(4)   /* [15:0] compare value */
 #define TIMER_CAP R32V_REG(5)   /* [15:0] captured count, read-only */
+#define TIMER_CTRL_B1 (*(volatile uint8_t *)(R32V_IO_BASE + 4u * 6u + 1u)) /* [9:8] capture edge */
 #define TIMER_CTRL R32V_REG(6)  /* see TMR_* */
 #define PWM_CTRL R32V_REG(7)    /* see PWM_* */
 #define PWM_DUTY0 R32V_REG(8)   /* [9:0] */

@@ -42,7 +42,7 @@ needs_rtl = pytest.mark.skipif(not RTL, reason="RTL cosim needs Verilator: run o
 
 @pytest.fixture(scope="session")
 def built():
-    for args in (["examples"], ["SKETCH=tests/progs/overhead"]):
+    for args in (["examples"], ["SKETCH=tests/progs/overhead"], ["SKETCH=tests/progs/capture"]):
         p = subprocess.run(["make", "-s", "-C", str(SDK), *args], capture_output=True, text=True)
         assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
     return BUILD
@@ -414,3 +414,21 @@ def test_interrupt_overhead_on_rtl(built, tmp_path):
     assert n_tb >= 5 and out["timebase"]["cpu_percent"] < 2.0, out
     assert out["tone_1000hz"]["cpu_percent"] < 25 and out["tone_2000hz"]["cpu_percent"] < 50, out
     assert 0 <= drift[2] <= 200 and all(abs(drift[p] - drift[2]) <= 50 for p in (3, 4)), drift
+
+
+@needs_rtl
+def test_capture_interrupt_on_rtl(built, tmp_path):
+    """attachInterrupt(INT_CAPTURE, fn, RISING) arms the timer's capture edge (TIMER_CTRL[9:8],
+    byte 1 of slot 6): three rising edges on UI0, 20 ms and 30 ms apart, give three captures
+    with those intervals (captureMicros())."""
+    mc = 12_000_000
+    script = [[0, 0x02], [1_000_000, 0x03], [1_100_000, 0x02], [2_000_000, 0x03],
+              [2_100_000, 0x02], [3_500_000, 0x03], [3_600_000, 0x02]]  # ui1 (RX) stays high
+    exp = {"result_gpio": 0x5A, "final_altfn": 1, "uart_div": UART_DIV, "gpio_script": script}
+    summ, res, _, _ = run_rtl(tmp_path, "capture", exp, mc)
+    assert summ["pass"], (summ["error"], res.get("uart_tx"))
+    m = re.fullmatch(r"captures (\d+) (\d+) (\d+)\r\n", res["uart_tx"])
+    assert m, res["uart_tx"]
+    n, dt1, dt2 = (int(g) for g in m.groups())
+    assert n == 3, res["uart_tx"]
+    assert abs(dt1 - 20_000) <= 30 and abs(dt2 - 30_000) <= 30, (dt1, dt2)
