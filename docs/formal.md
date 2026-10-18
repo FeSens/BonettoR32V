@@ -355,7 +355,7 @@ first few instructions fails, because its window closes within the depth. An unb
 | checks | every check except liveness | every check, liveness included |
 | depth | short depth, per class group | full depth D; liveness D + 1,024 |
 | instruction tasks | 9 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
-| task timeout | 21,600 s, provisional (see "Measured runtimes") | 21,600 s |
+| task timeout | 40,000 s: 2 x the longest V2 task, reg at 19,669 s (see "Measured runtimes") | 40,000 s, never below fast (V2 at its full depth, 1,785, not measured) |
 | depth cap | 2,048 | 4,096 |
 | jobs | at most 8 on the Mac, `BONETTO_FORMAL_REMOTE_JOBS` (18) on a remote host, and never more than memory holds (below) | same |
 
@@ -423,8 +423,8 @@ rvfi 1,860 s, gpio 1,668 s, causal 713 s, ill 374 s; every instruction group's r
 reached all its triggers (267 to 1,407 s). reg was still running at about 8,260 s. Memory: at
 depth 1,623 each bitwuzla holds about 6 GB, so 10 jobs pushed the host into swap (11 GB after
 38 minutes, that run was stopped); use at most about one job per 9 GB on V2-class cores.
-The fast timeout is 21,600 s per task: at least 2 x the longest V2 task measured so far only if
-reg finishes under 10,800 s, which the running V2 measurement has to confirm.
+The task timeout (fast and deep) is 40,000 s: 2 x the longest V2 task, reg, 19,669 s in the
+7050096 run below (39,338 s, rounded up).
 
 **Contract v1 checks (commit 738a135, before the v2 port).** Every completed run below passed
 every check (56 in fast, 57 in deep: 40 instructions, 14 or 15 SBY checks, structure and
