@@ -167,6 +167,43 @@ def test_spi_pwm_loop_fields(built):
     assert built["ir_loop"]["loop_uo7_to_ui0"] is True
 
 
+def test_full_range_pwm_timer_ir_fields(built):
+    """pwm10 / pwm10q measure PER and duty bits 8-9 (PER 1023 and 1000, duties 1, 512, 1023 = PER,
+    1000 = PER, 1023 > PER, 341), Q 0 and 3, and the timer in PWM mode with CMP bit 15 set
+    (free-running, and auto-reload at a high CMP); timer16 loops uo7 back; ir_gate asks for the IR
+    gate meter (a 37.99 kHz carrier at 50 MHz, duty 1/3), the plain carrier after the gate is off,
+    and the loopback."""
+    s = stim()
+    p10 = sorted(built["pwm10"]["pwm"], key=lambda d: d["ch"])
+    assert p10 == [
+        {"ch": 0, "pin": 1, "per": 1023, "q": 0, "duty": 1},
+        {"ch": 1, "pin": 2, "per": 1023, "q": 0, "duty": 512},
+        {"ch": 2, "pin": 3, "per": 1023, "q": 0, "duty": 1023},
+        {"ch": 7, "pin": 7, "per": 65535, "q": 0, "duty": 0xC000},
+    ]
+    p10q = sorted(built["pwm10q"]["pwm"], key=lambda d: d["ch"])
+    assert p10q == [
+        {"ch": 0, "pin": 1, "per": 1000, "q": 3, "duty": 1023},
+        {"ch": 1, "pin": 2, "per": 1000, "q": 3, "duty": 1000},
+        {"ch": 2, "pin": 3, "per": 1000, "q": 3, "duty": 0x155},
+        {"ch": 7, "pin": 7, "per": 0xA000, "q": 1, "duty": 0xA000},
+    ]
+    # the settings before the mid-run change have a period no longer than the measured one
+    assert (s["P10_PRE_PER"] + 1) <= (s["P10_PER"] + 1) << s["P10_Q"]
+    assert (s["P10Q_PRE_PER"] + 1) << s["P10Q_PRE_Q"] <= (s["P10Q_PER"] + 1) << s["P10Q_Q"]
+    assert built["timer16"]["loop_uo7_to_ui0"] is True
+    e = built["ir_gate"]
+    assert e["ir_gate"] == {"per": 657, "q": 1, "duty": 219, "marks": s["IRG_MARKS"],
+                            "within": s["IRG_WITHIN"]}
+    assert abs(50e6 / ((657 + 1) * 2) - 38000) < 20  # 37,994 Hz at 50 MHz
+    assert e["pwm"] == [{"ch": 0, "pin": 1, "per": 657, "q": 1, "duty": 219}]
+    assert e["loop_uo7_to_ui0"] is True
+    # the 8 measured marks end well inside `within` (the lead, 8 marks, 7 spaces), in cycles
+    ticks = s["IRG_LEAD"] + 8 * s["IRG_MARK"] + 4 * s["IRG_SPACE0"] + 3 * s["IRG_SPACE1"]
+    assert ticks << s["IRG_P"] < s["IRG_WITHIN"] * 0.7
+    assert s["IRG_EDGES"] >= 2 * (s["IRG_MARKS"] + 2)
+
+
 @pytest.mark.parametrize("prog", ["gpio_edge", "wfi"])
 def test_gpio_scripts(built, prog):
     sc = built[prog]["gpio_script"]
@@ -181,7 +218,7 @@ def test_irq_programs_have_no_stimulus(built):
     common = {"prog", "kind", "result_gpio", "psram_window", "final_altfn"}
     assert set(built["irq_timer"]) == common  # the timer interrupts them
     assert set(built["irq_stress"]) == common | {"max_cycles"}
-    assert built["irq_stress"]["max_cycles"] == 200_000_000  # ruling R35
+    assert built["irq_stress"]["max_cycles"] == 800_000_000  # ruling R35
     assert all("max_cycles" not in built[p] for p in ALL if p != "irq_stress")
 
 
@@ -257,8 +294,10 @@ def test_progsim_event_programs_pass(built, prog, cpi):
         assert res["spi_tx"] == e["spi_tx_expect"]
     if prog in ("irq_timer", "wfi", "irq_stress"):
         assert res["interrupts"] >= 1
-    if prog == "pwm":
+    if prog in ("pwm", "pwm10", "pwm10q"):
         assert 0xA5 in res["uo_trace"] or (0xA5 & ~0x8E) in res["uo_trace"]
+    if prog == "ir_gate":  # the marks on the GPIO-mode pins (ALTFN = 0x82)
+        assert res["uo_trace"][:2] == [0xA6 & ~0x82, 0xA5 & ~0x82], res["uo_trace"]
     if prog == "irq_stress":
         # interrupts land all over the steps, and one right after the WFI (progsim's WFI stalls)
         sym = symbols(prog)

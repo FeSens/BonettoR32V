@@ -41,7 +41,13 @@ kind "declared" adds the stimulus fields the harness drives and checks (values f
   pwm:          pwm ([{ch, pin, per, q, duty}]: PWM channels 0-2 on uo1-uo3, and ch 7 = the timer
                 on uo7 in PWM mode as per = 65535, q = P, duty = CMP), measured after the program
                 writes GPIO_OUT = 0xA5
-  ir_loop:      loop_uo7_to_ui0 (true)
+  pwm10, pwm10q: pwm as above at the full 10-bit range (ch 7: the timer free-running in pwm10,
+                auto-reload at CMP in pwm10q: per = duty = CMP)
+  ir_gate:      ir_gate ({per, q, duty, marks, within}: after GPIO_OUT = 0xA6 the harness checks
+                uo1 = PWM0 carrier AND uo7 for `marks` marks, within `within` cycles), pwm (ch 0,
+                the plain carrier after the gate is turned off and GPIO_OUT = 0xA5) and
+                loop_uo7_to_ui0
+  ir_loop, timer16: loop_uo7_to_ui0 (true)
   gpio_edge, wfi: gpio_script ([[cycle, ui_value], ...], ui_in from that cycle on)
   irq_stress:   max_cycles (its run-length budget; the harness's --max-cycles overrides it)
 and the program still runs on the standalone ISS up to a bound, which must stop at the bound (or
@@ -208,6 +214,26 @@ def declared(name: str, s: dict):
         chans.append({"ch": 7, "pin": 7, "per": 65535, "q": s["PWM_TMR_P"],
                       "duty": s["PWM_TMR_CMP"]})
         return {"pwm": chans}, []
+    if name in ("pwm10", "pwm10q"):
+        p = "P10" if name == "pwm10" else "P10Q"
+        q, per = s[f"{p}_Q"], s[f"{p}_PER"]
+        chans = [{"ch": i, "pin": i + 1, "per": per, "q": q, "duty": s[f"{p}_DUTY_{i}"]}
+                 for i in range(3)]
+        cmp = s[f"{p}_TMR_CMP"]
+        # the timer in PWM mode: free-running, period 65,536 ticks (pwm10), or auto-reload at
+        # CMP, period CMP + 1 ticks, high CMP (pwm10q)
+        tper = 65535 if name == "pwm10" else cmp
+        chans.append({"ch": 7, "pin": 7, "per": tper, "q": s[f"{p}_TMR_P"], "duty": cmp})
+        return {"pwm": chans}, []
+    if name == "timer16":
+        return {"loop_uo7_to_ui0": True}, ["loop 1"]
+    if name == "ir_gate":
+        return ({"ir_gate": {"per": s["IRG_PER"], "q": s["IRG_Q"], "duty": s["IRG_DUTY"],
+                             "marks": s["IRG_MARKS"], "within": s["IRG_WITHIN"]},
+                 "pwm": [{"ch": 0, "pin": 1, "per": s["IRG_PER"], "q": s["IRG_Q"],
+                          "duty": s["IRG_DUTY"]}],
+                 "loop_uo7_to_ui0": True},
+                ["loop 1"])
     if name == "ir_loop":
         return {"loop_uo7_to_ui0": True}, ["loop 1"]
     if name in ("irq_timer", "irq_stress"):  # no stimulus: the timer interrupts them

@@ -379,6 +379,9 @@ Inputs are always readable through GPIO_IN and always feed their peripheral.
 - **Signoff clock: 40 MHz** (T = 25 ns, `CLOCK_PERIOD` in `src/config.json`), the user's target.
   - STA closes at every TT corner. The lead may move it in the performance phase, up to the
     memory limits of section 2 and a 50 MHz IO ceiling, unless a measurement proves more.
+  - Moved by the lead to 50 MHz (T = 20 ns) on 2026-10-18 (hypothesis 102, harden clean). The
+    cycle counts quoted at 40 MHz elsewhere in this document are examples: checkers convert
+    every time limit at the signoff period T.
 - **Physical:** the flow is TT's (LibreLane 3.0.14, sky130A, `sky130_fd_sc_hd`), in a **1x2 tile**.
   The user chose it on 2026-10-17: the full peripheral set measured about 20k µm² against about
   11.5k for a 1x1.

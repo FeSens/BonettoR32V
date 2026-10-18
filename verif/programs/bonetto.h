@@ -16,6 +16,7 @@
 #define RESULT_PASS 0x5A
 #define RESULT_FAIL 0xEE
 #define MARK_PWM 0xA5      /* pwm: the harness measures the PWM pins after this GPIO_OUT value */
+#define MARK_IR 0xA6       /* ir_gate: the harness checks the IR gate on uo1/uo7 after this */
 #define MARK_CM_START 0xC0 /* coremark: timed iterations start */
 #define MARK_CM_STOP 0xC1  /* coremark: timed iterations end */
 

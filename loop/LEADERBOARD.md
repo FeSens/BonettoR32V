@@ -6,7 +6,7 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 ## Current champion
 
-**111** `19bd3a17702c` (hyp/108c-a1-indexed): 0.6131 CoreMark iterations/s (clock 20 ns), 21,986.1 µm², 2,257 cells, formal skipped, tile fraction -, deep formal -. Register x11 (a1) on the die, indexed (108 revived as 108c on the 110 core): a1r = 32 sdfxtp_1 holding through SCD, nibble k loads from wdo4 at data strobe k of an x11 write slot, reads via an 8:1 ...
+**112** `4c82e3ad7b04` (hyp/112a-pair-fetch): 0.6845 CoreMark iterations/s (clock 20 ns), 23,073.4 µm², 2,336 cells, formal skipped, tile fraction -, deep formal -. Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 = 0) reads 8 more data edges, the word at pc + 4, into a 32-flop buffer; the next sequential instruction skips its fetch (1-clock ...
 
 ## Champion history
 
@@ -20,12 +20,15 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 | 5 | 105 | 2026-10-18 | `f9a663317f` | 0.5225 | +55.96% | 20 | 21,737.1 | 2,248 | +803.3 | skipped | - | - | - | pc on die on the nibble core: pcr (32-bit nibble shift register) holds the pc and doubl... |
 | 6 | 107 | 2026-10-18 | `fa93772c9c` | 0.5451 | +4.33% | 20 | 21,804.7 | 2,241 | +67.6 | skipped | - | - | - | Cut no-transfer slots: branches on x0 run F A (A computes pc+imm into the ring via the ... |
 | 7 | 110 | 2026-10-18 | `f71a9ca961` | 0.5451 | +0.00% | 20 | 20,764.9 | 2,167 | -1,039.7 | skipped | - | - | - | Core area diet at identical cycles: 116 core enable flops (ring, ir, pcr, c, cy, cmp, m... |
-| 8 | 111 | 2026-10-18 | `19bd3a1770` | 0.6131 | +12.47% | 20 | 21,986.1 | 2,257 | +1,221.2 | skipped | - | - | champion | Register x11 (a1) on the die, indexed (108 revived as 108c on the 110 core): a1r = 32 s... |
+| 8 | 111 | 2026-10-18 | `19bd3a1770` | 0.6131 | +12.47% | 20 | 21,986.1 | 2,257 | +1,221.2 | skipped | - | - | - | Register x11 (a1) on the die, indexed (108 revived as 108c on the 110 core): a1r = 32 s... |
+| 9 | 112 | 2026-10-18 | `4c82e3ad7b` | 0.6845 | +11.65% | 20 | 23,073.4 | 2,336 | +1,087.3 | skipped | - | - | champion | Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 = 0) reads 8 more da... |
 
 ## Last 20 hypotheses
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 112 | 2026-10-18 | hyp/112a-pair-fetch | merged | 0.6845 | +0.0714 | 20 | 23,073.4 | +1,087.3 | skipped | - | Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 ... | Measured (hwe-bench): 81,557,200 -> 73,047,400 cycles/iter (model p... |
+| 109 | 2026-10-18 | hyp/109-periph-sdfxtp | failed | 0.6131 | +0.0000 | 20 | 21,819.7 | -166.4 | skipped | - | Peripheral flops as sky130 scan flops (sdfxtp): counters load throu... | Gates pass, CoreMark ties (81,557,200). Synth: 9724598 21,388.0 (-5... |
 | 1081 | 2026-10-18 | hyp/108b-a1-on-die | rejected | - | - | - | - | - | - | n/a | Register x11 on the die with a rotating a1r shift chain (sdfxtp) on... | Agent-measured: all gates pass, coremark_ips 0.61307 (+12.47%), are... |
 | 111 | 2026-10-18 | hyp/108c-a1-indexed | merged | 0.6131 | +0.0680 | 20 | 21,986.1 | +1,221.2 | skipped | - | Register x11 (a1) on the die, indexed (108 revived as 108c on the 1... | Ledger id 111 = hyp 108c (108: blocked by area on the 107 core; 108... |
 | 110 | 2026-10-18 | hyp/110-core-area-diet | merged | 0.5451 | +0.0000 | 20 | 20,764.9 | -1,039.7 | skipped | - | Core area diet at identical cycles: 116 core enable flops (ring, ir... | Lead re-eval on hwe-bench (f71a9ca, clean, MIN_IPS=0.54507489187294... |

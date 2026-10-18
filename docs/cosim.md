@@ -21,8 +21,8 @@ run_cosim.py --mode rvfi|pins --prog P [--seed S] [--src DIR] [--clk-ns 25]
 run_cosim.py --all [--src DIR] [--jobs N] [--no-make]
 ```
 
-`--all` covers every program `make -C verif/programs list` reports (28 today: the plan's 26
-plus gpio_demo and uart_echo_fast; the plan's 26 must be among them, else a setup error). Each
+`--all` covers every program `make -C verif/programs list` reports (32 today: the plan's 26
+plus gpio_demo, uart_echo_fast and the full-range pwm10, pwm10q, timer16 and ir_gate; the plan's 26 must be among them, else a setup error). Each
 runs in both modes at seeds 1-4, and the rvfi-mode fuzz runs at seeds 1-5. The result goes to
 `build/cosim.json` with `"contract": "v3"`. That is the `make cosim` gate: `tools/eval.py` runs
 it once and re-checks the json (docs/eval.md). `--v3`, the flag that selected this harness before
@@ -108,6 +108,7 @@ Malformed fields are setup errors (exit 2, no JSON):
 | `spi_div_d`, `spi_tx_expect` | `spi_div_d` (1..7; R29: D ≥ 1) puts the SPI echo device on ui[3]. It replies with the previous byte (0xFF first) and holds each MISO bit from its rising SCK edge through 3 cycles after it (contract 5.6, c7d9910). `spi_tx_expect` gives the MOSI bytes in order, as a string or a list of bytes. |
 | `pwm` | `[{ch, per, q, duty}]`, checked after the GPIO-mode pins show 0xA5. Period (PER+1) 2^Q, high min(DUTY, PER+1) 2^Q, measured exactly after one settling period, within 4 periods. `ch` 7 is the timer output on uo[7] (`per` 65535 without auto-reload, `q` = P, `duty` = CMP). Extra keys (`pin`) are ignored. |
 | `loop_uo7_to_ui0`, `gpio_script` | ui[0] follows uo[7]; ui_in from `[[cycle, value], ...]` relative to the anchor |
+| `ir_gate` | `{per, q, duty, marks, within}` (opt-in, contract 5.2): after the GPIO-mode pins show 0xA6, uo[1] must carry the PWM0 carrier (period (PER+1) 2^Q, high DUTY 2^Q) exactly while the timer output uo[7] is high and stay low while it is low, for `marks` marks within `within` cycles (periph_models.h IrGateMeter; program ir_gate) |
 | `coremark_iters` | N: `coremark_cycles_per_iter` = cycles from the GPIO-mode pins showing 0xC0 to their showing 0xC1, divided by N (R21, R24) |
 | `max_cycles` | N (positive): the run budget (R35; below) |
 
@@ -276,6 +277,7 @@ Verilator runs on hwe-bench, never on the Mac (ruling R11): wrap these in
 | `run_cosim.py ... --dump-ram PATH` | writes the final 8 MiB PSRAM image (raw bytes from PSRAM byte 0) as the design left it, the core region included |
 | `run_cosim.py ... --max-cycles C` | overrides the run budget (R35) |
 | `run_cosim.py ... --trace out.fst` | separate traced build, FST waveform |
+| `run_cosim.py ... --dump-pins PATH` | writes every uo_out change as `cycle hex` lines, then `cycle end` (observation only; sdk/tests decodes the IR NEC frames from it) |
 | `run_cosim.py ... --src DIR` | runs another design directory (mutants, candidates) |
 | `run_cosim.py --fuzz-liveness --seed S [--src DIR]` | the liveness fuzz (below), rvfi mode; prints `{"prog","mode","seed","pass","liveness_checked","runs","walks","probes_retired","ended","capped","wfi_stalls","retired","cycles","max_cycles_per_insn","error"}`; exit 0 on a pass |
 | `pytest verif/cosim/test_iss.py` | the reference ISS's unit cases (needs riscv32-unknown-elf-gcc) |
@@ -343,7 +345,7 @@ Makefile's header and `mkexpect.py` describe each `expect.json`:
 - **Peripheral programs** (`kind: "declared"`, ruling R13): their outcome depends on peripheral
   timing or interrupts, so expect.json carries the declared stimulus and expectations (`stim.h`):
   UART frames and rates, SPI bytes, PWM settings, GPIO scripts, the `ir_loop` loopback, and for
-  irq_stress its own run budget (`max_cycles` 200,000,000, R35).
+  irq_stress its own run budget (`max_cycles` 800,000,000, R35).
 - **CoreMark** (ITERATIONS = 1, TOTAL_DATA_SIZE = 2000, -O2): timing marks GPIO_OUT 0xC0 / 0xC1
   around the timed region (R21) and `coremark_iters`, and "Correct operation validated" in the
   PSRAM log ring (CPU 0x017F_0000).
