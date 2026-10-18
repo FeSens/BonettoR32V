@@ -250,7 +250,7 @@ module tt_um_fesens_r32v (
     wire wact   = wr & ~mk;                             // the slot drives data on the bus
     wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   // {SD3, SD2, SD1, SD0}
     // 0 in a masked slot, x11's nibble in an x11 slot (x11r implies mk); 0 while booting (sl = F)
-    wire [3:0] nib_m = active ? nib : (a1r[3:0] & {4{x11r}});
+    wire [3:0] nib_m = (nib & {4{active}}) | (a1r[3:0] & {4{x11r}});
 
     // strobes: stb = the clock where SCK is high (it falls at its edge)
     wire       stb   = sck;
@@ -547,8 +547,8 @@ module tt_um_fesens_r32v (
     wire [5:0]  c_d     = ~rst_n ? 6'd63 : (gap & ~booting) ? c_go : cn;
     wire        c_h     = rst_n & ~(gap | stb);
     // x11: an x11 read slot rotates a1r at its data strobes (nib_m takes the head), a write slot
-    // (W, W4: wr) shifts the emitted nibble in at the top
-    wire [31:0] a1r_d   = {(wr ? wdo4 : a1r[3:0]), a1r[31:4]};
+    // (W, W4: fW) shifts the emitted nibble in at the top
+    wire [31:0] a1r_d   = {(fW ? wdo4 : a1r[3:0]), a1r[31:4]};
     wire        a1r_h   = ~(dstb & x11r);
     genvar gi;
     generate
