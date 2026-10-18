@@ -1,27 +1,31 @@
 # BonettoR32V: rules for every session and agent
 
-Goal: the smallest correct RV32E core on Tiny Tapeout sky130 (programs from SPI RAM, GPIO). It's
-step one toward a full microcontroller in ONE 1x1 tile. The score is silicon area: RTL cell area
-first, then the smallest share of the real 1x1 tile that hardens clean. Speed isn't scored.
+Goal: the most performant RV32E microcontroller (CoreMark iterations per second) in a 1x2 Tiny
+Tapeout sky130 tile. Code runs from the TT QSPI Pmod's flash, data lives in its PSRAM, and every
+peripheral stays (GPIO, timer, PWM, UART, SPI, interrupts). The score is `coremark_ips` = f_clk /
+CoreMark cycles per iteration, at the 40 MHz signoff clock. A candidate must pass every gate and
+harden clean in 1x2; synthesized area breaks ties.
 
-- `docs/contract.md`: the exact interface (pins, SPI protocol, memory map, EEI, RVFI). Read it
-  first.
-- `docs/superpowers/specs/2026-10-16-bonettor32v-loop-setup-design.md`: the design and its
-  rationale.
-- `.claude/skills/area-loop/SKILL.md`: how the lead runs the optimization loop.
+- `docs/contract.md`: the exact interface (pins, the QSPI Pmod rules, memory map, EEI and CSRs,
+  peripherals, the score, RVFI). Read it first. `docs/contract-v2.md` is the superseded v2 text,
+  kept as history.
+- `docs/superpowers/specs/2026-10-17-mcu-v3-draft.md`: the MCU design and its rationale;
+  `docs/superpowers/specs/2026-10-16-bonettor32v-loop-setup-design.md`: the loop's setup.
+- `.claude/skills/area-loop/SKILL.md`: how the lead runs the optimization loop (the performance
+  loop; the directory keeps its old name).
 
 ## Hard invariants (each enforced by a gate that fails loudly)
 
 | # | Invariant | Gate |
 |---|---|---|
-| 1 | RV32E per docs/contract.md section 4: every instruction correct, all fatal traps halt with `rvfi_trap = rvfi_halt = 1` | riscv-formal (rv32e config), cosim against the ISS, riscv-arch-test |
-| 2 | The pins follow the SPI waveform rules (contract section 2), and every SPI transaction matches the RVFI-reported fetch, load or store | formal bus checks via the SPI monitor, cosim memory model |
-| 3 | GPIO behaves per contract section 3 | formal GPIO check, cosim |
-| 4 | Logic under `ifdef RISCV_FORMAL` only observes; the design without it behaves identically | equivalence gate (RVFI-stripped build equals plain build), plain-build cosim, gate-level test |
-| 5 | Architectural state (x1..x15, pc) lives on the die or in the core region 0xFF80-0xFFFF of the SPI RAM (contract v2); no hard-wired GPRs; no other core state in RAM | review, formal (reg check with a real region memory), cosim |
-| 6 | The design doesn't rely on power-up values | cosim with random init (several seeds), gate-level X propagation |
-| 7 | Plain RTL, one posedge clock, no latches in v1 (contract section 1) | lint and review |
-| 8 | Every instruction retires within 1,024 cycles of the previous one | cosim watchdog, formal liveness |
+| 1 | RV32E + Zicsr per docs/contract.md section 4: every instruction correct; traps and the interrupt go to `mtvec` (nothing halts); the CSRs behave per section 4 | cosim against the ISS (rvfi mode, lockstep, every RVFI field), riscv-arch-test (53 tests, trap tests included), riscv-formal (`make eval FORMAL=1`) |
+| 2 | The Pmod pins follow contract section 2 (waveform rules, each chip's command legality, power-up modes, tCEM); every PSRAM write outside the core region writes bytes of retired stores at their addresses (section 8); loads and fetches are coherent (section 3) | cosim Pmod chip models on every cycle in both modes and all four power-up modes, PSRAM attribution and final compare, the `coherence` program; gate-level test on the same Pmod model; formal bus monitor (`FORMAL=1`) |
+| 3 | GPIO and every peripheral behave per contract sections 5 and 6, and every peripheral stays (section 7) | cosim peripheral pin checkers (UART, SPI, PWM, timer, GPIO timing and edges, interrupt line) and the programs' self-checks; gate-level test; formal peripheral register check (`FORMAL=1`) |
+| 4 | Logic under `ifdef RISCV_FORMAL` only observes; the design without it behaves identically | equivalence gate (RVFI-stripped build equals plain build), pins-mode cosim, gate-level test |
+| 5 | Architectural state (x1..x15, pc, CSRs) lives on the die or in the PSRAM core region 0x7F_FF80-0x7F_FFFF (contract section 3); no hard-wired GPRs; no other core state in memory | review, cosim (random core region at reset, PSRAM write attribution), formal (`FORMAL=1`) |
+| 6 | The design doesn't rely on power-up values, of its flip-flops or of the memories' modes | cosim with random flip-flop init and the four memory power-up modes (seeds 1-4), gate-level X propagation |
+| 7 | Plain RTL, one posedge clock, no latches (contract section 1) | lint (src_check and Verilator), the area gate's latch count, review |
+| 8 | Every instruction retires within 2,048 cycles of the previous one, the first within 2,048 of reset (memory reset sequence included); exempt: a WFI stall while `mip.MEIP & mie.MEIE` is 0 | cosim watchdog on every program, the liveness fuzz (seeds 1-5), formal liveness (`FORMAL=1`) |
 | 9 | A candidate's diff touches only allowed paths | `tools/contract_check.py` |
 
 ## Don't-touch list (hypothesis agents never modify these)
@@ -29,13 +33,15 @@ first, then the smallest share of the real 1x1 tile that hardens clean. Speed is
 `verif/`, `tools/`, `test/`, `third_party/`, `info.yaml`, `src/config.json`, `docs/contract.md`,
 `CLAUDE.md`, `Makefile`, `.github/`, `loop/`, `.claude/`.
 
-The hypothesis is "what design change makes the chip smaller", never "what evaluation change lets
-this design pass". If a gate looks wrong, report it to the lead; don't route around it.
+The hypothesis is "what design change makes CoreMark faster (or the chip smaller at the same
+speed)", never "what evaluation change lets this design pass". If a gate looks wrong, report it to
+the lead; don't route around it.
 
 ## What hypotheses may change
 
 - `src/**`, except `src/config.json`. That covers any restructuring: merge or split modules,
-  rename files, bit-serial, latches, sky130 cell instances.
+  rename files, serial or parallel datapaths, caches and prefetch (coherent, contract section 3),
+  sky130 cell instances.
 - Their own unit tests in `src/test_*` (optional).
 - `physical/**` only when the lead assigns a physical hypothesis.
 
@@ -43,17 +49,18 @@ this design pass". If a gate looks wrong, report it to the lead; don't route aro
 
 | Command | What it does |
 |---|---|
-| `make lint` | Verilator lint |
-| `make formal` | riscv-formal at the pins (fast config) |
-| `make formal-deep` | the deep config (champions) |
-| `make cosim` | Verilator cosim: selftest, GPIO, CoreMark, random streams, RVFI and non-RVFI builds |
-| `make arch` | riscv-arch-test RV32E subset |
-| `make gl` | gate-level test of the synthesized netlist |
+| `make lint` | src_check, then Verilator `-Wall` lint, plain and RISCV_FORMAL builds |
+| `make formal` | riscv-formal at the pins (fast config); its contract v3 port is plan Task 10, due by the 10th merged improvement |
+| `make formal-deep` | the deep config (signoff) |
+| `make cosim` | Verilator cosim (contract v3): every program of `make -C verif/programs list` in rvfi and pins modes under seeds 1-4, plus the liveness fuzz (seeds 1-5); the 2,048-cycle cap; reports CoreMark cycles per iteration |
+| `make arch` | riscv-arch-test, all 53 RV32E and privilege tests under seeds 1-4, on one host with GCC, spike and Verilator (hwe-bench, `tools/hwe_run.sh --third-party`) |
+| `make gl` | the TT test (test/, the QSPI Pmod model) on the synthesized netlist (`GATES=yes`) |
 | `make equiv` | the RVFI-stripped build equals the plain build |
-| `make area` | the fast score: sky130 cell area, broken down |
-| `make eval` | every gate plus the score, cheapest first, writing `build/eval.json`; `MAX_AREA=<champion um2>` stops a candidate that isn't smaller right after the area gate |
-| `make harden` | TT 1x1 hardening (LibreLane) |
-| `make tilefit` | the physical score: the smallest fraction of the real 1x1 tile the design signs off in |
+| `make area` | sky130 cell area, broken down (the tiebreak), and the `fits` pre-filter (1x2, provisional 24,000 µm²) |
+| `make eval` | every gate plus the score, cheapest first, writing `build/eval.json`. `MIN_IPS=<champion coremark_ips>` (full precision, from `tools/ledger.py show --json`) stops a slower candidate right after cosim; a tie runs on, since area breaks it. Formal is skipped unless `FORMAL=1` |
+| `make eval FORMAL=1` | the same plus formal last: at every 10th merged improvement (run in parallel while development continues) and at signoff |
+| `make harden` | TT 1x2 hardening (LibreLane), signoff at 40 MHz |
+| `make tilefit` | the smallest fraction of the real 1x2 tile the design signs off in (champion rounds) |
 
 ## Working rules
 
@@ -68,6 +75,14 @@ this design pass". If a gate looks wrong, report it to the lead; don't route aro
   - Push over HTTPS:
     `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.
 - **Mac load.**
-  - One heavy job at a time: formal, hardening or a tile-fit search. Wrap them in
-    `lockf -k /tmp/bonetto-heavy.lock`.
-  - Cosim and area runs are light.
+  - Heavy builds and simulations run on hwe-bench through `tools/hwe_run.sh`, never on the Mac
+    (it ran out of memory with several agents compiling): Verilator (lint, cosim, arch, the seed's
+    unit tests), cocotb and Icarus (gl), yosys (equiv). `make arch` needs `--third-party`. At most
+    2 implementers are active on the Mac, and local `make -j` stays at 4 or below (ruling R11).
+  - Programs (`make -C verif/programs`) build on either host; the images are byte-identical.
+  - One heavy job at a time on the Mac: formal, hardening or a tile-fit search. Wrap them in
+    `lockf -k /tmp/bonetto-heavy.lock`. LibreLane (area, harden, tilefit) runs where the lead
+    says.
+  - Kill only the PIDs or process groups your own PID files or job records name, never by a name
+    pattern. hwe-bench is shared, with other workloads under the same uid: touch nothing outside
+    your own directories and process trees there (ruling R36).

@@ -5,8 +5,8 @@
 # Gate order in `make eval`: lint, area, cosim, arch, equiv, gl, then formal only with FORMAL=1
 # (exactly 1; FORMAL=0 or empty skips it). Stops at the first FAIL. MIN_IPS=<champion
 # coremark_ips, full precision from `tools/ledger.py show --json`> retires a slower candidate right
-# after cosim (exit 3); a tie continues. MAX_AREA is gone: the score is CoreMark/s (contract v3
-# section 7).
+# after cosim (exit 3); a tie continues. MAX_AREA is gone: the score is CoreMark/s (contract
+# section 7). Heavy gates (Verilator, cocotb, yosys) run on hwe-bench via tools/hwe_run.sh.
 # `make gates` is the same command under another name, for agent sandboxes that block commands
 # containing the word "eval".
 # Only formal, harden and tilefit take `lockf -k /tmp/bonetto-heavy.lock` (one heavy job at a
@@ -40,18 +40,18 @@ TILEFIT_ARGS ?=
 
 help:
 	@echo "make lint         Verilator -Wall lint, plain and RISCV_FORMAL builds"
-	@echo "make cosim        pin-level cosim: every program, modes rvfi and pins, seeds 1-3"
+	@echo "make cosim        pin-level cosim (contract v3): every program, rvfi and pins, seeds 1-4, fuzz 1-5"
 	@echo "make equiv        RVFI-stripped RISCV_FORMAL build == plain build (yosys equiv)"
 	@echo "make formal       riscv-formal at the pins, fast config (heavy lock)"
 	@echo "make formal-deep  riscv-formal deep config, for champions (heavy lock)"
-	@echo "make arch         riscv-arch-test RV32E subset"
-	@echo "make area         sky130 cell area (build/area.json)"
-	@echo "make gl           gate-level cocotb test on the area netlist"
+	@echo "make arch         riscv-arch-test, 53 tests, one host (GCC, spike, Verilator: hwe-bench)"
+	@echo "make area         sky130 cell area (build/area.json) and the 1x2 fits pre-filter"
+	@echo "make gl           the TT test (test/, QSPI Pmod model) on the area netlist, GATES=yes"
 	@echo "make eval         all gates in order, stop at first FAIL, write build/eval.json (V=1 streams logs)"
 	@echo "                  FORMAL=1 adds formal last; MIN_IPS=<champion coremark_ips> stops a slower candidate after cosim"
 	@echo "make gates        exactly the same as make eval (for sandboxes that block the word)"
-	@echo "make harden       TT 1x1 hardening with LibreLane (heavy lock)"
-	@echo "make tilefit      smallest signoff-clean fraction of the 1x1 tile (heavy lock)"
+	@echo "make harden       TT 1x2 hardening with LibreLane, 40 MHz (heavy lock)"
+	@echo "make tilefit      smallest signoff-clean fraction of the 1x2 tile (heavy lock)"
 	@echo "make test-tools   pytest over tools/"
 	@echo "make clean        remove build outputs"
 
@@ -59,7 +59,7 @@ $(GATE_TARGETS):
 	$(EVAL) --gate $@
 
 eval gates:
-	$(if $(MAX_AREA),$(error MAX_AREA was replaced by MIN_IPS=<champion coremark_ips> (contract v3 section 7)))
+	$(if $(MAX_AREA),$(error MAX_AREA was replaced by MIN_IPS=<champion coremark_ips> (contract section 7)))
 	$(EVAL) $(if $(V),-v) $(if $(filter 1,$(FORMAL)),--formal) $(if $(MIN_IPS),--min-ips $(MIN_IPS))
 
 harden:

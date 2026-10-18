@@ -26,7 +26,8 @@ zero).
   tt-support-tools.
 
 **Spec:** `docs/superpowers/specs/2026-10-16-bonettor32v-loop-setup-design.md`, plus the
-interface in `docs/contract.md`. Every task reads both.
+interface in `docs/contract.md` (now `docs/contract-v2.md`: contract v3 replaced it at the
+MCU plan's Task 9 swap). Every task reads both.
 
 ## Global Constraints
 

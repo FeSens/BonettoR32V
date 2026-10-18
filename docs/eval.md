@@ -22,13 +22,19 @@ Everything here is contract: hypothesis agents run it and never edit it (CLAUDE.
 - **Heavy lock:** only formal, harden and tilefit take `lockf -k /tmp/bonetto-heavy.lock`, one
   heavy job at a time on this Mac. Never wrap `make eval` or `make gates` in that lock: formal
   would then wait on it forever.
+- **Where it runs:** lint, cosim, arch, equiv and gl need Verilator, cocotb, Icarus or yosys, so
+  they run on hwe-bench through `tools/hwe_run.sh` (ruling R11; `make arch` needs
+  `--third-party`), e.g. `tools/hwe_run.sh --pull build/eval.json -- make gates`.
+- **Jobs:** the cosim and arch gates run their runner with `--jobs N`: `BONETTO_EVAL_JOBS` (a
+  positive integer), else the machine's cores minus 2, at most 16. It changes scheduling, never a
+  verdict.
 
 ## Gates, in `make eval` order
 
 Cheapest first, so a bad candidate retires early: lint (~1 s), area (~10 s), cosim and arch
 (minutes), equiv, gl (minutes), then formal (the longest) only with `--formal` (`make eval
 FORMAL=1`).
-- **Formal cadence (contract v3 section 7):** formal runs at final signoff and on every tenth
+- **Formal cadence (contract section 7):** formal runs at final signoff and on every tenth
   merged improvement, so most candidates skip it. eval.json then says `"formal": "skipped"`,
   `gates` has no `formal` entry, and the overall `pass` covers the six gates that ran.
 - **`--min-ips X`:** a candidate whose `coremark_ips` is below X (the champion's) stops right
@@ -39,7 +45,7 @@ FORMAL=1`).
   - X must be the champion's exact score: take it from `python3 tools/ledger.py show --json` (or
     `show`, which prints it at full precision), never from the board, which rounds. A bar
     rounded up would stop a tie.
-- **The score** (contract v3 section 7): `coremark_ips = f_clk / coremark_cycles_per_iter`, with
+- **The score** (contract section 7): `coremark_ips = f_clk / coremark_cycles_per_iter`, with
   `f_clk = 1e9 / CLOCK_PERIOD` (ns, from `src/config.json`; 25 ns gives 40 MHz, so 1,000,000
   cycles per iteration gives 40.0). The cosim gate computes it; see the cosim row below.
 
@@ -51,11 +57,11 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 | # | Gate | Runner (as called) | PASS requires |
 |---|---|---|---|
 | 1 | lint | `tools/src_check.py` rules (below), then `verilator --lint-only -Wall --top-module tt_um_fesens_r32v src/*.v`, then again with the RVFI defines | src hygiene clean; Verilator exit 0 for both builds |
-| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract v1), the `netlist` file exists; then **`fits`**: `area_um2 <= 11,500` (a fast 1x1 pre-filter; the champion round's `make harden` confirms) |
-| 3 | cosim | `make -C verif/programs`; the liveness fuzz `run_cosim.py --fuzz-liveness --seed S` for S in 1..5 (each: exit 0, `pass` and `liveness_checked` true, `runs` >= 2,056); then for every `build/programs/*.hex`, mode in {rvfi, pins}, seed in {1, 2, 3}: `run_cosim.py --mode M --prog P --seed S` (no `--max-cycles`: the harness bounds each run by 1,024 x its own ISS retirement count + 16, and its watchdog bounds every gap) | every run exits 0 with a last-line JSON summary `pass: true`, `error` empty, `max_cycles_per_insn <= 1024`, and `coremark_cycles_per_iter` (when present and not null) a positive number |
-| 4 | arch | `verif/arch-test/run_arch.py` | exit 0, `pass: true`, at least one test, every test `true` |
+| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract section 1), the `netlist` file exists; then **`fits`**: `area_um2 <= FIT_AREA_UM2`, a fast 1x2 pre-filter, **provisionally 24,000 µm²** (the lead confirms the value from a 1x2 harden; the champion round's `make harden` has the last word) |
+| 3 | cosim | `make -C verif/programs`; `make -s -C verif/programs list`; then one `run_cosim.py --all --no-make --jobs N` (contract v3, writes `build/cosim.json`): every listed program in modes rvfi and pins under seeds 1-4 (the four memory power-up modes), plus the rvfi-mode liveness fuzz under seeds 1-5. No `--max-cycles`: each run's budget is expect.json `max_cycles` or the harness default (R35), and the harness watchdog bounds every gap | a fresh `build/cosim.json` with no `error`, `contract: "v3"`, `programs` equal to `make list`, `seeds` [1, 2, 3, 4] and `fuzz_seeds` [1..5]; every (program, mode, seed) run exactly once, each `pass: true` with no `error`, `max_cycles_per_insn <= 2048`, and `coremark_cycles_per_iter` null or a positive number; each fuzz seed once, `pass` and `liveness_checked` true, `runs` >= 2,056, its gap `<= 2048`; then exit 0 and `pass: true` |
+| 4 | arch | `verif/arch-test/run_arch.py --jobs N` (`--phase all`: GCC, spike and Verilator on one host; seeds 1-4) | exit 0, `pass: true`, every test `true`, and exactly 53 tests (ruling R34) |
 | 5 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` | exit 0 and `pass: true` |
-| 6 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
+| 6 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`): the TT test (test/, contract v3: the QSPI Pmod model, gpio_demo in the four power-up modes, uart_hello) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
 | 7 | formal (only with `--formal`) | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` (with `BONETTO_FORMAL_HOST` set, no Mac lock: the solvers run on that host under its own lock) | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
 
 Details:
@@ -67,13 +73,15 @@ Details:
 - **Paths on command lines:** Verilator gets each path as its own argv entry, absolute, and
   checked against `^/[A-Za-z0-9_./+-]+$`. Yosys scripts get the same check plus double quotes
   where yosys strips them.
-- **Cosim cycle budget:** `C = 1024 * (retired + 1)`, the contract latency cap applied to the
-  ISS's retired count from `build/programs/<name>.expect.json`.
-  - The key is `retired`; the adapter also accepts `retired_count`, `instret`, `insns` and
-    `instructions`, and fails if none is there.
-  - Selftest runs first, then gpio_demo, then the rest alphabetically.
-  - The gate stops at the first failing run.
-- **cpi** in eval.json: total cycles over total retired, over the `pins` runs with seed 1.
+- **Cosim judgment:** the adapter doesn't take the runner's `pass` on trust. It re-checks every
+  run and fuzz seed in `build/cosim.json` (a runner claiming a pass with a failing run still
+  fails), and names the first failing run in the detail with the count of failing runs.
+  - The run budget (ruling R35): `--max-cycles` (never passed by the gate) > expect.json
+    `max_cycles` > the harness default (2,048 x (reference retirements + 16), or 50,000,000 for
+    programs the ISS can't run alone). The contract v2 adapter's per-program runs and expect.json
+    `retired` check are gone: peripheral programs have no reference count (ruling R13).
+- **cpi** in eval.json: total cycles over total retired, over the `rvfi` runs with seed 1 (pins
+  mode can't see retirements).
 - **coremark_ips** in eval.json (the score):
   - `coremark_cycles_per_iter` is the largest value among the `coremark` program's runs (every
     mode and seed) whose summary reports it. The runs should agree; the slowest one counts.
@@ -140,7 +148,7 @@ handle them; escaped identifiers read whole and then rejected by rule 11):
    non-ASCII bytes fail anywhere in the file. So do unterminated comments and strings.
 6. **Module names.** Every `module` is named `tt_um_fesens_r32v` or `r32v_[A-Za-z0-9_]*`, as a
    plain identifier, so no design module can shadow a checker's (`rvfi_wrapper`, `tb`,
-   `spiram_23lc512`, `iss`, ...).
+   `iss`, ...).
    - The same rule covers `macromodule`, `primitive` and the SystemVerilog units Verilator
      accepts (`interface`, `program`, `checker`, `package`, `class`, `config`).
    - Escaped names (`\r32v_x`), `$` in a name, and a lifetime keyword after `module` all fail.
@@ -240,7 +248,7 @@ Fixtures in `tools/test_fixtures/src_check/`:
   "pass": true,
   "gates": {
     "lint":   {"pass": true, "detail": "<one line>", "runtime_s": 1.2},
-    "area":   {"pass": true, "detail": "..., fits (<= 11,500 um2)", "runtime_s": 20.0},
+    "area":   {"pass": true, "detail": "..., fits 1x2 (<= 24,000 um2)", "runtime_s": 20.0},
     "cosim":  {"pass": true, "detail": "...", "runtime_s": 300.0},
     "arch":   {"pass": true, "detail": "...", "runtime_s": 60.0},
     "equiv":  {"pass": true, "detail": "...", "runtime_s": 2.0},
@@ -290,11 +298,13 @@ Fixtures in `tools/test_fixtures/src_check/`:
 
 `build/gates/<name>.json` (one gate): `{"gate", "sha", "dirty", "pass", "detail", "runtime_s",
 "data", "timestamp"}`, where `data` is gate-specific (cosim: every run with its
-`coremark_cycles_per_iter`, the cpi and the CoreMark fields; area: area, cells, flops, `fits`).
+`coremark_cycles_per_iter`, each fuzz seed's runs and worst gap, the cpi and the CoreMark fields;
+area: area, cells, flops, `fits`).
 
 ## Equivalence gate (tools/equiv.py)
 
-Contract section 6: logic under `ifdef RISCV_FORMAL` may only compute RVFI outputs.
+Contract section 8 (v2 section 6): logic under `ifdef RISCV_FORMAL` may only compute RVFI
+outputs.
 - **First:** src_check must pass (see above), the static rules and the differential backstop.
 - **A (gold):** `read_verilog -mem2reg -DRISCV_FORMAL`, `hierarchy -check -top`, `proc`,
   `flatten`, `delete -port` on every `rvfi_*` wire, `opt_clean`.
@@ -425,7 +435,7 @@ delta_um2, gates, formal, forced, notes, tile_fraction, formal_deep`.
 
 **A merge must become the champion.** `add --verdict merged` refuses an entry that would not
 outrank the current champion: it must be faster, or exactly as fast with a smaller `area_um2`
-(contract v3 section 7 tiebreak). An equal area is not smaller. While the champion has no score
+(contract section 7 tiebreak). An equal area is not smaller. While the champion has no score
 (v2 history only, or none yet), any merge passes this check.
 - `--force-merge` is the lead's override, for a merge that has to land anyway (a correctness or
   timing fix that costs speed). It skips only this ranking check; every other merged check
@@ -434,7 +444,7 @@ outrank the current champion: it must be faster, or exactly as fast with a small
   Later merges must outrank it. Rolling it back restores the best entry from before it.
 
 **Champion:** among the `merged` entries that no later `rolled_back` entry names, the one with
-the highest `coremark_ips` (contract v3 section 7).
+the highest `coremark_ips` (contract section 7).
 - Ties go to the smaller `area_um2` (the contract's tiebreak), then to the later entry.
 - A standing forced merge restarts the race: only it and the merges after it compete.
 - While no standing entry has a score (v2 history only), the latest one is the champion, the v2

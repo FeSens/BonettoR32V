@@ -7,7 +7,7 @@ BASE is the champion sha the hypothesis started from, HEAD the hypothesis sha. T
 the two trees directly (`git diff BASE HEAD`, the same as BASE..HEAD), so HEAD must carry the exact
 contract of BASE: a branch based on an older champion fails if the contract moved since.
 
-Allowed (CLAUDE.md, docs/contract.md section 7):
+Allowed (CLAUDE.md, docs/contract.md section 9):
   - src/**, except src/config.json (this covers the optional unit tests src/test_*);
   - physical/**, only with --physical (physical hypotheses the lead assigns).
 Everything else fails, including deletions and renames out of src/ (renames are listed as a

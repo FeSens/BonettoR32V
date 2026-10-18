@@ -1,8 +1,12 @@
 # The seed core (champion zero)
 
-`src/tt_um_fesens_r32v.v` is a deliberately plain, correct RV32E. Every gate is proven against
-it first; the area loop shrinks it later. The interface is `docs/contract.md`; this page only
-describes how the seed implements it.
+**History.** This page describes the contract v2 seed (`docs/contract-v2.md`), champion zero of
+the area loop. The contract v3 MCU seed (plan Task 8) that replaced it is described in the header
+comment of `src/tt_um_fesens_r32v.v` and in its unit tests, `src/test_v3/`.
+
+`src/tt_um_fesens_r32v.v` was a deliberately plain, correct RV32E. Every gate was proven against
+it first; the area loop shrank it later. The interface was `docs/contract-v2.md`; this page only
+describes how the seed implemented it.
 
 ## Datapath
 

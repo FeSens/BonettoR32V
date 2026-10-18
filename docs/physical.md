@@ -96,8 +96,8 @@ tools/area.py --top tt_um_fesens_r32v --src src/
 ## `tools/harden_tt.sh`: TT's flow, locally
 
 ```
-tools/harden_tt.sh                      # this repo, 1x1, writes build/harden/summary.json
-tools/harden_tt.sh --tiles 1x2          # same, staged with a bigger tile
+tools/harden_tt.sh                      # this repo, info.yaml's tiles (1x2), writes build/harden/summary.json
+tools/harden_tt.sh --tiles 2x2          # same, staged with another tile
 ```
 
 It stages a copy of the project in `build/harden/proj` (the real `src/` and `info.yaml` are
@@ -219,7 +219,7 @@ The NanoV 1x1 failure and the unfinished seed 2x2 run are under "Findings".
 ## `physical/tilefit.py`: the physical score
 
 ```
-physical/tilefit.py                     # this repo, 1x1, writes build/tilefit.json
+physical/tilefit.py                     # this repo, info.yaml's tiles (1x2), writes build/tilefit.json
 ```
 
 - **Blockage.** Each trial is a full `harden_tt.sh` run, in the same staged TT template (tt_tool

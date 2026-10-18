@@ -30,7 +30,7 @@ Tokens of every src/*.v (check_hdl), comments and strings handled:
      anywhere in the file.
   6. Every module (and macromodule, primitive, interface, program, checker, package, class,
      config) is named tt_um_fesens_r32v or r32v_[A-Za-z0-9_]*, as a plain identifier, so no
-     design module can shadow a checker's (rvfi_wrapper, tb, spiram_23lc512, iss, ...).
+     design module can shadow a checker's (rvfi_wrapper, tb, iss, ...).
 
 Constructs that simulate differently from what synthesis builds (check_constructs; tokens on
 directive lines are not code and are skipped):

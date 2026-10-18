@@ -507,14 +507,23 @@ def test_formal_deep_passes_flag(repo):
 
 # --- arch adapter ------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("doc,ok", [
-    ({"pass": True, "tests": {"add-01": True, "sw-align-01": True}}, True),
-    ({"pass": True, "tests": {"add-01": True, "sw-align-01": False}}, False),
-    ({"pass": True, "tests": {}}, False),
+ALL53 = {f"t{i:02d}": True for i in range(53)}
+
+
+@pytest.mark.parametrize("doc,ok,msg", [
+    ({"pass": True, "tests": ALL53}, True, "53 riscv-arch-test tests pass"),
+    ({"pass": True, "tests": {**ALL53, "t07": False}}, False, "t07"),
+    ({"pass": True, "tests": {}}, False, "no tests reported"),
+    ({"pass": True, "tests": {"add-01": True, "sw-align-01": True}}, False,
+     "2 tests ran, ruling R34 needs all 53"),
+    ({"pass": False, "tests": ALL53}, False, "exit 0"),
 ])
-def test_arch_adapter(repo, doc, ok):
-    fake_runner(repo, "verif/arch-test/run_arch.py", "build/arch.json", doc, 0)
-    assert run_gate(repo, "arch")["pass"] is ok
+def test_arch_adapter(repo, doc, ok, msg):
+    fake_runner(repo, "verif/arch-test/run_arch.py", "build/arch.json", doc, 0,
+                extra="assert sys.argv[1] == '--jobs' and int(sys.argv[2]) > 0 "
+                      "and len(sys.argv) == 3, sys.argv")
+    res = run_gate(repo, "arch")
+    assert res["pass"] is ok and msg in res["detail"], res["detail"]
 
 
 # --- area adapter ------------------------------------------------------------------------------
@@ -542,29 +551,35 @@ def test_area_adapter(repo, change, ok, msg):
     assert res["pass"] is ok and msg in res["detail"], res["detail"]
 
 
-@pytest.mark.parametrize("area,ok", [(11501, False), (11500.01, False), (11500, True),
-                                     (4780.0, True)])
+def test_fits_is_the_provisional_1x2_threshold():
+    # contract section 7: 1x2 tile; the lead confirms the value from a 1x2 harden
+    assert (ev.FIT_AREA_UM2, ev.FIT_TILES) == (24000.0, "1x2")
+
+
+@pytest.mark.parametrize("area,ok", [(24001, False), (24000.01, False), (24000, True),
+                                     (20288.0, True), (4780.0, True)])
 def test_fits_prefilter(repo, area, ok):
     put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
     fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": area}, 0)
     res = run_gate(repo, "area")
     assert res["pass"] is ok, res["detail"]
     if ok:
-        assert "fits (<= 11,500 um2)" in res["detail"] and res["data"]["fits"] is True
+        assert "fits 1x2 (<= 24,000 um2)" in res["detail"] and res["data"]["fits"] is True
     else:
-        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 11,500 um2")
+        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 24,000 um2, "
+                                        f"the 1x2 pre-filter")
 
 
 def test_fits_failure_stops_eval_at_area(repo, monkeypatch):
     put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
-    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": 11501}, 0)
+    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": 24001}, 0)
     calls = fake_gates(monkeypatch)
     monkeypatch.setitem(ev.GATES, "area", ev.gate_area)
     assert ev.main(["--repo", str(repo)]) == 1
     doc = eval_doc(repo)
     assert calls == ["lint"] and doc["stopped_at"] == "area" and "fits FAIL" in \
         doc["gates"]["area"]["detail"]
-    assert doc["area_um2"] == 11501                 # the measured area is still reported
+    assert doc["area_um2"] == 24001                 # the measured area is still reported
 
 
 # --- gl adapter --------------------------------------------------------------------------------
@@ -604,7 +619,7 @@ def test_gl_rejects_netlist_older_than_area_step(repo):
 
 def test_gl_alone_does_not_need_the_fits_prefilter(repo):
     # `make gl` synthesizes for its netlist; whether the design fits is the area gate's verdict.
-    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": 20000.0},
+    fake_runner(repo, "tools/area.py", "build/area.json", {**good_area(), "area_um2": 30000.0},
                 0, extra=WRITE_NETLIST)
     put(repo, "test/Makefile",
         gl_makefile('<testsuites><testsuite><testcase name="gpio"/></testsuite></testsuites>'))
@@ -624,42 +639,62 @@ PROGRAMS_MAKEFILE = (
     "all:\n"
     "\t@mkdir -p ../../build/programs\n"
     "\t@printf '00\\n' > ../../build/programs/selftest.hex\n"
-    "\t@printf '{\"retired\": 10, \"uo_out\": []}' > ../../build/programs/selftest.expect.json\n"
     "\t@printf '00\\n' > ../../build/programs/coremark.hex\n"
-    "\t@printf '{\"retired\": 1000}' > ../../build/programs/coremark.expect.json\n")
+    "list:\n"
+    "\t@echo selftest coremark\n")
 
+# A stand-in for `run_cosim.py --all --no-make --jobs N`: writes build/cosim.json as the real one
+# does (contract v3), shaped by FAKE_* environment variables, and prints its summary line.
 FAKE_COSIM = """
 import argparse, json, os, sys
 ap = argparse.ArgumentParser()
-ap.add_argument("--fuzz-liveness", action="store_true")
-ap.add_argument("--seed", required=True)
-ap.add_argument("--mode")
-ap.add_argument("--prog")
-a = ap.parse_args()   # an unexpected --max-cycles is an argparse error (exit 2)
-if a.fuzz_liveness:
-    assert a.mode is None and a.prog is None
-    bad = os.environ.get("FAKE_FUZZ")
-    print(json.dumps({"prog": "fuzz_liveness", "mode": "rvfi", "seed": int(a.seed),
-                      "pass": bad != "fail", "liveness_checked": bad != "unchecked",
-                      "runs": 3 if bad == "short" else 2056,
-                      "error": "latency cap: no retirement" if bad == "fail" else None}))
-    sys.exit(1 if bad == "fail" else 0)
-assert a.mode and a.prog
-retired = 10 if "selftest" in a.prog else 1000
-fail = os.environ.get("FAKE_COSIM_FAIL") == a.mode
-gap = int(os.environ.get("FAKE_COSIM_GAP", "100"))
-summary = {"prog": a.prog, "mode": a.mode, "seed": int(a.seed), "pass": not fail,
-           "retired": retired, "cycles": retired * 90, "cpi": 90.0,
-           "max_cycles_per_insn": gap, "error": "rd mismatch" if fail else None}
-cm = os.environ.get("FAKE_CM_CYCLES")    # unset: a v2 runner, which has no such key
-if cm is not None:
-    vals = json.loads(cm)                  # one value, or one per seed
-    summary["coremark_cycles_per_iter"] = (
-        None if "coremark" not in a.prog else vals[int(a.seed) - 1] if isinstance(vals, list)
-        else vals)
+ap.add_argument("--all", action="store_true")
+ap.add_argument("--no-make", action="store_true")
+ap.add_argument("--jobs", type=int, required=True)
+a = ap.parse_args()   # anything else (--mode, --max-cycles, --v3, ...) is an argparse error
+assert a.all and a.no_make and a.jobs > 0
+env = os.environ.get
+progs = ["selftest", "coremark"]
+seeds = json.loads(env("FAKE_SEEDS", "[1, 2, 3, 4]"))
+cm = env("FAKE_CM_CYCLES")    # unset: no run reports CoreMark cycles
+runs = []
+for p in progs:
+    for m in ("rvfi", "pins"):
+        for s in seeds:
+            if env("FAKE_DROP") == f"{p}/{m}/{s}":
+                continue
+            retired = 10 if p == "selftest" else 1000
+            fail = env("FAKE_COSIM_FAIL") == m
+            r = {"prog": p, "mode": m, "seed": s, "pass": not fail, "retired": retired,
+                 "cycles": retired * 90, "cpi": 90.0,
+                 "max_cycles_per_insn": int(env("FAKE_COSIM_GAP", "100")),
+                 "coremark_cycles_per_iter": None, "error": "rd mismatch" if fail else None}
+            if cm is not None and p == "coremark":
+                vals = json.loads(cm)          # one value, or one per seed
+                r["coremark_cycles_per_iter"] = vals[s - 1] if isinstance(vals, list) else vals
+            runs.append(r)
+            if env("FAKE_DUP") == f"{p}/{m}/{s}":
+                runs.append(dict(r))
+bad = env("FAKE_FUZZ")
+fuzz = [{"prog": "fuzz_liveness", "mode": "rvfi", "seed": s, "pass": bad != "fail",
+         "liveness_checked": bad != "unchecked", "runs": 3 if bad == "short" else 2056,
+         "max_cycles_per_insn": 2049 if bad == "gap" else 500,
+         "error": "latency cap: no retirement" if bad == "fail" else None}
+        for s in json.loads(env("FAKE_FUZZ_SEEDS", "[1, 2, 3, 4, 5]"))]
+ok = all(r["pass"] for r in runs) and all(f["pass"] and f["liveness_checked"] for f in fuzz)
+if env("FAKE_LIE"):
+    ok = True                                   # a runner that claims a pass it didn't earn
+doc = {"pass": ok, "contract": env("FAKE_CONTRACT", "v3"), "runs": runs, "fuzz": fuzz,
+       "programs": json.loads(env("FAKE_PROGRAMS", json.dumps(progs))), "seeds": seeds,
+       "fuzz_seeds": [f["seed"] for f in fuzz], "runtime_s": 1.0}
+if env("FAKE_SETUP_ERROR"):
+    doc = {"pass": False, "contract": "v3", "error": env("FAKE_SETUP_ERROR")}
+if not env("FAKE_NO_JSON"):
+    os.makedirs("build", exist_ok=True)
+    json.dump(doc, open("build/cosim.json", "w"))
 print("building...")
-print(json.dumps(summary))
-sys.exit(1 if fail else 0)
+print(json.dumps({"pass": ok, "runs": len(runs), "fuzz": len(fuzz), "failed": 0}))
+sys.exit(0 if ok else 1)
 """
 
 
@@ -674,19 +709,36 @@ def test_cosim_adapter_passes(cosim_repo):
     res = run_gate(cosim_repo, "cosim")
     assert res["pass"] is True, res["detail"]
     runs = res["data"]["runs"]
-    assert len(runs) == 2 * 2 * 3
-    assert runs[0]["prog"] == "selftest"                       # selftest runs first
-    assert {(r["mode"], r["seed"]) for r in runs} == {(m, s) for m in ("rvfi", "pins")
-                                                      for s in (1, 2, 3)}
+    assert len(runs) == 2 * 2 * 4
+    assert {(r["prog"], r["mode"], r["seed"]) for r in runs} == {
+        (p, m, s) for p in ("selftest", "coremark") for m in ("rvfi", "pins") for s in (1, 2, 3, 4)}
+    assert [f["seed"] for f in res["data"]["fuzz"]] == [1, 2, 3, 4, 5]
     assert res["data"]["cpi"] == 90.0
+    assert "16 runs pass (2 programs x 2 modes x 4 seeds) + liveness fuzz x 5" in res["detail"]
+
+
+def test_cosim_constants_are_contract_v3():
+    assert ev.COSIM_SEEDS == (1, 2, 3, 4) and ev.FUZZ_SEEDS == (1, 2, 3, 4, 5)
+    assert ev.LATENCY_CAP == 2048 and ev.FUZZ_MIN_RUNS == 2056
 
 
 @pytest.mark.parametrize("env,msg", [
     ({"FAKE_COSIM_FAIL": "pins"}, "rd mismatch"),
-    ({"FAKE_COSIM_GAP": "1025"}, "exceeds the latency cap"),
+    ({"FAKE_COSIM_FAIL": "pins", "FAKE_LIE": "1"}, "rd mismatch"),
+    ({"FAKE_COSIM_GAP": "2049"}, "exceeds the latency cap 2048"),
     ({"FAKE_FUZZ": "fail"}, "liveness fuzz --seed 1: latency cap"),
     ({"FAKE_FUZZ": "unchecked"}, "liveness was not checked"),
+    ({"FAKE_FUZZ": "unchecked", "FAKE_LIE": "1"}, "liveness was not checked"),
     ({"FAKE_FUZZ": "short"}, "only 3 fuzz runs"),
+    ({"FAKE_FUZZ": "gap"}, "liveness fuzz --seed 1: max_cycles_per_insn 2049 exceeds"),
+    ({"FAKE_SEEDS": "[1, 2, 3]"}, "need [1, 2, 3, 4]"),
+    ({"FAKE_FUZZ_SEEDS": "[1, 2, 3]"}, "need [1, 2, 3, 4] and [1, 2, 3, 4, 5]"),
+    ({"FAKE_DROP": "coremark/pins/4"}, "missing [('coremark', 'pins', 4)]"),
+    ({"FAKE_DUP": "selftest/rvfi/2"}, "extra or repeated [('selftest', 'rvfi', 2)]"),
+    ({"FAKE_PROGRAMS": '["selftest"]'}, "differ from `make -C verif/programs list`"),
+    ({"FAKE_CONTRACT": "v2"}, "not 'v3'"),
+    ({"FAKE_NO_JSON": "1"}, "runner wrote no build/cosim.json"),
+    ({"FAKE_SETUP_ERROR": "program build failed: boom"}, "program build failed: boom"),
 ])
 def test_cosim_adapter_fails(cosim_repo, monkeypatch, env, msg):
     for k, v in env.items():
@@ -695,10 +747,30 @@ def test_cosim_adapter_fails(cosim_repo, monkeypatch, env, msg):
     assert res["pass"] is False and msg in res["detail"], res["detail"]
 
 
-def test_cosim_needs_expect_count(cosim_repo):
-    put(cosim_repo, "verif/programs/Makefile", PROGRAMS_MAKEFILE.replace('"retired": 10, ', ""))
+def test_cosim_gap_at_the_cap_passes(cosim_repo, monkeypatch):
+    monkeypatch.setenv("FAKE_COSIM_GAP", "2048")
+    assert run_gate(cosim_repo, "cosim")["pass"] is True
+
+
+def test_cosim_stale_json_is_not_trusted(cosim_repo, monkeypatch):
+    put(cosim_repo, "build/cosim.json", json.dumps({"pass": True, "contract": "v3"}))
+    monkeypatch.setenv("FAKE_NO_JSON", "1")
     res = run_gate(cosim_repo, "cosim")
-    assert "no retired-instruction count in selftest.expect.json" in res["detail"]
+    assert res["pass"] is False and "runner wrote no build/cosim.json" in res["detail"]
+
+
+def test_cosim_needs_the_program_list(cosim_repo):
+    put(cosim_repo, "verif/programs/Makefile", PROGRAMS_MAKEFILE.split("list:")[0])
+    res = run_gate(cosim_repo, "cosim")
+    assert res["pass"] is False and "make -C verif/programs list" in res["detail"]
+
+
+def test_eval_jobs(monkeypatch):
+    monkeypatch.setenv("BONETTO_EVAL_JOBS", "3")
+    assert ev.eval_jobs() == 3
+    for bad in ("0", "-2", "x", ""):
+        monkeypatch.setenv("BONETTO_EVAL_JOBS", bad)
+        assert 1 <= ev.eval_jobs() <= 16
 
 
 # --- the score: coremark_ips -------------------------------------------------------------------
@@ -738,14 +810,14 @@ def test_coremark_ips_reaches_eval_json(cosim_repo, monkeypatch):
 
 def test_coremark_ips_uses_the_slowest_seed(cosim_repo, monkeypatch):
     put(cosim_repo, "src/config.json", config_json(25))
-    monkeypatch.setenv("FAKE_CM_CYCLES", "[1000000, 1250000, 1000000]")
+    monkeypatch.setenv("FAKE_CM_CYCLES", "[1000000, 1000000, 1000000, 1250000]")
     d = run_gate(cosim_repo, "cosim")["data"]
     assert d["coremark_cycles_per_iter"] == 1250000 and d["coremark_ips"] == 32.0
 
 
 def test_coremark_ips_null_without_cycles(cosim_repo, monkeypatch):
-    # A runner that reports no CoreMark cycles (v2, or a program without iteration marks):
-    # the gate still judges correctness; the score is null (and --min-ips treats it as no gain).
+    # No run reports CoreMark cycles (a program without iteration marks, R21): the gate still
+    # judges correctness; the score is null (and --min-ips treats it as no gain, R17).
     res = run_gate(cosim_repo, "cosim")
     assert res["pass"] is True and res["data"]["coremark_ips"] is None
     monkeypatch.setenv("FAKE_CM_CYCLES", "null")
