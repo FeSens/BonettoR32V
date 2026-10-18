@@ -33,16 +33,20 @@
  * (`first`); the first instruction writes all of it. pcr is also the address register: a load's
  * M header takes the address from the ring (A leaves it there); a store spills pc + 4 to the
  * core region's x0 word (WP), leaves its address in pcr for M and the IO slot, and reloads the pc
- * (P); a register shift does the same around B, which leaves rs2[4:0] (the amount) in pcr.
+ * (P); a register shift does the same around B, which leaves rs2[4:0] (the amount) in pcr. An
+ * IO store restores the pc before BS, so its write lands at its retirement.
  *
  *   F   READ  pc -> instruction register; at the same strobes ring <- pc + 4
- *   P   READ  x0 (the spilled pc + 4) -> pc
+ *   P   READ  x0 (the spilled pc + 4) -> pc; the ring rotates by 2 nibbles (an IO store's address
+ *             nibbles 0-1 to the top)
  *   A   READ  rs1 -> ALU (+imm; AUIPC: pc + imm; CSR: rs1 or zimm; branches: rs1 - 0) -> ring
  *             (a store: and pcr); at the same strobes pc <- the ring's pc + 4, except for
  *             branches, JALR and stores; JALR: pc <- the target unless it traps (the ring keeps
  *             pc + 4); an IO load captures the slot into the ring at A's tail
  *   B   READ  rs2 -> ALU with the ring (OP, branches); register shifts: rs2 -> pcr
- *   BS  READ  rs2 -> ring (store data); an IO store writes the slot at BS's tail
+ *   BS  READ  rs2 -> ring (store data); an IO store takes nibbles 0-5 only (rs2[15:0] lands in
+ *             ring[23:8], under the address nibbles 0-1 in ring[7:0]) and writes the slot at BS's
+ *             tail
  *   C   READ  a CSR: core-region word (masked bits read 0) or the die bits -> ring; in a trap
  *             sequence (mtvec) and in MRET (mepc) -> pc
  *   RS  READ  scratch, combined with the ring (CSRRW / CSRRS / CSRRC) -> ring
@@ -54,7 +58,7 @@
  *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT)
  *   WS  WRITE scratch <- ring;  WC: the CSR <- ring (in a trap sequence: mepc <- pc)
  * Sequences: ALU F A [B] W (register shifts F WP A B W P); load F A M W (IO: F A W); store
- * F WP A BS M P (IO: F WP A BS P); branch F A [B] X; JAL F W4; JALR F A W4; FENCE, WFI F X;
+ * F WP A BS M P (IO: F WP A P BS); branch F A [B] X; JAL F W4; JALR F A W4; FENCE, WFI F X;
  * CSR F A WS C W RS WC; MRET F C. A
  * synchronous trap (decode after F, JALR after A, branch after A or B) leaves the pc unchanged,
  * runs WC(mepc <- pc) C(pc <- mtvec) and retires; an interrupt (at a retirement) runs WC C and
@@ -253,7 +257,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     wire       taken  = cmp ^ f3[0];
     wire [3:0] four   = {1'b0, n0, 2'b00};
-    wire [3:0] pk4    = pcr[3:0] & {4{~first}};         // pc nibble n (0 until the first retirement)
+    wire [3:0] pk4    = pcr[3:0] & {4{~first}};         // pc nibble n (0 before the 1st retirement)
     wire       bimm_a = ~(c_op | c_br | c_sh);
     wire       a_pc   = sF | (sA & c_pcrel) | sX | (sW4 & c_jal);
     wire [3:0] a4     = a_pc ? pk4 : (sB | sW4) ? ring[3:0] : nib_m;
@@ -362,7 +366,7 @@ module tt_um_fesens_r32v (
                 end else if (c_op)
                     nsl = SL_B;
                 else if (c_st)
-                    nsl = SL_BS;
+                    nsl = io ? SL_P : SL_BS;
                 else if (c_ld & ~io)
                     nsl = SL_M;
                 else if (c_csr)
@@ -377,7 +381,14 @@ module tt_um_fesens_r32v (
                         nsl = SL_X;
                 end
             end
-            SL_BS: nsl = io ? SL_P : SL_M;
+            SL_P: begin
+                nret = ~(c_st & io);                    // an IO store's P comes before BS
+                nsl  = SL_BS;
+            end
+            SL_BS: begin
+                nret = io;
+                nsl  = SL_M;
+            end
             SL_M:  nsl = c_st ? SL_P : SL_W;
             SL_WS: nsl = SL_C;
             SL_C: begin
@@ -395,19 +406,19 @@ module tt_um_fesens_r32v (
                 nret = ~tm;
                 nsl  = SL_C;
             end
-            default: nret = 1'b1;                       // X, W4, P
+            default: nret = 1'b1;                       // X, W4
         endcase
     end
 
     // ------------------------------------------------------------------------------------
     // IO: an IO load captures the slot into the ring at A's tail (atomic: the read side effect
     // happens at the same edge), as M would leave 4 bytes; an IO store writes rs2[15:0] from the
-    // ring at BS's tail.
+    // ring at BS's tail, its retirement.
     // ------------------------------------------------------------------------------------
     wire        io_re = e_end & sA & c_ld & io;
-    wire        io_we = e_end & sBS & io;
-    // the IO slot: a load's address is in the ring (A), a store's in pcr
-    wire [6:0]  mar_lo = sBS ? pcr[6:0] : ring[6:0];
+    wire        io_we = e_end & sBS & io;            // data: rs2[15:0] in ring[23:8]
+    // the IO slot: the address's nibbles 0-1 are in the ring (A; an IO store: P, BS)
+    wire [6:0]  mar_lo = ring[6:0];
     wire [1:0]  off   = mar_lo[1:0];
     wire [7:0]  iob0  = off[1] ? 8'd0 : off[0] ? io_rdata[15:8] : io_rdata[7:0];
     wire [7:0]  iob1  = (off == 2'd0) ? io_rdata[15:8] : 8'd0;
@@ -415,9 +426,10 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Ring and instruction register (no reset: nothing reads them before they are written)
     // ------------------------------------------------------------------------------------
-    wire ring_in  = dstb & (fR | sF | (sM & c_ld)) & ~shB & ~(sA & c_jalr);
+    wire ring_in  = dstb & (fR | sF | (sM & c_ld)) & ~shB & ~(sA & c_jalr) & ~sP &
+                    ~(sBS & io & n[2] & n[1]);
     wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] <= rotn);
-    wire ring_rot = (dstb & wr) | hrot;
+    wire ring_rot = (dstb & (wr | (sP & ~n[2] & ~n[1]))) | hrot;
     // pcr writes: A (the ring's pc + 4; a store: its address; JALR: the target unless it traps:
     // target[1] is sumj[1] at nibble 0, then ~cmp; not for branches), B of a register shift
     // (rs2), P (the spilled pc + 4), X, W4 of JAL, and C in a trap sequence or MRET. F and a trap
@@ -535,7 +547,7 @@ module tt_um_fesens_r32v (
     r32v_periph u_periph (
         .clk(clk), .rst_n(rst_n), .ui_in(ui_in), .uo_out(uo_out),
         .slot(mar_lo[6:2]), .off(off), .size(f3[1:0]), .we(io_we), .re(io_re),
-        .wdata(ring[15:0]), .rdata(io_rdata), .irq(irq)
+        .wdata(ring[23:8]), .rdata(io_rdata), .irq(irq)
     );
 
     // ------------------------------------------------------------------------------------
