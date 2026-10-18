@@ -13,7 +13,8 @@
  *   read:  8 header edges (r32v_mem), 4 dummy/wait edges, 8 data edges: 42 clocks
  *   write: 8 header edges, 2/4/8 data edges: 22/26/34 clocks
  * The counter c counts SCK edges: it starts at 52 (read) or 56 (write) and wraps to 0 at the
- * first data edge, so c is the data nibble index in the data phase. A masked slot (x0, or no
+ * first data edge, so c is the data nibble index in the data phase (while booting, c is the low
+ * 6 bits of the memory reset sequence's counter instead). A masked slot (x0, or no
  * register) keeps CS_n high and SCK low and runs only its 8 data strobes, one per clock: the
  * internal sck stays high through its data phase (10 clocks). Data moves at the clock where SCK
  * falls (the strobe): a read samples nibble c there, a write loads the nibble for the next
@@ -29,7 +30,9 @@
  * ({ring[7:4], ring[3:0]} >> r) with zero or sign fill.
  *
  * pc. pcr is a second 8-nibble shift register: it holds the pc with nibble k at pcr[4k+3:4k],
- * so the fetch header reads its address nibbles (and bit 24, the chip) straight from it. A slot
+ * so the fetch header reads its address nibbles (and bit 24, the chip) straight from it: F and M
+ * rotate pcr and the ring by one nibble per header nibble (8 in all), so each address nibble is
+ * at an odd position when its turn comes and r32v_mem selects among 4 nibbles, not 6. A slot
  * that updates the pc shifts the new nibble in at the top at each of its 8 data strobes and
  * reads the old one at the head (pk4). The memory reset sequence (`booting`) shifts zeros into
  * it, so the first fetch is at 0 in flash. pcr is also the address register: a load's
