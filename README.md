@@ -21,7 +21,7 @@ Status: pre-silicon. Verified in simulation (RTL and gate level), and hardened c
 | Memory | 16 MiB flash (code, execute in place), 8 MiB PSRAM (data) |
 | Gates | lint, area, cosim (256 runs + liveness fuzz), riscv-arch-test 53/53, equivalence, gate level 5/5; riscv-formal is being ported |
 
-The clock, slack and utilization figures come from hardening the a85f6cb netlist (the same RTL)
+The clock, slack and utilization figures come from hardening 4c82e3a (the champion RTL)
 with the current `src/config.json`: DRC, LVS, antenna and TT precheck clean (manual section 9).
 
 ## Documentation

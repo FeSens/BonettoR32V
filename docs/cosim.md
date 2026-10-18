@@ -21,8 +21,8 @@ run_cosim.py --mode rvfi|pins --prog P [--seed S] [--src DIR] [--clk-ns 25]
 run_cosim.py --all [--src DIR] [--jobs N] [--no-make]
 ```
 
-`--all` covers every program `make -C verif/programs list` reports (28 today: the plan's 26
-plus gpio_demo and uart_echo_fast; the plan's 26 must be among them, else a setup error). Each
+`--all` covers every program `make -C verif/programs list` reports (32 today: the plan's 26
+plus gpio_demo, uart_echo_fast and the full-range pwm10, pwm10q, timer16 and ir_gate; the plan's 26 must be among them, else a setup error). Each
 runs in both modes at seeds 1-4, and the rvfi-mode fuzz runs at seeds 1-5. The result goes to
 `build/cosim.json` with `"contract": "v3"`. That is the `make cosim` gate: `tools/eval.py` runs
 it once and re-checks the json (docs/eval.md). `--v3`, the flag that selected this harness before

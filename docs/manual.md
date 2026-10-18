@@ -791,7 +791,7 @@ make -C sdk F_CPU=40000000 ...  # build for another clock
 | Digital | `pinMode(pin, mode)` (UOx OUTPUT returns the pin to GPIO; `INPUT_PULLUP` is accepted but there are no pull-ups), `digitalWrite`, `digitalRead` (UOx reads back GPIO_OUT) |
 | PWM | `analogWrite(UO1..UO3, 0..1023)` (1023 = fully on; 48.9 kHz by default), `analogWriteFrequency(hz)` (returns the new `pwmMax()`), `pwmMax()`; other pins: HIGH from half of `pwmMax()` |
 | Time | `millis()` (wraps after 49.7 days), `micros()` (wraps after 71.6 minutes), `delay(ms)`, `delayMicroseconds(us)` (busy-waits on the timer), `timerPeriodMicros(us)` (INT_TIMER period, 3,932 to 20,971 µs at 50 MHz), `yield()` (weak) |
-| Interrupts | `attachInterrupt(digitalPinToInterrupt(UIx), fn, RISING/FALLING/CHANGE)`, `INT_TIMER` (every timebase period), `INT_CAPTURE` (with `captureMicros()`, `captureTicks()`; see the known SDK bug below), `INT_SERIAL` (a byte arrived); `detachInterrupt`, `interrupts()`, `noInterrupts()` |
+| Interrupts | `attachInterrupt(digitalPinToInterrupt(UIx), fn, RISING/FALLING/CHANGE)`, `INT_TIMER` (every timebase period), `INT_CAPTURE` (with `captureMicros()`, `captureTicks()`), `INT_SERIAL` (a byte arrived); `detachInterrupt`, `interrupts()`, `noInterrupts()` |
 | Tone | `tone(pin, hz[, ms])`, `noTone(pin)`: UO7 (timer, 24 to 2,000 Hz) or UO1-UO3 (PWM, from 382 Hz, no CPU cost) |
 | Serial | `Serial.begin(baud)` (up to 3,125,000 at 50 MHz), `end`, `available`, `read`, `peek`, `write`, `print`, `println` (strings, chars, integers in BIN/OCT/DEC/HEX), `flush`; C: `serial_*`, `serial_overruns()` |
 | SPI | `SPI.begin()`, `end()`, `beginTransaction(SPISettings(hz))`, `transfer(byte)`, `transfer(buf, n)`, `setClock(hz)`; `digitalWrite(SS, ...)` drives CS_n; C: `spi_begin`, `spi_end`, `spi_set_clock` (12.5 MHz to 195 kHz), `spi_transfer` |
@@ -799,14 +799,10 @@ make -C sdk F_CPU=40000000 ...  # build for another clock
 | Registers | `sdk/core/r32v.h`: every IO register and bit, `csr_read/write/set/clear(csr, v)`, `r32v_irq_save()` / `r32v_irq_restore(m)` |
 | Hooks | `r32v_fault(mcause, mepc)` (weak; called on ECALL, EBREAK or an illegal word; the default spins with interrupts off) |
 
-**Known SDK bug: `INT_CAPTURE`.** In this version `attachInterrupt(INT_CAPTURE, fn, mode)` writes
-the capture edge to `0x8000_0064` (unimplemented slot 25) instead of TIMER_CTRL byte 1
-(`0x8000_0019`): `R32V_REG8()` takes a slot number, and `sdk/core/r32v_core.c` passes the byte
-offset 25. Capture stays off until the SDK next rewrites TIMER_CTRL (a UO7 tone or an IR frame).
-No SDK test covers capture. Workaround: after `attachInterrupt(INT_CAPTURE, ...)`, write
-`*(volatile uint8_t *)0x80000019 = 1;` (rising; 2 falling, 3 both). Checked in progsim for this
-manual: a sketch with three rising edges on `ui[0]` counted 0 captures without the workaround and
-3 with it.
+`attachInterrupt(INT_CAPTURE, fn, mode)` arms the timer's capture edge (TIMER_CTRL byte 1) and
+the CAP interrupt; `sdk/tests/test_sdk.py` checks it on the RTL (three `ui[0]` pulses 20 ms and
+30 ms apart give three captures with those intervals, within 30 µs). An earlier SDK revision
+wrote the edge to the wrong address; this manual's review found it, and it is fixed.
 
 ### 6.4 Resource rules
 
@@ -1070,8 +1066,7 @@ scripted button presses, and `sdk/tests/nec_decode.py` decodes `uo[1]` with cycl
 - the carrier period is 1,316 cycles (37,994 Hz) with 438 cycles high.
 
 **Receiving IR** is possible in hardware (a TSOP38238-style demodulator on `ui[0]`, timer capture
-on both edges, `INT_CAPTURE` with `captureMicros()`), but the SDK has no decoder yet, and
-`INT_CAPTURE` needs the workaround of section 6.3.
+on both edges, `INT_CAPTURE` with `captureMicros()`), but the SDK has no decoder yet.
 
 ## 8. Performance
 
@@ -1141,9 +1136,8 @@ From the seed: 7.9x fewer cycles per iteration and 9.9x the score (the clock giv
 | Signoff checks | DRC, LVS, antenna and TT precheck clean |
 | Configuration | `src/config.json`: synthesis `AREA 2` with the smallest drive strengths allowed, hold margins 0.015/0.01 ns, design repair without slew/cap margins, timing-driven and routability-driven placement (overflow threshold 0.15), target density 60% |
 
-- The hardening numbers are from the a85f6cb netlist, which has the same RTL as 4c82e3a, with
-  the current `src/config.json` (sweep x6). A fresh harden of 4c82e3a was running when this was
-  written.
+- The hardening numbers are measured on 4c82e3a (merged to main as 5c66234) with the current
+  `src/config.json`; the sweep run on the a85f6cb netlist (the same RTL) gave identical figures.
 - **Design style.** One rising-edge clock, synchronous reset, no latches, no tristates, plain
   Verilog-2005 (contract 1). Core state flip-flops (the ring, instruction register, pc, x11, the
   pair-fetch buffer, counters) are `sky130_fd_sc_hd__sdfxtp_1` scan flops used as enable flops
@@ -1202,5 +1196,4 @@ the interrupt overhead of section 6.5.
 | One timer, one PWM period | shared by the SDK's timebase, UO7 tone and IR sender, and by the three PWM channels |
 | Memory | 8 MiB of PSRAM used (PSRAM B unused); the flash is read-only at run time; the top 128 bytes of PSRAM belong to the CPU |
 | UART pin at reset | `uo[0]` is a GPIO driving 0 until software selects the UART (ALTFN[0]) |
-| SDK capture interrupt | `attachInterrupt(INT_CAPTURE, ...)` doesn't set the capture edge in this SDK version (section 6.3, with a workaround) |
 | CoreMark | one-iteration project score, not an EEMBC-reportable result |

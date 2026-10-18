@@ -4,8 +4,8 @@ BonettoR32V is an RV32E + Zicsr microcontroller in a 1x2 Tiny Tapeout tile: code
 flash of TT's QSPI Pmod, data lives in its PSRAM, and it has GPIO, a 16-bit timer, three 10-bit
 PWM channels with an IR gate, a UART, an SPI master and one interrupt line. `docs/contract.md` is
 the authoritative interface (section numbers below are its own); `sdk/` gives an Arduino-style
-API. Code is fetched over serial flash, so an instruction averages about 110 cycles (CoreMark
-measures 109.6 in `make cosim`), about 2.2 µs at 50 MHz: budget interrupt work accordingly.
+API. Code is fetched over serial flash, so an instruction averages about 100 cycles (99.1 over the
+cosim programs, CoreMark included), about 2 µs at 50 MHz: budget interrupt work accordingly.
 
 ## 1. Memory map and boot (contract 3, 4)
 
@@ -73,7 +73,7 @@ UART_DATA for RX. TXIDLE is set whenever the UART is idle: enable it only to wai
 `make -C sdk` builds every example and `make -C sdk SKETCH=dir` one sketch (`.ino`, `.c`, `.cpp`)
 into `sdk/build/<name>/<name>.{elf,bin,hex,lst}` with the xPack `riscv32-unknown-elf-gcc`
 15.2.0 (macOS or Linux). The `.bin` is the flash image from address 0. `F_CPU` (default
-50000000, the 20 ns `CLOCK_PERIOD` of `src/config.json`; contract 7 still says 40 MHz) must be
+50000000, the 20 ns `CLOCK_PERIOD` of `src/config.json`, contract 7) must be
 the board's clock. Examples: blink, fade, serial_echo, button, tone, ir_remote, c_blink.
 
 | Area | API (C names in `Arduino.h`: `serial_*`, `spi_*`, `ir_*`) |

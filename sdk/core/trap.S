@@ -1,6 +1,6 @@
 # BonettoR32V SDK trap entry (mtvec = r32v_trap, set by crt0.S; contract section 4).
 #
-# An instruction takes about 110 cycles on this core, and more for loads and stores to PSRAM,
+# An instruction takes about 100 cycles on this core, and more for loads and stores to PSRAM,
 # so the C handler (r32v_trap_c in r32v_core.c, about 95 instructions with 12 registers saved
 # on the stack) is too slow for two cases, which this file takes first:
 #   1. UART receive. The UART holds one byte; at 115,200 baud the next one arrives 4,340 cycles
