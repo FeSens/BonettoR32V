@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Regenerate verif/formal/mutants/<name>/ from the champion (src/, contract v3).
+"""Regenerate verif/formal/mutants/<name>/ from the champion (src/, contract v3; ported to
+champion 112, the pair fetch, 4c82e3a; the measured mutant results in docs/formal.md are on
+champion 111, 346c4a3).
 
 Each mutant is a copy of the champion's design files that the mutation touches (test_formal.py
 lays them over a copy of src/), each with exactly one change, plus expect.json naming the formal
@@ -147,9 +149,9 @@ MUTANTS = {
     "store_data_flip": (
         "a store writes a wrong bit", ["psram_write"], "psram_write_attr",
         "Bit 0 of a store's data nibble 1 is flipped on the bus (RVFI reports rs2).",
-        [(TOP, "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk) ? pk4 : ring[3:0];",
+        [(TOP, "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk) ? pk4 :",
           "    wire [3:0] wdo4   = sW ? wd4 : fM ? (tap4 ^ {3'b000, n == 3'd1}) : "
-          "(sWC & tm & ~tk) ? pk4 : ring[3:0];")],
+          "(sWC & tm & ~tk) ? pk4 :")],
     ),
     "region_wrap": (
         "core-region words at a 2-byte offset", ["psram_write"], "psram_write_attr",
@@ -236,9 +238,8 @@ MUTANTS = {
     "trap_mepc": (
         "a trap writes the ring to mepc", ["csr"], "csr_read",
         "A trap sequence's WC writes the ring, not the pc, to mepc.",
-        [(TOP, "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk) ? pk4 : ring[3:0];",
-          "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk & 1'b0) ? pk4 : "
-          "ring[3:0];")],
+        [(TOP, "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk) ? pk4 :",
+          "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk & 1'b0) ? pk4 :")],
     ),
     # ---- liveness (contract 4), deep --------------------------------------------------------
     "hang_reserved": (
@@ -302,10 +303,10 @@ MUTANTS = {
     "trap_writes_rd": (
         "a trap reports rd", ["rvfi"], "conv_trap_rd_addr",
         "A trapping instruction reports its rd field and a write (contract 8: rd 0 on a trap).",
-        [(TOP, "    wire        r_rde  = ~r_tr & (c_alu | c_u | c_jal | c_jalr | c_ld | c_csr) & "
-               "(rd_f != 4'd0);",
-          "    wire        r_rde  = (c_alu | c_u | c_jal | c_jalr | c_ld | c_csr) & "
-          "(rd_f != 4'd0);")],
+        [(TOP, "    wire        r_rde  = ~r_tr & (ri_alu | ri_u | ri_jal | ri_jalr | ri_ld | ri_csr) & "
+               "(ri[10:7] != 4'd0);",
+          "    wire        r_rde  = (ri_alu | ri_u | ri_jal | ri_jalr | ri_ld | ri_csr) & "
+          "(ri[10:7] != 4'd0);")],
     ),
     "zero_init": (
         "the pc is not cleared", ["rvfi"], "conv_first_pc",
@@ -340,7 +341,8 @@ MUTANTS = {
         "a wrong RVFI rd value", ["insn_xor"], "insn_rd_wdata",
         "RVFI reports XOR results with bit 0 flipped (the register gets the right value).",
         [(TOP, "    assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;",
-          "    assign rvfi_rd_wdata  = r_rde ? (r_rd ^ {31'd0, c_op & (f3 == 3'b100)}) : 32'd0;")],
+          "    assign rvfi_rd_wdata  = r_rde ? (r_rd ^ {31'd0, ri_op & (ri_f3 == 3'b100)}) : "
+          "32'd0;")],
     ),
     "claim_region_stop": (
         "claims a core-region address to stop the checks", ["insn_add"], "insn_rd_wdata",
@@ -348,10 +350,10 @@ MUTANTS = {
         "UNSPECIFIED stop uses the spec's address for a specified instruction, so the claim "
         "stops nothing.",
         [(TOP, "    assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;",
-          "    assign rvfi_rd_wdata  = r_rde ? (r_rd ^ {31'd0, c_op & (f3 == 3'b000) & ~insn[30]})"
-          " : 32'd0;"),
+          "    assign rvfi_rd_wdata  = r_rde ? (r_rd ^ {31'd0, ri_op & (ri_f3 == 3'b000) & "
+          "~ri[30]}) : 32'd0;"),
          (TOP, "    assign rvfi_mem_addr  = r_mem ? maddr : 32'd0;",
-          "    assign rvfi_mem_addr  = r_mem ? maddr : c_op ? 32'h017fff80 : 32'd0;")],
+          "    assign rvfi_mem_addr  = r_mem ? maddr : ri_op ? 32'h017fff80 : 32'd0;")],
     ),
     "norvfi_diff": (
         "a behavior difference only without RVFI", ["equiv"], "equiv",

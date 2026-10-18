@@ -14,6 +14,7 @@
  * (a gap clock with CS_n high, the edges, a tail clock with SCK low).
  *   read:  8 header edges (r32v_mem), 4 dummy/wait edges, 8 data edges: 42 clocks
  *   write: 8 header edges, 2/4/8 data edges: 22/26/34 clocks
+ *   pair fetch: a read with 16 data edges: 58 clocks
  * The counter c counts SCK edges: it starts at 52 (read) or 56 (write) and wraps to 0 at the
  * first data edge, so c is the data nibble index in the data phase (while booting, c is the low
  * 6 bits of the memory reset sequence's counter instead). A masked slot (x0, x11, or no
@@ -30,6 +31,17 @@
  * header rotation (rotn nibbles) in rotn + 1 header strobes, one per clock (none when
  * rotn = 0). The core region's x11 word is unused.
  *
+ * Pair fetch. A fetch from flash whose word has opcode bit 6 = 0 (no branch, jump or system
+ * instruction: those rarely continue at pc + 4) clocks 8 more data edges, the word at pc + 4 (the
+ * flash's continuous read is a linear burst; contract 2.1.9: a read may end at any edge), into
+ * pfs (28 bits) and pfl (4 bits). The instruction register loads from pfs and pfl, never by
+ * shifting: {pfs, pfl} at data strobe 7 (ir[3:0] one clock later), or the buffered word at the
+ * retirement of the instruction before it (pf: the last fetch paired, no trap sequence ends, no
+ * interrupt is taken, and the next pc, which every bit-6 = 0 instruction leaves in pcr as
+ * pc + 4, is in flash). Its F then runs only its tail, one clock with both CS_n high, which
+ * decodes it. Flash never changes during a run, so the buffer is always coherent; a fetch from
+ * PSRAM never pairs.
+ *
  * Ring. ring is a 32-bit shift register of 8 nibbles. A read slot shifts its result nibble in at
  * the top at each data strobe; a write slot rotates it (head ring[3:0] to the top) and emits
  * from it. After 8 strobes a value sits with nibble k at ring[4k+3:4k]. Core-region words are
@@ -45,24 +57,27 @@
  * at an odd position when its turn comes and r32v_mem selects among 4 nibbles, not 6. A slot
  * that updates the pc shifts the new nibble in at the top at each of its 8 data strobes and
  * reads the old one at the head (pk4). The memory reset sequence (`booting`) shifts zeros into
- * it, so the first fetch is at 0 in flash. pcr is also the address register: a load's
+ * it, so the first fetch is at 0 in flash. pc + 4 comes from an incrementer on pcr's head
+ * nibble (inc4, carry ci) beside the ALU, at the strobes of the slot that needs it, so no slot
+ * depends on a fetch having run. pcr is also the address register: a load's
  * M header takes the address from the ring (A leaves it there); a store spills pc + 4 to the
  * core region's x0 word (WP), leaves its address in pcr for M and the IO slot, and reloads the pc
  * (P); a register shift does the same around B, which leaves rs2[4:0] (the amount) in pcr. An
  * IO store restores the pc before BS, so its write lands at its retirement. A taken branch on
- * x0 retires with its target in the ring instead (`tk`): the next F takes its address from the
- * ring and moves it into pcr at its strobes; an interrupt entry's WC writes it to mepc.
+ * x0, and JALR, retire with the target in the ring instead (`tk`): the next F takes its address
+ * from the ring and moves it into pcr at its strobes; an interrupt entry's WC writes it to mepc.
  *
- *   F   READ  pc -> instruction register; at the same strobes ring <- pc + 4
+ *   F   READ  pc -> instruction register (a pair fetch: and the word at pc + 4 -> pfs, pfl); the
+ *             ring rotates; after a taken branch on x0 or JALR (tk): ring -> pc
  *   P   READ  x0 (the spilled pc + 4) -> pc; the ring rotates by 2 nibbles (an IO store's address
  *             nibbles 0-1 to the top)
  *   A   READ  rs1 -> ALU (+imm; AUIPC: pc + imm; CSR: rs1 or zimm; branches: rs1 + 0) -> ring
- *             (a store: and pcr); at the same strobes pc <- the ring's pc + 4, except for
- *             branches, JALR and stores; JALR: pc <- the target, or the pc rotates if the target
- *             traps (the ring keeps pc + 4); an IO load captures the slot into the ring at A's
- *             tail. A branch on x0 compares rs1 with 0 beside the ALU, which computes pc + imm
- *             into the ring, and moves pc + 4 into pcr (not when imm[1] = 1: that target traps
- *             if taken, so the pc stays; untaken, X adds 4)
+ *             (a store: and pcr); at the same strobes pc <- pc + 4, except for branches, JALR
+ *             and stores; JALR: the target -> ring and the pc rotates (it stays, for W4's link
+ *             or the trap); an IO load captures the slot into the ring at A's tail. A branch on
+ *             x0 compares rs1 with 0 beside the ALU, which computes pc + imm into the ring, and
+ *             moves pc + 4 into pcr (not when imm[1] = 1: that target traps if taken, so the pc
+ *             stays; untaken, X adds 4)
  *   B   READ  rs2 -> ALU with the ring (OP, branches); register shifts: rs2 -> pcr
  *   BS  READ  rs2 -> ring (store data); an IO store takes nibbles 0-5 only (rs2[15:0] lands in
  *             ring[23:8], under the address nibbles 0-1 in ring[7:0]) and writes the slot at BS's
@@ -73,10 +88,10 @@
  *   X   no transaction (masked, 10 clocks): pc <- pc + (taken branch ? imm : 4)
  *   M   READ/WRITE the load/store address (4 bytes / the store's bytes); a store to flash is
  *             masked
- *   W4  WRITE rd <- the ring (pc + 4); JAL: pc <- pc + imm
- *   WP  WRITE x0 <- the ring (pc + 4, the spill)
+ *   W4  WRITE rd <- pc + 4; JAL: pc <- pc + imm; JALR: the pc rotates (the target is in the ring)
+ *   WP  WRITE x0 <- pc + 4 (the spill); the pc rotates
  *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT); LI (ADDI rd, x0, imm)
- *             and LUI: rd <- the immediate, and pc <- the ring's pc + 4 at the same strobes
+ *             and LUI: rd <- the immediate, and pc <- pc + 4 at the same strobes
  *   WS  WRITE scratch <- ring;  WC: the CSR <- ring (in a trap sequence: mepc <- pc)
  * Sequences: ALU F A [B] W (register shifts F WP A B W P; LI, LUI F W); load F A M W (IO: F A
  * W); store F WP A BS M P (IO: F WP A P BS); branch F A B X, on x0 F A (imm[1] = 1, untaken:
@@ -153,6 +168,8 @@ module tt_um_fesens_r32v (
     wire [31:0] pcr;    // the pc
     wire [31:0] a1r;    // x11, nibble k at a1r[4k+3:4k]
     wire        x11r;   // the slot reads or writes x11 (x11, registered at the gap clock)
+    wire [27:0] pfs;    // pair fetch buffer: the word at pc + 4, data nibbles 8-14 ...
+    wire [3:0]  pfl;    // ... and 15
 
     wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[0], 1'b0};
 
@@ -212,6 +229,7 @@ module tt_um_fesens_r32v (
     wire sRS  = (sl == SL_RS);
     wire sF   = (sl == SL_F);
     wire sM   = (sl == SL_M);
+    wire sWP  = (sl == SL_WP);
     wire sW4  = (sl == SL_W4);
     wire sW   = (sl == SL_W);
     wire sWS  = (sl == SL_WS);
@@ -274,7 +292,10 @@ module tt_um_fesens_r32v (
     wire       stb   = sck;
     wire [5:0] cn    = c + 6'd1;
     wire [2:0] nlast = (sM & c_st) ? {nm1, 1'b1} : 3'd7;
-    wire       dend  = stb & ~c[5] & (c[2:0] == nlast); // the last data edge's strobe
+    // pair fetch: a flash fetch whose word has opcode bit 6 = 0 (no branch, jump or system
+    // instruction) reads 8 more data edges, the word at pc + 4, into pfs and pfl
+    wire       pcont = sF & ~c[3] & ~ps & ~pfs[26];     // pfs[27:24] is the word's nibble 0 at c = 7
+    wire       dend  = stb & ~c[5] & (c[2:0] == nlast) & ~pcont;   // the last data edge's strobe
     // data strobe: a read samples nibble c; a write (on the bus) loads nibble c + 1 for the
     // next rising edge; a masked slot of either kind steps like a read
     wire       dstb  = wact ? (stb & ~cn[5] & ~dend) : (stb & ~c[5]);
@@ -321,15 +342,19 @@ module tt_um_fesens_r32v (
     wire [3:0] four   = {1'b0, n0, 2'b00};
     wire [3:0] pk4    = pcr[3:0];                       // pc nibble n
     wire       bimm_a = ~(c_op | c_sh | (c_br & ~rs2z));
-    // the pc operand: pcr, or the ring in a fetch after a taken branch on x0 (tk)
-    wire       a_pc   = (sF & ~tk) | (sA & (c_pcrel | nb)) | sX | (sW4 & c_jal);
+    // the pc operand: pcr
+    wire       a_pc   = (sA & (c_pcrel | nb)) | sX | (sW4 & c_jal);
     wire       rsb    = sRS & f3[1];                   // CSRRS, CSRRC: ring op scratch
-    wire [3:0] a4     = a_pc ? pk4 : (sB | sW4 | (sF & tk) | rsb) ? ring[3:0] : nib_m;
+    wire [3:0] a4     = a_pc ? pk4 : (sB | rsb) ? ring[3:0] : nib_m;
     wire [3:0] b4     = sA ? (imm4 & {4{bimm_a}}) :
                         (sB | rsb) ? nib_m :
-                        sF ? four :
                         sX ? ((c_br & taken) ? imm4 : four) :
                         (sW4 & c_jal) ? imm4 : 4'd0;
+    // pc + 4, nibble n, beside the ALU (ci: its carry): A and W of LI and LUI move it into pcr,
+    // WP and W4 emit it
+    wire       ci;
+    wire [3:0] inc4   = n0 ? {pk4[3] ^ pk4[2], ~pk4[2], pk4[1:0]} : (pk4 + {3'd0, ci});
+    wire       ci_d   = n0 ? (pk4[3] & pk4[2]) : (ci & (&pk4));
     // A: SLTI/SLTIU compare rs1 with imm; B: SUB, SLT, SLTU and branches subtract
     wire       sub    = sA ? c_slt : ((sB & (c_br | (~f3[2] & (f3[1] | insn[30])))) |
                                        (rsb & f3[0]));
@@ -400,9 +425,10 @@ module tt_um_fesens_r32v (
                         c_sh  ? fun :
                         liw   ? imm4 :
                                 ring[3:0];
-    // a trap sequence's WC (mepc): the pc (from the ring after a taken branch on x0: tk); W4,
-    // WP (pc + 4), WS, WC: the ring
-    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk & 1'b0) ? pk4 : ring[3:0];
+    // a trap sequence's WC (mepc): the pc (from the ring after a taken branch on x0 or JALR:
+    // tk); W4, WP: pc + 4; WS, WC: the ring
+    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk & 1'b0) ? pk4 :
+                        (sWP | sW4) ? inc4 : ring[3:0];
 
     // ------------------------------------------------------------------------------------
     // Next slot after the tail
@@ -504,8 +530,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Ring and instruction register (no reset: nothing reads them before they are written)
     // ------------------------------------------------------------------------------------
-    wire ring_in  = dstb & (fR | sF | (sM & c_ld)) & ~shB & ~(sA & c_jalr) & ~sP &
-                    ~(sBS & io & n[2] & n[1]);
+    wire ring_in  = dstb & (fR | (sM & c_ld)) & ~shB & ~sP & ~(sBS & io & n[2] & n[1]);
     // W of a shift rotates at its last rotn header strobes before c = 63 (8 header edges on the
     // bus, c = 56..63; a fast W starts at c = 63 - rotn)
     wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] > ~rotn);
@@ -514,22 +539,22 @@ module tt_um_fesens_r32v (
     // (r32v_mem). A read's dummy edges (cn[3] & cn[2]) load no address.
     wire hdr_ld   = (gap & ~booting & ~mask) | (stb & hdr & cn[5]);
     wire rot_hdr  = fM & hdr_ld & (gap | wr | ~(cn[3] & cn[2]));
-    wire ring_rot = (dstb & (wr | (sP & ~n[2] & ~n[1]))) | hrot | rot_hdr;
-    // pcr writes: A (the ring's pc + 4, also for a branch on x0 unless imm[1] = 1; a store: its
-    // address; JALR: the target), B of a register shift (rs2), P (the spilled pc + 4), X, W4 of
-    // JAL, W of LI and LUI (the ring's pc + 4), and C in a trap sequence or MRET. F and a trap
-    // sequence's WC read the pc nibble by nibble: pcr rotates; so does JALR's A when the target
-    // traps (target[1] is sumj[1] at nibble 0, then ~cmp), leaving the pc. The write enable is
-    // decode only (no ALU term). A fetch after a taken branch on x0 (tk) moves the ring's target
-    // into pcr.
-    wire       jtrap = c_jalr & (n0 ? sumj[1] : ~cmp);
-    wire       prot = sF | (sWC & tm);
+    // F rotates the ring at its data strobes (16 in a pair fetch: twice around)
+    wire ring_rot = (dstb & (wr | sF | (sP & ~n[2] & ~n[1]))) | hrot | rot_hdr;
+    // pcr writes: A (pc + 4, also for a branch on x0 unless imm[1] = 1; a store: its address),
+    // B of a register shift (rs2), P (the spilled pc + 4), X, W4 of JAL, W of LI and LUI
+    // (pc + 4), and C in a trap sequence or MRET. WP, JALR's A and W4 and a trap sequence's WC
+    // read the pc nibble by nibble: pcr rotates (JALR's target goes to the ring; it retires with
+    // tk, or traps with the pc in place). The write enable is decode only (no ALU term). A fetch
+    // after tk moves the ring's target into pcr (twice in a pair fetch, the ring rotating).
+    wire       prot = sWP | (sWC & tm) | (c_jalr & (sA | sW4));
     wire       pwr  = (sA & (~c_br | nbw)) | (sB & c_sh) | sP | sX | (sW4 & c_jal) |
-                      (sC & (tm | p_mret)) | (sW & liw);
+                      (sC & (tm | p_mret)) | (sW & liw) | (sF & tk);
     // The memory reset sequence shifts zeros in (nib_m is 0 at the gap).
     wire       pwe  = (dstb & (pwr | prot)) | rot_hdr | booting;
-    wire [3:0] pin4 = ((rot_hdr | (prot & ~(sF & tk)) | (sA & jtrap)) & ~booting) ? pcr[3:0] :
-                      ((sA & ~c_st & ~c_jalr) | (sF & tk) | sW) ? ring[3:0] :
+    wire [3:0] pin4 = ((rot_hdr | prot) & ~booting) ? pcr[3:0] :
+                      (sF & tk) ? ring[3:0] :
+                      ((sA & ~c_st) | sW) ? inc4 :
                       (sB | sP | booting) ? nib_m : din4;
 
     // ------------------------------------------------------------------------------------
@@ -546,13 +571,24 @@ module tt_um_fesens_r32v (
                            ring[31:20],
                            (io_re ? {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]} : ring[19:4])};
     wire [31:0] ring_h  = {{16{io_re | ~ring_sh}}, {16{~(io_re | ring_sh)}}};
-    wire [31:0] ir_d    = {ir[27:0], nib_m};
-    wire        ir_h    = ~(sF & dstb);
+    // Fetch: pfs shifts in data nibbles 0-6 and 8-14, pfl takes each nibble (15 is the last).
+    // The instruction register loads {pfs, pfl}: nibbles 0-6 at data strobe 7, nibble 7 (ir[3:0],
+    // which no fetch tail decision reads) at the next clock (c = 8, SCK low: a pair fetch's
+    // ninth low phase or a single fetch's tail; the loads at other F clocks with c[3:0] = 8 come
+    // before strobe 7 and are overwritten). A retirement whose next instruction is the buffered
+    // word (pf) loads all of {pfs, pfl} and skips its fetch.
+    wire        pf;
+    wire        fd      = sF & dstb;
+    wire [31:0] ir_d    = {pfs, pfl};
+    wire        ir_h    = ~((fd & ~c[3] & (&c[2:0])) | pf);
+    wire        irl_h   = ~((sF & ~stb & (c[3:0] == 4'd8)) | pf);
+    wire [27:0] pfs_d   = {pfs[23:0], nib_m};
+    wire        pfs_h   = ~fd | (&c[2:0]);
     wire [31:0] pcr_d   = {pin4, pcr[31:4]};
     wire        pcr_h   = ~pwe;
     // cy: cleared at the gap; a load's W latches the sign, the adder's slots the carry
     wire        cy_d    = ~gap & (sW ? tap4[3] : cout);
-    wire        cy_h    = ~(gap | (dstb & (sW ? ~ldfill : (fR | sF | sW4))));
+    wire        cy_h    = ~(gap | (dstb & (sW ? ~ldfill : (fR | sW4))));
     // cmp: A of a branch (zc), SLT (ocmp), JALR (target[1] == 0), a shift (rs1[31] at the last
     // nibble); B of SLT and branches (ocmp)
     wire        cmp_d   = ~sA ? ocmp : c_br ? zc : c_slt ? ocmp : (c_jalr & n0) ? ~sumj[1] : a4[3];
@@ -573,8 +609,8 @@ module tt_um_fesens_r32v (
         for (gi = 0; gi < 32; gi = gi + 1) begin : g_rip
             sky130_fd_sc_hd__sdfxtp_1 u_ring (.CLK(clk), .D(ring_d[gi]), .SCD(ring[gi]),
                                               .SCE(ring_h[gi]), .Q(ring[gi]));
-            sky130_fd_sc_hd__sdfxtp_1 u_ir (.CLK(clk), .D(ir_d[gi]), .SCD(ir[gi]), .SCE(ir_h),
-                                            .Q(ir[gi]));
+            sky130_fd_sc_hd__sdfxtp_1 u_ir (.CLK(clk), .D(ir_d[gi]), .SCD(ir[gi]),
+                                            .SCE(gi < 4 ? irl_h : ir_h), .Q(ir[gi]));
             sky130_fd_sc_hd__sdfxtp_1 u_pcr (.CLK(clk), .D(pcr_d[gi]), .SCD(pcr[gi]),
                                              .SCE(pcr_h), .Q(pcr[gi]));
             sky130_fd_sc_hd__sdfxtp_1 u_a1r (.CLK(clk), .D(wdo4[gi % 4]), .SCD(a1r[gi]),
@@ -584,22 +620,42 @@ module tt_um_fesens_r32v (
             sky130_fd_sc_hd__sdfxtp_1 u_c (.CLK(clk), .D(c_d[gi]), .SCD(c[gi]), .SCE(c_h),
                                            .Q(c[gi]));
         end
+        for (gi = 0; gi < 28; gi = gi + 1) begin : g_pfs
+            sky130_fd_sc_hd__sdfxtp_1 u_pfs (.CLK(clk), .D(pfs_d[gi]), .SCD(pfs[gi]),
+                                             .SCE(pfs_h), .Q(pfs[gi]));
+        end
+        for (gi = 0; gi < 4; gi = gi + 1) begin : g_pfl
+            sky130_fd_sc_hd__sdfxtp_1 u_pfl (.CLK(clk), .D(nib_m[gi]), .SCD(pfl[gi]), .SCE(~fd),
+                                             .Q(pfl[gi]));
+        end
     endgenerate
     sky130_fd_sc_hd__sdfxtp_1 u_cy (.CLK(clk), .D(cy_d), .SCD(cy), .SCE(cy_h), .Q(cy));
+    sky130_fd_sc_hd__sdfxtp_1 u_ci (.CLK(clk), .D(ci_d), .SCD(ci), .SCE(~dstb), .Q(ci));
     sky130_fd_sc_hd__sdfxtp_1 u_cmp (.CLK(clk), .D(cmp_d), .SCD(cmp), .SCE(cmp_h), .Q(cmp));
-    sky130_fd_sc_hd__sdfxtp_1 u_mk (.CLK(clk), .D(mask), .SCD(mk), .SCE(~gap), .Q(mk));
+    // mk: registered at the gap; a skipped fetch (pf) sets it, so its tail keeps both CS_n high
+    sky130_fd_sc_hd__sdfxtp_1 u_mk (.CLK(clk), .D(mask | pf), .SCD(mk), .SCE(~(gap | pf)),
+                                    .Q(mk));
     sky130_fd_sc_hd__sdfxtp_1 u_x11 (.CLK(clk), .D(x11), .SCD(x11r), .SCE(~gap), .Q(x11r));
 
     // ------------------------------------------------------------------------------------
     // Control (reset)
     // ------------------------------------------------------------------------------------
-    wire tk_set = sA & nbw & taken;                     // at A's tail
+    // at A's tail: a taken branch on x0; JALR (no trap) at A's or W4's tail
+    wire tk_set = (sA & nbw & taken) | (c_jalr & cmp & (sA | sW4));
+    // pv: the last fetch was a pair fetch (it ended at c = 16), so pfs and pfl hold the word at
+    // its pc + 4. A retirement uses it (pf) unless it ends a trap sequence or takes an interrupt,
+    // or the next pc is in PSRAM (the fetch was from flash: pc + 4 wrapped past 0xFF_FFFF). Only
+    // instructions with opcode bit 6 = 0 pair, and each of them retires with next pc = pc + 4
+    // in pcr. The skipped fetch runs only its tail (one clock), which decodes the new word.
+    reg  pv;
+    assign pf = e_end & nret & pv & ~tm & ~take & ~pcr[24];
     always @(posedge clk) begin
         if (!rst_n) begin
             sl    <= SL_F;
             ep    <= E_GAP;
             sck   <= 1'b0;
             tk    <= 1'b0;
+            pv    <= 1'b0;
         end else begin
             // toggles in HDR and DATA; a masked slot holds it high through DATA (a strobe per
             // clock; SCK stays low on the pin)
@@ -610,8 +666,10 @@ module tt_um_fesens_r32v (
                 E_DATA: if (dend) ep <= E_TAIL;
                 default: begin
                     sl <= nret ? (take ? SL_WC : SL_F) : nsl;
-                    ep <= E_GAP;
+                    ep <= {pf, pf};                     // E_TAIL after a skipped fetch, else E_GAP
                     tk <= tk_set;
+                    if (sF)
+                        pv <= c[4];
                 end
             endcase
         end
@@ -665,6 +723,7 @@ module tt_um_fesens_r32v (
     reg [63:0]  r_order;
     reg         r_v, r_tr, r_intr, r_ipend;
     reg [31:0]  r_rs1, r_rs2, r_rd, r_pc, r_npc, r_mrd;
+    reg [31:0]  ri;     // the retiring instruction (a skipped fetch reloads the ir at that edge)
     integer     mi;
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -686,9 +745,11 @@ module tt_um_fesens_r32v (
             if (e_end & nret)
                 r_intr <= r_ipend;
         end
+        if (e_end & nret)
+            ri <= insn;
         if (e_end & sF)
             r_pc <= {pcr[31:2], 2'b00};
-        if (dstb & pwr & ~(sA & c_st) & ~sB)            // every pc write covers nibbles 0..7
+        if (dstb & pwr & ~(sA & c_st) & ~sB & ~sF)      // every pc write covers nibbles 0..7
             r_npc <= {pin4, r_npc[31:4]};
         if (e_end & tk_set)                             // a taken branch on x0: the ring's target
             r_npc <= ring;
@@ -708,38 +769,55 @@ module tt_um_fesens_r32v (
             r_mrd <= {16'd0, io_rdata} >> {off, 3'b000};
     end
 
-    wire [31:0] imm_i = {{20{insn[31]}}, insn[31:20]};
-    wire [31:0] imm_s = {{20{insn[31]}}, insn[31:25], insn[11:7]};
-    wire        r_rs1e = ~trap_dec & (c_alu | c_mem | c_br | c_jalr | (c_csr & ~f3[2]));
-    wire        r_rs2e = ~trap_dec & (c_br | c_st | c_op);
-    wire        r_rde  = ~r_tr & (c_alu | c_u | c_jal | c_jalr | c_ld | c_csr) & (rd_f != 4'd0);
-    wire        r_mem  = ~r_tr & c_mem;
-    wire [31:0] maddr  = r_rs1 + (c_st ? imm_s : imm_i);
-    wire [3:0]  r_mask = (f3[1:0] == 2'b00) ? 4'b0001 : (f3[1:0] == 2'b01) ? 4'b0011 : 4'b1111;
+    // the decode above, of ri
+    wire [2:0]  ri_f3   = ri[14:12];
+    wire        ri_br   = ri[6] & ~ri[4] & ~ri[2];
+    wire        ri_sys  = ri[6] &  ri[4] & ~ri[2];
+    wire        ri_jalr = ri[6] &  ri[2] & ~ri[3];
+    wire        ri_jal  = ri[6] &  ri[2] &  ri[3];
+    wire        ri_mem  = ~ri[6] & ~ri[4] & ~ri[2];
+    wire        ri_st   = ri_mem & ri[5];
+    wire        ri_ld   = ri_mem & ~ri[5];
+    wire        ri_u    = ~ri[6] & ri[4] & ri[2];
+    wire        ri_alu  = ~ri[6] & ri[4] & ~ri[2];
+    wire        ri_op   = ri_alu & ri[5];
+    wire        ri_priv = ri_sys & (ri_f3[1:0] == 2'b00);
+    wire        ri_csr  = ri_sys & (ri_f3[1:0] != 2'b00);
+    wire        ri_trap = ~ri[0] | (ri[6] & ri[4] & ri[2]) | (ri_jal & ri[21]) |
+                         (ri_priv & ~ri[21] & ~ri[22]);
+    wire [31:0] imm_i = {{20{ri[31]}}, ri[31:20]};
+    wire [31:0] imm_s = {{20{ri[31]}}, ri[31:25], ri[11:7]};
+    wire        r_rs1e = ~ri_trap & (ri_alu | ri_mem | ri_br | ri_jalr | (ri_csr & ~ri_f3[2]));
+    wire        r_rs2e = ~ri_trap & (ri_br | ri_st | ri_op);
+    wire        r_rde  = ~r_tr & (ri_alu | ri_u | ri_jal | ri_jalr | ri_ld | ri_csr) & (ri[10:7] != 4'd0);
+    wire        r_mem  = ~r_tr & ri_mem;
+    wire [31:0] maddr  = r_rs1 + (ri_st ? imm_s : imm_i);
+    wire [3:0]  r_mask = (ri_f3[1:0] == 2'b00) ? 4'b0001 : (ri_f3[1:0] == 2'b01) ? 4'b0011 :
+                                                          4'b1111;
     wire [31:0] lmask  = {{8{r_mask[3]}}, {8{r_mask[2]}}, {8{r_mask[1]}}, {8{r_mask[0]}}};
-    wire [31:0] r_rs2v = rs2z ? 32'd0 : r_rs2;          // a branch on x0 runs no B slot
+    wire [31:0] r_rs2v = (ri[23:20] == 4'd0) ? 32'd0 : r_rs2;   // a branch on x0 runs no B slot
 
     assign rvfi_valid     = r_v;
     assign rvfi_order     = r_order;
-    assign rvfi_insn      = insn;
+    assign rvfi_insn      = ri;
     assign rvfi_trap      = r_tr;
     assign rvfi_halt      = 1'b0;
     assign rvfi_intr      = r_intr;
     assign rvfi_mode      = 2'd3;
     assign rvfi_ixl       = 2'd1;
-    assign rvfi_rs1_addr  = r_rs1e ? {1'b0, rs1_f} : 5'd0;
-    assign rvfi_rs2_addr  = r_rs2e ? {1'b0, rs2_f} : 5'd0;
+    assign rvfi_rs1_addr  = r_rs1e ? {1'b0, ri[18:15]} : 5'd0;
+    assign rvfi_rs2_addr  = r_rs2e ? {1'b0, ri[23:20]} : 5'd0;
     assign rvfi_rs1_rdata = r_rs1e ? r_rs1 : 32'd0;
     assign rvfi_rs2_rdata = r_rs2e ? r_rs2v : 32'd0;
-    assign rvfi_rd_addr   = r_rde ? {1'b0, rd_f} : 5'd0;
+    assign rvfi_rd_addr   = r_rde ? {1'b0, ri[10:7]} : 5'd0;
     assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;
     assign rvfi_pc_rdata  = r_pc;
     assign rvfi_pc_wdata  = r_npc;
     assign rvfi_mem_addr  = r_mem ? maddr : 32'd0;
-    assign rvfi_mem_rmask = (r_mem & c_ld) ? r_mask : 4'd0;
-    assign rvfi_mem_wmask = (r_mem & c_st) ? r_mask : 4'd0;
-    assign rvfi_mem_rdata = (r_mem & c_ld) ? (r_mrd & lmask) : 32'd0;
-    assign rvfi_mem_wdata = (r_mem & c_st) ? (r_rs2v & lmask) : 32'd0;
+    assign rvfi_mem_rmask = (r_mem & ri_ld) ? r_mask : 4'd0;
+    assign rvfi_mem_wmask = (r_mem & ri_st) ? r_mask : 4'd0;
+    assign rvfi_mem_rdata = (r_mem & ri_ld) ? (r_mrd & lmask) : 32'd0;
+    assign rvfi_mem_wdata = (r_mem & ri_st) ? (r_rs2v & lmask) : 32'd0;
 `endif
 
 endmodule

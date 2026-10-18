@@ -97,7 +97,7 @@ module r32v_csr (
     always @(posedge clk) begin
         if (!rst_n) begin
             mie  <= 1'b0;
-            mpie <= 1'b0;                               // arbitrary by contract; 0 matches the ISSs
+            mpie <= 1'b0;                               // contract 4: MPIE resets to 0
             meie <= 1'b0;
             tm   <= 1'b0;
         end else begin
