@@ -20,12 +20,13 @@
  * falls (the strobe): a read samples nibble c there, a write loads the nibble for the next
  * rising edge.
  *
- * x11. a1r is a third 8-nibble shift register: it holds x11 (the multiply routine's operand,
- * RV32E having no M), so a slot of x11 (A for rs1, B or BS for rs2, W or W4 for rd) is a fast
- * slot like a masked one: no transaction, 8 strobes in 10 clocks. A read rotates a1r at each
- * strobe and takes its head nibble in place of the bus nibble; a write shifts the emitted nibble
- * in at the top. A fast W of a shift first runs its header rotation (rotn nibbles) in rotn + 1
- * header strobes, one per clock (none when rotn = 0). The core region's x11 word is unused.
+ * x11. a1r holds x11 (the multiply routine's operand, RV32E having no M), nibble k at
+ * a1r[4k+3:4k], so a slot of x11 (A for rs1, B or BS for rs2, W or W4 for rd) is a fast slot
+ * like a masked one: no transaction, 8 strobes in 10 clocks. a1r does not shift: a read takes
+ * nibble c through a nibble mux in place of the bus nibble at strobe c, a write loads the
+ * emitted nibble into nibble c (no flop feeds another). A fast W of a shift first runs its
+ * header rotation (rotn nibbles) in rotn + 1 header strobes, one per clock (none when
+ * rotn = 0). The core region's x11 word is unused.
  *
  * Ring. ring is a 32-bit shift register of 8 nibbles. A read slot shifts its result nibble in at
  * the top at each data strobe; a write slot rotates it (head ring[3:0] to the top) and emits
@@ -249,8 +250,22 @@ module tt_um_fesens_r32v (
     wire active = ~gap & ~mk;
     wire wact   = wr & ~mk;                             // the slot drives data on the bus
     wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   // {SD3, SD2, SD1, SD0}
+    // x11's nibble c (an x11 slot is fast, so its data nibble index n is c[2:0])
+    reg  [3:0] a1n;
+    always @(*) begin
+        case (c[2:0])
+            3'd0:    a1n = a1r[3:0];
+            3'd1:    a1n = a1r[7:4];
+            3'd2:    a1n = a1r[11:8];
+            3'd3:    a1n = a1r[15:12];
+            3'd4:    a1n = a1r[19:16];
+            3'd5:    a1n = a1r[23:20];
+            3'd6:    a1n = a1r[27:24];
+            default: a1n = a1r[31:28];
+        endcase
+    end
     // 0 in a masked slot, x11's nibble in an x11 slot (x11r implies mk); 0 while booting (sl = F)
-    wire [3:0] nib_m = (nib & {4{active}}) | (a1r[3:0] & {4{x11r}});
+    wire [3:0] nib_m = (nib & {4{active}}) | (a1n & {4{x11r}});
 
     // strobes: stb = the clock where SCK is high (it falls at its edge)
     wire       stb   = sck;
@@ -546,10 +561,10 @@ module tt_um_fesens_r32v (
                            (mask ? (~rotn & {3{fh}}) : {~wr, 2'b00})};
     wire [5:0]  c_d     = ~rst_n ? 6'd63 : (gap & ~booting) ? c_go : cn;
     wire        c_h     = rst_n & ~(gap | stb);
-    // x11: an x11 read slot rotates a1r at its data strobes (nib_m takes the head), a write slot
-    // (W, W4: fW) shifts the emitted nibble in at the top
-    wire [31:0] a1r_d   = {(fW ? wdo4 : a1r[3:0]), a1r[31:4]};
-    wire        a1r_h   = ~(dstb & x11r);
+    // x11: an x11 write slot (W, W4: fW) loads the emitted nibble into nibble c at its data
+    // strobe c; every other a1r flop holds
+    wire        a1w     = dstb & x11r & fW;
+    wire [7:0]  a1we    = {8{a1w}} & (8'd1 << c[2:0]);
     genvar gi;
     generate
         for (gi = 0; gi < 32; gi = gi + 1) begin : g_rip
@@ -559,8 +574,8 @@ module tt_um_fesens_r32v (
                                             .Q(ir[gi]));
             sky130_fd_sc_hd__sdfxtp_1 u_pcr (.CLK(clk), .D(pcr_d[gi]), .SCD(pcr[gi]),
                                              .SCE(pcr_h), .Q(pcr[gi]));
-            sky130_fd_sc_hd__sdfxtp_1 u_a1r (.CLK(clk), .D(a1r_d[gi]), .SCD(a1r[gi]),
-                                             .SCE(a1r_h), .Q(a1r[gi]));
+            sky130_fd_sc_hd__sdfxtp_1 u_a1r (.CLK(clk), .D(wdo4[gi % 4]), .SCD(a1r[gi]),
+                                             .SCE(~a1we[gi / 4]), .Q(a1r[gi]));
         end
         for (gi = 0; gi < 6; gi = gi + 1) begin : g_c
             sky130_fd_sc_hd__sdfxtp_1 u_c (.CLK(clk), .D(c_d[gi]), .SCD(c[gi]), .SCE(c_h),
