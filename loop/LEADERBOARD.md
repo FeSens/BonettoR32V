@@ -6,12 +6,16 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 ## Current champion
 
-No champion yet.
+**100** `f657a72aec8c` (setup/v3-swap): 0.0691 CoreMark iterations/s (clock 25 ns), 20,442.1 µm², 2,398 cells, formal skipped, tile fraction -, deep formal -. MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core region, Zicsr traps/interrupts, GPIO/timer/PWMx3/UART/SPI/IRQ peripherals; 1x2 routing settings (hold margins 0.03/0.02, routability...
 
 ## Champion history
 
-No merged entries yet.
+| # | id | date | sha | CoreMark/s | delta % | clock ns | area µm² | cells | delta µm² | formal | tile fraction | deep formal | status | idea |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 100 | 2026-10-18 | `f657a72aec` | 0.0691 | - | 25 | 20,442.1 | 2,398 | - | skipped | - | - | champion | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core region, Zicsr traps/in... |
 
 ## Last 20 hypotheses
 
-No entries yet.
+| id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 100 | 2026-10-18 | setup/v3-swap | merged | 0.0691 | - | 25 | 20,442.1 | - | skipped | - | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core re... | Plan 2026-10-17-mcu-v3 Tasks 1-9. Harden 1x2 @25 ns (hwe-bench, hos... |
