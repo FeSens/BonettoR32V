@@ -1,8 +1,8 @@
 /*
- * BonettoR32V MCU (contract v3, docs/contract.md): a nibble-serial RV32E core with x1..x15,
- * mtvec, mscratch and mepc in the PSRAM core region and the pc on the die, on TT's QSPI Pmod in
- * quad mode (code runs from flash in continuous read, data in PSRAM in QPI mode), with a minimal
- * Zicsr, traps and one interrupt to mtvec, and the contract-5 peripherals.
+ * BonettoR32V MCU (contract v3, docs/contract.md): a nibble-serial RV32E core with x1..x10,
+ * x12..x15, mtvec, mscratch and mepc in the PSRAM core region and x11 and the pc on the die, on
+ * TT's QSPI Pmod in quad mode (code runs from flash in continuous read, data in PSRAM in QPI
+ * mode), with a minimal Zicsr, traps and one interrupt to mtvec, and the contract-5 peripherals.
  *
  * Modules: r32v_mem (reset sequence, the transaction chip, header nibbles, pins), r32v_csr (CSR
  * state and the trap/interrupt flags), r32v_periph (IO slots, the interrupt line). This file:
@@ -14,11 +14,18 @@
  *   write: 8 header edges, 2/4/8 data edges: 22/26/34 clocks
  * The counter c counts SCK edges: it starts at 52 (read) or 56 (write) and wraps to 0 at the
  * first data edge, so c is the data nibble index in the data phase (while booting, c is the low
- * 6 bits of the memory reset sequence's counter instead). A masked slot (x0, or no
+ * 6 bits of the memory reset sequence's counter instead). A masked slot (x0, x11, or no
  * register) keeps CS_n high and SCK low and runs only its 8 data strobes, one per clock: the
  * internal sck stays high through its data phase (10 clocks). Data moves at the clock where SCK
  * falls (the strobe): a read samples nibble c there, a write loads the nibble for the next
  * rising edge.
+ *
+ * x11. a1r is a third 8-nibble shift register: it holds x11 (the multiply routine's operand,
+ * RV32E having no M), so a slot of x11 (A for rs1, B or BS for rs2, W or W4 for rd) is a fast
+ * slot like a masked one: no transaction, 8 strobes in 10 clocks. A read rotates a1r at each
+ * strobe and takes its head nibble in place of the bus nibble; a write shifts the emitted nibble
+ * in at the top. A fast W of a shift first runs its header rotation (rotn nibbles) in rotn + 1
+ * header strobes, one per clock (none when rotn = 0). The core region's x11 word is unused.
  *
  * Ring. ring is a 32-bit shift register of 8 nibbles. A read slot shifts its result nibble in at
  * the top at each data strobe; a write slot rotates it (head ring[3:0] to the top) and emits
@@ -141,6 +148,8 @@ module tt_um_fesens_r32v (
     wire [31:0] ring;   // operand/result ring
     wire [31:0] ir;     // instruction register, in wire nibble order
     wire [31:0] pcr;    // the pc
+    wire [31:0] a1r;    // x11, nibble k at a1r[4k+3:4k]
+    wire        x11r;   // the slot reads or writes x11 (x11, registered at the gap clock)
 
     wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[0], 1'b0};
 
@@ -221,18 +230,27 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Slot control
     // ------------------------------------------------------------------------------------
-    wire csr_sl = sC | sWC;
-    wire mask = (sA & (c_u | (rs1_f == 4'd0) | (c_csr & f3[2]))) |
+    wire csr_sl  = sC | sWC;
+    wire scr     = sWS | sRS;                           // the scratch word 0x80
+    wire regarea = ~scr & ~csr_sl;                      // x1..x15 at 0xC0 + 4r
+    wire [3:0] rsel = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | sW4) ? rd_f :
+                      csr_sl ? {2'b01, csr_idx} : 4'd0;
+    wire za   = c_u | (c_csr & f3[2]);                  // A reads 0 whatever rs1_f holds
+    // x11 lives on the die (a1r): its slots (A for rs1, B and BS for rs2, W and W4 for rd) run
+    // as fast slots, like the masked ones, and take or give the nibbles of a1r
+    wire x11  = (rsel == 4'd11) & ~(sA & za);
+    wire mask = (sA & (za | (rs1_f == 4'd0))) |
                 ((sB | sBS) & rs2z) |
                 ((sW | sW4) & (rd_f == 4'd0)) |
                 (csr_sl & ~csr_region) |
                 (sM & c_st & ~ps) |                     // a store to flash issues nothing
-                sX;
+                sX | x11;
     // every input of mask is constant from a slot's gap to its tail, so the slot uses mk
     wire active = ~gap & ~mk;
     wire wact   = wr & ~mk;                             // the slot drives data on the bus
     wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   // {SD3, SD2, SD1, SD0}
-    wire [3:0] nib_m = nib & {4{active}};               // 0 in a masked slot
+    // 0 in a masked slot, x11's nibble in an x11 slot (x11r implies mk); 0 while booting (sl = F)
+    wire [3:0] nib_m = active ? nib : (a1r[3:0] & {4{x11r}});
 
     // strobes: stb = the clock where SCK is high (it falls at its edge)
     wire       stb   = sck;
@@ -342,6 +360,8 @@ module tt_um_fesens_r32v (
     wire       rnz    = |r;
     wire [2:0] rotn   = sh_left ? (~q + {2'b00, ~rnz}) : q;
     wire [1:0] amt    = sh_left ? (~r + 2'd1) : r;
+    // a fast shift W (rd = x11, or x0) runs rotn + 1 header strobes, one per clock, when rotn > 0
+    wire       fh     = sW & c_sh & (|rotn);
     wire [3:0] qh     = {1'b0, q} + {3'b000, rnz};
     wire       hv     = ~sh_left | ({1'b0, n} >= qh);
     wire       nv     = sh_left ? (n >= q) : (n != 3'd7);
@@ -468,7 +488,9 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     wire ring_in  = dstb & (fR | sF | (sM & c_ld)) & ~shB & ~(sA & c_jalr) & ~sP &
                     ~(sBS & io & n[2] & n[1]);
-    wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] <= rotn);
+    // W of a shift rotates at its last rotn header strobes before c = 63 (8 header edges on the
+    // bus, c = 56..63; a fast W starts at c = 63 - rotn)
+    wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] > ~rotn);
     // F and M rotate the ring and pcr by one nibble at each header nibble load (8 in all, so
     // both end where they started): the header's address nibbles then sit at odd positions
     // (r32v_mem). A read's dummy edges (cn[3] & cn[2]) load no address.
@@ -518,10 +540,16 @@ module tt_um_fesens_r32v (
     wire        cmp_d   = ~sA ? ocmp : c_br ? zc : c_slt ? ocmp : (c_jalr & n0) ? ~sumj[1] : a4[3];
     wire        cmp_h   = ~(dstb & ((sA & (c_br | c_slt | (c_jalr & n0) | c_sh)) | (sB & ~c_sh)));
     // c: also the low 6 bits of the memory reset sequence's counter (r32v_mem): 63 in reset,
-    // then it counts every clock while booting
-    wire [5:0]  c_d     = ~rst_n ? 6'd63 :
-                          (gap & ~booting) ? (mask ? 6'd0 : wr ? 6'd56 : 6'd52) : cn;
+    // then it counts every clock while booting. A slot starts it at 52 (read), 56 (write),
+    // 0 (masked) or 63 - rotn (a fast shift W, fh)
+    wire [5:0]  c_go    = {{2{~mask | fh}}, (mask ? fh : wr),
+                           (mask ? (~rotn & {3{fh}}) : {~wr, 2'b00})};
+    wire [5:0]  c_d     = ~rst_n ? 6'd63 : (gap & ~booting) ? c_go : cn;
     wire        c_h     = rst_n & ~(gap | stb);
+    // x11: an x11 read slot rotates a1r at its data strobes (nib_m takes the head), a write slot
+    // (W, W4: wr) shifts the emitted nibble in at the top
+    wire [31:0] a1r_d   = {(wr ? wdo4 : a1r[3:0]), a1r[31:4]};
+    wire        a1r_h   = ~(dstb & x11r);
     genvar gi;
     generate
         for (gi = 0; gi < 32; gi = gi + 1) begin : g_rip
@@ -531,6 +559,8 @@ module tt_um_fesens_r32v (
                                             .Q(ir[gi]));
             sky130_fd_sc_hd__sdfxtp_1 u_pcr (.CLK(clk), .D(pcr_d[gi]), .SCD(pcr[gi]),
                                              .SCE(pcr_h), .Q(pcr[gi]));
+            sky130_fd_sc_hd__sdfxtp_1 u_a1r (.CLK(clk), .D(a1r_d[gi]), .SCD(a1r[gi]),
+                                             .SCE(a1r_h), .Q(a1r[gi]));
         end
         for (gi = 0; gi < 6; gi = gi + 1) begin : g_c
             sky130_fd_sc_hd__sdfxtp_1 u_c (.CLK(clk), .D(c_d[gi]), .SCD(c[gi]), .SCE(c_h),
@@ -540,6 +570,7 @@ module tt_um_fesens_r32v (
     sky130_fd_sc_hd__sdfxtp_1 u_cy (.CLK(clk), .D(cy_d), .SCD(cy), .SCE(cy_h), .Q(cy));
     sky130_fd_sc_hd__sdfxtp_1 u_cmp (.CLK(clk), .D(cmp_d), .SCD(cmp), .SCE(cmp_h), .Q(cmp));
     sky130_fd_sc_hd__sdfxtp_1 u_mk (.CLK(clk), .D(mask), .SCD(mk), .SCE(~gap), .Q(mk));
+    sky130_fd_sc_hd__sdfxtp_1 u_x11 (.CLK(clk), .D(x11), .SCD(x11r), .SCE(~gap), .Q(x11r));
 
     // ------------------------------------------------------------------------------------
     // Control (reset)
@@ -556,7 +587,7 @@ module tt_um_fesens_r32v (
             // clock; SCK stays low on the pin)
             sck <= gap ? (~booting & mask) : ((ep[0] ^ ep[1]) & (~sck | mk) & ~dend);
             case (ep)
-                E_GAP:  if (~booting) ep <= mask ? E_DATA : E_HDR;
+                E_GAP:  if (~booting) ep <= (mask & ~fh) ? E_DATA : E_HDR;
                 E_HDR:  if (stb & (c == 6'd63)) ep <= E_DATA;
                 E_DATA: if (dend) ep <= E_TAIL;
                 default: begin
@@ -571,14 +602,10 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Submodules
     // ------------------------------------------------------------------------------------
-    wire       scr     = sWS | sRS;                     // the scratch word 0x80
-    wire       regarea = ~scr & ~csr_sl;                // x1..x15 at 0xC0 + 4r
     // the address register's odd nibbles (r32v_mem): the ring for a load's M and after a taken
     // branch on x0 (tk), else pcr
     wire [15:0] pa_odd = (sM ? c_ld : tk) ? {ring[31:28], ring[23:20], ring[15:12], ring[7:4]} :
                                             {pcr[31:28], pcr[23:20], pcr[15:12], pcr[7:4]};
-    wire [3:0] rsel    = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | sW4) ? rd_f :
-                         csr_sl ? {2'b01, csr_idx} : 4'd0;
 
     r32v_mem u_mem (
         .clk(clk), .rst_n(rst_n),
