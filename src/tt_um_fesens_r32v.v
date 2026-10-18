@@ -283,14 +283,16 @@ module tt_um_fesens_r32v (
     wire       bimm_a = ~(c_op | c_sh | (c_br & ~rs2z));
     // the pc operand: pcr, or the ring in a fetch after a taken branch on x0 (tk)
     wire       a_pc   = (sF & ~tk) | (sA & (c_pcrel | nb)) | sX | (sW4 & c_jal);
-    wire [3:0] a4     = a_pc ? pk4 : (sB | sW4 | (sF & tk)) ? ring[3:0] : nib_m;
+    wire       rsb    = sRS & f3[1];                   // CSRRS, CSRRC: ring op scratch
+    wire [3:0] a4     = a_pc ? pk4 : (sB | sW4 | (sF & tk) | rsb) ? ring[3:0] : nib_m;
     wire [3:0] b4     = sA ? (imm4 & {4{bimm_a}}) :
-                        sB ? nib_m :
+                        (sB | rsb) ? nib_m :
                         sF ? four :
                         sX ? ((c_br & taken) ? imm4 : four) :
                         (sW4 & c_jal) ? imm4 : 4'd0;
     // A: SLTI/SLTIU compare rs1 with imm; B: SUB, SLT, SLTU and branches subtract
-    wire       sub    = sA ? c_slt : (sB & (c_br | (~f3[2] & (f3[1] | insn[30]))));
+    wire       sub    = sA ? c_slt : ((sB & (c_br | (~f3[2] & (f3[1] | insn[30])))) |
+                                       (rsb & f3[0]));
     wire [3:0] b_x    = b4 ^ {4{sub}};
     wire       cin    = n0 ? sub : cy;
     wire [4:0] add    = {1'b0, a4} + {1'b0, b_x} + {4'd0, cin};
@@ -307,15 +309,16 @@ module tt_um_fesens_r32v (
     // A of a branch compares rs1 with 0 beside the ALU: equal (all nibbles 0), signed less
     // (rs1[31], the last nibble's), unsigned less (never); B recomputes it when rs2 != x0
     wire       zc     = f3[2] ? (~f3[1] & nib_m[3]) : (~(|nib_m) & (cmp | n0));
-    // logic ops: XORI, ORI, ANDI in A; XOR, OR, AND in B (a B result with f3 = 001..011 is unused)
-    wire       useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & f3[2]);
+    // logic ops: XORI, ORI, ANDI in A; XOR, OR, AND in B (a B result with f3 = 001..011 is
+    // unused); CSRRS, CSRRC in RS
+    wire       useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & f3[2]) | rsb;
     wire [3:0] alu_w  = useb ? boolr : sumj;
 
-    // C: a core-region CSR word (bits 1:0 of mtvec and mepc read 0) or the die bits;
-    // RS: CSRRW takes the scratch word (rs1 or zimm), CSRRS ors it in, CSRRC clears its bits
-    wire [3:0] c4     = csr_region ? (nib_m & {2'b11, {2{~mask_lo2}}}) : rd_die;
-    wire [3:0] rs4    = f3[1] ? (f3[0] ? (ring[3:0] & ~nib_m) : (ring[3:0] | nib_m)) : nib_m;
-    wire [3:0] din4   = sC ? c4 : sRS ? rs4 : alu_w;
+    // C: a core-region CSR word (bits 1:0 of mtvec and mepc read 0) or the die bits.
+    // RS goes through the ALU: CSRRW adds 0 to the scratch word (rs1 or zimm), CSRRS and CSRRC
+    // take ring | scratch and ring & ~scratch from its logic ops.
+    wire [3:0] c4    = csr_region ? (nib_m & {2'b11, {2{~mask_lo2}}}) : rd_die;
+    wire [3:0] din4   = sC ? c4 : alu_w;
 
     // ------------------------------------------------------------------------------------
     // Write family emission, nibble n at the data strobe (before the ring rotates)
@@ -490,9 +493,10 @@ module tt_um_fesens_r32v (
     // enable flop synthesis picks) that holds through its scan input: D = the next value,
     // SCD = Q, SCE = hold (contract section 1, CLAUDE.md).
     // ------------------------------------------------------------------------------------
-    // ring: an IO load's capture (low half), else a shift in or a rotation
+    // ring: an IO load's capture (low half), else a shift in or a rotation (never both at once:
+    // the top nibble takes din4 unless rotating)
     wire        ring_sh = ring_in | ring_rot;
-    wire [31:0] ring_d  = {(ring_in ? din4 : ring[3:0]), ring[31:20],
+    wire [31:0] ring_d  = {(ring_rot ? ring[3:0] : din4), ring[31:20],
                            (io_re ? {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]} : ring[19:4])};
     wire [31:0] ring_h  = {{16{io_re | ~ring_sh}}, {16{~(io_re | ring_sh)}}};
     wire [31:0] ir_d    = {ir[27:0], nib_m};
