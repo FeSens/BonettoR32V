@@ -10,9 +10,11 @@
  *     w4-w5    flash: 0xEB, 6 quad address edges, M = 0x20, then CS_n high inside the dummy
  *              field: the flash is in continuous read from here on;
  *     w6       PSRAM: 0x35 in SPI form (QPI mode from here on).
- * - Program address: the core supplies `pa` (bit 24 the chip, 1 = PSRAM): the pc for a fetch,
- *   the load or store address for M. `fz` (the first fetch) zeroes the address and picks the
- *   flash. `ps` holds the chip of the slot's transaction, steady while the pc rotates or the
+ * - Program address: the core supplies the address register's odd nibbles `pa_odd` and bit 24
+ *   `pa24` (the chip, 1 = PSRAM): the pc for a fetch, the load or store address for M. The
+ *   register rotates by one nibble per header nibble, so each address nibble is at an odd
+ *   position when its turn comes. `ps` holds the chip of the slot's transaction, steady while the
+ *   pc rotates or the
  *   ring takes data: a fetch loads it at its gap; A's data strobes load a load/store address's
  *   bit 24 (and bit 31 into `io`).
  * - Transactions: the core loads `sdo` with a header nibble (hdr_ld, index hidx) or a data
@@ -39,13 +41,13 @@ module r32v_mem (
     output wire        io,
     output wire        ps,
     output wire        booting,
+    input  wire [5:0]  bc,         // reset sequence counter bits 5:0 (the core's c)
     // transaction (from the core's engine)
     input  wire        active,     // a CS_n is low (an unmasked slot past its gap)
     input  wire        prog,       // program transaction (F, M): address from pa_odd
     input  wire        fetch,      // the slot is F
     input  wire        pa24,       // address bit 24 (a fetch's chip)
     input  wire [15:0] pa_odd,     // address register nibbles 7, 5, 3, 1 (rotating in the header)
-    input  wire        fz,         // the first fetch: address 0 in flash
     input  wire        sck,
     input  wire        gap,        // the cycle between transactions
     input  wire        hdr_ld,     // load header nibble hidx into sdo
@@ -63,7 +65,7 @@ module r32v_mem (
     // Address flags
     // ------------------------------------------------------------------------------------
     wire _unused_din = &{din4[2:1], 1'b0};
-    wire fchip = pa24 & ~fz;                            // a fetch's chip (pc bit 24)
+    wire fchip = pa24;                                  // a fetch's chip (pc bit 24)
     // scan flops holding through SCD (D = the next value, SCD = Q, SCE = hold)
     wire ps_ld = gap & fetch;
     sky130_fd_sc_hd__sdfxtp_1 u_ps (.CLK(clk), .D(ps_ld ? fchip : din4[0]), .SCD(ps),
@@ -75,7 +77,6 @@ module r32v_mem (
     // Header nibbles
     // ------------------------------------------------------------------------------------
     wire        flash = prog & ~((gap & fetch) ? fchip : ps);   // the gap loads header nibble 0
-    wire        az    = fz & ~(hidx[2] & hidx[1]);      // the first fetch's address nibbles: 0
     // The address register rotates by one nibble at each header nibble load (the core's
     // rot_hdr), so address nibble k sits at position k - hidx: flash header nibble hidx = 0..5
     // (A nibble 5 - hidx) is at 5 - 2 hidx, PSRAM nibble hidx = 2..7 (A nibble 7 - hidx) at
@@ -105,7 +106,7 @@ module r32v_mem (
 
     wire [3:0] sdo;
     reg        sdoe;
-    wire [3:0] sdo_d = hdr_ld ? (hn & {4{~az}}) : dat_ld ? wd4 : 4'h0;
+    wire [3:0] sdo_d = hdr_ld ? hn : dat_ld ? wd4 : 4'h0;
     wire       sdo_h = ~(hdr_ld | dat_ld | gap);
     genvar gi;
     generate
@@ -124,8 +125,11 @@ module r32v_mem (
     // ------------------------------------------------------------------------------------
     // Reset sequence: window w = b[7:5], position p = b[4:0]; w4-w5 is one 64-cycle window
     // ------------------------------------------------------------------------------------
-    reg  [7:0] b;
+    // b[5:0] is the core's edge counter c, which counts every clock while booting (reset to 63);
+    // bh, b[7:6], steps when it wraps
+    reg  [1:0] bh;
     reg        done;
+    wire [7:0] b    = {bh, bc};
     wire [2:0] w    = b[7:5];
     wire [4:0] p    = b[4:0];
     wire       fe   = (w[2:1] == 2'b10);                 // w4, w5: flash enter, position b[5:0]
@@ -158,10 +162,11 @@ module r32v_mem (
     end
     always @(posedge clk) begin
         if (!rst_n) begin
-            b    <= 8'hFF;                              // idle (w7) during reset
+            bh   <= 2'b11;                              // b = 255: idle (w7) during reset
             done <= 1'b0;
         end else if (!done) begin
-            b    <= b + 8'd1;
+            if (&bc)
+                bh <= bh + 2'd1;
             done <= (b == 8'd211);                      // 0x35 ended at 209
         end
     end

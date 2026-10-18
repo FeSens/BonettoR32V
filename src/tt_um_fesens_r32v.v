@@ -30,8 +30,8 @@
  * pc. pcr is a second 8-nibble shift register: it holds the pc with nibble k at pcr[4k+3:4k],
  * so the fetch header reads its address nibbles (and bit 24, the chip) straight from it. A slot
  * that updates the pc shifts the new nibble in at the top at each of its 8 data strobes and
- * reads the old one at the head (pk4). Until the first retirement every read of it gives 0
- * (`first`); the first instruction writes all of it. pcr is also the address register: a load's
+ * reads the old one at the head (pk4). The memory reset sequence (`booting`) shifts zeros into
+ * it, so the first fetch is at 0 in flash. pcr is also the address register: a load's
  * M header takes the address from the ring (A leaves it there); a store spills pc + 4 to the
  * core region's x0 word (WP), leaves its address in pcr for M and the IO slot, and reloads the pc
  * (P); a register shift does the same around B, which leaves rs2[4:0] (the amount) in pcr. An
@@ -130,7 +130,6 @@ module tt_um_fesens_r32v (
     reg  [1:0]  ep;
     wire [5:0]  c;      // SCK edge counter: 52/56..63 header, 0..7 data
     reg         sck;
-    reg         first;  // until the first retirement: the pc reads 0
     reg         tk;     // a taken branch on x0 retired: the pc is in the ring, not in pcr
     wire        cy;     // ALU carry; sign latch of a load's W
     wire        cmp;    // compare; JALR target[1] == 0; a shift's sign bit
@@ -270,7 +269,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     wire       taken  = cmp ^ f3[0];
     wire [3:0] four   = {1'b0, n0, 2'b00};
-    wire [3:0] pk4    = pcr[3:0] & {4{~first}};         // pc nibble n (0 before the 1st retirement)
+    wire [3:0] pk4    = pcr[3:0];                       // pc nibble n
     wire       bimm_a = ~(c_op | c_sh | (c_br & ~rs2z));
     // the pc operand: pcr, or the ring in a fetch after a taken branch on x0 (tk)
     wire       a_pc   = (sF & ~tk) | (sA & (c_pcrel | nb)) | sX | (sW4 & c_jal);
@@ -469,10 +468,11 @@ module tt_um_fesens_r32v (
     wire       prot = sF | (sWC & tm);
     wire       pwr  = (sA & (~c_br | nbw)) | (sB & c_sh) | sP | sX | (sW4 & c_jal) |
                       (sC & (tm | p_mret)) | (sW & liw);
-    wire       pwe  = (dstb & (pwr | prot)) | rot_hdr;
-    wire [3:0] pin4 = (rot_hdr | (prot & ~(sF & tk)) | (sA & jtrap)) ? pcr[3:0] :
+    // The memory reset sequence shifts zeros in (nib_m is 0 at the gap).
+    wire       pwe  = (dstb & (pwr | prot)) | rot_hdr | booting;
+    wire [3:0] pin4 = ((rot_hdr | (prot & ~(sF & tk)) | (sA & jtrap)) & ~booting) ? pcr[3:0] :
                       ((sA & ~c_st & ~c_jalr) | (sF & tk) | sW) ? ring[3:0] :
-                      (sB | sP) ? nib_m : din4;
+                      (sB | sP | booting) ? nib_m : din4;
 
     // ------------------------------------------------------------------------------------
     // Enable flops (no reset): the ring, the instruction register, the pc, the datapath flags
@@ -496,8 +496,11 @@ module tt_um_fesens_r32v (
     // nibble); B of SLT and branches (ocmp)
     wire        cmp_d   = ~sA ? ocmp : c_br ? zc : c_slt ? ocmp : (c_jalr & n0) ? ~sumj[1] : a4[3];
     wire        cmp_h   = ~(dstb & ((sA & (c_br | c_slt | (c_jalr & n0) | c_sh)) | (sB & ~c_sh)));
-    wire [5:0]  c_d     = gap ? (mask ? 6'd0 : wr ? 6'd56 : 6'd52) : cn;
-    wire        c_h     = ~(gap | stb);
+    // c: also the low 6 bits of the memory reset sequence's counter (r32v_mem): 63 in reset,
+    // then it counts every clock while booting
+    wire [5:0]  c_d     = ~rst_n ? 6'd63 :
+                          (gap & ~booting) ? (mask ? 6'd0 : wr ? 6'd56 : 6'd52) : cn;
+    wire        c_h     = rst_n & ~(gap | stb);
     genvar gi;
     generate
         for (gi = 0; gi < 32; gi = gi + 1) begin : g_rip
@@ -526,7 +529,6 @@ module tt_um_fesens_r32v (
             sl    <= SL_F;
             ep    <= E_GAP;
             sck   <= 1'b0;
-            first <= 1'b1;
             tk    <= 1'b0;
         end else begin
             // toggles in HDR and DATA; a masked slot holds it high through DATA (a strobe per
@@ -540,8 +542,6 @@ module tt_um_fesens_r32v (
                     sl <= nret ? (take ? SL_WC : SL_F) : nsl;
                     ep <= E_GAP;
                     tk <= tk_set;
-                    if (nret)
-                        first <= 1'b0;
                 end
             endcase
         end
@@ -562,11 +562,10 @@ module tt_um_fesens_r32v (
     r32v_mem u_mem (
         .clk(clk), .rst_n(rst_n),
         .cap_a(dstb & sA), .kn(n), .din4(din4),
-        .io(io), .ps(ps), .booting(booting),
+        .io(io), .ps(ps), .booting(booting), .bc(c),
         .active(active), .prog(fM), .fetch(sF),
         .pa24(tk ? ring[24] : pcr[24]),
         .pa_odd(pa_odd),
-        .fz(sF & first),
         .sck(sck), .gap(gap),
         .hdr_ld(hdr_ld),
         .hidx(gap ? 3'd0 : (cn[2:0] ^ {~wr, 2'b00})),
@@ -622,7 +621,7 @@ module tt_um_fesens_r32v (
                 r_intr <= r_ipend;
         end
         if (e_end & sF)
-            r_pc <= {pcr[31:2], 2'b00} & {32{~first}};
+            r_pc <= {pcr[31:2], 2'b00};
         if (dstb & pwr & ~(sA & c_st) & ~sB)            // every pc write covers nibbles 0..7
             r_npc <= {pin4, r_npc[31:4]};
         if (e_end & tk_set)                             // a taken branch on x0: the ring's target
