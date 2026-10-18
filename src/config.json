@@ -16,8 +16,8 @@
   "PL_TARGET_DENSITY_PCT": 60,
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
-  "//": "The value is in nanoseconds, so 20ns == 50MHz. BonettoR32V: 25 ns, the 40 MHz signoff (contract section 7).",
-  "CLOCK_PERIOD": 25,
+  "//": "The value is in nanoseconds, so 20ns == 50MHz. BonettoR32V: 20 ns, the 50 MHz IO ceiling (contract section 7; the lead moved it from 40 MHz in the performance phase, hypothesis 102).",
+  "CLOCK_PERIOD": 20,
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "//": "BonettoR32V (lead, 2026-10-18 sweep on the v3 seed in 1x2): 0.1/0.05 added ~320 hold buffers",
