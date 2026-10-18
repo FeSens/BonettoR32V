@@ -368,6 +368,92 @@ lowers placement utilization in a 1x1, and may a TT project set it?
   `librelane --dockerized`. There's been no crash since.
 - **If Docker is down**, `area.py --engine yosys` still works, with the caveat above.
 
+## LibreLane on hwe-bench (no Docker)
+
+hwe-bench (x86_64, 20 cores, 62 GB) has no container engine, but it has bubblewrap and
+unprivileged user namespaces. Two shims make `harden_tt.sh`, `area.py` and `tilefit.py` run
+there unchanged, so several hardens can run in parallel off the Mac.
+
+- **`tools/hwe_docker_shim.py`** is installed as `docker` in `~/bonetto-venv/bin`, first on
+  `tools/hwe_run.sh`'s PATH. It implements only what our tools use: `docker run` with `--rm`,
+  `-i`, `--user`, `-v SRC:DST[:ro]`, `-e`, `-w` and `--label`; `docker ps -q --filter label=...`
+  and `docker kill` (the `--timeout` cleanup); `docker info` (`test_physical.py`'s probe); and
+  `docker pull`. Any other option exits 125.
+  - Image: only digest pins run. `pull` takes the linux/amd64 manifest of the same multi-arch
+    digest the Mac runs as arm64 (`sha256:f91b21d7...` is an index; amd64 manifest
+    `sha256:23fc800d...`). It verifies every digest and diff_id, then unpacks the layers
+    (whiteouts handled, no entry through a symlink) into
+    `~/bonetto-librelane/images/sha256-<digest>/rootfs` (5.6 GB).
+  - Container: an overlay root (image read-only, writes in a per-container directory deleted
+    on exit), new user, pid, ipc and uts namespaces, host network, the image's Env plus the
+    `-e` values and nothing from the host. `--user` maps that uid onto the caller.
+    `--die-with-parent` means a killed `docker run` can't leave a container behind.
+  - Same tools as the Mac's image: yosys 0.62, OpenROAD dcf36133, magic 8.3.623, klayout
+    0.30.7, netgen 1.5.316, ciel 2.4.0.
+- **`tools/hwe_lockf_shim.py`** is installed as `lockf`: Linux has no `lockf(1)`. It's the same
+  BSD syntax (`-k`, `-n`, `-s`, `-t`), and every file is a plain exclusive flock except the heavy
+  lock `/tmp/bonetto-heavy.lock`, which on hwe-bench is a counting semaphore:
+  - `BONETTO_HWE_HEAVY_SLOTS` holders at once (default 3);
+  - each one is admitted only while `MemAvailable` is at least `BONETTO_HWE_MIN_FREE_GB`
+    (default 8): formal jobs there use about 40 GB.
+
+  So hardens and tilefit runs queue on memory and slots, not one at a time.
+- **libcairo.** `tt_tool.py` imports cairosvg, which dlopens libcairo, and hwe-bench has none.
+  The setup script unpacks Ubuntu's `libcairo2` and `libpixman-1-0` (from `apt-get download`,
+  so apt checks their hashes) into `~/bonetto-librelane/lib`. On Linux, `harden_tt.sh` puts that
+  directory on `LD_LIBRARY_PATH` when it exists. That's an `elif` after the Darwin branch, so
+  the Mac path is unchanged. It's the one harden_tt.sh change, and it can't be avoided: the tt
+  venvs are created per checkout by `harden_tt.sh` itself, and `hwe_run.sh` passes no
+  environment.
+- **PDK.** `~/.ciel` on hwe-bench, as on the Mac. The setup script replaced a partial copy of
+  the flow PDK there (13 files for the yosys fallback, each byte-identical to ciel's; the old
+  copy is in `~/bonetto-librelane/ciel-partial-<hash>`) with a full ciel fetch. Both PDK versions
+  are file-for-file identical to the Mac's. The one exception comes from macOS's case-
+  insensitive disk: `sky130_fd_io__sio_clamp_Pcap_4x5.mag` and `..._pcap_4x5.mag` are two
+  files on Linux and one on the Mac. It's an I/O-cell layout we never use.
+
+**Setup (idempotent):**
+
+```
+tools/hwe_run.sh --tag hwe-setup -- tools/hwe_harden_setup.sh
+```
+
+It installs the shims, pulls and unpacks the image, adds libcairo, fetches both PDKs, runs
+`harden_tt.sh --setup-only` and smoke-tests the tools. After the image download it takes about
+30 s.
+
+**Use.** Run the same commands through `hwe_run.sh`, giving each concurrent job its own `--tag`
+(its own mirror and `build/`) or at least its own `--out`. `harden_tt.sh` wipes `--out`, and
+the shared heavy lock no longer keeps two runs apart.
+
+```
+tools/hwe_run.sh --tag h012 --pull build/harden/summary.json -- tools/harden_tt.sh --tiles 1x2
+tools/hwe_run.sh --tag h012 --pull build/tilefit.json -- python3 physical/tilefit.py --tiles 1x2
+```
+
+- A project outside the checkout (`--project`, `--overlay`) has to be copied over first, with
+  an absolute path on hwe-bench. `hwe_run.sh` doesn't expand `~`.
+- Each mirror creates its own `build/tt-env` on its first harden, in a few seconds from uv's
+  cache.
+- `make area` runs there too, through the same shim and image.
+
+**Same numbers as the Mac, so far.** The amd64 image on hwe-bench gave the Mac's results
+exactly, even though detailed routing ran with 20 threads there against 10 in the Mac's Docker
+VM:
+
+- `make area` on the same sources: identical `area.json` (38,939.8464 um2, 3,748 cells, every
+  breakdown) and a byte-identical `build/synth/netlist.v`. Only `runtime_s` differs.
+- hyp/005's 1x1 harden: identical `summary.json` (pass, every check, slacks, utilization, repair
+  and wirelength). The final DEF, netlists and LEF are byte-identical, and so is the final GDS
+  once its 77 timestamp records are zeroed; the SPEFs differ only in their `*DATE` line.
+  LibreLane plus precheck took 135 + 25 s on hwe-bench (shared with a formal job and another
+  harden) against 98 + 23 s on the Mac.
+- The seed's 1x2 at a 25 ns clock: every intermediate netlist and DEF up to global routing is
+  byte-identical, and detailed routing reports the same violation count after every iteration.
+
+Still compare a candidate against a baseline hardened the same way. A future image or OpenROAD
+build could break this agreement, and the shim pins nothing beyond the image digest.
+
 ## Tests
 
 ```
