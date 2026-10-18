@@ -60,6 +60,23 @@ The same model gives the champion's CPI (762). New CPI about 207: about 157 M cy
 iteration, about 0.25 iterations/s (3.7x). Worst retirement gap about 500 (interrupt entry plus a
 CSR instruction); first retirement about 450.
 
+## Legality at both clocks (25 ns and 20 ns, the Pmod models run at CLOCK_PERIOD)
+
+| rule | 25 ns | 20 ns | slots here |
+|---|---|---|---|
+| SCK = clk/2 vs max rate | 20 MHz | 25 MHz | limits: flash 0xEB 133, PSRAM QPI 0x0B 66, 0x38 84, SPI 0x35/0x66/0x99 and QPI 0xF5 84 MHz: all met |
+| wait/dummy edges | fixed edge counts (flash 0xEB: M 2 + dummy 4; PSRAM QPI 0x0B: 4) | same | independent of the clock |
+| tCEM (PSRAM CS_n low) | 320 cycles | 400 cycles | longest PSRAM slot 42 cycles |
+| tRST after 0x99 | 2 cycles | 3 cycles | boot leaves at least 12 cycles before 0x35 |
+| tCPH | 1 cycle | 1 cycle | every CS_n stays high at least 1 cycle |
+| latency cap | 2,048 cycles | 2,048 cycles | projected worst gap about 500 |
+
+Setup timing at 20 ns (budget: no more than about 5 ns added to the champion's 14 ns path):
+projected +2 to +3 ns on the uio_in -> ALU -> ring/MAR path (4-bit ripple carry, about 4 x 0.4
+ns, plus one nibble-mux level for the immediate). If that is too much, the sampled nibble goes
+into a 4-bit register at the strobe and the ALU runs in the following SCK-low cycle, from a flop
+(+4 flops, no extra slot cycles).
+
 Area: projected +1,100 to +1,600 um2 (ring enables +320; 4-bit ALU, immediate, emission and
 funnel about +800; header nibble mux and boot +250; csr +50; `ph` removed -120): 21,550 to
 22,050 um2 against the 22,000 um2 pre-filter. Fallbacks if it lands over: a 9-nibble free-running
