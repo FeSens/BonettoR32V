@@ -511,10 +511,10 @@ each) run only with `BONETTO_FORMAL_SLOW=1`.
 
 Results, all on hwe-bench (shared with other runs at the time). Every FAIL mutant on the seed's
 timing was re-run at 7b2aba3, the final checks (3 jobs), and so were the three hyp/002 region
-mutants (2 jobs, times are proof seconds); the liveness mutants ran at 5d23efc (2 jobs); the
-legal rows say where they ran. Which assertions fail first can differ
-between runs of the same mutant; the table gives the 7b2aba3 run and notes an earlier run's extra
-ones.
+mutants (2 jobs, times are proof seconds); the six seed-based legal variants passed at 7b2aba3
+too (3 jobs); the liveness mutants ran at 5d23efc (2 jobs); the hyp/002 legal rows say where
+they ran. Which assertions fail first can differ between runs of the same mutant; the table gives
+the 7b2aba3 run and notes an earlier run's extra ones.
 
 | mutant | RTL | bug | checks | result: failed assertions |
 |---|---|---|---|---|
@@ -568,9 +568,11 @@ On the seed's timing, every fast-config FAIL above came within 227 s of proof ti
 (the slowest: `load_half_swap`'s `bus_dmem`, 226.5 s, with the V2 and fc07cc3 runs sharing the
 host). The liveness counterexamples (deep, depth 1,487) are slower: 221 to 2,530 s on hwe-bench
 at 5d23efc, against 208 s for `stall_first_1025` on the Mac in an earlier run (see "Engines
-tried" on why a single-call liveness counterexample can take longer than a proof). A legal variant's whole fast run took
-215 to 253 s with 10 jobs. The hyp/002 region mutants FAILed within 943 s of proof time at 7b2aba3 (hwe-bench, 2 jobs, host
-shared), against 317 s on the Mac (2 jobs) in an earlier run.
+tried" on why a single-call liveness counterexample can take longer than a proof). A legal
+variant's whole fast run took 1,329 to 1,529 s at 7b2aba3 with 3 jobs (the V2 and fc07cc3 runs
+sharing the host; longest task 221 to 390 s), and 215 to 253 s with 10 jobs in an earlier run.
+The hyp/002 region mutants FAILed within 943 s of proof time at 7b2aba3 (2 jobs, host shared),
+against 317 s on the Mac (2 jobs) in an earlier run.
 
 ## Fail fast, scheduling, remote runs
 
