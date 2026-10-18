@@ -10,10 +10,10 @@
  *     w4-w5    flash: 0xEB, 6 quad address edges, M = 0x20, then CS_n high inside the dummy
  *              field: the flash is in continuous read from here on;
  *     w6       PSRAM: 0x35 in SPI form (QPI mode from here on).
- * - Address register `mar`: the low 24 bits of a load or store address (A), shifted in a nibble
- *   at a time, LSB nibble first; bit 24 goes to `ps` (1 = PSRAM, 0 = flash) and bit 31 to `io`.
- *   B (register shifts) leaves rs2[4:0] in mar[4:0]. A fetch takes its address and chip from
- *   the core's pc (`pca`, bit 24 the chip) instead.
+ * - Program address: the core supplies `pa` (bit 24 the chip, 1 = PSRAM): the pc for a fetch,
+ *   the load or store address for M. `fz` (the first fetch) zeroes the address and picks the
+ *   flash. A's data strobes capture a load/store address's bit 24 into `ps` (M's chip, steady
+ *   while the ring takes the data) and bit 31 into `io`.
  * - Transactions: the core loads `sdo` with a header nibble (hdr_ld, index hidx) or a data
  *   nibble (dat_ld) at the clocks where SCK stays or goes low. Headers:
  *     flash (program access with ps = 0, continuous read): A[23:20] .. A[3:0], 0x2, 0x0 (M);
@@ -31,21 +31,18 @@
 module r32v_mem (
     input  wire        clk,
     input  wire        rst_n,
-    // address capture (from the core's data strobes)
-    input  wire        cap,        // a P, A or B data strobe
-    input  wire        cap_a,      // ... of the A slot (io is captured only there)
+    // address flags (from the A slot's data strobes)
+    input  wire        cap_a,      // an A data strobe
     input  wire [2:0]  kn,         // its nibble index
     input  wire [3:0]  din4,       // its result nibble
-    output wire [4:0]  shamt,      // rs2[4:0] after B
-    output wire [6:0]  mar_lo,     // IO slot and byte offset
     output reg         io,
     output reg         ps,
     output wire        booting,
     // transaction (from the core's engine)
     input  wire        active,     // a CS_n is low (an unmasked slot past its gap)
-    input  wire        prog,       // program transaction (F, M): chip by ps
-    input  wire        fetch,      // ... F: address and chip from pca
-    input  wire [24:0] pca,        // the pc, bits 24:0
+    input  wire        prog,       // program transaction (F, M): address and chip from pa
+    input  wire [24:0] pa,
+    input  wire        fz,         // the first fetch: address 0 in flash
     input  wire        sck,
     input  wire        gap,        // the cycle between transactions
     input  wire        hdr_ld,     // load header nibble hidx into sdo
@@ -60,25 +57,21 @@ module r32v_mem (
 );
 
     // ------------------------------------------------------------------------------------
-    // Address register
+    // Address flags
     // ------------------------------------------------------------------------------------
-    reg [23:0] mar;
+    wire _unused_din = &{din4[2:1], 1'b0};
     always @(posedge clk) begin
-        if (cap & ~(kn[2] & kn[1]))                     // nibbles 0..5
-            mar <= {din4, mar[23:4]};
-        if (cap & (kn == 3'd6))
+        if (cap_a & (kn == 3'd6))
             ps <= din4[0];
         if (cap_a & (kn == 3'd7))
             io <= din4[3];
     end
-    assign mar_lo = mar[6:0];
-    assign shamt  = mar[4:0];
 
     // ------------------------------------------------------------------------------------
     // Header nibbles
     // ------------------------------------------------------------------------------------
-    wire [24:0] pa    = fetch ? pca : {ps, mar};          // the program address
-    wire        flash = prog & ~pa[24];
+    wire        flash = prog & ~(pa[24] & ~fz);
+    wire        az    = fz & ~(hidx[2] & hidx[1]);      // the first fetch's address nibbles: 0
     reg  [3:0] hn;
     always @(*) begin
         case ({flash, hidx})
@@ -105,7 +98,7 @@ module r32v_mem (
     reg       sdoe;
     always @(posedge clk) begin
         if (hdr_ld)
-            sdo <= hn;
+            sdo <= hn & {4{~az}};
         else if (dat_ld)
             sdo <= wd4;
         else if (gap)
