@@ -12,11 +12,12 @@
  * when off = 0 and the access is wider than a byte. Lanes 2 and 3 hold no bits. Misaligned IO
  * accesses are unspecified (contract 5).
  *
- * Inputs pass through a 2-flop synchronizer (s2 is the synchronized value, s3 the previous one
- * for edge detection): an input change reaches the logic 2 cycles later.
+ * Inputs pass through a one-flop synchronizer (s2 is the synchronized value, s3 the previous one
+ * for edge detection): an input change reaches the logic 1 cycle later, within contract 5's
+ * 3 cycles. At 50 MHz the flop has most of a 20 ns cycle to resolve before anything samples it.
  *
  * Resets: every register a load can read takes its contract reset value. Flops whose reset value
- * nothing can observe have none: the first synchronizer stage, the prescalers and bit timers,
+ * nothing can observe have none: the prescalers and bit timers,
  * the shift registers, and the toggle flop (the TIMER_CTRL write that selects toggle mode
  * clears it). Read/write registers and the timer counter are plain enable flops: the reset is
  * folded into the shared write data (0 while rst_n is low) and into each write enable.
@@ -72,14 +73,13 @@ module r32v_periph (
     // ------------------------------------------------------------------------------------
     // Input synchronizers
     // ------------------------------------------------------------------------------------
-    reg [7:0] s1, s2, s3;
+    reg [7:0] s2, s3;
     always @(posedge clk) begin
-        s1 <= ui_in;
         if (!rst_n) begin
             s2 <= 8'd0;
             s3 <= 8'd0;
         end else begin
-            s2 <= s1;
+            s2 <= ui_in;
             s3 <= s2;
         end
     end
@@ -269,15 +269,17 @@ module r32v_periph (
 
     // ------------------------------------------------------------------------------------
     // SPI master, mode 0, MSB first: 2^D cycles low, 2^D high per bit. MOSI shifts out of sdr at
-    // the falling SCK edges. MISO (synchronized, so 2 cycles late) is captured into srx three
+    // the falling SCK edges. MISO (synchronized, so 1 cycle late) is captured into srx two
     // cycles after each rising edge (srp is that delay line): the value the pin had in the first
-    // high cycle. BUSY stays 1 until the eighth capture.
+    // high cycle. The eighth capture comes at the last falling edge (D = 1) or before it, so
+    // BUSY is just sbusy.
     // ------------------------------------------------------------------------------------
     reg  [7:0] sdr, srx;
     reg        sbusy, ssck;
-    reg  [2:0] sbc, srp;
+    reg  [2:0] sbc;
+    reg  [1:0] srp;
     reg  [6:0] sdc;
-    wire       s_busy  = sbusy | (|srp);
+    wire       s_busy  = sbusy;
     wire       s_go    = be0 & s_sdat & ~s_busy;
     wire [7:0] sdc_run = {&sdc[6:0], &sdc[5:0], &sdc[4:0], &sdc[3:0], &sdc[2:0], &sdc[1:0], sdc[0], 1'b1};
     wire       s_half  = sbusy & sdc_run[sd];
@@ -295,10 +297,10 @@ module r32v_periph (
             srx   <= 8'd0;
             sbusy <= 1'b0;
             ssck  <= 1'b0;
-            srp   <= 3'd0;
+            srp   <= 2'd0;
         end else begin
-            srp <= {srp[1:0], s_half & ~ssck};
-            if (srp[2])
+            srp <= {srp[0], s_half & ~ssck};
+            if (srp[1])
                 srx <= {srx[6:0], s2[3]};
             if (s_go)
                 sbusy <= 1'b1;
