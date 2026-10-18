@@ -409,13 +409,14 @@ Mac: Apple M5, 10 cores, 32 GB, shared with other agents' jobs. hwe-bench: Intel
 265 (8 P + 12 E cores, 62 GB), shared with another project's jobs at times. Times are wall
 clock for the whole runner, with `--keep-going` (a passing run is the same either way).
 
-**Contract v2 checks (this version).** Every run below passed every check it ran (56 in fast).
+**Contract v2 checks (this version).** Every run below passed every check it ran (56 in fast),
+except fc07cc3's `reg`, which ran into the task timeout of the time (21,600 s).
 
 | run | Mac, 8 jobs | hwe-bench |
 |---|---|---|
 | seed, fast | 486.5 s at 4c03d59, cosim timing included (reg 419 s, bus_dmem 358 s; load ~11 from other agents) | 208 s at 38551e4 with 18 jobs (the memory cap allowed 18: 1.7 GB per task, 53.7 GB budget), 251 s with staging and transfer; reg 206 s, bus_dmem 201 s |
 | V2 = hyp/002-rf-in-ram-pcram b9a5211, fast (depths 1,461 to 1,623) | not run (memory) | 32,538 s (9 h 2 min) at 7050096 with 4 jobs (the memory cap: 6.4 GB per task, 30 GB budget, the host shared), 56/56 PASS and every reach task REACHED; reg 19,669 s, reset 9,076 s, bus_dmem 7,796 s, bus_imem 6,773 s, the instruction groups 943 to 3,581 s, every other check 184 to 3,118 s. A first 7-job attempt was hung up after 2 h 20 min when the Mac crashed (see "Orphans") |
-| fc07cc3 (hyp/002-rf-in-ram), fast (depths up to 1,222) | not run (memory) | a detached 3-job run was still running at the time of writing |
+| fc07cc3 (hyp/002-rf-in-ram), fast (depths up to 1,222) | not run (memory) | 36,823 s (10 h 14 min) at 7050096 with 3 jobs (4.9 GB per task, 15 GB budget, the host shared): 55/56 PASS, every reach task REACHED, and `reg` TIMEOUT at 21,602 s (a timeout is a FAIL); reset 11,487 s, bus_imem 7,636 s, bus_dmem 6,882 s, the instruction groups 378 to 1,517 s, every other check 240 to 1,731 s |
 
 The first V2 attempt (7 jobs, the host partly shared) finished these proofs before it was hung
 up, every one PASS: bus_dmem 6,495 s, the instruction groups 919 to 3,196 s, pc_bwd 2,859 s,
