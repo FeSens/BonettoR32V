@@ -130,7 +130,7 @@ def test_check_verdicts():
 
 def test_kill_tree():
     """stop_all/kill_tree reach every process below an SBY run, also those in other
-    process groups (solvers that outlived a killpg on hwe-bench)."""
+    process groups (SBY runs each engine in its own process group)."""
     import time
     pr = subprocess.Popen(["sh", "-c", "sleep 60 & (setsid sleep 61 || perl -e 'setpgrp; sleep 61') & wait"],
                           start_new_session=True)
