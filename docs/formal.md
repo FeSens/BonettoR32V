@@ -383,12 +383,12 @@ do not measure (see "Mutants").
 bitwuzla's RSS on the champion (hwe-bench) was 13.7 GB for irq at depth 1,448, 7.6 GB for csr and
 6.9 GB for coherence at 870, 3.5 GB for periph and 3.3 GB for gpio at 581. (The v2 checks needed
 3.7 MB per step; with that estimate the first champion runs put hwe-bench down to 5 GB
-available.) The runner caps the job count at the memory budget divided by that need at the
-deepest task's depth (`mem_jobs`). The budget is `$BONETTO_FORMAL_MEM_GB` if set (forwarded to a
+available.) The runner caps the thread count at the memory budget divided by that need at the
+shallowest task's depth (`mem_jobs`), and each task waits until its own estimate fits. The budget is `$BONETTO_FORMAL_MEM_GB` if set (forwarded to a
 remote run; set it to split a shared host), else 85 % of `MemAvailable` on Linux, else half the
 RAM on macOS. `reset` (free reset length) counts twice (22 GB at depth 1,222 on a v2 core, 6.2 GB
-at 581 on the champion). Each task also waits until its estimate fits next to the running ones
-(`MemGate`).
+at 581 on the champion). The waiting is `MemGate`; the deep tasks start first, so they are not
+starved by the short ones.
 
 Fast does not cover:
 

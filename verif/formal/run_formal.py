@@ -1617,15 +1617,21 @@ def main():
     reaches = [t for t in jobs_todo if t[0].endswith("_reach")]
     jobs_todo = [t for pair in zip(proofs, reaches) for t in pair] + \
         proofs[len(reaches):] + reaches[len(proofs):]
-    # Memory: as many tasks as the host's memory holds at the deepest task's depth.
+    # Memory: at most as many threads as the budget holds at the shallowest task's depth; each
+    # task then waits until its own estimate (its depth, its weight) fits next to the running
+    # ones (MemGate). The deep tasks start first (TASK_COST), so they are not starved.
     max_tdepth = max(task_depths.values()) if task_depths else deepest
-    jobs, per_gb, budget_gb = mem_jobs(max_tdepth, jobs)
+    min_tdepth = min(task_depths.values()) if task_depths else deepest
+    jobs, per_gb, budget_gb = mem_jobs(min_tdepth, jobs)
     global MEM_GATE
-    MEM_GATE = MemGate(budget_gb)   # heavier tasks (reset) also wait for room
+    MEM_GATE = MemGate(budget_gb)
     result["jobs"] = {"used": jobs, "gb_per_task": round(per_gb, 1),
-                      "budget_gb": round(budget_gb, 1), "max_task_depth": max_tdepth}
-    log(f"jobs={jobs}: about {per_gb:.1f} GB per task at depth {max_tdepth}, memory budget "
-        f"{budget_gb:.1f} GB")
+                      "gb_deepest_task": round(task_mem_gb("x", max_tdepth), 1),
+                      "budget_gb": round(budget_gb, 1), "max_task_depth": max_tdepth,
+                      "min_task_depth": min_tdepth}
+    log(f"jobs={jobs}: about {per_gb:.1f} GB per task at depth {min_tdepth} to "
+        f"{task_mem_gb('x', max_tdepth):.1f} GB at {max_tdepth}, memory budget "
+        f"{budget_gb:.1f} GB (each task waits for room)")
     log(f"running {len(jobs_todo)} SBY task(s) for {sum(len(r) for _, r in units)} check(s), "
         f"jobs={jobs}, base depth <= {deepest}" + ("" if args.keep_going else ", stop at the first FAIL"))
     unit_req = {}
