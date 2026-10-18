@@ -24,6 +24,7 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 108 | 2026-10-18 | hyp/108-a1-on-die | rejected | - | - | - | - | - | - | n/a | Register x11 (a1) on the die: a1r 32-bit nibble shift register; x11... | BLOCKED BY AREA, not refuted; revive when ~1,150 um2 is freed. Agen... |
 | 107 | 2026-10-18 | hyp/107-no-x-fast-slots | merged | 0.5451 | +0.0226 | 20 | 21,804.7 | +67.6 | skipped | - | Cut no-transfer slots: branches on x0 run F A (A computes pc+imm in... | Lead re-eval on hwe-bench (fa93772, clean, MIN_IPS=0.52246577765561... |
 | 105 | 2026-10-18 | hyp/105-pc-on-die-nibble | merged | 0.5225 | +0.1875 | 20 | 21,737.1 | +803.3 | skipped | - | pc on die on the nibble core: pcr (32-bit nibble shift register) ho... | Lead re-eval on hwe-bench (f9a6633 = 105 + merge of 106 + one-line ... |
 | 106 | 2026-10-18 | hyp/106-periph-diet-2 | merged | 0.3350 | +0.0000 | 20 | 20,933.8 | -212.7 | skipped | - | Periph diet 2, contract behavior unchanged: one SPI shift register ... | Lead re-eval on hwe-bench (f777e0f, clean, MIN_IPS=0.33500624284133... |
