@@ -61,11 +61,12 @@
  *             masked
  *   W4  WRITE rd <- the ring (pc + 4); JAL: pc <- pc + imm
  *   WP  WRITE x0 <- the ring (pc + 4, the spill)
- *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT)
+ *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT); LI (ADDI rd, x0, imm)
+ *             and LUI: rd <- the immediate, and pc <- the ring's pc + 4 at the same strobes
  *   WS  WRITE scratch <- ring;  WC: the CSR <- ring (in a trap sequence: mepc <- pc)
- * Sequences: ALU F A [B] W (register shifts F WP A B W P); load F A M W (IO: F A W); store
- * F WP A BS M P (IO: F WP A P BS); branch F A B X, on x0 F A (imm[1] = 1, untaken: F A X); JAL
- * F W4; JALR F A W4; FENCE, WFI F X;
+ * Sequences: ALU F A [B] W (register shifts F WP A B W P; LI, LUI F W); load F A M W (IO: F A
+ * W); store F WP A BS M P (IO: F WP A P BS); branch F A B X, on x0 F A (imm[1] = 1, untaken:
+ * F A X); JAL F W4; JALR F A W4 (rd = x0: F A); FENCE, WFI F X;
  * CSR F A WS C W RS WC; MRET F C. A
  * synchronous trap (decode after F, JALR after A, branch after A or B) leaves the pc unchanged,
  * runs WC(mepc <- pc) C(pc <- mtvec) and retires; an interrupt (at a retirement) runs WC C and
@@ -181,6 +182,8 @@ module tt_um_fesens_r32v (
     wire rs2z    = (rs2_f == 4'd0);
     wire nb      = c_br & rs2z;                         // a branch on x0: no B, no X
     wire nbw     = nb & ~insn[8];                       // ... whose A moves pc + 4 into pcr
+    // LI (ADDI rd, x0, imm) and LUI: no A; W writes the immediate and moves pc + 4 into pcr
+    wire liw     = (c_alu & ~insn[5] & (f3 == 3'b000) & (rs1_f == 4'd0)) | (c_u & insn[5]);
 
     wire fR   = ~sl[4] & ~sl[3];
     wire fM   = ~sl[4] &  sl[3];
@@ -340,6 +343,7 @@ module tt_um_fesens_r32v (
     wire [3:0] wd4    = c_ld  ? (ldfill ? {4{fillv}} : tap4) :
                         c_slt ? {3'b000, n0 & cmp} :
                         c_sh  ? fun :
+                        liw   ? imm4 :
                                 ring[3:0];
     // a trap sequence's WC (mepc): the pc (from the ring after a taken branch on x0: tk); W4,
     // WP (pc + 4), WS, WC: the ring
@@ -361,15 +365,19 @@ module tt_um_fesens_r32v (
                     nsl = SL_WC;
                 end else
                     nsl = c_jal ? SL_W4 : p_mret ? SL_C : (c_fence | priv) ? SL_X :
-                          spill ? SL_WP : SL_A;
+                          spill ? SL_WP : liw ? SL_W : SL_A;
             end
             SL_WP: nsl = SL_A;
             SL_A: begin
                 if (c_jalr & ~cmp) begin
                     tgo = 1'b1;
                     nsl = SL_WC;
-                end else if (c_jalr)
-                    nsl = SL_W4;
+                end else if (c_jalr) begin
+                    if (rd_f == 4'd0)
+                        nret = 1'b1;                    // nothing to link
+                    else
+                        nsl = SL_W4;
+                end
                 else if (c_br) begin
                     if (~rs2z)
                         nsl = SL_B;
@@ -449,17 +457,18 @@ module tt_um_fesens_r32v (
     wire ring_rot = (dstb & (wr | (sP & ~n[2] & ~n[1]))) | hrot;
     // pcr writes: A (the ring's pc + 4, also for a branch on x0 unless imm[1] = 1; a store: its
     // address; JALR: the target), B of a register shift (rs2), P (the spilled pc + 4), X, W4 of
-    // JAL, and C in a trap sequence or MRET. F and a trap sequence's WC read the pc nibble by
-    // nibble: pcr rotates; so does JALR's A when the target traps (target[1] is sumj[1] at
-    // nibble 0, then ~cmp), leaving the pc. The write enable is decode only (no ALU term). A
-    // fetch after a taken branch on x0 (tk) moves the ring's target into pcr.
+    // JAL, W of LI and LUI (the ring's pc + 4), and C in a trap sequence or MRET. F and a trap
+    // sequence's WC read the pc nibble by nibble: pcr rotates; so does JALR's A when the target
+    // traps (target[1] is sumj[1] at nibble 0, then ~cmp), leaving the pc. The write enable is
+    // decode only (no ALU term). A fetch after a taken branch on x0 (tk) moves the ring's target
+    // into pcr.
     wire       jtrap = c_jalr & (n0 ? sumj[1] : ~cmp);
     wire       prot = sF | (sWC & tm);
     wire       pwr  = (sA & (~c_br | nbw)) | (sB & c_sh) | sP | sX | (sW4 & c_jal) |
-                      (sC & (tm | p_mret));
+                      (sC & (tm | p_mret)) | (sW & liw);
     wire       pwe  = dstb & (pwr | prot);
     wire [3:0] pin4 = ((prot & ~(sF & tk)) | (sA & jtrap)) ? pcr[3:0] :
-                      ((sA & ~c_st & ~c_jalr) | (sF & tk)) ? ring[3:0] :
+                      ((sA & ~c_st & ~c_jalr) | (sF & tk) | sW) ? ring[3:0] :
                       (sB | sP) ? nib_m : din4;
     always @(posedge clk) begin
         if (io_re)
@@ -614,6 +623,8 @@ module tt_um_fesens_r32v (
             r_npc <= ring;
         if (dstb & sA)
             r_rs1 <= {nib_m, r_rs1[31:4]};
+        else if (e_end & sF)                            // LI runs no A: rs1 = x0 reads 0
+            r_rs1 <= 32'd0;
         if (dstb & (sB | sBS))
             r_rs2 <= {nib_m, r_rs2[31:4]};
         if (dstb & (sW | sW4))
