@@ -232,6 +232,11 @@ Self-check: `the program's self-check failed`.
   - SCD and D exchanged (the select polarity wrong): fails in both modes;
   - no reset folded in: fails under all four seeds (uo_out not 0 during reset), and passes when
     built with `--x-initial 0`, so the randomized cell state is what catches it.
+- **Design submodule power-up** (invariant 6, `noinline.vlt`). The playback stub with its `uo_out`
+  register built from 8 unreset `r32v_ureg` submodules (`output reg q`, each tied to a bit-select)
+  fails under all four seeds (uo_out not 0 during reset). It passes when built with
+  `--x-initial 0`, and when a test-only configuration file forces the inlining back, so
+  `noinline.vlt` is what catches it. The test also checks that the build reads `noinline.vlt`.
 - **`run_cosim.py`** (with and without the old `--v3` flag, now a no-op), the program-list rule,
   and the fuzz.
 
@@ -281,23 +286,46 @@ Verilator runs on hwe-bench, never on the Mac (ruling R11): wrap these in
 (no prelude, no include path); the rvfi build's only define is `RISCV_FORMAL` (contract sections
 1 and 8). After the design it reads the behavioral models of the sky130 cells `src/` may
 instantiate (`verif/cells/*.v`, one per `CELL_WHITELIST` entry in `tools/src_check.py`, sorted);
-`--top-module` drops the unused ones. It records the exact Verilator command in
+`--top-module` drops the unused ones. Then comes `verif/cosim/noinline.vlt`, a Verilator
+configuration file (below). It records the exact Verilator command in
 `build/cosim/<mode>/verilator.args`.
-- **Cell flops power up random too.** Each flop model keeps its state in an internal `reg q` and
-  drives `Q` with `assign Q = q`. Verilator zero-initializes an inlined module's output-port reg
-  when the parent connects it to a bit-select (a `__Vcellout` temporary), so `output reg Q`
-  would have hidden a design that relies on a cell flop's power-up value.
-  `test_cell_stub_power_up_reliance_fails` checks it.
-- **The same holds for design modules.** An `output reg` flop of a `src/` submodule that the
-  parent connects to a bit-select powers up 0 in the cosim, not random. A plain-reg playback
-  stub fails the reset check under all four seeds; the same register as such a submodule passes
-  all four. Building with `-fno-inline` randomizes it. The gate-level test still starts it at X.
+
+**Every flop powers up random (invariant 6).** Verilator runs with `--x-initial unique`, and the
+harness seeds the random values from `--seed`. One case escaped that until `noinline.vlt`:
+- **The gap.** When Verilator inlines a module and the parent connects one of its `output reg`
+  ports to a bit-select, the port becomes a `__Vcellout` temporary that Verilator initializes to
+  0, not at random. A design relying on that flop's power-up value passed the cosim.
+  - Measured: the playback stub with its `uo_out` register made of 8 unreset `r32v_ureg`
+    submodules (`output reg q`, each tied to `uo_r[k]`) passed under seeds 1-4 with 5c6e3be's
+    `build.sh`.
+  - The same register as a plain `reg` in the top failed under all four seeds.
+- **The fix.** `noinline.vlt` holds `no_inline -module "r32v_*"`. Every design submodule (contract
+  section 1 names them all `r32v_*`; the top is never inlined) stays its own class, so the port
+  stays a member and is randomized like any flop. The same stub now fails under all four seeds
+  (uo_out not 0 during reset).
+  - It applies to every harness build: both modes, the liveness fuzz and arch.
+  - `-fno-inline` closes the gap too, but it also un-inlines every cell model instance. No
+    narrower `-f` flag does: `-fno-gate`, `-fno-subst`, `-fno-dfg`, `-fno-life`, `-fno-localize`,
+    `-fno-expand`, `-fno-split`, `-fno-reorder`, `-fno-const`, `-fno-table`, `-fno-combine`,
+    `-fno-merge-cond` and `--inline-mult 1` or `10` all left the stub passing.
+- **Cost**, measured on hwe-bench with champion 107: CoreMark (seed 1), 4 interleaved repetitions
+  per mode, took 172.9 s with `noinline.vlt` against 165.5 s with the inlining forced back (+4.5%):
+  rvfi 91.2 against 84.9 s (+7.4%), pins 81.7 against 80.7 s (+1.2%), summed from the per-run
+  times as printed (0.1 s). Cycle counts are identical.
+- **Cell flops.** Each cell model keeps its state in an internal `reg q` and drives `Q` with
+  `assign Q = q`, so an inlined cell is randomized as well; the cell models stay inlined.
+- **Self-tests.** `test_cell_stub_power_up_reliance_fails` covers the cells.
+  `test_submodule_output_reg_power_up_reliance_fails` covers design submodules: the `r32v_ureg`
+  stub fails under seeds 1-4, and passes when built with `--x-initial 0` or with the inlining
+  forced back by a test-only configuration file.
+- The gate-level test starts every flop at X, so it never had this gap.
 
 `run_cosim.py` rebuilds the Verilator model when anything that can reach it changes: it keys a
 stamp on every file under the design directory except `__pycache__` and non-Verilog `test_*`
-files, the harness sources (`harness.cpp`, `pmod.h`, `iss3.h`, `periph_models.h`, `build.sh`), the
-cell models (`verif/cells/*.v`) and `verilator --version`. Builds hold `build/cosim/<build dir>.lock` (lockf), so concurrent processes
-don't build the same model at once. `build.sh` with no arguments builds the standalone pieces
+files, the harness sources (`harness.cpp`, `pmod.h`, `iss3.h`, `periph_models.h`, `build.sh`,
+`noinline.vlt`), the cell models (`verif/cells/*.v`) and `verilator --version`. Builds hold
+`build/cosim/<build dir>.lock` (lockf), so concurrent processes don't build the same model at
+once. `build.sh` with no arguments builds the standalone pieces
 instead: `test_pmod`, `libpmod.so` (the Pmod models behind a C API, for the TT test's ctypes),
 `iss_main` and `test_periph`.
 

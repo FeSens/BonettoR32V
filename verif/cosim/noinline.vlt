@@ -1,0 +1,14 @@
+// Cosim harness configuration file (read by verif/cosim/build.sh in both modes; arch and the
+// liveness fuzz use the same build): never inline a design submodule (r32v_*, contract section 1;
+// the top is never inlined). No comment here may start with the tool's name: it would read as a
+// metacomment.
+//
+// Why (invariant 6): Verilator zero-initializes an inlined module's output reg when the parent
+// connects it to a bit-select, because inlining turns the port into a __Vcellout temporary that
+// --x-initial unique does not randomize. A design relying on such a flop's power-up value passed
+// the cosim under all four seeds. A submodule kept as its own class keeps the reg as a member,
+// randomized like every other flop. -fno-inline does the same for every module, the sky130 cell
+// models included (their state is an internal reg, so they need no help).
+// test_cosim_harness.py::test_submodule_output_reg_power_up_reliance_fails checks it.
+`verilator_config
+no_inline -module "r32v_*"

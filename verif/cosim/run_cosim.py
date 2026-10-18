@@ -110,7 +110,8 @@ def verilator_version() -> str:
     return _verilator_version
 
 
-HARNESS_DEPS = ("harness.cpp", "pmod.h", "iss3.h", "periph_models.h", "build.sh")
+HARNESS_DEPS = ("harness.cpp", "pmod.h", "iss3.h", "periph_models.h", "build.sh",
+                "noinline.vlt")
 CELLS = ROOT / "verif" / "cells"    # the sky130 cell models build.sh reads after the design
 
 
