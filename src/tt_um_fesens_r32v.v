@@ -109,6 +109,7 @@ module tt_um_fesens_r32v (
     reg         first;  // until the first retirement: P (and a branch's PX) read pc = 0
     reg         cy;     // ALU carry; sign latch of a load's W
     reg         cmp;    // compare; JALR target[1] == 0; a shift's sign bit
+    reg         mk;     // the slot is masked (mask, registered at the gap clock)
     reg  [31:0] ring;   // operand/result ring
     reg  [31:0] ir;     // instruction register, in wire nibble order
 
@@ -197,8 +198,9 @@ module tt_um_fesens_r32v (
                 (first & (sP | (sPX & c_br))) |
                 (csr_sl & ~csr_region) |
                 (sM & c_st & ~ps);                      // a store to flash issues nothing
-    wire active = ~gap & ~mask;
-    wire wact   = wr & ~mask;                           // the slot drives data on the bus
+    // every input of mask is constant from a slot's gap to its tail, so the slot uses mk
+    wire active = ~gap & ~mk;
+    wire wact   = wr & ~mk;                             // the slot drives data on the bus
     wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   // {SD3, SD2, SD1, SD0}
     wire [3:0] nib_m = nib & {4{active}};               // 0 in a masked slot
 
@@ -210,7 +212,8 @@ module tt_um_fesens_r32v (
     // data strobe: a read samples nibble c; a write (on the bus) loads nibble c + 1 for the
     // next rising edge; a masked slot of either kind steps like a read
     wire       dstb  = wact ? (stb & ~cn[5] & ~dend) : (stb & ~c[5]);
-    wire [2:0] n     = wact ? cn[2:0] : c[2:0];         // data nibble index at dstb
+    wire [2:0] n     = wr ? cn[2:0] : c[2:0];           // data nibble index at dstb (a masked
+                                                        // write's emission is discarded)
     wire       n0    = (n == 3'd0);
 
     // ------------------------------------------------------------------------------------
@@ -452,9 +455,10 @@ module tt_um_fesens_r32v (
         end else if (dstb & sB & ~c_sh)                 // SLT, branches
             cmp <= ocmp;
 
-        if (gap)
-            c <= mask ? 6'd0 : wr ? 6'd56 : 6'd52;
-        else if (stb)
+        if (gap) begin
+            c  <= mask ? 6'd0 : wr ? 6'd56 : 6'd52;
+            mk <= mask;
+        end else if (stb)
             c <= cn;
     end
 
