@@ -36,14 +36,15 @@ module r32v_mem (
     input  wire        cap_a,      // an A data strobe
     input  wire [2:0]  kn,         // its nibble index
     input  wire [3:0]  din4,       // its result nibble
-    output reg         io,
-    output reg         ps,
+    output wire        io,
+    output wire        ps,
     output wire        booting,
     // transaction (from the core's engine)
     input  wire        active,     // a CS_n is low (an unmasked slot past its gap)
-    input  wire        prog,       // program transaction (F, M): address from pa
+    input  wire        prog,       // program transaction (F, M): address from pa_odd
     input  wire        fetch,      // the slot is F
-    input  wire [24:0] pa,
+    input  wire        pa24,       // address bit 24 (a fetch's chip)
+    input  wire [15:0] pa_odd,     // address register nibbles 7, 5, 3, 1 (rotating in the header)
     input  wire        fz,         // the first fetch: address 0 in flash
     input  wire        sck,
     input  wire        gap,        // the cycle between transactions
@@ -62,52 +63,58 @@ module r32v_mem (
     // Address flags
     // ------------------------------------------------------------------------------------
     wire _unused_din = &{din4[2:1], 1'b0};
-    wire fchip = pa[24] & ~fz;                          // a fetch's chip (pc bit 24)
-    always @(posedge clk) begin
-        if (gap & fetch)
-            ps <= fchip;
-        else if (cap_a & (kn == 3'd6))
-            ps <= din4[0];
-        if (cap_a & (kn == 3'd7))
-            io <= din4[3];
-    end
+    wire fchip = pa24 & ~fz;                            // a fetch's chip (pc bit 24)
+    // scan flops holding through SCD (D = the next value, SCD = Q, SCE = hold)
+    wire ps_ld = gap & fetch;
+    sky130_fd_sc_hd__sdfxtp_1 u_ps (.CLK(clk), .D(ps_ld ? fchip : din4[0]), .SCD(ps),
+                                    .SCE(~(ps_ld | (cap_a & (kn == 3'd6)))), .Q(ps));
+    sky130_fd_sc_hd__sdfxtp_1 u_io (.CLK(clk), .D(din4[3]), .SCD(io),
+                                    .SCE(~(cap_a & (kn == 3'd7))), .Q(io));
 
     // ------------------------------------------------------------------------------------
     // Header nibbles
     // ------------------------------------------------------------------------------------
     wire        flash = prog & ~((gap & fetch) ? fchip : ps);   // the gap loads header nibble 0
     wire        az    = fz & ~(hidx[2] & hidx[1]);      // the first fetch's address nibbles: 0
+    // The address register rotates by one nibble at each header nibble load (the core's
+    // rot_hdr), so address nibble k sits at position k - hidx: flash header nibble hidx = 0..5
+    // (A nibble 5 - hidx) is at 5 - 2 hidx, PSRAM nibble hidx = 2..7 (A nibble 7 - hidx) at
+    // 7 - 2 hidx, always an odd position: pa_odd's nibble (2 + psram - hidx) mod 4.
+    wire [1:0]  ai    = 2'd2 + {1'b0, ~flash} - hidx[1:0];
+    reg  [3:0]  an;
+    always @(*) begin
+        case (ai)
+            2'd0:    an = pa_odd[3:0];
+            2'd1:    an = pa_odd[7:4];
+            2'd2:    an = pa_odd[11:8];
+            default: an = pa_odd[15:12];
+        endcase
+    end
     reg  [3:0] hn;
     always @(*) begin
         case ({flash, hidx})
-            4'b1000: hn = pa[23:20];
-            4'b1001: hn = pa[19:16];
-            4'b1010: hn = pa[15:12];
-            4'b1011: hn = pa[11:8];
-            4'b1100: hn = pa[7:4];
-            4'b1101: hn = pa[3:0];
             4'b1110: hn = 4'h2;                         // M = 0x20: stay in continuous read
             4'b1111: hn = 4'h0;
             4'b0000: hn = 4'h0;
             4'b0001: hn = h_wr ? 4'h2 : 4'hB;           // QPI 0x02 write, 0x0B read
-            4'b0010: hn = prog ? pa[23:20] : 4'hF;
-            4'b0011: hn = prog ? pa[19:16] : 4'hF;
-            4'b0100: hn = prog ? pa[15:12] : 4'hF;
-            4'b0101: hn = prog ? pa[11:8]  : 4'hF;
-            4'b0110: hn = prog ? pa[7:4]   : {1'b1, h_reg[4:2]};
-            default: hn = prog ? pa[3:0]   : {h_reg[1:0], 2'b00};
+            4'b0110: hn = prog ? an : {1'b1, h_reg[4:2]};
+            4'b0111: hn = prog ? an : {h_reg[1:0], 2'b00};
+            default: hn = (flash | prog) ? an : 4'hF;   // flash 0-5; PSRAM 2-5
         endcase
     end
 
-    reg [3:0] sdo;
-    reg       sdoe;
+    wire [3:0] sdo;
+    reg        sdoe;
+    wire [3:0] sdo_d = hdr_ld ? (hn & {4{~az}}) : dat_ld ? wd4 : 4'h0;
+    wire       sdo_h = ~(hdr_ld | dat_ld | gap);
+    genvar gi;
+    generate
+        for (gi = 0; gi < 4; gi = gi + 1) begin : g_sdo
+            sky130_fd_sc_hd__sdfxtp_1 u_sdo (.CLK(clk), .D(sdo_d[gi]), .SCD(sdo[gi]), .SCE(sdo_h),
+                                             .Q(sdo[gi]));
+        end
+    endgenerate
     always @(posedge clk) begin
-        if (hdr_ld)
-            sdo <= hn & {4{~az}};
-        else if (dat_ld)
-            sdo <= wd4;
-        else if (gap)
-            sdo <= 4'h0;
         if (gap)
             sdoe <= 1'b1;
         else if (oe_off)

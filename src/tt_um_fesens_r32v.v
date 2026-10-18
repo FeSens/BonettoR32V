@@ -128,16 +128,16 @@ module tt_um_fesens_r32v (
 
     reg  [4:0]  sl;
     reg  [1:0]  ep;
-    reg  [5:0]  c;      // SCK edge counter: 52/56..63 header, 0..7 data
+    wire [5:0]  c;      // SCK edge counter: 52/56..63 header, 0..7 data
     reg         sck;
     reg         first;  // until the first retirement: the pc reads 0
     reg         tk;     // a taken branch on x0 retired: the pc is in the ring, not in pcr
-    reg         cy;     // ALU carry; sign latch of a load's W
-    reg         cmp;    // compare; JALR target[1] == 0; a shift's sign bit
-    reg         mk;     // the slot is masked (mask, registered at the gap clock)
-    reg  [31:0] ring;   // operand/result ring
-    reg  [31:0] ir;     // instruction register, in wire nibble order
-    reg  [31:0] pcr;    // the pc
+    wire        cy;     // ALU carry; sign latch of a load's W
+    wire        cmp;    // compare; JALR target[1] == 0; a shift's sign bit
+    wire        mk;     // the slot is masked (mask, registered at the gap clock)
+    wire [31:0] ring;   // operand/result ring
+    wire [31:0] ir;     // instruction register, in wire nibble order
+    wire [31:0] pcr;    // the pc
 
     wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[0], 1'b0};
 
@@ -452,7 +452,12 @@ module tt_um_fesens_r32v (
     wire ring_in  = dstb & (fR | sF | (sM & c_ld)) & ~shB & ~(sA & c_jalr) & ~sP &
                     ~(sBS & io & n[2] & n[1]);
     wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] <= rotn);
-    wire ring_rot = (dstb & (wr | (sP & ~n[2] & ~n[1]))) | hrot;
+    // F and M rotate the ring and pcr by one nibble at each header nibble load (8 in all, so
+    // both end where they started): the header's address nibbles then sit at odd positions
+    // (r32v_mem). A read's dummy edges (cn[3] & cn[2]) load no address.
+    wire hdr_ld   = (gap & ~booting & ~mask) | (stb & hdr & cn[5]);
+    wire rot_hdr  = fM & hdr_ld & (gap | wr | ~(cn[3] & cn[2]));
+    wire ring_rot = (dstb & (wr | (sP & ~n[2] & ~n[1]))) | hrot | rot_hdr;
     // pcr writes: A (the ring's pc + 4, also for a branch on x0 unless imm[1] = 1; a store: its
     // address; JALR: the target), B of a register shift (rs2), P (the spilled pc + 4), X, W4 of
     // JAL, W of LI and LUI (the ring's pc + 4), and C in a trap sequence or MRET. F and a trap
@@ -464,55 +469,53 @@ module tt_um_fesens_r32v (
     wire       prot = sF | (sWC & tm);
     wire       pwr  = (sA & (~c_br | nbw)) | (sB & c_sh) | sP | sX | (sW4 & c_jal) |
                       (sC & (tm | p_mret)) | (sW & liw);
-    wire       pwe  = dstb & (pwr | prot);
-    wire [3:0] pin4 = ((prot & ~(sF & tk)) | (sA & jtrap)) ? pcr[3:0] :
+    wire       pwe  = (dstb & (pwr | prot)) | rot_hdr;
+    wire [3:0] pin4 = (rot_hdr | (prot & ~(sF & tk)) | (sA & jtrap)) ? pcr[3:0] :
                       ((sA & ~c_st & ~c_jalr) | (sF & tk) | sW) ? ring[3:0] :
                       (sB | sP) ? nib_m : din4;
-    always @(posedge clk) begin
-        if (io_re)
-            ring[15:0] <= {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]};
-        else if (ring_in)
-            ring <= {din4, ring[31:4]};
-        else if (ring_rot)
-            ring <= {ring[3:0], ring[31:4]};
-        if (sF & dstb)
-            ir <= {ir[27:0], nib_m};
-        if (pwe)
-            pcr <= {pin4, pcr[31:4]};
-    end
 
     // ------------------------------------------------------------------------------------
-    // Datapath flags and the edge counter (no reset)
+    // Enable flops (no reset): the ring, the instruction register, the pc, the datapath flags
+    // and the edge counter. Each is a scan flop (sky130_fd_sc_hd__sdfxtp_1, smaller than the
+    // enable flop synthesis picks) that holds through its scan input: D = the next value,
+    // SCD = Q, SCE = hold (contract section 1, CLAUDE.md).
     // ------------------------------------------------------------------------------------
-    always @(posedge clk) begin
-        if (gap)
-            cy <= 1'b0;
-        else if (dstb) begin
-            if (sW) begin
-                if (~ldfill)
-                    cy <= tap4[3];
-            end else if (fR | sF | sW4)
-                cy <= cout;
+    // ring: an IO load's capture (low half), else a shift in or a rotation
+    wire        ring_sh = ring_in | ring_rot;
+    wire [31:0] ring_d  = {(ring_in ? din4 : ring[3:0]), ring[31:20],
+                           (io_re ? {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]} : ring[19:4])};
+    wire [31:0] ring_h  = {{16{io_re | ~ring_sh}}, {16{~(io_re | ring_sh)}}};
+    wire [31:0] ir_d    = {ir[27:0], nib_m};
+    wire        ir_h    = ~(sF & dstb);
+    wire [31:0] pcr_d   = {pin4, pcr[31:4]};
+    wire        pcr_h   = ~pwe;
+    // cy: cleared at the gap; a load's W latches the sign, the adder's slots the carry
+    wire        cy_d    = ~gap & (sW ? tap4[3] : cout);
+    wire        cy_h    = ~(gap | (dstb & (sW ? ~ldfill : (fR | sF | sW4))));
+    // cmp: A of a branch (zc), SLT (ocmp), JALR (target[1] == 0), a shift (rs1[31] at the last
+    // nibble); B of SLT and branches (ocmp)
+    wire        cmp_d   = ~sA ? ocmp : c_br ? zc : c_slt ? ocmp : (c_jalr & n0) ? ~sumj[1] : a4[3];
+    wire        cmp_h   = ~(dstb & ((sA & (c_br | c_slt | (c_jalr & n0) | c_sh)) | (sB & ~c_sh)));
+    wire [5:0]  c_d     = gap ? (mask ? 6'd0 : wr ? 6'd56 : 6'd52) : cn;
+    wire        c_h     = ~(gap | stb);
+    genvar gi;
+    generate
+        for (gi = 0; gi < 32; gi = gi + 1) begin : g_rip
+            sky130_fd_sc_hd__sdfxtp_1 u_ring (.CLK(clk), .D(ring_d[gi]), .SCD(ring[gi]),
+                                              .SCE(ring_h[gi]), .Q(ring[gi]));
+            sky130_fd_sc_hd__sdfxtp_1 u_ir (.CLK(clk), .D(ir_d[gi]), .SCD(ir[gi]), .SCE(ir_h),
+                                            .Q(ir[gi]));
+            sky130_fd_sc_hd__sdfxtp_1 u_pcr (.CLK(clk), .D(pcr_d[gi]), .SCD(pcr[gi]),
+                                             .SCE(pcr_h), .Q(pcr[gi]));
         end
-
-        if (dstb & sA) begin
-            if (c_br)
-                cmp <= zc;
-            else if (c_slt)
-                cmp <= ocmp;
-            else if (c_jalr & n0)
-                cmp <= ~sumj[1];                        // JALR target[1] == 0
-            else if (c_sh)
-                cmp <= a4[3];                           // rs1[31] at the last nibble
-        end else if (dstb & sB & ~c_sh)                 // SLT, branches
-            cmp <= ocmp;
-
-        if (gap) begin
-            c  <= mask ? 6'd0 : wr ? 6'd56 : 6'd52;
-            mk <= mask;
-        end else if (stb)
-            c <= cn;
-    end
+        for (gi = 0; gi < 6; gi = gi + 1) begin : g_c
+            sky130_fd_sc_hd__sdfxtp_1 u_c (.CLK(clk), .D(c_d[gi]), .SCD(c[gi]), .SCE(c_h),
+                                           .Q(c[gi]));
+        end
+    endgenerate
+    sky130_fd_sc_hd__sdfxtp_1 u_cy (.CLK(clk), .D(cy_d), .SCD(cy), .SCE(cy_h), .Q(cy));
+    sky130_fd_sc_hd__sdfxtp_1 u_cmp (.CLK(clk), .D(cmp_d), .SCD(cmp), .SCE(cmp_h), .Q(cmp));
+    sky130_fd_sc_hd__sdfxtp_1 u_mk (.CLK(clk), .D(mask), .SCD(mk), .SCE(~gap), .Q(mk));
 
     // ------------------------------------------------------------------------------------
     // Control (reset)
@@ -549,6 +552,10 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     wire       scr     = sWS | sRS;                     // the scratch word 0x80
     wire       regarea = ~scr & ~csr_sl;                // x1..x15 at 0xC0 + 4r
+    // the address register's odd nibbles (r32v_mem): the ring for a load's M and after a taken
+    // branch on x0 (tk), else pcr
+    wire [15:0] pa_odd = (sM ? c_ld : tk) ? {ring[31:28], ring[23:20], ring[15:12], ring[7:4]} :
+                                            {pcr[31:28], pcr[23:20], pcr[15:12], pcr[7:4]};
     wire [3:0] rsel    = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | sW4) ? rd_f :
                          csr_sl ? {2'b01, csr_idx} : 4'd0;
 
@@ -557,10 +564,11 @@ module tt_um_fesens_r32v (
         .cap_a(dstb & sA), .kn(n), .din4(din4),
         .io(io), .ps(ps), .booting(booting),
         .active(active), .prog(fM), .fetch(sF),
-        .pa({(tk ? ring[24] : pcr[24]), ((sM ? c_ld : tk) ? ring[23:0] : pcr[23:0])}),
+        .pa24(tk ? ring[24] : pcr[24]),
+        .pa_odd(pa_odd),
         .fz(sF & first),
         .sck(sck), .gap(gap),
-        .hdr_ld((gap & ~booting & ~mask) | (stb & hdr & cn[5])),
+        .hdr_ld(hdr_ld),
         .hidx(gap ? 3'd0 : (cn[2:0] ^ {~wr, 2'b00})),
         .h_wr(wr), .h_reg({regarea, rsel}),
         .dat_ld(dstb & wact), .wd4(wdo4),

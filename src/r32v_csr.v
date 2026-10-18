@@ -49,8 +49,9 @@ module r32v_csr (
     output wire        take        // an interrupt is taken at this retirement
 );
 
-    reg       mie, mpie, meie, mc31;
-    reg [3:0] mc;
+    reg       mie, mpie, meie;
+    wire      mc31;
+    wire [3:0] mc;
 
     // Decode (exact on the contract-4 numbers)
     wire b11 = csr_num[11], b6 = csr_num[6], b2 = csr_num[2], b1 = csr_num[1], b0 = csr_num[0];
@@ -115,14 +116,19 @@ module r32v_csr (
                 intr <= 1'b0;
             end
         end
-        if (go) begin
-            mc31 <= irq_take;
-            mc   <= irq_take ? 4'd11 : cause;
-        end else if (wc_end & c_mcause) begin
-            mc31 <= wb[6];
-            mc   <= wb[3:0];
-        end
     end
+    // mcause: scan flops holding through SCD (D = the next value, SCD = Q, SCE = hold)
+    wire [4:0] mc_d = go ? {irq_take, (irq_take ? 4'd11 : cause)} : {wb[6], wb[3:0]};
+    wire [4:0] mc_q;
+    wire       mc_h = ~(go | (wc_end & c_mcause));
+    genvar gi;
+    generate
+        for (gi = 0; gi < 5; gi = gi + 1) begin : g_mc
+            sky130_fd_sc_hd__sdfxtp_1 u_mc (.CLK(clk), .D(mc_d[gi]), .SCD(mc_q[gi]), .SCE(mc_h),
+                                            .Q(mc_q[gi]));
+        end
+    endgenerate
+    assign {mc31, mc} = mc_q;
 
 endmodule
 
