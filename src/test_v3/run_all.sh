@@ -46,12 +46,13 @@ run uart_echo_m1 uart_echo --uart-div 39 --uart-rx 0f1e2d3c4b5a6978 --uart-rx-st
 run spi_loop spi_loop --loop
 run capture capture --loop
 run pwm pwm --pwm 1:99:1:0,2:99:1:50,3:99:1:120,7:65535:0:300
-# core datapath: random streams (the EBREAK at the end traps; rvfi mode ends there)
+# core datapath: random streams (rvfi mode: they end with GPIO_OUT = 0x5A and the self-loop, and
+# GPIO_OUT takes random values on the way, which only the rvfi verdict's self-loop check tells apart)
 for s in 1 2 3 4; do
     case "random_$s" in *$FILTER*) ;; *) continue ;; esac
     for seed in $SEEDS; do
         total=$((total + 1))
-        out=$("$TB/harness_rvfi" "$P/random_$s.bin" --seed "$seed" --end-ebreak 2>/dev/null | tail -1)
+        out=$("$TB/harness_rvfi" "$P/random_$s.bin" --seed "$seed" 2>/dev/null | tail -1)
         case "$out" in
             *'"pass":true'*) echo "PASS random_$s rvfi $out" ;;
             *) fails=$((fails + 1)); echo "FAIL random_$s rvfi $out" ;;

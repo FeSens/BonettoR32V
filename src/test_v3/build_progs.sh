@@ -29,13 +29,15 @@ CM=$ROOT/verif/programs/coremark
 CMS="$CM/core_list_join.c $CM/core_main.c $CM/core_matrix.c $CM/core_state.c $CM/core_util.c $CM/bonetto/core_portme.c"
 for it in 1 2; do
     $CC $ARCH -O2 -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-common -I$P \
-        -I$CM -I$CM/bonetto -DITERATIONS=$it -DTOTAL_DATA_SIZE=2000 -DPERFORMANCE_RUN=1 \
-        -Wno-unused-but-set-variable $LDF -T link.ld -Wl,--defsym=_log_ring=0x017F0000 \
+        -I$CM -I$CM/bonetto -I$ROOT/verif/programs -DITERATIONS=$it -DTOTAL_DATA_SIZE=2000 -DPERFORMANCE_RUN=1 \
+        -Wno-unused-but-set-variable $LDF -T link.ld -Wl,--defsym=_log_ring=0x017F0000 -Wl,--defsym=_log_ring_end=0x017F0800 \
         crt0.S $CMS -lgcc -o "$OUT/coremark$it.elf"
 done
+# The contract v3 random streams (verif/programs/gen_random.py: data window in PSRAM, register
+# dump, GPIO_OUT = 0x5A and the self-loop at the end) need verif/programs/link.ld's symbols.
 for s in 1 2 3 4; do
     python3 "$ROOT/verif/programs/gen_random.py" $s 2000 -o "$OUT/random_$s.S"
-    $CC $ARCH $LDF -T rand.ld "$OUT/random_$s.S" -o "$OUT/random_$s.elf"
+    $CC $ARCH $LDF -T "$ROOT/verif/programs/link.ld" "$OUT/random_$s.S" -o "$OUT/random_$s.elf"
 done
 for e in "$OUT"/*.elf; do
     $OBJCOPY -O binary "$e" "${e%.elf}.bin"
