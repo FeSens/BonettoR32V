@@ -254,8 +254,17 @@ Fixtures in `tools/test_fixtures/src_check/`:
 `src/` may instantiate the sky130 standard cells of `CELL_WHITELIST` in `tools/src_check.py`:
 `sky130_fd_sc_hd__dfxtp_1`, `dfxtp_2`, `edfxtp_1`, `sdfxtp_1`, `sdfxtp_2`, `mux2_1` and
 `mux2_2`. Rule 13 above says how.
-- **Why.** Synthesis maps an enable flop to `edfxtp_1` (30.03 µm²). `sdfxtp_1` (26.28 µm²) does the
-  same job with SCE as the enable, SCD as the data and D tied to Q, but synthesis never picks it.
+- **Why.** Synthesis maps an enable flop to `edfxtp_1` (30.03 µm²). `sdfxtp_1` (26.28 µm²) can do
+  the same job with its scan mux, but synthesis never picks it.
+- **Measured** (branch `demo/cell-instances`, not for merge): r32v_periph's 125 configuration flops
+  as `sdfxtp_1` on champion 106. Every gate passes and CoreMark is unchanged. Each 1x2 harden
+  below passed with the precheck; "placed" is LibreLane's final std-cell area.
+  - Hold loop through D (D = Q, SCD = data, SCE = enable): synth 20,933.8 to 20,477.1 µm²
+    (-456.7). The harden needs 134 hold buffers instead of 50, 83 of them on the Q-to-D loops,
+    so placed area grows from 25,215.4 to 25,791.0 µm² (+575.6).
+  - Hold loop through SCD (SCD = Q, D = data, SCE = the enable inverted): the liberty's hold
+    constraint on SCD is lower than on D (tt: -0.002 against 0.056 ns). Synth 20,378.3 µm²
+    (-555.5); 77 hold buffers, 25 of them on SCD; placed 24,893.9 µm² (-321.5).
 - **Exclusion lists.**
   - No whitelisted cell is on the PDK's `drc_exclude.cells`, PnR's dont_use list.
   - TT's cell categories know every base name.
