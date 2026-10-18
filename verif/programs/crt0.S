@@ -10,7 +10,8 @@
 #   5. _pass: ALTFN = 0 (every uo pin back to GPIO), GPIO_OUT = 0x5A, then the program end
 #      (`jal x0, 0` retired twice at the same pc, contract 4).
 #
-# _fail (a0 = failure id < 0x60): ALTFN = 0, GPIO_OUT = id, then GPIO_OUT = 0xEE, self-loop.
+# _fail (a0 = failure id < 0x60): interrupts off (MIE = MEIE = 0, so a failing interrupt test
+# still reaches the end), ALTFN = 0, GPIO_OUT = id, then GPIO_OUT = 0xEE, self-loop.
 # 0x5F: the interrupt enables were not 0 after reset.
 # _default_trap (any trap a program doesn't handle): fails with id 0x60 + mcause[3:0], plus 0x10
 # for an interrupt.
@@ -85,6 +86,8 @@ _end_ok:
 
     .global _fail
 _fail:
+    csrci mstatus, MSTATUS_MIE
+    csrw mie, zero
     lui  t0, 0x80000
     sw   zero, OFS_ALTFN(t0)
     sb   a0, OFS_GPIO_OUT(t0)

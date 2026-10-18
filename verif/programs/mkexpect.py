@@ -3,9 +3,11 @@
 cosim harness reads (Task 3's field names), and check the program is valid.
 
 Usage: mkexpect.py --iss ISS_MAIN --hex PROG.hex --elf PROG.elf --out PROG.expect.json
-                   [--declared] [--coremark-iters N]
+                   [--declared] [--max-cycles C] [--coremark-iters N]
 
 --declared marks a peripheral program (the Makefile's EVENT_PROGS, the one list of them).
+--max-cycles C writes max_cycles = C: the program's cycle budget, for a declared program that
+needs more than the harness's default (ruling R35: irq_stress).
 
 Every expect.json has:
   prog          the program name
@@ -41,6 +43,7 @@ kind "declared" adds the stimulus fields the harness drives and checks (values f
                 writes GPIO_OUT = 0xA5
   ir_loop:      loop_uo7_to_ui0 (true)
   gpio_edge, wfi: gpio_script ([[cycle, ui_value], ...], ui_in from that cycle on)
+  irq_stress:   max_cycles (its run-length budget; the harness's --max-cycles overrides it)
 and the program still runs on the standalone ISS up to a bound, which must stop at the bound (or
 the self-loop) with no unspecified step and no read before write. It also writes <name>.stim, the
 same stimulus for progsim.
@@ -225,6 +228,8 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--declared", action="store_true",
                     help="a peripheral program: expectations from the declared stimulus")
+    ap.add_argument("--max-cycles", type=int,
+                    help="a declared program's cycle budget (expect.json max_cycles)")
     ap.add_argument("--coremark-iters", type=int)
     a = ap.parse_args()
     name = os.path.basename(a.hex)[:-len(".hex")]
@@ -243,6 +248,8 @@ def main() -> int:
         exp["final_altfn"] = FINAL_ALTFN.get(name, 0)
         fields, stim_lines = declared(name, parse_stim())
         exp.update(fields)
+        if a.max_cycles:
+            exp["max_cycles"] = a.max_cycles
         with open(a.out[:-len(".expect.json")] + ".stim", "w") as f:
             f.write("".join(ln + "\n" for ln in stim_lines))
         summary_line = f"declared ({', '.join(fields) or 'result_gpio only'})"
