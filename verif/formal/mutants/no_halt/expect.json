@@ -1,0 +1,10 @@
+{
+  "class": "no_halt",
+  "checks": [
+    "silent"
+  ],
+  "description": "EBREAK retires as a trap but the core keeps running.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/no_halt"
+}

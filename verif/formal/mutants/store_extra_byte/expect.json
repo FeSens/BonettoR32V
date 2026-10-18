@@ -1,0 +1,10 @@
+{
+  "class": "store_extra_byte",
+  "checks": [
+    "bus_dmem"
+  ],
+  "description": "SB sends 2 data bytes: its own and the next one (rs2[15:8]), a byte outside the store.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/store_extra_byte"
+}

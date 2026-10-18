@@ -1,0 +1,10 @@
+{
+  "class": "uo_glitch",
+  "checks": [
+    "gpio"
+  ],
+  "description": "An IO store shows its value on uo_out in EXEC, restores the old value for the retirement cycle, then writes it again (a glitch and return before retirement).",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/uo_glitch"
+}

@@ -1,0 +1,8 @@
+{
+  "class": "legal_split_store",
+  "checks": "all",
+  "description": "Legal: SW is split into two 2-byte WRITEs (bytes 0-1 at addr, then bytes 2-3 at addr + 2); contract v2 section 6 allows a store to be split, each byte once.",
+  "expect": "pass",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/legal_split_store"
+}

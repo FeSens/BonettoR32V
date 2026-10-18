@@ -1,0 +1,7 @@
+{
+  "class": "legal: junk fields on non-branch traps",
+  "checks": "all",
+  "description": "Trapping retirements other than a branch or JALR report arbitrary rs1/rs2 fields, rd_wdata and pc_wdata; contract section 6 compares none of them. Expect PASS.",
+  "expect": "pass",
+  "deep": false
+}

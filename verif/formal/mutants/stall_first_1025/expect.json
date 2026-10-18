@@ -1,0 +1,9 @@
+{
+  "class": "first retirement at edge 1025 at the latest",
+  "checks": [
+    "liveness"
+  ],
+  "description": "The first fetch waits 796 extra cycles after reset: the latest first retirement (a 4-byte RAM access) is at edge 1025. Expect FAIL.",
+  "expect": "fail",
+  "deep": true
+}

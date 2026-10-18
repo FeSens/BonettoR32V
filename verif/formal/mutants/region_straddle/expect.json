@@ -1,0 +1,12 @@
+{
+  "class": "region_straddle",
+  "checks": [
+    "bus_dmem"
+  ],
+  "description": "hyp/002-rf-in-ram with its scratch slot (pc spill/restore around RAM stores) at 0xFF7E instead of 0xFFC0: those 4-byte transactions straddle 0xFF7F/0xFF80.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/region_straddle",
+  "timing": "legal_h002_rf",
+  "slow": true
+}

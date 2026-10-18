@@ -1,0 +1,9 @@
+{
+  "class": "a region READ that wraps out of the region",
+  "checks": [
+    "bus_dmem"
+  ],
+  "description": "Before a trapping instruction retires, the core READs 4 bytes at 0xFFFE: 0xFFFE, 0xFFFF, 0x0000, 0x0001 (contract section 6: a region transaction may not wrap out of the region).",
+  "expect": "fail",
+  "deep": false
+}

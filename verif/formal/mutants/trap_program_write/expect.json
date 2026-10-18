@@ -1,0 +1,9 @@
+{
+  "class": "a program WRITE on a trapping instruction",
+  "checks": [
+    "bus_dmem"
+  ],
+  "description": "Before a trapping instruction retires, the core WRITEs one byte at 0x0100 (contract section 4: no program-memory write on a trap).",
+  "expect": "fail",
+  "deep": false
+}

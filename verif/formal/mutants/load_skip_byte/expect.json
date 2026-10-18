@@ -1,0 +1,10 @@
+{
+  "class": "load_skip_byte",
+  "checks": [
+    "bus_dmem"
+  ],
+  "description": "LW reads only its first 3 bytes over SPI and takes the 4th from the shift register.",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/load_skip_byte"
+}

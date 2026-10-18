@@ -1,0 +1,9 @@
+{
+  "class": "changes MOSI on the rising SCK edge",
+  "checks": [
+    "spi"
+  ],
+  "description": "MOSI is XORed with the next bit while SCK is high.",
+  "expect": "fail",
+  "deep": false
+}

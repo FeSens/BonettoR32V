@@ -1,0 +1,9 @@
+{
+  "class": "claims a region access to escape the checks",
+  "checks": [
+    "insn_add"
+  ],
+  "description": "On an OP instruction with rs1 == rs2 the result has bit 0 flipped (in the register and in RVFI), and RVFI claims a 1-byte read at 0xFF80 (rmask 0001). The region stop comes from the spec's address only (contract section 3), so the claim must not stop the checks.",
+  "expect": "fail",
+  "deep": false
+}

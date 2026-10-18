@@ -1,0 +1,10 @@
+{
+  "class": "WRITE ends mid-byte",
+  "checks": [
+    "spi",
+    "bus_dmem"
+  ],
+  "description": "Store transactions send one data bit fewer than the access size.",
+  "expect": "fail",
+  "deep": false
+}

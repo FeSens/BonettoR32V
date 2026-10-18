@@ -1,0 +1,9 @@
+{
+  "class": "samples MISO while SCK is low",
+  "checks": [
+    "bus_imem"
+  ],
+  "description": "MISO goes through an extra flip-flop, so the falling-edge capture reads the value from the cycle where SCK was low (noise).",
+  "expect": "fail",
+  "deep": false
+}

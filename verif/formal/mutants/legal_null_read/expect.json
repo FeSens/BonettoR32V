@@ -1,0 +1,7 @@
+{
+  "class": "legal: a null READ",
+  "checks": "all",
+  "description": "Before a trapping instruction retires, the core sends a READ header for 0x1234 and raises CS_n with no data bit (contract section 6: null READs are allowed anywhere). Expect PASS.",
+  "expect": "pass",
+  "deep": false
+}
