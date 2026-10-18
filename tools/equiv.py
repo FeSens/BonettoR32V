@@ -5,9 +5,14 @@ Contract section 6: logic under `ifdef RISCV_FORMAL` may only compute RVFI outpu
 drives a pin may depend on it. This gate proves it, so formal (which runs the RVFI build) proves
 the design that ships.
 
-  A (gold): read_verilog -mem2reg -DRISCV_FORMAL src/*.v, hierarchy, proc, flatten, remove the
-            port flag from every rvfi_* wire, opt_clean (logic that only fed RVFI disappears).
+  A (gold): read_verilog -mem2reg -DRISCV_FORMAL src/*.v plus the cell models, hierarchy, proc,
+            flatten, remove the port flag from every rvfi_* wire, opt_clean (logic that only fed
+            RVFI disappears).
   B (gate): the same without the define.
+  Cell models: src/ may instantiate the whitelisted sky130 cells (contract section 1); both builds
+  read their behavioral models (verif/cells/<cell>.v, src_check.cell_model_files()) after
+  src/*.v, the same files in the same order, and flatten inlines them, so cell flops are matched
+  and proven like any other register. Unused models are dropped by `hierarchy -top`.
   Proof:    async2sync, equiv_make gold gate, equiv_simple -seq N, equiv_induct -seq N,
             equiv_status -assert.
 
@@ -289,6 +294,12 @@ def main(argv=None):
     if not srcs:
         return finish(False, f"no *.v files in {args.src}")
     result["src_files"] = [os.path.basename(s) for s in srcs]
+    models = src_check.cell_model_files()
+    missing = [m for m in models if not os.path.isfile(m)]
+    if missing:
+        return finish(False, f"cell model missing: {missing[0]}")
+    result["cell_models"] = [os.path.basename(m) for m in models]
+    srcs = srcs + models
 
     work = os.path.abspath(args.work)
     try:

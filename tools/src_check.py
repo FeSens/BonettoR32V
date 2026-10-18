@@ -50,6 +50,15 @@ directive lines are not code and are skipped):
  12. Functions: a local variable (or the function's own result) must not be read before it is
      assigned on every path (no stale or uninitialized values; Icarus keeps them between calls,
      synthesis makes them undefined).
+ 13. Standard cells: an identifier starting with `sky130` (any case) must be a name in
+     CELL_WHITELIST, used as the module type of one instance: `<cell> <name> (.PORT(expr), ...);`
+     with named connections only, each of the cell's ports exactly once and non-empty, no power
+     pins, no parameters, no instance arrays and one instance per statement. Rule 6 already
+     keeps src/ from defining a module with a cell's name, so no model can be shadowed.
+
+Cell models: every gate that compiles RTL (lint, cosim and arch, equiv, the RTL test, formal)
+reads cell_model_files(), the behavioral model verif/cells/<cell>.v of every whitelisted cell,
+after src/*.v. Synthesis never reads them: area and harden keep each instance as the liberty cell.
 
 Differential backstop (check_differential): for the plain and the RISCV_FORMAL builds, preprocess
 src/*.v (sorted) with `verilator -E -P`, yosys `read_verilog -ppdump` and `iverilog -E`, tokenize
@@ -72,6 +81,36 @@ VFILE_RE = re.compile(r"^[A-Za-z0-9_]+\.v$")
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9_./+-]+$")
 EXEMPT_DIRS = ("__pycache__",)
 TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
+# realpath: a test repo that symlinks tools/ still reads the cell models of the real checkout.
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# The sky130 standard cells src/ may instantiate (contract section 1, rule 13): name -> (output
+# ports, input ports), as in the PDK's Verilog without power pins. A direct instance survives
+# synthesis as the liberty cell (LibreLane reads the full liberty as blackboxes), and tools/area.py
+# counts its liberty area. None of these is on the PDK's drc_exclude.cells (PnR's dont_use list,
+# cells with DRC errors), and TT's cell categories know every base name. The sdfxtp cells stay on
+# the PDK's no_synth.cells (src/config.json takes dfxtp_1 and edfxtp_1 back out of it, not them):
+# that list only keeps synthesis from mapping logic onto a cell, and an instance is not mapped.
+# Power pins stay out of RTL: LibreLane connects them in PnR, and the gate-level test defines
+# USE_POWER_PINS for a powered netlist.
+CELL_WHITELIST = {
+    "sky130_fd_sc_hd__dfxtp_1": (("Q",), ("CLK", "D")),
+    "sky130_fd_sc_hd__dfxtp_2": (("Q",), ("CLK", "D")),
+    "sky130_fd_sc_hd__edfxtp_1": (("Q",), ("CLK", "D", "DE")),
+    "sky130_fd_sc_hd__sdfxtp_1": (("Q",), ("CLK", "D", "SCD", "SCE")),
+    "sky130_fd_sc_hd__sdfxtp_2": (("Q",), ("CLK", "D", "SCD", "SCE")),
+    "sky130_fd_sc_hd__mux2_1": (("X",), ("A0", "A1", "S")),
+    "sky130_fd_sc_hd__mux2_2": (("X",), ("A0", "A1", "S")),
+}
+CELL_RE = re.compile(r"^sky130", re.I)
+POWER_PINS = ("VPWR", "VGND", "VPB", "VNB")
+CELL_MODELS_DIR = os.path.join(REPO, "verif", "cells")
+
+
+def cell_model_files(models_dir=CELL_MODELS_DIR):
+    """The behavioral model of every whitelisted cell (verif/cells/<cell>.v), sorted. Every gate
+    that compiles RTL reads them after src/*.v; unused ones are dropped by the top selection."""
+    return [os.path.join(models_dir, c + ".v") for c in sorted(CELL_WHITELIST)]
 
 VARIABLE_TYPES = {"reg", "integer", "time", "real", "realtime", "logic", "bit", "int", "byte",
                   "shortint", "longint"}
@@ -462,6 +501,83 @@ def check_constructs(name, toks):
     return errors
 
 
+def check_cells(name, toks):
+    """Rule 13: whitelisted sky130 cells only, each as one instance with named connections to
+    exactly its own ports (no power pins, parameters or arrays)."""
+    errors = []
+
+    def err(line, msg):
+        errors.append(f"src/{name}:{line}: {msg} (contract section 1)")
+
+    n = len(toks)
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "id" or not CELL_RE.match(text):
+            continue
+        prev = toks[i - 1][1] if i else ""
+        if prev in DEFINITION_KEYWORDS:
+            continue                                  # rule 6 reports the module name
+        if text not in CELL_WHITELIST:
+            err(line, f"cell {text} is not in the cell whitelist (CELL_WHITELIST in "
+                      f"tools/src_check.py: {', '.join(sorted(CELL_WHITELIST))})")
+            continue
+        nxt = toks[i + 1] if i + 1 < n else ("", "", line)
+        if nxt[1] == "#":
+            err(line, f"an instance of {text} takes no parameters")
+            continue
+        if not (nxt[0] == "id" and i + 2 < n and toks[i + 2][1] in ("(", "[")):
+            err(line, f"{text} may only be the module type of an instance: "
+                      f"`{text} <name> (.PORT(signal), ...);`")
+            continue
+        inst = nxt[1]
+        if toks[i + 2][1] == "[":
+            err(line, f"instance {inst} of {text}: instance arrays are not allowed (use a "
+                      f"generate loop)")
+            continue
+        close = close_of(toks, i + 2)
+        if close is None:
+            err(line, f"instance {inst} of {text}: unbalanced connection list")
+            continue
+        if close + 1 >= n or toks[close + 1][1] != ";":
+            err(line, f"instance {inst} of {text}: one instance per statement, ended by `;`")
+        outs, ins = CELL_WHITELIST[text]
+        ports = outs + ins
+        seen, p, ok = set(), i + 3, True
+        while p < close:
+            if toks[p][1] != ".":
+                err(line, f"instance {inst} of {text}: positional connections are not allowed; "
+                          f"connect each port by name, .PORT(signal)")
+                ok = False
+                break
+            q = close_of(toks, p + 2) if p + 2 < close and toks[p + 2][1] == "(" else None
+            if toks[p + 1][0] != "id" or q is None or q >= close:
+                err(line, f"instance {inst} of {text}: malformed connection (want .PORT(signal))")
+                ok = False
+                break
+            port = toks[p + 1][1]
+            if port in POWER_PINS:
+                err(line, f"instance {inst} of {text}: power pin {port} is not allowed in RTL "
+                          f"(LibreLane connects power in PnR)")
+            elif port not in ports:
+                err(line, f"instance {inst} of {text}: the cell has no port {port} (its ports: "
+                          f"{', '.join(ports)})")
+            elif port in seen:
+                err(line, f"instance {inst} of {text}: port {port} connected twice")
+            elif q == p + 3:
+                err(line, f"instance {inst} of {text}: port {port} is left unconnected")
+            seen.add(port)
+            p = q + 1
+            if p < close and (toks[p][1] != "," or p + 1 == close):
+                err(line, f"instance {inst} of {text}: malformed connection list")
+                ok = False
+                break
+            p += 1
+        missing = [x for x in ports if x not in seen]
+        if ok and missing:
+            err(line, f"instance {inst} of {text}: every port must be connected, missing "
+                      f"{', '.join(missing)}")
+    return errors
+
+
 class FunctionShapeError(Exception):
     pass
 
@@ -697,12 +813,13 @@ def check_hdl(src):
                               f"contract section 1)")
         errors += check_declarations(name, toks)
         errors += check_module_names(name, toks)
-        # Rules 7-12 run on what each build actually compiles: the plain and the RISCV_FORMAL
+        # Rules 7-13 run on what each build actually compiles: the plain and the RISCV_FORMAL
         # token streams, ifdefs resolved and directive lines dropped.
         seen = set(errors)
         for rvfi in (False, True):
             code = build_tokens(toks, rvfi)
-            for e in check_constructs(name, code) + check_functions(name, code):
+            for e in (check_constructs(name, code) + check_functions(name, code)
+                      + check_cells(name, code)):
                 if e not in seen:
                     seen.add(e)
                     errors.append(e)

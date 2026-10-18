@@ -19,8 +19,11 @@
 # design). SRC_DIR defaults to src/. Every SRC_DIR/*.v file is part of the design (contract
 # section 1) and they are read in sorted (C locale) order, like the gates. The RVFI build gets
 # exactly one define, RISCV_FORMAL, and nothing is read in front of the design: no prelude, no
-# include path. OUT_DIR defaults to build/cosim/MODE. TRACE=1 adds FST tracing (harness --trace
-# PATH). VFLAGS adds Verilator arguments; only the harness self-tests use it, on mutant copies.
+# include path. After the design come the behavioral models of the sky130 cells src/ may
+# instantiate (verif/cells/*.v, one per CELL_WHITELIST entry in tools/src_check.py), sorted;
+# --top-module drops the unused ones. OUT_DIR defaults to build/cosim/MODE. TRACE=1 adds FST
+# tracing (harness --trace PATH). VFLAGS adds Verilator arguments; only the harness self-tests
+# use it, on mutant copies.
 #
 # Verilator runs with --x-initial unique and --x-assign unique; the harness randomizes every
 # power-up value at run time from its --seed, so a design that relies on zero-initialized state
@@ -58,6 +61,14 @@ if [ ${#FILES[@]} -eq 0 ]; then
   echo "build.sh: no Verilog sources in $SRC" >&2
   exit 1
 fi
+CELLS=()
+for f in "$ROOT"/verif/cells/*.v; do
+  [ -f "$f" ] && CELLS+=("$f")
+done
+if [ ${#CELLS[@]} -eq 0 ]; then
+  echo "build.sh: no cell models in $ROOT/verif/cells" >&2
+  exit 1
+fi
 
 DEFS=()
 CDEFS=""
@@ -89,6 +100,7 @@ ARGS=(--cc --exe --build -j 0 -O3
   ${DEFS[@]+"${DEFS[@]}"}
   ${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"}
   "${FILES[@]}"
+  "${CELLS[@]}"
   "$HSRC"
   -CFLAGS "-O2 -std=c++17 -I$COSIM $CDEFS"
   -Mdir "$OUT/obj" -o "$OUT/harness")
@@ -98,4 +110,4 @@ verilator "${ARGS[@]}" >"$OUT/build.log" 2>&1 || {
   tail -40 "$OUT/build.log" >&2
   exit 1
 }
-echo "built $OUT/harness ($MODE, ${#FILES[@]} source files)"
+echo "built $OUT/harness ($MODE, ${#FILES[@]} source files, ${#CELLS[@]} cell models)"

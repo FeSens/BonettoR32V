@@ -16,8 +16,16 @@ Usage:
 
 Outputs:
   build/area.json        {"area_um2", "cells", "by_type", "by_module", "flops", "latches",
-                          "netlist", ...}
+                          "instanced_cells", "netlist", ...}
   build/synth/netlist.v  the flattened gate-level netlist (consumed by the gate-level test)
+
+Cell instances: src/ may instantiate the whitelisted sky130 cells (contract section 1,
+CELL_WHITELIST in tools/src_check.py). Only src/*.v is staged, never the behavioral models in
+verif/cells, so each instance stays the liberty cell (LibreLane reads the full liberty as
+blackboxes). Yosys `stat` reads the synthesis liberty, which lacks the cells synthesis may not map
+to (the sdfxtp scan flops, say), so it has no area for them; area_um2 adds their liberty area and
+instanced_cells lists them. A netlist cell missing from the synthesis liberty that is not
+whitelisted fails.
 
 Engines:
   librelane (default): LibreLane's own Yosys.Synthesis step in the LibreLane 3.0.14 Docker
@@ -43,6 +51,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import src_check  # noqa: E402  (CELL_WHITELIST: the cells src/ may instantiate)
 
 REPO = Path(__file__).resolve().parent.parent
 # ghcr.io/librelane/librelane:3.0.14, pinned by digest
@@ -374,29 +385,64 @@ def synth_checks(step_dir, engine):
     return {k: int(v) for k, v in vals.items()}
 
 
-def summarize(step_dir, top, libcells):
+def synth_lib_cells(step_dir, engine, st):
+    """Cell names of the liberty synthesis (and its `stat`) used: LibreLane's trimmed copy without
+    the excluded cells (extra.json "libs_synth"), or the fallback engine's lib_synth.lib."""
+    if engine == "librelane":
+        try:
+            libs = json.loads((step_dir / "extra.json").read_text())["libs_synth"]
+        except (OSError, KeyError, ValueError) as e:
+            die(f"cannot read the synthesis liberty list from {step_dir / 'extra.json'}: {e}")
+    else:
+        libs = [str(st / "lib_synth.lib")]
+    cells = set()
+    for lib in libs:
+        if not Path(lib).is_file():
+            die(f"synthesis liberty {lib} missing")
+        cells.update(parse_liberty(lib))
+    return cells
+
+
+def summarize(step_dir, top, libcells, synth_cells):
+    """The score from the flattened stat.json. Yosys `stat` reads the synthesis liberty, which
+    lacks the cells synthesis may not map to (no_synth.cells and friends), so it has no area for
+    such a cell. Only a direct instance of a whitelisted cell (contract section 1) can put one in
+    the netlist: its liberty area is added to stat's area and listed under instanced_cells. Any
+    other cell missing from the synthesis liberty fails."""
     stat = json.loads((step_dir / "reports" / "stat.json").read_text())
     design = stat["design"]
-    by_type = {}
+    by_type, instanced = {}, {}
     flops = latches = 0
-    total = 0.0
+    total = known = extra = 0.0
     for cell, n in sorted(design["num_cells_by_type"].items()):
         info = libcells.get(cell)
         if info is None:
             die(f"cell {cell} is not in the {SCL} liberty (unmapped logic?)")
         a = info["area"] * n
         total += a
+        if cell in synth_cells:
+            known += a
+        elif cell in src_check.CELL_WHITELIST:
+            extra += a
+            instanced[cell] = {"count": n, "area_um2": round(a, 4)}
+        else:
+            die(f"cell {cell} is in the netlist but neither in the synthesis liberty nor in the "
+                f"cell whitelist (CELL_WHITELIST in tools/src_check.py)")
         by_type[cell] = {"count": n, "area_um2": round(a, 4)}
         if info["kind"] == "flop":
             flops += n
         elif info["kind"] == "latch":
             latches += n
-    area = float(design.get("area", total))
+    area = float(design.get("area", known))
+    if abs(area - known) > 0.01:
+        die(f"stat area {area} != sum over the synthesis liberty's cell types {known}")
+    area += extra
     if abs(area - total) > 0.01:
-        die(f"stat area {area} != sum over cell types {total}")
+        die(f"area {area} != sum over cell types {total}")
     by_type = dict(sorted(by_type.items(), key=lambda kv: (-kv[1]["area_um2"], kv[0])))
     return {"area_um2": round(area, 4), "cells": int(design["num_cells"]),
-            "by_type": by_type, "flops": flops, "latches": latches}, stat
+            "by_type": by_type, "flops": flops, "latches": latches,
+            "instanced_cells": instanced}, stat
 
 
 def short_module_name(mod):
@@ -406,14 +452,39 @@ def short_module_name(mod):
     return m.group(1) if m else name
 
 
-def by_module(stat, libcells):
+def unknown_area(stat, libcells, synth_cells):
+    """Per module, the liberty area yosys `stat` left out (cells missing from the synthesis
+    liberty: whitelisted instances), submodules included."""
+    mods = stat.get("modules", {})
+    memo = {}
+
+    def miss(mod):
+        if mod not in memo:
+            memo[mod] = 0.0
+            total = 0.0
+            for c, n in mods[mod]["num_cells_by_type"].items():
+                # a submodule type is `name` for module `\name`, or `$paramod\...` as is
+                sub = c if c in mods else "\\" + c
+                if c in libcells and c not in synth_cells:
+                    total += libcells[c]["area"] * n
+                elif sub in mods and sub != mod:
+                    total += miss(sub) * n
+            memo[mod] = total
+        return memo[mod]
+
+    return {mod: miss(mod) for mod in mods}
+
+
+def by_module(stat, libcells, synth_cells=None):
     """Per module: self_area_um2 (its own cells only), area_um2 (yosys' inclusive figure,
-    submodule instances included) and its own cell count. Hierarchical synthesis."""
+    submodule instances included, plus the liberty area of whitelisted instances yosys has no
+    area for) and its own cell count. Hierarchical synthesis."""
     out = {}
+    missing = unknown_area(stat, libcells, synth_cells if synth_cells is not None else libcells)
     for mod, s in stat.get("modules", {}).items():
         own = {c: n for c, n in s["num_cells_by_type"].items() if c in libcells}
         self_area = sum(libcells[c]["area"] * n for c, n in own.items())
-        incl = s.get("area", self_area)
+        incl = s.get("area", self_area - missing[mod]) + missing[mod]
         name = short_module_name(mod)
         if name in out:
             name = mod.lstrip("\\")
@@ -462,7 +533,8 @@ def main():
         steps = run_yosys(st, rel, a.top, cfg, lib, root, a.param, not a.no_hier)
 
     checks = {k: synth_checks(d, a.engine) for k, d in steps.items()}
-    res, _ = summarize(steps["flat"], a.top, libcells)
+    synth_cells = synth_lib_cells(steps["flat"], a.engine, st)
+    res, _ = summarize(steps["flat"], a.top, libcells, synth_cells)
     res["synth_checks"] = checks["flat"]
     netlist = synth_dir / "netlist.v"
     shutil.copy2(steps["flat"] / f"{a.top}.nl.v", netlist)
@@ -470,8 +542,12 @@ def main():
     mods = {}
     if "hier" in steps:
         hstat = json.loads((steps["hier"] / "reports" / "stat.json").read_text())
-        mods = by_module(hstat, libcells)
-        hier_total = round(float(hstat["design"].get("area", 0.0)), 4)
+        hcells = synth_lib_cells(steps["hier"], a.engine, st)
+        mods = by_module(hstat, libcells, hcells)
+        extra = sum(libcells[c]["area"] * n
+                    for c, n in hstat["design"]["num_cells_by_type"].items()
+                    if c in libcells and c not in hcells)
+        hier_total = round(float(hstat["design"].get("area", 0.0)) + extra, 4)
 
     srchash = hashlib.sha256()
     for r in rel:

@@ -945,6 +945,99 @@ def test_tcem_mutant_fails(tools, tmp_path, mode):
     assert list(s) == list(run_cosim.KEYS) and s["coremark_cycles_per_iter"] is None
 
 
+# Cell mutants (contract section 1: src/ may instantiate the whitelisted sky130 cells; build.sh
+# reads their behavioral models from verif/cells). Each is the playback stub with its uo_out
+# register built from sky130_fd_sc_hd__sdfxtp_1 scan flops, written into a temporary src dir.
+UO_REG = """            uo_r <= 8'h00;
+"""
+UO_LOAD = """                {oe_r, uio_r, uo_r} <= pn[{pi, 1'b1}][23:0];
+"""
+UO_DECL = "    reg [7:0] uo_r, uio_r, oe_r;\n"
+CELL_UO = {
+    # the reset folded into the load: SCE = load, SCD = the new value, D = Q (an enable flop)
+    "good": ("~rst_n | hit", "rst_n ? pn[{pi, 1'b1}][7:0] : 8'h00", ".D(uo_r[k]), .SCD(uo_d[k])"),
+    # select polarity swapped: SCD and D exchanged, so SCE = 1 holds and SCE = 0 loads
+    "swapped": ("~rst_n | hit", "rst_n ? pn[{pi, 1'b1}][7:0] : 8'h00",
+                ".D(uo_d[k]), .SCD(uo_r[k])"),
+    # no reset: the register relies on its power-up value until the first pin record
+    "no_reset": ("hit", "pn[{pi, 1'b1}][7:0]", ".D(uo_r[k]), .SCD(uo_d[k])"),
+}
+
+
+def cell_stub(tmp: Path, variant: str) -> Path:
+    load, data, conns = CELL_UO[variant]
+    text = (PLAYBACK / "tt_um_fesens_r32v.v").read_text()
+    for old in (UO_REG, UO_LOAD, UO_DECL):
+        assert text.count(old) == 1, old
+    gen = (f"    reg [7:0] uio_r, oe_r;\n    wire [7:0] uo_r;\n"
+           f"    wire hit = rst_n & (pn[{{pi, 1'b0}}] == cnt + 32'd1);\n"
+           f"    wire uo_ld = {load};\n    wire [7:0] uo_d = {data};\n"
+           f"    genvar k;\n    generate\n        for (k = 0; k < 8; k = k + 1) begin : g_uo\n"
+           f"            sky130_fd_sc_hd__sdfxtp_1 u_ff (.CLK(clk), {conns}, .SCE(uo_ld), "
+           f".Q(uo_r[k]));\n        end\n    endgenerate\n")
+    text = (text.replace(UO_REG, "").replace(UO_DECL, gen)
+            .replace(UO_LOAD, "                {oe_r, uio_r} <= pn[{pi, 1'b1}][23:8];\n"))
+    d = tmp / f"cell_{variant}"
+    d.mkdir()
+    (d / "tt_um_fesens_r32v.v").write_text(text)
+    return d
+
+
+def gpio_scenario(tmp_path):
+    """test_gpio_one_cycle_rule's program: GPIO_OUT = 0x5A, the store retiring at cycle 300; the
+    stub shows it on uo_out from cycle 301."""
+    prog = [lui(1, 0x80000), addi(2, 0, 0x5A), sw(2, GPIO_OUT, 1), SELF]
+    hexf = flash_hex(tmp_path / "g.hex", {0: prog})
+    pins = Pins()
+    pins.set_uo(301, 0x5A)
+    return hexf, iss_log(hexf), pins
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_cell_stub_good_passes(tools, tmp_path, mode):
+    """The scan-flop register with SCE = load passes in both modes and all four seeds: build.sh
+    compiles the cell models, and the cosim runs a design that instantiates cells."""
+    hexf, rets, pins = gpio_scenario(tmp_path)
+    src = cell_stub(tmp_path, "good")
+    for seed in run_cosim.SEEDS:
+        r = stub(mode, hexf, tmp_path, pins, rets, every(5), {"result_gpio": 0x5A}, seed=seed,
+                 src=src)
+        assert r["pass"], (seed, r["error"])
+    args = (run_cosim.build_dir_for(mode, src, "", False) / "verilator.args").read_text()
+    assert "/verif/cells/sky130_fd_sc_hd__sdfxtp_1.v\n" in args
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_cell_stub_swapped_select_fails(tools, tmp_path, mode):
+    """sdfxtp with SCD and D exchanged (the select polarity wrong) fails the cosim."""
+    hexf, rets, pins = gpio_scenario(tmp_path)
+    r = stub(mode, hexf, tmp_path, pins, rets, every(5), {"result_gpio": 0x5A},
+             src=cell_stub(tmp_path, "swapped"))
+    assert not r["pass"] and "uo_out" in r["error"], r["error"]
+
+
+def test_cell_stub_power_up_reliance_fails(tools, tmp_path):
+    """Invariant 6 reaches cell flops: --x-initial unique and the harness's seeded randReset
+    randomize the model's Q, so a scan-flop register without a reset fails (uo_out is not 0
+    after reset). The same mutant built with --x-initial 0 (every flop powers up 0) passes, so
+    the failure comes from the randomized cell state alone."""
+    hexf, rets, pins = gpio_scenario(tmp_path)
+    src = cell_stub(tmp_path, "no_reset")
+    res = [stub("rvfi", hexf, tmp_path, pins, rets, every(5), {"result_gpio": 0x5A}, seed=s,
+                src=src) for s in run_cosim.SEEDS]
+    assert all(not r["pass"] and "uo_out" in r["error"] for r in res), [r["error"] for r in res]
+    exe = run_cosim.ensure_built("rvfi", src, vflags="--x-initial 0")
+    _n[0] += 1
+    pp, rp, ep = tmp_path / "zp.hex", tmp_path / "zr.hex", tmp_path / "ze.json"
+    pins.write(pp)
+    rvfi_rom(rp, rets, every(5))
+    ep.write_text(json.dumps({"result_gpio": 0x5A}))
+    p = subprocess.run([str(exe), str(hexf), "--seed", "1", "--expect", str(ep), f"+PINS={pp}",
+                        f"+RVFI={rp}"], capture_output=True, text=True, timeout=900)
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+    assert r["pass"], r["error"]
+
+
 @pytest.mark.parametrize("v3_flag", [[], ["--v3"]], ids=["default", "v3-no-op"])
 def test_run_cosim_cli(tools, tmp_path, v3_flag):
     """R18: the CLI runs the v3 harness and prints KEYS (coremark_cycles_per_iter included), with

@@ -1,7 +1,8 @@
 # Makefile
 # See https://docs.cocotb.org/en/stable/quickstart.html for more info
 #
-#   make                                  RTL simulation of every top-level src/*.v
+#   make                                  RTL simulation of every top-level src/*.v (plus the
+#                                         sky130 cell models in verif/cells)
 #   make SRC_DIR=<dir>                    RTL simulation of another design directory (*.v in it)
 #   make GATES=yes                        gate level on gate_level_netlist.v
 #   make GATES=yes GL_NETLIST=<file>      gate level on another netlist file
@@ -33,6 +34,13 @@ ifeq ($(PROJECT_SOURCES),)
 $(error no Verilog sources in $(SRC_DIR))
 endif
 VERILOG_SOURCES += $(PROJECT_SOURCES)
+# After the design: the behavioral models of the sky130 cells src/ may instantiate (contract
+# section 1, CELL_WHITELIST in tools/src_check.py). The gate-level build uses the PDK's own models.
+CELL_MODELS := $(sort $(wildcard $(ROOT)/verif/cells/*.v))
+ifeq ($(CELL_MODELS),)
+$(error no cell models in $(ROOT)/verif/cells)
+endif
+VERILOG_SOURCES += $(CELL_MODELS)
 
 else
 

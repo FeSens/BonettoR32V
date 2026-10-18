@@ -56,13 +56,13 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 
 | # | Gate | Runner (as called) | PASS requires |
 |---|---|---|---|
-| 1 | lint | `tools/src_check.py` rules (below), then `verilator --lint-only -Wall --top-module tt_um_fesens_r32v src/*.v`, then again with the RVFI defines | src hygiene clean; Verilator exit 0 for both builds |
-| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract section 1), the `netlist` file exists; then **`fits`**: `area_um2 <= FIT_AREA_UM2`, a fast 1x2 pre-filter, **22,000 µm²** (the seed, 20,442 µm², signs off in 1x2 at utilization 0.728; the champion round's `make harden` has the last word) |
+| 1 | lint | `tools/src_check.py` rules (below), then `verilator --lint-only -Wall --top-module tt_um_fesens_r32v src/*.v` followed by the cell models (`verif/cells/*.v`, see Cell instances), then again with the RVFI defines | src hygiene clean; Verilator exit 0 for both builds |
+| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract section 1), the `netlist` file exists (a cell instance counts at its liberty area, see Cell instances); then **`fits`**: `area_um2 <= FIT_AREA_UM2`, a fast 1x2 pre-filter, **22,000 µm²** (the seed, 20,442 µm², signs off in 1x2 at utilization 0.728; the champion round's `make harden` has the last word) |
 | 3 | cosim | `make -C verif/programs`; `make -s -C verif/programs list`; then one `run_cosim.py --all --no-make --jobs N --clk-ns <CLOCK_PERIOD>` (contract v3, writes `build/cosim.json`; the Pmod models check tCEM and the SCK rate at the signoff clock): every listed program in modes rvfi and pins under seeds 1-4 (the four memory power-up modes), plus the rvfi-mode liveness fuzz under seeds 1-5. No `--max-cycles`: each run's budget is expect.json `max_cycles` or the harness default (R35), and the harness watchdog bounds every gap | a fresh `build/cosim.json` with no `error`, `contract: "v3"`, `clk_ns` equal to `CLOCK_PERIOD`, `programs` equal to `make list`, `seeds` [1, 2, 3, 4] and `fuzz_seeds` [1..5]; every (program, mode, seed) run exactly once, each `pass: true` with no `error`, `max_cycles_per_insn <= 2048`, and `coremark_cycles_per_iter` null or a positive number; each fuzz seed once, `pass` and `liveness_checked` true, `runs` >= 2,056, its gap `<= 2048`; then exit 0 and `pass: true` |
 | 4 | arch | `verif/arch-test/run_arch.py --jobs N` (`--phase all`: GCC, spike and Verilator on one host; seeds 1-4) | exit 0, `pass: true`, every test `true`, and exactly 53 tests (ruling R34) |
-| 5 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` | exit 0 and `pass: true` |
+| 5 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` (both builds read the cell models after `src/*.v`) | exit 0 and `pass: true` |
 | 6 | gl | copy the area netlist to `test/gate_level_netlist.v`, `make -C test GATES=yes GL_NETLIST=<abs netlist>` (PDK_ROOT defaults to `~/.ciel`): the TT test (test/, contract v3: the QSPI Pmod model, gpio_demo in the four power-up modes, uart_hello) | the netlist is no older than this run's area step; a fresh `test/results.xml` with at least one passed testcase and no failure or error; exit 0 |
-| 7 | formal (only with `--formal`) | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` (with `BONETTO_FORMAL_HOST` set, no Mac lock: the solvers run on that host under its own lock) | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
+| 7 | formal (only with `--formal`) | `lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py` (with `BONETTO_FORMAL_HOST` set, no Mac lock: the solvers run on that host under its own lock). Not on main yet (plan Task 10); its port must read the cell models after `src/*.v`, see Cell instances | exit 0, `pass: true`, at least one check, every check `PASS` (`UNREACHED` fails) |
 
 Details:
 - **RVFI build flags** (lint, equiv and the differential check): just `-DRISCV_FORMAL`.
@@ -205,6 +205,16 @@ ignore or reject many of these constructs, while Icarus RTL simulation honors th
       Icarus RTL shows `a5` where the netlist shows `xx`.
     - A result left partly unassigned is not caught. Verilator `-Wall` flags locals that are
       never written.
+13. **Standard cells only from the whitelist.** An identifier that starts with `sky130` (any
+    case) must be a name in `CELL_WHITELIST` (`tools/src_check.py`), used as the module type of
+    one instance: `<cell> <name> (.PORT(signal), ...);`.
+    - Named connections only (no positional or mixed lists, no `.*` or implicit `.PORT`), each of
+      the cell's own ports exactly once, none empty.
+    - No power pins (`VPWR`, `VGND`, `VPB`, `VNB`): LibreLane connects power in PnR, and the
+      gate-level test defines `USE_POWER_PINS` for a powered netlist.
+    - No parameters, no instance arrays (use a generate loop), one instance per statement.
+    - Rule 6 already keeps `src/` from defining a module with a cell's name, so no model can be
+      shadowed.
 
 **Differential backstop.** For the plain and the RISCV_FORMAL builds, src_check preprocesses
 `src/*.v` (sorted) three times: with `verilator -E -P`, with yosys `read_verilog -ppdump` and
@@ -238,6 +248,58 @@ Fixtures in `tools/test_fixtures/src_check/`:
     an `ifdef RISCV_FORMAL` port block). It also passes lint and equiv.
   - The others are a generate loop, `parameter integer`/`localparam integer`, `@(* )`, and the
     reviewer's minimal lint-clean top (`pass_minimal`).
+
+## Cell instances (contract section 1)
+
+`src/` may instantiate the sky130 standard cells of `CELL_WHITELIST` in `tools/src_check.py`:
+`sky130_fd_sc_hd__dfxtp_1`, `dfxtp_2`, `edfxtp_1`, `sdfxtp_1`, `sdfxtp_2`, `mux2_1` and
+`mux2_2`. Rule 13 above says how.
+- **Why.** Synthesis maps an enable flop to `edfxtp_1` (30.03 µm²). `sdfxtp_1` (26.28 µm²) can do
+  the same job with its scan mux, but synthesis never picks it.
+- **Measured** (branch `demo/cell-instances`, not for merge): r32v_periph's 125 configuration flops
+  as `sdfxtp_1` on champion 106. Every gate passes and CoreMark is unchanged. Each 1x2 harden
+  below passed with the precheck; "placed" is LibreLane's final std-cell area.
+  - Hold loop through D (D = Q, SCD = data, SCE = enable): synth 20,933.8 to 20,477.1 µm²
+    (-456.7). The harden needs 134 hold buffers instead of 50, 83 of them on the Q-to-D loops,
+    so placed area grows from 25,215.4 to 25,791.0 µm² (+575.6).
+  - Hold loop through SCD (SCD = Q, D = data, SCE = the enable inverted): the liberty's hold
+    constraint on SCD is lower than on D (tt: -0.002 against 0.056 ns). Synth 20,378.3 µm²
+    (-555.5); 77 hold buffers, 25 of them on SCD; placed 24,893.9 µm² (-321.5).
+- **Exclusion lists.**
+  - No whitelisted cell is on the PDK's `drc_exclude.cells`, PnR's dont_use list.
+  - TT's cell categories know every base name.
+  - The sdfxtp cells are on `no_synth.cells`, which only stops synthesis from mapping logic onto
+    them; an instance is not mapped. `tools/test_cells.py` pins both facts.
+- **Models.** `verif/cells/<cell>.v` is a behavioral model of each, one per file, with the state
+  in an internal `reg q` and no power-up value.
+  - `tools/cell_drift.py` proves each model matches the PDK's functional model: Icarus, both
+    netlist views (with and without power pins), random vectors with X on the inputs, every
+    output compared with `!==`, and power-up X turning known at the same edge.
+  - It also checks the inventory: one file per whitelisted cell, defining exactly that module
+    and its ports.
+- **Which gates read the models**, always after `src/*.v` and never as design files:
+  - lint: the Verilator command line;
+  - cosim and arch: `verif/cosim/build.sh` reads `verif/cosim/../cells/*.v`, and the build stamp
+    hashes them;
+  - equiv: both yosys builds, the same files in the same order;
+  - the RTL test: `test/Makefile` without `GATES=yes`;
+  - formal: not on main yet (plan Task 10). Its port must read `src_check.cell_model_files()`
+    after `src/*.v`. A yosys `read_verilog -formal -DRISCV_FORMAL` of `src/*.v` plus the models,
+    then `prep -top tt_um_fesens_r32v`, is the check that it compiles.
+- **Which tools never see them:**
+  - area and harden stage only `src/*.v`, so an instance stays the liberty cell (LibreLane reads
+    the full liberty as blackboxes);
+  - the gate-level test simulates the PDK's own models on the netlist.
+- **Area.** Yosys `stat` reads the synthesis liberty, which lacks the cells synthesis may not map
+  to, so it has no area for an `sdfxtp` instance ("Area for cell type ... is unknown!").
+  `tools/area.py` adds the liberty area of such cells, lists them under `instanced_cells` in
+  `build/area.json`, and fails on any other cell missing from the synthesis liberty.
+  - A design without such instances scores stat's area exactly, as before.
+- **Tests.**
+  - `tools/test_cells.py`: rule 13 and its mutants, the inventory, the drift check and its
+    mutants (SCE or DE polarity, mux select, clock edge, a power-up value, an X-hiding select),
+    lint and equiv on a design with scan flops, and the area accounting.
+  - `verif/cosim/test_cosim_harness.py`: the cosim cell mutants (docs/cosim.md).
 
 ## build/eval.json
 

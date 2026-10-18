@@ -225,6 +225,13 @@ Self-check: `the program's self-check failed`.
   - the PWM path (mark, (PER+1)·2^Q, settle and deadline, ALTFN cleared early).
 - **The `mutants/tcem_stall` stub** (R12). PSRAM CS_n stays low past 320 cycles, and both modes
   fail with `tCEM`.
+- **Cell mutants** (contract section 1, cell instances). The playback stub with its `uo_out`
+  register built from `sky130_fd_sc_hd__sdfxtp_1` scan flops, on the GPIO store scenario:
+  - SCE = load, SCD = new value, D = Q: passes in both modes under seeds 1-4, and the build reads
+    `verif/cells`;
+  - SCD and D exchanged (the select polarity wrong): fails in both modes;
+  - no reset folded in: fails under all four seeds (uo_out not 0 during reset), and passes when
+    built with `--x-initial 0`, so the randomized cell state is what catches it.
 - **`run_cosim.py`** (with and without the old `--v3` flag, now a no-op), the program-list rule,
   and the fuzz.
 
@@ -272,11 +279,24 @@ Verilator runs on hwe-bench, never on the Mac (ruling R11): wrap these in
 
 `build.sh` compiles every `src/*.v` file, in sorted (byte) order, with nothing in front of them
 (no prelude, no include path); the rvfi build's only define is `RISCV_FORMAL` (contract sections
-1 and 8). It records the exact Verilator command in `build/cosim/<mode>/verilator.args`.
+1 and 8). After the design it reads the behavioral models of the sky130 cells `src/` may
+instantiate (`verif/cells/*.v`, one per `CELL_WHITELIST` entry in `tools/src_check.py`, sorted);
+`--top-module` drops the unused ones. It records the exact Verilator command in
+`build/cosim/<mode>/verilator.args`.
+- **Cell flops power up random too.** Each flop model keeps its state in an internal `reg q` and
+  drives `Q` with `assign Q = q`. Verilator zero-initializes an inlined module's output-port reg
+  when the parent connects it to a bit-select (a `__Vcellout` temporary), so `output reg Q`
+  would have hidden a design that relies on a cell flop's power-up value.
+  `test_cell_stub_power_up_reliance_fails` checks it.
+- **The same holds for design modules.** An `output reg` flop of a `src/` submodule that the
+  parent connects to a bit-select powers up 0 in the cosim, not random. A plain-reg playback
+  stub fails the reset check under all four seeds; the same register as such a submodule passes
+  all four. Building with `-fno-inline` randomizes it. The gate-level test still starts it at X.
+
 `run_cosim.py` rebuilds the Verilator model when anything that can reach it changes: it keys a
 stamp on every file under the design directory except `__pycache__` and non-Verilog `test_*`
-files, the harness sources (`harness.cpp`, `pmod.h`, `iss3.h`, `periph_models.h`, `build.sh`) and
-`verilator --version`. Builds hold `build/cosim/<build dir>.lock` (lockf), so concurrent processes
+files, the harness sources (`harness.cpp`, `pmod.h`, `iss3.h`, `periph_models.h`, `build.sh`), the
+cell models (`verif/cells/*.v`) and `verilator --version`. Builds hold `build/cosim/<build dir>.lock` (lockf), so concurrent processes
 don't build the same model at once. `build.sh` with no arguments builds the standalone pieces
 instead: `test_pmod`, `libpmod.so` (the Pmod models behind a C API, for the TT test's ctypes),
 `iss_main` and `test_periph`.
