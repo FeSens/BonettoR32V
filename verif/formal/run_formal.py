@@ -876,9 +876,10 @@ def descendants(pid):
 
 
 def kill_tree(pid):
-    """SIGTERM an SBY run and everything below it. Its solvers (bitwuzla) can sit in
-    other process groups and outlive a killpg (seen on hwe-bench), so every descendant
-    is signalled by pid, the deepest first, then the group."""
+    """SIGTERM an SBY run this runner started and everything below it. SBY puts each
+    engine in its own process group (setpgrp) and forwards SIGTERM to them; in case it
+    cannot, every descendant (from the process tree of our own child, never by name) is
+    signalled by pid, the deepest first, then the group."""
     for p in reversed(descendants(pid)):
         try:
             os.kill(p, signal.SIGTERM)
@@ -1327,17 +1328,12 @@ def _run_remote(args, host, tempfile):
                      f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
                      f"--out out/formal.json --jobs {jobs} --keep "
                      + " ".join(shlex.quote(a) for a in cfg_arg + fwd))
-            # Detached: its own session (remote.pid = the session leader, whose process
-            # group the stop below signals), no tie to this ssh connection. `done` gets
-            # the exit code.
             body = f"echo $$ > remote.pid; {inner}; echo $? > done"
-            launch = (f"cd {qd} && setsid nohup sh -c {shlex.quote(body)} "
-                      f"> run.log 2>&1 < /dev/null &")
             log(f"remote: {host}:{rdir} (jobs={jobs}, detached)")
-            if subprocess.run(ssh + [launch]).returncode != 0:
+            launched = True
+            if subprocess.run(ssh + [remote_launch_cmd(qd, body)]).returncode != 0:
                 log("remote: launch failed")
                 return 1
-            launched = True
             # Follow the log until the run ends; a dropped connection follows again.
             follow = (f"cd {qd} && n=0; while [ ! -f remote.pid ] && [ $n -lt 60 ]; do "
                       f"sleep 1; n=$((n+1)); done; "
@@ -1376,14 +1372,37 @@ def _run_remote(args, host, tempfile):
             return rc
         finally:
             if launched and not finished:
-                # Interrupted here: stop the remote run unless it already finished (its
-                # pid may be reused then; its runner stops its SBY tasks on SIGTERM), wait
-                # for it, then remove the dir.
-                subprocess.run(ssh + [f"cd {qd} && [ ! -f done ] && p=$(cat remote.pid 2>/dev/null) && "
-                                      f"kill -TERM -- -$p 2>/dev/null; n=0; while kill -0 $p "
-                                      f"2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n+1)); "
-                                      f"done; true"])
+                # Interrupted here: stop the remote run, wait for it, remove the dir.
+                subprocess.run(ssh + [remote_stop_cmd(qd)])
             subprocess.run(ssh + [f"rm -rf {qd}"])
+
+
+def remote_launch_cmd(qd, body):
+    """Shell command (run through ssh) that starts `body` in run dir `qd`, detached: its
+    own session (setsid; body writes remote.pid = the session leader, whose process group
+    remote_stop_cmd signals), no tie to the ssh connection. Only the simple command goes
+    to the background ("cd || exit;", not "cd &&"): with "cd X && cmd &" the shell
+    backgrounds a subshell that keeps the ssh channel open and waits for cmd, so the ssh
+    returned only when the run ended (through 7b2aba3: no live log, and an interrupt
+    during the run removed its dir without stopping it)."""
+    return (f"cd {qd} || exit 1; setsid nohup sh -c {shlex.quote(body)} "
+            f"> run.log 2>&1 < /dev/null &")
+
+
+def remote_stop_cmd(qd):
+    """Shell command that stops the detached run in `qd` and waits (60 s at most) for it
+    to end; its runner stops its SBY tasks on SIGTERM. Only that run's own process group
+    is signalled: never once it finished (`done`), and only if the remote.pid process
+    still works in the run dir (Linux /proc; a reused pid belongs to someone else, and
+    the host is shared). It waits up to 10 s for remote.pid (an interrupt right after the
+    launch)."""
+    return (f"cd {qd} && n=0; while [ ! -f remote.pid ] && [ ! -f done ] && [ $n -lt 10 ]; "
+            f"do sleep 1; n=$((n+1)); done; "
+            f"[ ! -f done ] && p=$(cat remote.pid 2>/dev/null) && [ -n \"$p\" ] && "
+            f"[ \"$(readlink /proc/$p/cwd 2>/dev/null)\" = \"$(pwd -P)\" ] && "
+            f"{{ kill -TERM -- -$p 2>/dev/null; n=0; "
+            f"while kill -0 $p 2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n+1)); done; }}; "
+            f"true")
 
 
 def fetch_orphans(host):

@@ -376,8 +376,10 @@ On top of the job cap, each task waits until its estimate fits in the budget nex
 running ones (`MemGate`; a task alone always runs).
 
 Stopping a run (fail-fast, a signal, a timeout, an exception) signals every process below each
-SBY run (`kill_tree`): its solvers can sit in other process groups, and on hwe-bench bitwuzla
-processes outlived a process-group kill.
+SBY run it started (`kill_tree`, by pid from the process tree, never by name). SBY puts each
+engine in its own process group and forwards SIGTERM to them; `kill_tree` also reaches them if
+SBY itself cannot. (The bitwuzla processes first blamed on a process-group kill on hwe-bench
+came from the launch bug under "Fail fast, scheduling, remote runs": no signal had been sent.)
 
 Fast keeps every instruction check and every bus, SPI, GPIO and RVFI-consistency check. It does
 not cover:
@@ -597,14 +599,28 @@ the gate on another machine. The verdict is the same on any host:
    `BONETTO_FORMAL_REMOTE_OSS` (default `/opt/hwe-toolchain/oss-cad-suite/bin`).
 4. **The remote run is detached** from the ssh session (`setsid nohup`, its session leader's pid
    in `remote.pid`, its exit code in `done`, its log in `run.log`). The local runner follows the
-   log over ssh; a dropped connection only makes it follow again 30 s later.
+   log over ssh; a dropped connection only makes it follow again 30 s later. The launch
+   (`remote_launch_cmd`) backgrounds only the simple command (`cd <dir> || exit 1; setsid ... &`).
+   Up to 7b2aba3 it was `cd <dir> && setsid ... &`, which backgrounds a subshell that keeps the
+   ssh channel open and waits for the run: the launch ssh returned only when the run ended. The
+   run itself was detached all the same (it survived the Mac, and its result was fetched at the
+   end), but the log only showed at the end, and an interrupt during the run removed the run dir
+   without stopping the run (the runner had not yet marked it launched). On 2026-10-17 that left
+   a V2 and an fc07cc3 run computing in deleted dirs on hwe-bench, stopped by hand.
 5. `formal.json`, the task logs and any counterexample traces come back to
    `build/formal/remote-<run id>/`, and the remote run dir is deleted. During a run, each task's
    model files and each reach task's traces are deleted as soon as the task finishes.
 
-SIGTERM, SIGINT or SIGHUP on the local runner stops the remote run (SIGTERM to its process group,
-unless it has already written `done`; its runner stops every SBY task) and deletes its dir. Any other exception in a runner stops every
-SBY task before it exits.
+SIGTERM, SIGINT or SIGHUP on the local runner stops the remote run and deletes its dir
+(`remote_stop_cmd`): SIGTERM to the run's own process group (its runner then stops every SBY
+task), waiting up to 60 s for it to end. The host is shared, so nothing else is ever signalled:
+not by name, not after the run wrote `done`, and only if the `remote.pid` process still works in
+the run dir (`/proc/<pid>/cwd`; a reused pid belongs to someone else). Any other exception in a
+runner stops every SBY task before it exits. `test_formal.py::test_remote_launch_and_stop` runs
+the launch and the stop on a Linux host (setsid and /proc; skipped on macOS): the launch returns
+at once, a `remote.pid` naming a process in another dir is left alone, and the run's own process
+group is stopped. It passed on hwe-bench, and a real run there streamed its log live, fetched its
+result, and on SIGTERM left no process in its dir.
 
 **Orphans.** A local runner that dies without cleaning up (the Mac crashes or runs out of
 memory, SIGKILL) leaves its remote run alive: it finishes on its own, holding the host's lock,

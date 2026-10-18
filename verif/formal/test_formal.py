@@ -153,6 +153,48 @@ def test_kill_tree():
     assert alive == []
 
 
+def test_remote_launch_and_stop(tmp_path):
+    """The detached launch returns at once (only the simple command is backgrounded, so no
+    shell keeps the ssh channel open), and the stop signals only the run's own process
+    group, never a remote.pid process that works elsewhere (a reused pid)."""
+    import shlex
+    import time
+    launch = run_formal.remote_launch_cmd(shlex.quote(str(tmp_path / "run")),
+                                          "echo $$ > remote.pid; exec sleep 60")
+    assert "&& setsid" not in launch and launch.endswith("&")
+    if not shutil.which("setsid") or not os.path.isdir("/proc/self"):
+        pytest.skip("needs setsid and /proc (Linux), like the remote host")
+    for d in ("run", "fake", "other"):
+        (tmp_path / d).mkdir()
+    t0 = time.time()
+    r = subprocess.run(["sh", "-c", launch], capture_output=True, timeout=20)
+    assert r.returncode == 0 and time.time() - t0 < 5
+    pidf = tmp_path / "run" / "remote.pid"
+    for _ in range(50):
+        if pidf.exists() and pidf.read_text().strip():
+            break
+        time.sleep(0.1)
+    p = int(pidf.read_text())
+    other = subprocess.Popen(["sleep", "60"], cwd=tmp_path / "other", start_new_session=True)
+    try:
+        (tmp_path / "fake" / "remote.pid").write_text(f"{other.pid}\n")
+        subprocess.run(["sh", "-c", run_formal.remote_stop_cmd(shlex.quote(str(tmp_path / "fake")))],
+                       timeout=30)
+        assert other.poll() is None          # someone else's process: left alone
+        os.kill(p, 0)                        # and the run is untouched
+        subprocess.run(["sh", "-c", run_formal.remote_stop_cmd(shlex.quote(str(tmp_path / "run")))],
+                       timeout=90)
+        with pytest.raises(ProcessLookupError):
+            os.kill(p, 0)                    # its own run: stopped
+    finally:
+        os.killpg(other.pid, 15)
+        other.wait()
+        try:
+            os.killpg(p, 15)
+        except OSError:
+            pass
+
+
 def test_mem_jobs(monkeypatch):
     """Jobs are capped by memory at the deepest task's depth: the seed (348) fits 18 jobs
     in 50 GB, V2 (1,623, about 6.4 GB per task) only 7, the Mac's 16 GB 2; at least 1."""
