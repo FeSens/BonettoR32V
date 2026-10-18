@@ -421,11 +421,16 @@ except fc07cc3's `reg`, which ran into the task timeout of the time (21,600 s).
 The first V2 attempt (7 jobs, the host partly shared) finished these proofs before it was hung
 up, every one PASS: bus_dmem 6,495 s, the instruction groups 919 to 3,196 s, pc_bwd 2,859 s,
 rvfi 1,860 s, gpio 1,668 s, causal 713 s, ill 374 s; every instruction group's reach task
-reached all its triggers (267 to 1,407 s). reg was still running at about 8,260 s. Memory: at
+reached all its triggers (267 to 1,407 s). reg was still running at about 8,260 s (it took
+19,669 s in the full run above). Memory: at
 depth 1,623 each bitwuzla holds about 6 GB, so 10 jobs pushed the host into swap (11 GB after
 38 minutes, that run was stopped); use at most about one job per 9 GB on V2-class cores.
 The task timeout (fast and deep) is 40,000 s: 2 x the longest V2 task, reg, 19,669 s in the
-7050096 run below (39,338 s, rounded up).
+7050096 run above (39,338 s, rounded up). fc07cc3's reg is slower: it timed out at 21,602 s in
+its full run. A reg-only run of it with a 24 h timeout (scratch config, 1 job) was started on
+hwe-bench and was still running at hand-off; its result is in
+`~/bonetto-formal/exp-rfreg/run-*/run.log` (the `reg` line), `done` and `out/formal.json`. If it
+needs more than 20,000 s, the timeout should become 2 x its time.
 
 **Contract v1 checks (commit 738a135, before the v2 port).** Every completed run below passed
 every check (56 in fast, 57 in deep: 40 instructions, 14 or 15 SBY checks, structure and
@@ -562,8 +567,8 @@ the 7b2aba3 run and notes an earlier run's extra ones.
 | legal_uo_early | seed | uo_out set on the edge into the retirement cycle | all (fast) | PASS, 56 checks |
 | legal_trap_region | seed | a region READ (0xFF80) before a trap | all (fast) | PASS, 56 checks |
 | legal_null_read | seed | a null READ (0x1234, header only) before a trap | all (fast) | PASS, 56 checks |
-| legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | running at the time of writing (detached, hwe-bench) |
-| legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | running at the time of writing (detached, hwe-bench); the first attempt PASSed every proof that finished (see "Measured runtimes") |
+| legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | 55/56 under the old 21,600 s task timeout: `reg` TIMEOUT at 21,602 s, every other check PASS and every reach task REACHED (7050096, run directly with `run_formal.py`). A reg-only run with a 24 h timeout was still running at hand-off (see "Measured runtimes") |
+| legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | PASS, 56 checks, every reach task REACHED (7050096, the test's run made directly with `run_formal.py`; 32,538 s, see "Measured runtimes") |
 
 On the seed's timing, every fast-config FAIL above came within 227 s of proof time at 7b2aba3
 (the slowest: `load_half_swap`'s `bus_dmem`, 226.5 s, with the V2 and fc07cc3 runs sharing the
