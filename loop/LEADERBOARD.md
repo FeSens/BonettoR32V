@@ -6,18 +6,20 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 ## Current champion
 
-**102** `cd5d629bf5f5` (hyp/102-clk50): 0.0864 CoreMark iterations/s (clock 20 ns), 20,442.1 µm², 2,398 cells, formal skipped, tile fraction -, deep formal -. Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead move it up to the 50 MHz IO ceiling); physical, lead
+**104** `2293e4a765a3` (hyp/104-periph-diet): 0.0864 CoreMark iterations/s (clock 20 ns), 19,690.1 µm², 1,985 cells, formal skipped, tile fraction -, deep formal -. Peripheral area diet, contract behavior unchanged: enable flops with reset folded into shared write data, 1-flop input synchronizer, marker-terminated UART RX/SPI, inverted internal counters, no re...
 
 ## Champion history
 
 | # | id | date | sha | CoreMark/s | delta % | clock ns | area µm² | cells | delta µm² | formal | tile fraction | deep formal | status | idea |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 0 | 100 | 2026-10-18 | `f657a72aec` | 0.0691 | - | 25 | 20,442.1 | 2,398 | - | skipped | - | - | - | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core region, Zicsr traps/in... |
-| 1 | 102 | 2026-10-18 | `cd5d629bf5` | 0.0864 | +25.00% | 20 | 20,442.1 | 2,398 | +0.0 | skipped | - | - | champion | Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead move it up to the 50 MH... |
+| 1 | 102 | 2026-10-18 | `cd5d629bf5` | 0.0864 | +25.00% | 20 | 20,442.1 | 2,398 | +0.0 | skipped | - | - | - | Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead move it up to the 50 MH... |
+| 2 | 104 | 2026-10-18 | `2293e4a765` | 0.0864 | +0.00% | 20 | 19,690.1 | 1,985 | -752.0 | skipped | - | - | champion | Peripheral area diet, contract behavior unchanged: enable flops with reset folded into ... |
 
 ## Last 20 hypotheses
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 104 | 2026-10-18 | hyp/104-periph-diet | merged | 0.0864 | +0.0000 | 20 | 19,690.1 | -752.0 | skipped | - | Peripheral area diet, contract behavior unchanged: enable flops wit... | Lead re-eval on hwe-bench (2293e4a, clean): all gates pass at 20 ns... |
 | 102 | 2026-10-18 | hyp/102-clk50 | merged | 0.0864 | +0.0173 | 20 | 20,442.1 | +0.0 | skipped | - | Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead mov... | Eval (hwe-bench, cosim Pmod models at 20 ns: tCEM 400 cycles, SCK 2... |
 | 100 | 2026-10-18 | setup/v3-swap | merged | 0.0691 | - | 25 | 20,442.1 | - | skipped | - | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core re... | Plan 2026-10-17-mcu-v3 Tasks 1-9. Harden 1x2 @25 ns (hwe-bench, hos... |
