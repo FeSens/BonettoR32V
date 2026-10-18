@@ -1,20 +1,26 @@
 /*
- * BonettoR32V memory controller for TT's QSPI Pmod (docs/contract.md sections 2 and 3).
+ * BonettoR32V memory controller for TT's QSPI Pmod (docs/contract.md sections 2 and 3), quad.
  *
- * - Reset sequence (contract 2.4), before the core starts: flash CS_n low for 8 SCK edges with
- *   SD0-SD3 high (leaves continuous read; in standard mode it is command 0xFF), then PSRAM
- *   0xF5 in QPI form (2 edges: leaves QPI; an ignored partial command in SPI mode), then 0x66
- *   and 0x99 in SPI form. One 32-cycle window per transaction, counted by `b`, which resets to
- *   127 so every CS_n is high during reset. The core waits for `booting` to fall (cycle 121).
- * - Address register `mar`: the low 24 bits of a program address (the pc during the P slot, a
- *   load/store address during the A slot), shifted in LSB first at the serial ALU's strobes;
- *   bit 24 goes to `ps` (1 = PSRAM, 0 = flash) and bit 31 to `io`. During a header the core
- *   reads `mar_bit` = mar[23 - n] for address bit n (index ~j[4:0]).
- * - Pins: single SPI on SD0 (MOSI) / SD1 (MISO), SCK = clk/2 while a CS_n is low. Program
- *   transactions (F, M) select the chip by `ps`; core-region transactions always use the
- *   PSRAM. SD2/SD3 are driven high outside the reset sequence (no memory ever drives them in
- *   the single-SPI commands used); SD1 is driven only during the reset sequence. PSRAM B's
- *   CS_n is constant 1.
+ * - Reset sequence (contract 2.4), before the core starts, one 32-cycle window per transaction
+ *   (counter `b`, reset to 255 = idle, so both CS_n are high during reset; the core waits for
+ *   `booting` to fall):
+ *     w0       flash: 8 edges with SD0-SD3 high (leaves continuous read, or the no-op 0xFF);
+ *     w1       PSRAM: 0xF5 in QPI form (2 edges; an ignored partial command in SPI mode);
+ *     w2, w3   PSRAM: 0x66, 0x99 in SPI form (SPI mode, initialized);
+ *     w4-w5    flash: 0xEB, 6 quad address edges, M = 0x20, then CS_n high inside the dummy
+ *              field: the flash is in continuous read from here on;
+ *     w6       PSRAM: 0x35 in SPI form (QPI mode from here on).
+ * - Address register `mar`: the low 24 bits of a program address (the pc during P, a load or
+ *   store address during A), shifted in a nibble at a time, LSB nibble first; bit 24 goes to
+ *   `ps` (1 = PSRAM, 0 = flash) and bit 31 to `io`. B (register shifts) leaves rs2[4:0] in
+ *   mar[4:0].
+ * - Transactions: the core loads `sdo` with a header nibble (hdr_ld, index hidx) or a data
+ *   nibble (dat_ld) at the clocks where SCK stays or goes low. Headers:
+ *     flash (program access with ps = 0, continuous read): A[23:20] .. A[3:0], 0x2, 0x0 (M);
+ *     PSRAM (QPI): 0x0, 0xB (read) or 0x2 (write), A[23:20] .. A[3:0]; core-region words at
+ *     0xFFFF80 | {1, regarea, rsel, 00} (A[23] is ignored).
+ *   `sdoe` drives SD0-SD3 from each slot's start; a read releases them after its 8 header
+ *   edges, for the dummy/wait edges and the data. PSRAM B's CS_n is constant 1.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -25,21 +31,28 @@
 module r32v_mem (
     input  wire        clk,
     input  wire        rst_n,
-    // address capture (serial, from the core)
-    input  wire        cap,        // a P or A data strobe
+    // address capture (from the core's data strobes)
+    input  wire        cap,        // a P, A or B data strobe
     input  wire        cap_a,      // ... of the A slot (io is captured only there)
-    input  wire [4:0]  kb,         // its bit index
-    input  wire        din,        // its result bit
-    input  wire [4:0]  j,          // header bit counter: address bit ~j[4:0]
-    output wire        mar_bit,
+    input  wire [2:0]  kn,         // its nibble index
+    input  wire [3:0]  din4,       // its result nibble
+    output wire [4:0]  shamt,      // rs2[4:0] after B
     output wire [6:0]  mar_lo,     // IO slot and byte offset
     output reg         io,
+    output reg         ps,
     output wire        booting,
     // transaction (from the core's engine)
-    input  wire        active,     // a CS_n is low (CMD, DATA, END of an unmasked slot)
+    input  wire        active,     // a CS_n is low (an unmasked slot past its gap)
     input  wire        prog,       // program transaction (F, M): chip by ps
     input  wire        sck,
-    input  wire        mosi,
+    input  wire        gap,        // the cycle between transactions
+    input  wire        hdr_ld,     // load header nibble hidx into sdo
+    input  wire [2:0]  hidx,
+    input  wire        h_wr,       // the slot writes
+    input  wire [4:0]  h_reg,      // core-region word {regarea, rsel[3:0]}
+    input  wire        dat_ld,     // load data nibble wd4 into sdo
+    input  wire [3:0]  wd4,
+    input  wire        oe_off,     // a read's header ends: release SD0-SD3
     output wire [7:0]  uio_out,
     output wire [7:0]  uio_oe
 );
@@ -48,44 +61,100 @@ module r32v_mem (
     // Address register
     // ------------------------------------------------------------------------------------
     reg [23:0] mar;
-    reg        ps;
     always @(posedge clk) begin
-        if (cap & ~(kb[4] & kb[3]))                     // bits 0..23
-            mar <= {din, mar[23:1]};
-        if (cap & (kb == 5'd24))
-            ps <= din;
-        if (cap_a & (kb == 5'd31))
-            io <= din;
+        if (cap & ~(kn[2] & kn[1]))                     // nibbles 0..5
+            mar <= {din4, mar[23:4]};
+        if (cap & (kn == 3'd6))
+            ps <= din4[0];
+        if (cap_a & (kn == 3'd7))
+            io <= din4[3];
     end
-    wire [31:0] marx = {8'd0, mar};
-    assign mar_bit = marx[~j];                           // j >= 8 in an address field
-    assign mar_lo  = mar[6:0];
+    assign mar_lo = mar[6:0];
+    assign shamt  = mar[4:0];
 
     // ------------------------------------------------------------------------------------
-    // Reset sequence: window w = b[6:5], position p = b[4:0]
+    // Header nibbles
     // ------------------------------------------------------------------------------------
-    reg  [6:0] b;
+    wire       flash = prog & ~ps;
+    reg  [3:0] hn;
+    always @(*) begin
+        case ({flash, hidx})
+            4'b1000: hn = mar[23:20];
+            4'b1001: hn = mar[19:16];
+            4'b1010: hn = mar[15:12];
+            4'b1011: hn = mar[11:8];
+            4'b1100: hn = mar[7:4];
+            4'b1101: hn = mar[3:0];
+            4'b1110: hn = 4'h2;                         // M = 0x20: stay in continuous read
+            4'b1111: hn = 4'h0;
+            4'b0000: hn = 4'h0;
+            4'b0001: hn = h_wr ? 4'h2 : 4'hB;           // QPI 0x02 write, 0x0B read
+            4'b0010: hn = prog ? mar[23:20] : 4'hF;
+            4'b0011: hn = prog ? mar[19:16] : 4'hF;
+            4'b0100: hn = prog ? mar[15:12] : 4'hF;
+            4'b0101: hn = prog ? mar[11:8]  : 4'hF;
+            4'b0110: hn = prog ? mar[7:4]   : {1'b1, h_reg[4:2]};
+            default: hn = prog ? mar[3:0]   : {h_reg[1:0], 2'b00};
+        endcase
+    end
+
+    reg [3:0] sdo;
+    reg       sdoe;
+    always @(posedge clk) begin
+        if (hdr_ld)
+            sdo <= hn;
+        else if (dat_ld)
+            sdo <= wd4;
+        else if (gap)
+            sdo <= 4'h0;
+        if (gap)
+            sdoe <= 1'b1;
+        else if (oe_off)
+            sdoe <= 1'b0;
+    end
+
+    // ------------------------------------------------------------------------------------
+    // Reset sequence: window w = b[7:5], position p = b[4:0]; w4-w5 is one 64-cycle window
+    // ------------------------------------------------------------------------------------
+    reg  [7:0] b;
     reg        done;
-    wire [1:0] w    = b[6:5];
+    wire [2:0] w    = b[7:5];
     wire [4:0] p    = b[4:0];
-    wire [1:0] e    = p[2:1];                           // edge index (low bits) within the command
+    wire       fe   = (w[2:1] == 2'b10);                 // w4, w5: flash enter, position b[5:0]
+    wire       fl   = (w == 3'd0) | fe;                  // a flash window
+    wire [2:0] e    = p[3:1];                           // edge index in an 8-edge window
+    wire [3:0] ef   = b[4:1];                           // edge index in the flash-enter window
     wire       lo8  = ~p[4] | (p[3:0] == 4'd0);         // p <= 16: 8 edges, then SCK low
     wire       lo2  = ~p[4] & ~p[3] & (~p[2] | (p[1:0] == 2'd0));   // p <= 4: 2 edges
-    wire       blo  = ~done & ((w == 2'd1) ? lo2 : lo8);
+    wire       lo16 = ~b[5] | (p == 5'd0);              // b[5:0] <= 32: 16 edges
+    wire       blo  = ~done & (fe ? lo16 : (w == 3'd1) ? lo2 : (w != 3'd7) & lo8);
     wire       bsck = blo & p[0];
-    wire       bcsf = ~(blo & (w == 2'd0));
-    wire       bcsr = ~(blo & (w != 2'd0));
-    // SD0: flash 1s, 0xF5 nibbles F, 5 (SD0 = 1, 1), 0x66 = 0110 0110, 0x99 = 1001 1001
-    wire       bsd0 = ~w[1] | (e[0] ^ e[1] ^ w[0]);
-    // SD1 and SD3: 1, except the second nibble (5) of 0xF5
-    wire       bsd13 = ~((w == 2'd1) & p[1]);
+    wire       bcsf = ~(blo & fl);
+    wire       bcsr = ~(blo & ~fl);
+    // SD0 of the single commands: 0x66 = 0110 0110, 0x99 = 1001 1001, 0x35 = 0011 0101,
+    // 0xEB = 1110 1011
+    wire       c66  = e[0] ^ e[1];
+    wire       c35  = e[2] ? e[0] : e[1];
+    wire       ceb  = ~((ef[2:0] == 3'd3) | (ef[2:0] == 3'd5));
+    reg  [3:0] bsd;
+    always @(*) begin
+        case (w)
+            3'd1:    bsd = p[1] ? 4'h5 : 4'hF;          // QPI 0xF5
+            3'd2:    bsd = {3'b111, c66};
+            3'd3:    bsd = {3'b111, ~c66};
+            3'd4, 3'd5:                                 // 0xEB, address 0, M = 0x20
+                     bsd = ef[3] ? {2'b00, ef[2:0] == 3'd6, 1'b0} : {3'b000, ceb};
+            3'd6:    bsd = {3'b111, c35};
+            default: bsd = 4'hF;
+        endcase
+    end
     always @(posedge clk) begin
         if (!rst_n) begin
-            b    <= 7'h7F;
+            b    <= 8'hFF;                              // idle (w7) during reset
             done <= 1'b0;
         end else if (!done) begin
-            b    <= b + 7'd1;
-            done <= (b == 7'd120);                      // 0x99 ended at 113: tRST satisfied
+            b    <= b + 8'd1;
+            done <= (b == 8'd211);                      // 0x35 ended at 209
         end
     end
     assign booting = ~done;
@@ -93,14 +162,13 @@ module r32v_mem (
     // ------------------------------------------------------------------------------------
     // Pins
     // ------------------------------------------------------------------------------------
-    wire csf = done ? ~(active & prog & ~ps) : bcsf;
-    wire csr = done ? ~(active & ~(prog & ~ps)) : bcsr;
-    wire sk  = done ? (sck & active) : bsck;
-    wire sd0 = done ? mosi : bsd0;
-    wire sd1 = bsd13;                                   // driven only while booting
-    wire sd3 = done | bsd13;
-    assign uio_out = {1'b1, csr, sd3, 1'b1, sk, sd1, sd0, csf};
-    assign uio_oe  = {5'b11111, booting, 2'b11};
+    wire       csf = done ? ~(active & flash) : bcsf;
+    wire       csr = done ? ~(active & ~flash) : bcsr;
+    wire       sk  = done ? (sck & active) : bsck;
+    wire [3:0] sd  = done ? sdo : bsd;
+    wire       oe  = ~done | sdoe;
+    assign uio_out = {1'b1, csr, sd[3], sd[2], sk, sd[1], sd[0], csf};
+    assign uio_oe  = {2'b11, oe, oe, 1'b1, oe, oe, 1'b1};
 
 endmodule
 

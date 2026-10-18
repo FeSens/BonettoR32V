@@ -7,7 +7,7 @@
  *   read into the ring (`mask_lo2`), so they read 0 whatever was stored, the reset content
  *   included.
  * - mstatus.MIE/MPIE, mie.MEIE and mcause (bit 31 and bits 3:0) are flops here; mip.MEIP is the
- *   interrupt line. A C slot reads them through `rd_die` (bit kb); the WC slot's END captures
+ *   interrupt line. A C slot reads them through `rd_die` (nibble kn); the WC slot's END captures
  *   the new value's bits from the ring (`wb`).
  * - misa, mtval, the id CSRs and every unlisted number read 0 and ignore writes (unlisted
  *   numbers may alias a listed CSR: contract 4 leaves them unspecified).
@@ -31,11 +31,11 @@ module r32v_csr (
     input  wire [11:0] csr_num,    // insn[31:20]
     input  wire        p_mret,     // the instruction is MRET
     input  wire        s_wc,       // the slot is WC (else C), for idx in a trap sequence
-    input  wire [4:0]  kb,         // C slot: bit index of the strobe
+    input  wire [2:0]  kn,         // C slot: nibble index of the strobe
     output wire        region,
     output wire [1:0]  idx,
-    output wire        mask_lo2,
-    output wire        rd_die,
+    output wire        mask_lo2,   // bits 1:0 of this nibble read 0
+    output wire [3:0]  rd_die,     // die bits 4kn+3 .. 4kn
     // events, each valid in an END cycle
     input  wire        trap_go,    // a synchronous trap starts
     input  wire [3:0]  cause,      // its mcause
@@ -64,18 +64,22 @@ module r32v_csr (
 
     assign region   = tm | p_mret | c_mtvec | c_mscr | c_mepc;
     assign idx      = tm ? {s_wc, 1'b1} : p_mret ? 2'b11 : {b6, b0};
-    assign mask_lo2 = idx[0] & (kb[4:1] == 4'd0);       // mtvec, mepc: bits 1:0 read 0
+    wire n0 = (kn == 3'd0);
+    wire n1 = (kn == 3'd1);
+    wire n2 = (kn == 3'd2);
+    wire n3 = (kn == 3'd3);
+    wire n7 = (kn == 3'd7);
+    assign mask_lo2 = idx[0] & n0;                      // mtvec, mepc: bits 1:0 read 0
 
-    wire k3  = (kb == 5'd3);
-    wire k7  = (kb == 5'd7);
-    wire k11 = (kb == 5'd11);
-    wire k12 = (kb == 5'd12);
-    wire k31 = (kb == 5'd31);
-    wire klo = (kb[4:2] == 3'd0);
-    assign rd_die = (c_mstatus & ((k3 & mie) | (k7 & mpie) | k11 | k12)) |
-                    (c_mie & k11 & meie) |
-                    (c_mip & k11 & irq) |
-                    (c_mcause & ((k31 & mc31) | (klo & mc[kb[1:0]])));
+    // mstatus bits 3 (MIE), 7 (MPIE), 12:11 (MPP = 3); mie and mip bit 11; mcause 31, 3:0
+    wire   mc_lo = c_mcause & n0;
+    assign rd_die[0] = (c_mstatus & n3) | (mc_lo & mc[0]);
+    assign rd_die[1] = mc_lo & mc[1];
+    assign rd_die[2] = mc_lo & mc[2];
+    assign rd_die[3] = (c_mstatus & ((n0 & mie) | (n1 & mpie) | n2)) |
+                       (c_mie & n2 & meie) |
+                       (c_mip & n2 & irq) |
+                       (c_mcause & ((n7 & mc31) | (n0 & mc[3])));
 
     // Next MIE / MEIE as written at this END (for the interrupt decision)
     wire ws = wc_end & c_mstatus;

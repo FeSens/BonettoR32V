@@ -1,46 +1,52 @@
 /*
- * BonettoR32V MCU seed (contract v3, docs/contract.md): the hypothesis-005 bit-serial RV32E
- * core with x1..x15, the pc, mtvec, mscratch and mepc in the PSRAM core region, on TT's QSPI Pmod
- * (code runs from flash, data in PSRAM), with a minimal Zicsr, traps and one interrupt to mtvec,
- * and the contract-5 peripherals.
+ * BonettoR32V MCU (contract v3, docs/contract.md): a nibble-serial RV32E core with x1..x15, the
+ * pc, mtvec, mscratch and mepc in the PSRAM core region, on TT's QSPI Pmod in quad mode (code
+ * runs from flash in continuous read, data in PSRAM in QPI mode), with a minimal Zicsr, traps
+ * and one interrupt to mtvec, and the contract-5 peripherals.
  *
- * Modules: r32v_mem (reset sequence, the 24-bit address register, pins), r32v_csr (CSR state and
- * the trap/interrupt flags), r32v_periph (IO slots, the interrupt line). This file: the slot
- * engine, the serial datapath, decode and sequencing.
+ * Modules: r32v_mem (reset sequence, the address register, header nibbles, pins), r32v_csr (CSR
+ * state and the trap/interrupt flags), r32v_periph (IO slots, the interrupt line). This file:
+ * the slot engine, the nibble-serial datapath, decode and sequencing.
  *
- * Ring. The buffer (bfr) is a 33-bit ring that rotates right on every clock; a free-running
- * phase counter ph counts 0..32, and the bit at ring position i shows phase ph + i (mod 33).
- * Every slot starts its CMD state at phase 2, so data bit k of any slot is strobed at phase
- * 2k + 1, and a value in the ring keeps bit k at phase 2k + 1 (bits 0..15 on the odd phases,
- * 16..31 on the even ones, phase 32 unused). Register traffic streams straight into the ring
- * input and out of a fixed tap; 33 is odd, so a time offset of 2s clocks is a shift by s bits.
+ * Slots. Every slot is one quad transaction at SCK = clk/2: E SCK edges take 2E + 2 clocks
+ * (a gap clock with CS_n high, the edges, a tail clock with SCK low).
+ *   read:  8 header edges (r32v_mem), 4 dummy/wait edges, 8 data edges: 42 clocks
+ *   write: 8 header edges, 2/4/8 data edges: 22/26/34 clocks
+ * The counter c counts SCK edges: it starts at 52 (read) or 56 (write) and wraps to 0 at the
+ * first data edge, so c is the data nibble index in the data phase. A masked slot (x0, or no
+ * register) keeps CS_n high and runs only the 8 data strobes (18 clocks). Data moves at the
+ * clock where SCK falls (the strobe): a read samples nibble c there, a write loads the nibble
+ * for the next rising edge.
  *
- * Transactions (slots). Every transaction: CS_n low, 8 command bits (0x03 READ / 0x02 WRITE),
- * 24 address bits, data, all single SPI at SCK = clk/2; 132 clocks (4 laps) for 32 data bits,
- * 99 for 8 or 16. Program transactions (F, M) take their address from r32v_mem's register and
- * their chip from address bit 24; core-region transactions go to the PSRAM at
- * 0x7F_FF80 | {bit 6, word select, 00}. A slot whose register is x0 (or that has none) keeps
- * CS_n high and runs the same timing.
+ * Ring. ring is a 32-bit shift register of 8 nibbles. A read slot shifts its result nibble in at
+ * the top at each data strobe; a write slot rotates it (head ring[3:0] to the top) and emits
+ * from it. After 8 strobes a value sits with nibble k at ring[4k+3:4k]. Core-region words are
+ * stored LSB nibble first; program data arrives high nibble first in each byte, so loads (in W)
+ * and stores (in M) emit ring[7:4] on even strobes and ring[31:28] on odd ones. Loads always
+ * read 4 bytes. Shifts: W rotates the ring by q nibbles (shamt = 4q + r) during its own header,
+ * then emits ({ring[7:4], ring[3:0]} >> r) with zero or sign fill.
+ *
  *   P   READ  x0 (the pc)                     -> ring, address register
- *   A   READ  rs1 -> serial ALU (+imm; AUIPC/JAL: ring + imm; CSR: rs1 or zimm) -> ring,
- *             address register (loads/stores); an IO load captures the slot into the ring at
- *             A's END
+ *   A   READ  rs1 -> ALU (+imm; AUIPC/JAL: ring + imm; CSR: rs1 or zimm; branches: rs1 - 0)
+ *             -> ring, address register (loads/stores); an IO load captures the slot into the
+ *             ring at A's tail
  *   PX  READ  x0 -> ring + (taken ? imm : 4) (branch); READ scratch -> ring (JALR)
- *   B   READ  rs2 -> serial ALU with the ring (OP, branches, shift amount)
- *   BS  READ  rs2 -> ring (store data); an IO store writes the slot at BS's END
+ *   B   READ  rs2 -> ALU with the ring (OP, branches); register shifts: rs2[4:0] -> mar
+ *   BS  READ  rs2 -> ring (store data); an IO store writes the slot at BS's tail
  *   C   READ  a CSR: core-region word (masked bits read 0) or the die bits -> ring
  *   RS  READ  scratch, combined with the ring (CSRRW / CSRRS / CSRRC) -> ring
- *   F   READ  pc[23:0] -> instruction register
- *   M   READ/WRITE the load/store address; data into the ring / out of the ring's byte taps
+ *   F   READ  pc -> instruction register
+ *   M   READ/WRITE the load/store address (4 bytes / the store's bytes); a store to flash is
+ *             masked
  *   WP  WRITE x0 <- ring;  WP4: x0 <- ring + 4;  W4: rd (JAL) or scratch (JALR) <- ring + 4
- *   W   WRITE rd <- ring (forward, load bytes reversed and extended, shifted, SLT)
+ *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT)
  *   WS  WRITE scratch <- ring;  WC: the CSR <- ring
  * Sequences: ALU P F WP4 A [B] W; load P F WP4 A M W (IO: A W); store P F WP4 A BS M (IO: A BS);
- * branch P F A B PX WP; JAL P F W4 A WP; JALR P F W4 A WP [PX W]; FENCE, WFI P F WP4;
- * CSR P F WP4 A WS C W RS WC; MRET P F C WP. A synchronous trap (decode after F, JALR after A,
- * branch after B) runs [P] WC(mepc <- pc) C(mtvec) WP and retires; an interrupt (at a
- * retirement) runs P WC C WP and continues with the handler's P. Until the first retirement P
- * (and a branch's PX) read pc = 0 without a transaction.
+ * branch P F A [B] PX WP (B only if rs2 != x0); JAL P F W4 A WP; JALR P F W4 A WP [PX W];
+ * FENCE, WFI P F WP4; CSR P F WP4 A WS C W RS WC; MRET P F C WP. A synchronous trap (decode
+ * after F, JALR after A, branch after A or B) runs [P] WC(mepc <- pc) C(mtvec) WP and retires; an
+ * interrupt (at a retirement) runs P WC C WP and continues with the handler's P. Until the first
+ * retirement P (and a branch's PX) read pc = 0 without a transaction.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -89,39 +95,37 @@ module tt_um_fesens_r32v (
                      SL_F  = 5'b01000, SL_M  = 5'b01001,
                      SL_WP = 5'b10000, SL_WP4 = 5'b10001, SL_W4 = 5'b10010, SL_W = 5'b10011,
                      SL_WS = 5'b10100, SL_WC = 5'b10101;
-    // Engine phases: 1x0 = command/address or data (SCK runs), ep[2] = CS_n low
-    localparam [2:0] E_IDLE = 3'b000,    // CS_n high, wait for phase 1
-                     E_PW   = 3'b001,    // shift pre-roll: wait for the reference phase
-                     E_PC   = 3'b010,    // shift pre-roll: count j up to 63
-                     E_CMD  = 3'b100,    // command and address bits
-                     E_DATA = 3'b101,    // data bits
-                     E_END  = 3'b111;    // SCK low, then CS_n high
+    // Engine phases
+    localparam [1:0] E_GAP  = 2'b00,     // CS_n high, SCK low (one clock; waits while booting)
+                     E_HDR  = 2'b01,     // header and dummy edges
+                     E_DATA = 2'b10,     // data edges
+                     E_TAIL = 2'b11;     // SCK low, CS_n still low: the slot's events
 
     reg  [4:0]  sl;
-    reg  [2:0]  ep;
-    reg  [5:0]  ph;     // 0..32
-    reg  [5:0]  j;      // bit counter (32..63 command/address, 0.. data), shift pre-roll
-    reg         sck, mosi;
+    reg  [1:0]  ep;
+    reg  [5:0]  c;      // SCK edge counter: 52/56..63 header, 0..7 data
+    reg         sck;
     reg         first;  // until the first retirement: P (and a branch's PX) read pc = 0
-    reg         cy;     // ALU carry; sign latch in W; carry of the + 4 (WP4, W4)
-    reg         cmp;    // compare; JALR target[1] == 0; shift fill state
-    reg  [32:0] bfr;    // operand/result ring
-    reg  [30:0] irs;    // instruction register, in SPI order, without insn[1]
+    reg         cy;     // ALU carry; sign latch of a load's W
+    reg         cmp;    // compare; JALR target[1] == 0; a shift's sign bit
+    reg  [31:0] ring;   // operand/result ring
+    reg  [31:0] ir;     // instruction register, in wire nibble order
 
-    wire _unused = &{ena, uio_in[7:3], uio_in[1:0], 1'b0};
+    wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[0], 1'b0};
 
     // ------------------------------------------------------------------------------------
     // Decode, spec-minimum (contract 4). Traps: insn[0] = 0 (the all-zeros word) and
     // opcode[6] & [4] & [2] (the all-ones word) are illegal (2), ECALL (11), EBREAK (3), a
     // misaligned JAL (0). Every other encoding executes as the class its opcode bits select;
-    // register fields use 4 bits; insn[1] is not stored.
+    // register fields use 4 bits.
     // ------------------------------------------------------------------------------------
-    wire [31:0] insn  = {irs[7:0], irs[15:8], irs[23:16], irs[30:25], 1'b1, irs[24]};
-    wire        _unused_insn1 = insn[1];
+    wire [31:0] insn  = {ir[7:4], ir[3:0], ir[15:12], ir[11:8], ir[23:20], ir[19:16],
+                         ir[31:28], ir[27:24]};
     wire [2:0]  f3    = insn[14:12];
     wire [3:0]  rd_f  = insn[10:7];
     wire [3:0]  rs1_f = insn[18:15];
     wire [3:0]  rs2_f = insn[23:20];
+    wire        _unused_insn = insn[1];
 
     wire c_br    = insn[6] & ~insn[4] & ~insn[2];
     wire c_sys   = insn[6] &  insn[4] & ~insn[2];
@@ -146,6 +150,7 @@ module tt_um_fesens_r32v (
     wire trap_ill = ~insn[0] | (insn[6] & insn[4] & insn[2]);
     wire trap_dec = trap_ill | (c_jal & insn[21]) | p_trap;
     wire [3:0] cause = {p_trap & ~trap_ill & ~insn[20], 1'b0, trap_ill | p_trap, p_trap & ~trap_ill};
+    wire rs2z    = (rs2_f == 4'd0);
 
     wire fR   = ~sl[4] & ~sl[3];
     wire fM   = ~sl[4] &  sl[3];
@@ -166,174 +171,152 @@ module tt_um_fesens_r32v (
     wire sWS  = (sl == SL_WS);
     wire sWC  = (sl == SL_WC);
     wire shB  = sB & c_sh;
-    wire e_cd = ep[2] & ~ep[1];                    // CMD or DATA: SCK runs
-    wire e_end = (ep == E_END);
+    wire gap  = (ep == E_GAP);
+    wire hdr  = (ep == E_HDR);
+    wire e_end = (ep == E_TAIL);
+    wire wr   = fW | (sM & c_st);                       // the slot writes
 
     // submodule wires
     wire        tm, intr, irq, booting;
-    wire        csr_region, mask_lo2, rd_die;
+    wire        csr_region, mask_lo2;
+    wire [3:0]  rd_die;
     wire [1:0]  csr_idx;
-    wire        io, mar_bit;
+    wire        io, ps;
+    wire [4:0]  shamt_r;
     wire [6:0]  mar_lo;
     wire [15:0] io_rdata;
-    wire        active;
-    wire        miso_m;
-
-    // ------------------------------------------------------------------------------------
-    // Bit index of the current data strobe: bit k meets phase 2k + 1 in every slot.
-    // ------------------------------------------------------------------------------------
-    wire [4:0] kb = {~ph[0], ph[4:1]};
-    wire       k0 = (ph[4:0] == 5'd1);                // ph <= 32: ph[5] is 1 only at 32
-
-    // Shared immediate selectors: insn[20 + i] (i = k for k < 12, k - 20 for the U-type k >= 20),
-    // insn[7 + k] (k < 5), insn[k] (k = 12..19) and zimm insn[15 + k] (k < 5).
-    wire [3:0]  ki   = kb[3:0] - {1'b0, kb[4], 2'b00};
-    wire [15:0] va   = {4'd0, insn[31:20]};
-    wire [7:0]  vb   = {3'd0, insn[11:7]};
-    wire [7:0]  vm   = {insn[15:12], insn[19:16]};
-    wire [7:0]  vz   = {3'd0, insn[19:15]};
-    wire        m_a  = va[ki];
-    wire        m_b  = vb[kb[2:0]];
-    wire        m_m  = vm[kb[2:0]];
-    wire        m_z  = vz[kb[2:0]];
-    wire        k_hi = kb[4] | (kb[3] & kb[2]);                       // k >= 12
-    wire        k_20 = kb[4] & (kb[3] | kb[2]);                       // k >= 20
-    wire        k11  = (kb == 5'd11);
-    wire        k_lo5 = ~kb[4] & ~kb[3] & ~(kb[2] & (kb[1] | kb[0]));  // k < 5
-    wire        sign = insn[31];
-    wire        imm_bit =
-        c_u   ? (k_20 ? m_a : (k_hi & m_m)) :
-        c_jal ? (k_20 ? sign : k_hi ? m_m : (k0 ? 1'b0 : k11 ? insn[20] : m_a)) :
-        c_sys ? (f3[2] & k_lo5 & m_z) :
-        k_hi  ? sign :
-        c_br  ? (k0 ? 1'b0 : k11 ? insn[7] : k_lo5 ? m_b : m_a) :
-        c_st  ? (k_lo5 ? m_b : m_a) :
-                m_a;
-
-    // ------------------------------------------------------------------------------------
-    // Serial ALU (strobe = SCK-high clock of a data bit)
-    // ------------------------------------------------------------------------------------
-    wire stb    = ep[0] & sck;                       // SCK is high only in CMD and DATA
-    wire taken  = cmp ^ f3[0];
-    wire bimm_a = ~(c_op | c_br | c_sh);
-    wire a_bit  = (sB | (sA & c_pcrel)) ? bfr[0] : miso_m;
-    wire b_raw  = sA ? (bimm_a & imm_bit) :
-                  sB ? ((c_sh & ~c_op) ? imm_bit : miso_m) :
-                  (sPX & c_br & (taken ? imm_bit : (ph[4:0] == 5'd5)));
-    // B holds only OP, shifts (sub unused) and branches: SUB, SLT, SLTU and every branch subtract
-    wire sub    = sA ? c_slt : (sB & (c_br | (~f3[2] & (f3[1] | insn[30]))));
-    wire b_x    = b_raw ^ sub;
-    wire cin    = k0 ? sub : cy;
-    wire pp     = a_bit ^ b_x;
-    wire gg     = a_bit & b_x;
-    wire sum    = pp ^ cin;
-    wire cout   = gg | (cin & pp);
-    wire boolr  = (pp & ~f3[0]) | (f3[1] & gg);
-    wire sgnd   = c_br ? ~f3[1] : ~f3[0];
-    wire lt     = cout ^ (pp | ~sgnd);
-    wire sumj   = sum & ~(k0 & c_jalr);              // JALR clears target bit 0
-    wire eqacc  = ~sumj & (cmp | k0);
-    wire ocmp   = (c_br & ~f3[2]) ? eqacc : lt;
-    // logic ops: XORI, ORI, ANDI in A; XOR, OR, AND in B (a B result with f3 = 001..011 is unused)
-    wire useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & f3[2]);
-    wire alu_w  = useb ? boolr : sumj;
-
-    // C: a core-region CSR word (bits 1:0 of mtvec and mepc read 0) or the die bits;
-    // RS: CSRRW takes the scratch word (rs1 or zimm), CSRRS ors it in, CSRRC clears its bits
-    wire c_bit  = csr_region ? (miso_m & ~mask_lo2) : rd_die;
-    wire rs_val = f3[1] ? (f3[0] ? (bfr[0] & ~miso_m) : (bfr[0] | miso_m)) : miso_m;
-    wire din    = sC ? c_bit : sRS ? rs_val : alu_w;
-
-    // ------------------------------------------------------------------------------------
-    // Ring byte taps, select a = j[2:0]: bit a of each byte of a value read into the ring, at
-    // the strobe before bit a (store data, MSB first) or before result bit a (load data,
-    // reversed within each byte). Position 16 - 4a (mod 33).
-    // ------------------------------------------------------------------------------------
-    reg bfm;
-    always @(*) begin
-        case (j[2:0])
-            3'd0: bfm = bfr[16];
-            3'd1: bfm = bfr[12];
-            3'd2: bfm = bfr[8];
-            3'd3: bfm = bfr[4];
-            3'd4: bfm = bfr[0];
-            3'd5: bfm = bfr[29];
-            3'd6: bfm = bfr[25];
-            default: bfm = bfr[21];
-        endcase
-    end
-    wire       wtap = bfr[2];   // W family forward emission: bit k at its emission clock
-
-    // ------------------------------------------------------------------------------------
-    // W family data: bit k = j[4:0] at the emission strobe (the SCK-high clock before bit k)
-    // ------------------------------------------------------------------------------------
-    wire wem    = fW & sck & ~j[5];
-    wire sh_evt = sh_left ? ph[5] : (ph[4:0] == 5'd30);  // 30: source 32 passes; 32: source 0
-    wire shfill = sh_left ? ~(cmp | sh_evt) : (cmp | sh_evt);
-    // loads: IO slots have 16 bits, so an IO LW is an LHU
-    wire [1:0] nm1_l = io ? {1'b0, nm1[0]} : nm1;
-    wire ldfill = (j[4:3] > nm1_l);
-    wire fillv  = ~f3[2] & cy & ~(io & f3[1]);
-    wire wfill  = c_sh ? shfill : ldfill;
-    wire wd     = c_ld  ? (ldfill ? fillv : bfm) :
-                  c_slt ? ((j[4:0] == 5'd0) & cmp) :
-                  c_sh  ? (shfill ? (insn[30] & cy) : wtap) :
-                          wtap;
-    wire winc   = sWP4 | sW4;
-    wire wpl    = wtap ^ (cy & winc);
-    wire wdo    = sW ? wd : wpl;
-
-    // ------------------------------------------------------------------------------------
-    // MOSI: command, address (program: the address register; core region: 0xFFFF80 |
-    // {bit 6, word, 00}), data
-    // ------------------------------------------------------------------------------------
-    wire       wr      = fW | (sM & c_st);
-    wire       csr_sl  = sC | sWC;
-    wire       scr     = (sPX & ~c_br) | (sW4 & ~c_jal) | sWS | sRS;   // the scratch word 0x80
-    wire       regarea = ~scr & ~csr_sl;                                // x0..x15 at 0xC0 + 4r
-    wire [3:0] rsel    = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | (sW4 & c_jal)) ? rd_f :
-                         csr_sl ? {2'b01, csr_idx} : 4'd0;
-    reg        ra_bit;
-    always @(*) begin
-        case (j[2:0])
-            3'd0: ra_bit = 1'b1;
-            3'd1: ra_bit = regarea;
-            3'd2: ra_bit = rsel[3];
-            3'd3: ra_bit = rsel[2];
-            3'd4: ra_bit = rsel[1];
-            3'd5: ra_bit = rsel[0];
-            default: ra_bit = 1'b0;
-        endcase
-    end
-    wire cmdbit  = (j[2:1] == 2'b11) & ~(j[0] & wr);
-    wire mosi_ca = (j[4:3] == 2'b00) ? cmdbit : fM ? mar_bit : ((j[4:3] != 2'b11) | ra_bit);
-    wire mosi_d  = fM ? bfm : wdo;
-    wire mosi_nx = j[5] ? mosi_ca : mosi_d;
 
     // ------------------------------------------------------------------------------------
     // Slot control
     // ------------------------------------------------------------------------------------
+    wire csr_sl = sC | sWC;
     wire mask = (sA & (c_u | c_jal | (rs1_f == 4'd0) | (c_csr & f3[2]))) |
-                (sB & ~(c_op | c_br)) |
-                ((sB | sBS) & (rs2_f == 4'd0)) |
+                ((sB | sBS) & rs2z) |
                 ((sW | sW4) & (rd_f == 4'd0)) |
                 (first & (sP | (sPX & c_br))) |
-                (csr_sl & ~csr_region);
-    assign active = ep[2] & ~mask;
-    assign miso_m = uio_in[2] & active;               // 0 in a masked slot
-    // data length: 8 bits (LB, SB), 16 (LH, SH) or 32; the data phase ends at the first strobe
-    // with j >= length (j counts the data bits up from 1)
-    wire len8  = sM & (nm1 == 2'b00);
-    wire len16 = sM & (nm1 == 2'b01);
-    wire dend  = shB ? (ph[4:0] == 5'd30) : (j[5] | (j[4] & (len16 | len8)) | (j[3] & len8));
+                (csr_sl & ~csr_region) |
+                (sM & c_st & ~ps);                      // a store to flash issues nothing
+    wire active = ~gap & ~mask;
+    wire wact   = wr & ~mask;                           // the slot drives data on the bus
+    wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   // {SD3, SD2, SD1, SD0}
+    wire [3:0] nib_m = nib & {4{active}};               // 0 in a masked slot
 
-    // next slot after END
+    // strobes: stb = the clock where SCK is high (it falls at its edge)
+    wire       stb   = sck;
+    wire [5:0] cn    = c + 6'd1;
+    wire [2:0] nlast = (sM & c_st) ? {nm1, 1'b1} : 3'd7;
+    wire       dend  = stb & ~c[5] & (c[2:0] == nlast); // the last data edge's strobe
+    // data strobe: a read samples nibble c; a write (on the bus) loads nibble c + 1 for the
+    // next rising edge; a masked slot of either kind steps like a read
+    wire       dstb  = wact ? (stb & ~cn[5] & ~dend) : (stb & ~c[5]);
+    wire [2:0] n     = wact ? cn[2:0] : c[2:0];         // data nibble index at dstb
+    wire       n0    = (n == 3'd0);
+
+    // ------------------------------------------------------------------------------------
+    // Immediate nibble n (bits 4n+3 .. 4n)
+    // ------------------------------------------------------------------------------------
+    wire       sign = insn[31];
+    wire       zi   = c_sys & f3[2];                    // CSR immediate forms: zimm
+    reg  [3:0] imm4;
+    always @(*) begin
+        case (n)
+            3'd0: imm4 = c_u ? 4'd0 : c_jal ? {insn[23:21], 1'b0} : c_sys ? (insn[18:15] & {4{zi}}) :
+                         c_br ? {insn[10:8], 1'b0} : c_st ? insn[10:7] : insn[23:20];
+            3'd1: imm4 = c_u ? 4'd0 : c_sys ? {3'b000, zi & insn[19]} :
+                         (c_br | c_st) ? {insn[27:25], insn[11]} : insn[27:24];
+            3'd2: imm4 = (c_u | c_sys) ? 4'd0 : c_jal ? {insn[20], insn[30:28]} :
+                         c_br ? {insn[7], insn[30:28]} : insn[31:28];
+            3'd3: imm4 = (c_u | c_jal) ? insn[15:12] : {4{sign & ~c_sys}};
+            3'd4: imm4 = (c_u | c_jal) ? insn[19:16] : {4{sign & ~c_sys}};
+            3'd5: imm4 = c_u ? insn[23:20] : {4{sign & ~c_sys}};
+            3'd6: imm4 = c_u ? insn[27:24] : {4{sign & ~c_sys}};
+            default: imm4 = c_u ? insn[31:28] : {4{sign & ~c_sys}};
+        endcase
+    end
+
+    // ------------------------------------------------------------------------------------
+    // Nibble ALU (also the + 4 of WP4/W4 and the branch target in PX)
+    // ------------------------------------------------------------------------------------
+    wire       taken  = cmp ^ f3[0];
+    wire       winc   = sWP4 | sW4;
+    wire [3:0] four   = {1'b0, n0, 2'b00};
+    wire       bimm_a = ~(c_op | c_br | c_sh);
+    wire [3:0] a4     = (sB | (sA & c_pcrel) | winc) ? ring[3:0] : nib_m;
+    wire [3:0] b4     = sA ? (imm4 & {4{bimm_a}}) :
+                        sB ? nib_m :
+                        winc ? four :
+                        (sPX & c_br) ? (taken ? imm4 : four) : 4'd0;
+    // A: SLTI/SLTIU, and branches compare rs1 with 0; B: SUB, SLT, SLTU and branches subtract
+    wire       sub    = sA ? (c_slt | c_br) : (sB & (c_br | (~f3[2] & (f3[1] | insn[30]))));
+    wire [3:0] b_x    = b4 ^ {4{sub}};
+    wire       cin    = n0 ? sub : cy;
+    wire [4:0] add    = {1'b0, a4} + {1'b0, b_x} + {4'd0, cin};
+    wire [3:0] sum    = add[3:0];
+    wire       cout   = add[4];
+    wire [3:0] pp     = a4 ^ b_x;
+    wire [3:0] gg     = a4 & b_x;
+    wire [3:0] boolr  = (pp & {4{~f3[0]}}) | (gg & {4{f3[1]}});
+    wire       sgnd   = c_br ? ~f3[1] : ~f3[0];
+    wire       lt     = cout ^ (pp[3] | ~sgnd);
+    wire [3:0] sumj   = {sum[3:1], sum[0] & ~(n0 & c_jalr)};   // JALR clears target bit 0
+    wire       eqacc  = ~(|sumj) & (cmp | n0);
+    wire       ocmp   = (c_br & ~f3[2]) ? eqacc : lt;
+    // logic ops: XORI, ORI, ANDI in A; XOR, OR, AND in B (a B result with f3 = 001..011 is unused)
+    wire       useb   = (sA & c_alu & ~insn[5] & f3[2] & ~c_sh) | (sB & f3[2]);
+    wire [3:0] alu_w  = useb ? boolr : sumj;
+
+    // C: a core-region CSR word (bits 1:0 of mtvec and mepc read 0) or the die bits;
+    // RS: CSRRW takes the scratch word (rs1 or zimm), CSRRS ors it in, CSRRC clears its bits
+    wire [3:0] c4     = csr_region ? (nib_m & {2'b11, {2{~mask_lo2}}}) : rd_die;
+    wire [3:0] rs4    = f3[1] ? (f3[0] ? (ring[3:0] & ~nib_m) : (ring[3:0] | nib_m)) : nib_m;
+    wire [3:0] din4   = sC ? c4 : sRS ? rs4 : alu_w;
+
+    // ------------------------------------------------------------------------------------
+    // Write family emission, nibble n at the data strobe (before the ring rotates)
+    // ------------------------------------------------------------------------------------
+    // program data (load bytes in W, store bytes in M): byte nibbles swapped
+    wire [3:0] tap4   = n[0] ? ring[31:28] : ring[7:4];
+    // loads: IO slots have 16 bits, so an IO LW is an LHU
+    wire [1:0] nm1_l  = io ? {1'b0, nm1[0]} : nm1;
+    wire       ldfill = (n[2:1] > nm1_l);
+    wire       fillv  = ~f3[2] & cy & ~(io & f3[1]);
+    // shifts: shamt = 4q + r; right: the ring is rotated by q, emit ({next, head} >> r);
+    // left: rotated by -q - (r != 0), emit ({next, head} >> (4 - r) mod 4)
+    wire [4:0] shamt  = c_op ? shamt_r : insn[24:20];
+    wire [2:0] q      = shamt[4:2];
+    wire [1:0] r      = shamt[1:0];
+    wire       rnz    = |r;
+    wire [2:0] rotn   = sh_left ? (~q + {2'b00, ~rnz}) : q;
+    wire [1:0] amt    = sh_left ? (~r + 2'd1) : r;
+    wire [3:0] qh     = {1'b0, q} + {3'b000, rnz};
+    wire       hv     = sh_left ? ({1'b0, n} >= qh) : (n <= ~q);
+    wire       nv     = sh_left ? (n >= q) : (n < ~q);
+    wire       shf    = ~sh_left & insn[30] & cmp;      // SRA fill: rs1[31], latched in A
+    wire [3:0] hd     = hv ? ring[3:0] : {4{shf}};
+    wire [2:0] nx     = nv ? ring[6:4] : {3{shf}};
+    reg  [3:0] fun;
+    always @(*) begin
+        case (amt)
+            2'd0: fun = hd;
+            2'd1: fun = {nx[0], hd[3:1]};
+            2'd2: fun = {nx[1:0], hd[3:2]};
+            default: fun = {nx, hd[3]};
+        endcase
+    end
+    wire [3:0] wd4    = c_ld  ? (ldfill ? {4{fillv}} : tap4) :
+                        c_slt ? {3'b000, n0 & cmp} :
+                        c_sh  ? fun :
+                                ring[3:0];
+    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : winc ? sum : ring[3:0];
+
+    // ------------------------------------------------------------------------------------
+    // Next slot after the tail
+    // ------------------------------------------------------------------------------------
     reg [4:0] nsl;
-    reg       nret, npre, tgo;
+    reg       nret, tgo;
     always @(*) begin
         nsl  = SL_W;
         nret = 1'b0;
-        npre = 1'b0;
         tgo  = 1'b0;
         case (sl)
             SL_P: nsl = tm ? SL_WC : SL_F;
@@ -355,7 +338,15 @@ module tt_um_fesens_r32v (
                     nsl = SL_P;
                 end else if (c_jal | c_jalr)
                     nsl = SL_WP;
-                else if (c_br | c_op | c_sh)
+                else if (c_br) begin
+                    if (~rs2z)
+                        nsl = SL_B;
+                    else if (taken & insn[8]) begin
+                        tgo = 1'b1;
+                        nsl = SL_P;
+                    end else
+                        nsl = SL_PX;
+                end else if (c_op)
                     nsl = SL_B;
                 else if (c_st)
                     nsl = SL_BS;
@@ -365,9 +356,7 @@ module tt_um_fesens_r32v (
                     nsl = SL_WS;
             end
             SL_B: begin
-                if (c_sh)
-                    npre = 1'b1;
-                else if (c_br) begin
+                if (c_br) begin
                     if (taken & insn[8]) begin
                         tgo = 1'b1;
                         nsl = SL_P;
@@ -409,86 +398,61 @@ module tt_um_fesens_r32v (
     end
 
     // ------------------------------------------------------------------------------------
-    // IO: an IO load captures the slot into the ring at A's END (atomic: the read side effect
-    // happens at the same edge); an IO store writes rs2[15:0] from the ring at BS's END.
-    // In an END cycle (phase 31) bit k of a value read into the ring is at position 2k + 3, and
-    // load data wire bit m (bytes in address order, MSB first) belongs at position 2m + 2.
+    // IO: an IO load captures the slot into the ring at A's tail (atomic: the read side effect
+    // happens at the same edge), as M would leave 4 bytes; an IO store writes rs2[15:0] from the
+    // ring at BS's tail.
     // ------------------------------------------------------------------------------------
     wire        io_re = e_end & sA & c_ld & io;
     wire        io_we = e_end & sBS & io;
     wire [1:0]  off   = mar_lo[1:0];
     wire [7:0]  iob0  = off[1] ? 8'd0 : off[0] ? io_rdata[15:8] : io_rdata[7:0];
     wire [7:0]  iob1  = (off == 2'd0) ? io_rdata[15:8] : 8'd0;
-    wire [15:0] io_wdata = {bfr[0], bfr[31], bfr[29], bfr[27], bfr[25], bfr[23], bfr[21], bfr[19],
-                            bfr[17], bfr[15], bfr[13], bfr[11], bfr[9], bfr[7], bfr[5], bfr[3]};
 
     // ------------------------------------------------------------------------------------
-    // Ring (no reset: nothing reads it before it is written)
+    // Ring and instruction register (no reset: nothing reads them before they are written)
     // ------------------------------------------------------------------------------------
-    wire        we32 = stb & (fR | (sM & c_ld)) & ~shB;
-    wire [32:0] rot  = {we32 ? din : bfr[0], bfr[32:1]};
-    reg  [32:0] ring_n;
-    integer     ri;
-    always @(*) begin
-        ring_n = rot;
-        if (io_re) begin
-            for (ri = 0; ri < 8; ri = ri + 1) begin
-                ring_n[2 * ri + 2]  = iob0[7 - ri];
-                ring_n[2 * ri + 18] = iob1[7 - ri];
-            end
-        end
-    end
+    wire ring_in  = dstb & (fR | (sM & c_ld)) & ~shB;
+    wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] <= rotn);
+    wire ring_rot = (dstb & wr) | hrot;
     always @(posedge clk) begin
-        bfr <= ring_n;
-        // the tail (insn[7:2]) skips the last strobe, so insn[1] (the strobe before) drops out
-        if (sF & stb) begin
-            irs[24:0] <= {irs[23:0], uio_in[2]};
-            if (~j[5])
-                irs[30:25] <= irs[29:24];
-        end
+        if (io_re)
+            ring[15:0] <= {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]};
+        else if (ring_in)
+            ring <= {din4, ring[31:4]};
+        else if (ring_rot)
+            ring <= {ring[3:0], ring[31:4]};
+        if (sF & dstb)
+            ir <= {ir[27:0], nib_m};
     end
 
     // ------------------------------------------------------------------------------------
-    // Datapath flags (no reset)
+    // Datapath flags and the edge counter (no reset)
     // ------------------------------------------------------------------------------------
     always @(posedge clk) begin
-        if (~ep[2])                                     // between transactions
+        if (gap)
             cy <= 1'b0;
-        else if (sW) begin
-            if (wem & ~wfill)
-                cy <= c_ld ? bfm : wtap;
-        end else if (wem)
-            cy <= (j[4:0] == 5'd1) | (cy & wtap);
-        else if (stb & fR)
-            cy <= cout;
+        else if (dstb) begin
+            if (sW) begin
+                if (~ldfill)
+                    cy <= tap4[3];
+            end else if (fR | winc)
+                cy <= cout;
+        end
 
-        if (stb & sA) begin
-            if (c_slt)
+        if (dstb & sA) begin
+            if (c_slt | c_br)
                 cmp <= ocmp;
-            else if ((ph[4:2] == 3'd0) & ph[0])             // bits 0 and 1
-                cmp <= eqacc;                               // JALR target[1] == 0
-        end else if (stb & sB)                          // SLT, branches; a shift starts its
-            cmp <= ocmp & ~c_sh;                        // W fill state at 0
-        else if (sW & c_sh & wem & sh_evt)
-            cmp <= 1'b1;
+            else if (c_jalr & n0)
+                cmp <= ~sumj[1];                        // JALR target[1] == 0
+            else if (c_sh)
+                cmp <= a4[3];                           // rs1[31] at the last nibble
+        end else if (dstb & sB & ~c_sh)                 // SLT, branches
+            cmp <= ocmp;
 
-        // bit counter
-        if ((ep == E_IDLE) | ((ep == E_PC) & (j == 6'd63)))
-            j <= 6'd32;
-        else if (((ep == E_CMD) | ((ep == E_DATA) & ~shB)) & ~sck)
-            j <= j + 6'd1;
-        else if (ep == E_PC)
-            j <= j + 6'd1;
-        else if (stb & shB & k_lo5)                 // bits 0..4
-            j <= {b_raw ^ ~sh_left, j[5:1]};
-
-        // MOSI changes only where SCK stays low or falls
-        if (e_cd & ~sck)
-            mosi <= mosi;
-        else if (e_cd)
-            mosi <= mosi_nx;
-        else
-            mosi <= 1'b0;
+        if (gap)
+            c <= mask ? 6'd0 : wr ? 6'd56 : 6'd52;
+        else if (stb)
+            c <= cn;
     end
 
     // ------------------------------------------------------------------------------------
@@ -497,29 +461,21 @@ module tt_um_fesens_r32v (
     always @(posedge clk) begin
         if (!rst_n) begin
             sl    <= SL_P;
-            ep    <= E_IDLE;
-            ph    <= 6'd0;
+            ep    <= E_GAP;
             sck   <= 1'b0;
             first <= 1'b1;
         end else begin
-            ph  <= ph[5] ? 6'd0 : ph + 6'd1;
-            sck <= e_cd & ~sck;
+            sck <= (ep[0] ^ ep[1]) & ~sck;              // toggles in HDR and DATA
             case (ep)
-                E_IDLE: if ((ph[4:0] == 5'd1) & ~booting)
-                    ep <= E_CMD;
-                E_CMD: if (sck & ~j[5])                     // j wrapped to 0: data
-                    ep <= E_DATA;
-                E_DATA: if (sck & dend)
-                    ep <= E_END;
-                E_END: begin
+                E_GAP:  if (~booting) ep <= mask ? E_DATA : E_HDR;
+                E_HDR:  if (stb & (c == 6'd63)) ep <= E_DATA;
+                E_DATA: if (dend) ep <= E_TAIL;
+                default: begin
                     sl <= nret ? SL_P : nsl;
-                    ep <= npre ? E_PW : E_IDLE;
+                    ep <= E_GAP;
                     if (nret)
                         first <= 1'b0;
                 end
-                E_PW: if (sh_left ? (ph[1] & ph[0]) : ph[5]) ep <= E_PC;   // from 32: 3 (left), 32
-                E_PC: if (j == 6'd63) ep <= E_CMD;
-                default: ep <= E_IDLE;
             endcase
         end
     end
@@ -527,21 +483,31 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Submodules
     // ------------------------------------------------------------------------------------
+    wire       scr     = (sPX & ~c_br) | (sW4 & ~c_jal) | sWS | sRS;   // the scratch word 0x80
+    wire       regarea = ~scr & ~csr_sl;                                // x0..x15 at 0xC0 + 4r
+    wire [3:0] rsel    = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | (sW4 & c_jal)) ? rd_f :
+                         csr_sl ? {2'b01, csr_idx} : 4'd0;
+
     r32v_mem u_mem (
         .clk(clk), .rst_n(rst_n),
-        .cap(stb & (sP | sA)), .cap_a(stb & sA), .kb(kb), .din(din), .j(j[4:0]),
-        .mar_bit(mar_bit), .mar_lo(mar_lo), .io(io), .booting(booting),
-        .active(active), .prog(fM), .sck(sck), .mosi(mosi),
+        .cap(dstb & (sP | sA | sB)), .cap_a(dstb & sA), .kn(n), .din4(sB ? nib_m : din4),
+        .shamt(shamt_r), .mar_lo(mar_lo), .io(io), .ps(ps), .booting(booting),
+        .active(active), .prog(fM), .sck(sck), .gap(gap),
+        .hdr_ld((gap & ~booting & ~mask) | (stb & hdr & cn[5])),
+        .hidx(gap ? 3'd0 : (cn[2:0] ^ {~wr, 2'b00})),
+        .h_wr(wr), .h_reg({regarea, rsel}),
+        .dat_ld(dstb & wact), .wd4(wdo4),
+        .oe_off(stb & hdr & ~wr & (cn[3:0] == 4'b1100)),
         .uio_out(uio_out), .uio_oe(uio_oe)
     );
 
     r32v_csr u_csr (
         .clk(clk), .rst_n(rst_n),
-        .csr_num(insn[31:20]), .p_mret(p_mret), .s_wc(sWC), .kb(kb),
+        .csr_num(insn[31:20]), .p_mret(p_mret), .s_wc(sWC), .kn(n),
         .region(csr_region), .idx(csr_idx), .mask_lo2(mask_lo2), .rd_die(rd_die),
         .trap_go(e_end & tgo), .cause(cause), .retire(e_end & nret),
         .wc_end(e_end & sWC & ~tm),
-        .wb({bfr[32], bfr[25], bfr[17], bfr[9], bfr[7], bfr[5], bfr[3]}),
+        .wb({ring[31], ring[11], ring[7], ring[3:0]}),
         .seq_end(e_end & sWP & tm), .irq(irq),
         .tm(tm), .intr(intr)
     );
@@ -549,19 +515,17 @@ module tt_um_fesens_r32v (
     r32v_periph u_periph (
         .clk(clk), .rst_n(rst_n), .ui_in(ui_in), .uo_out(uo_out),
         .slot(mar_lo[6:2]), .off(off), .size(f3[1:0]), .we(io_we), .re(io_re),
-        .wdata(io_wdata), .rdata(io_rdata), .irq(irq)
+        .wdata(ring[15:0]), .rdata(io_rdata), .irq(irq)
     );
 
     // ------------------------------------------------------------------------------------
     // RVFI (formal and cosim builds only; observes, never drives the pins)
     // ------------------------------------------------------------------------------------
 `ifdef RISCV_FORMAL
-    reg         r_i1;                                   // insn[1], not stored by the design
     reg [63:0]  r_order;
     reg         r_v, r_tr, r_intr, r_ipend;
     reg [31:0]  r_rs1, r_rs2, r_rd, r_pc, r_npc, r_mrd;
     integer     mi;
-    wire [4:0]  dj = j[4:0] - 5'd1;
     always @(posedge clk) begin
         if (!rst_n) begin
             r_order <= 64'd0;
@@ -574,7 +538,7 @@ module tt_um_fesens_r32v (
                 r_order <= r_order + 64'd1;
             // a trap or interrupt sequence ends: the next retirement is the handler's first
             // instruction (rvfi_intr = 1 for both, contract 8). A synchronous trap's own
-            // retirement comes at this same END and still reports the old value.
+            // retirement comes at this same tail and still reports the old value.
             if (e_end & sWP & tm)
                 r_ipend <= 1'b1;
             else if (e_end & nret)
@@ -582,21 +546,20 @@ module tt_um_fesens_r32v (
             if (e_end & nret)
                 r_intr <= r_ipend;
         end
-        if (stb & sP)
-            r_pc <= {miso_m, r_pc[31:1]};
-        if (stb & sF & (j == 6'd7))
-            r_i1 <= uio_in[2];
-        if (wem & (sWP | sWP4))
-            r_npc <= {wdo, r_npc[31:1]};
-        if (stb & sA)
-            r_rs1 <= {miso_m, r_rs1[31:1]};
-        if (stb & (sB | sBS))
-            r_rs2 <= {miso_m, r_rs2[31:1]};
-        if (wem & (sW | (sW4 & c_jal)))
-            r_rd <= {wdo, r_rd[31:1]};
+        if (dstb & sP)
+            r_pc <= {nib_m, r_pc[31:4]};
+        if (dstb & (sWP | sWP4))
+            r_npc <= {wdo4, r_npc[31:4]};
+        if (dstb & sA)
+            r_rs1 <= {nib_m, r_rs1[31:4]};
+        if (dstb & (sB | sBS))
+            r_rs2 <= {nib_m, r_rs2[31:4]};
+        if (dstb & (sW | (sW4 & c_jal)))
+            r_rd <= {wdo4, r_rd[31:4]};
+        // M: byte n/2 of the load, high nibble first
         for (mi = 0; mi < 32; mi = mi + 1)
-            if (stb & sM & c_ld & ({dj[4:3], ~dj[2:0]} == mi[4:0]))
-                r_mrd[mi] <= uio_in[2];
+            if (dstb & sM & c_ld & ({n[2:1], ~n[0]} == mi[4:2]))
+                r_mrd[mi] <= nib_m[mi[1:0]];
         if (io_re)
             r_mrd <= {16'd0, io_rdata} >> {off, 3'b000};
     end
@@ -610,10 +573,11 @@ module tt_um_fesens_r32v (
     wire [31:0] maddr  = r_rs1 + (c_st ? imm_s : imm_i);
     wire [3:0]  r_mask = (f3[1:0] == 2'b00) ? 4'b0001 : (f3[1:0] == 2'b01) ? 4'b0011 : 4'b1111;
     wire [31:0] lmask  = {{8{r_mask[3]}}, {8{r_mask[2]}}, {8{r_mask[1]}}, {8{r_mask[0]}}};
+    wire [31:0] r_rs2v = rs2z ? 32'd0 : r_rs2;          // a branch on x0 runs no B slot
 
     assign rvfi_valid     = r_v;
     assign rvfi_order     = r_order;
-    assign rvfi_insn      = {insn[31:2], r_i1, insn[0]};
+    assign rvfi_insn      = insn;
     assign rvfi_trap      = r_tr;
     assign rvfi_halt      = 1'b0;
     assign rvfi_intr      = r_intr;
@@ -622,7 +586,7 @@ module tt_um_fesens_r32v (
     assign rvfi_rs1_addr  = r_rs1e ? {1'b0, rs1_f} : 5'd0;
     assign rvfi_rs2_addr  = r_rs2e ? {1'b0, rs2_f} : 5'd0;
     assign rvfi_rs1_rdata = r_rs1e ? r_rs1 : 32'd0;
-    assign rvfi_rs2_rdata = r_rs2e ? r_rs2 : 32'd0;
+    assign rvfi_rs2_rdata = r_rs2e ? r_rs2v : 32'd0;
     assign rvfi_rd_addr   = r_rde ? {1'b0, rd_f} : 5'd0;
     assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;
     assign rvfi_pc_rdata  = r_pc;
@@ -631,7 +595,7 @@ module tt_um_fesens_r32v (
     assign rvfi_mem_rmask = (r_mem & c_ld) ? r_mask : 4'd0;
     assign rvfi_mem_wmask = (r_mem & c_st) ? r_mask : 4'd0;
     assign rvfi_mem_rdata = (r_mem & c_ld) ? (r_mrd & lmask) : 32'd0;
-    assign rvfi_mem_wdata = (r_mem & c_st) ? (r_rs2 & lmask) : 32'd0;
+    assign rvfi_mem_wdata = (r_mem & c_st) ? (r_rs2v & lmask) : 32'd0;
 `endif
 
 endmodule
