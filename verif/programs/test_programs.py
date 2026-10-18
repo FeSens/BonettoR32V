@@ -47,7 +47,7 @@ EVENT_PROGS = make_list("list-declared")  # the Makefile's EVENT_PROGS: the one 
 ALL = ISS_PROGS + EVENT_PROGS
 PASS = 0x5A
 REGION_LO = 0x7FFF80
-BUDGET = 50_000_000  # the harness's cycle budget for declared programs (Task 3 DEFAULT_BUDGET)
+BUDGET = 50_000_000  # the harness's default cycle budget for declared programs (Task 3)
 
 
 @pytest.fixture(scope="module")
@@ -178,8 +178,11 @@ def test_gpio_scripts(built, prog):
 
 
 def test_irq_programs_have_no_stimulus(built):
-    for prog in ("irq_timer", "irq_stress"):  # the timer interrupts them
-        assert set(built[prog]) == {"prog", "kind", "result_gpio", "psram_window", "final_altfn"}
+    common = {"prog", "kind", "result_gpio", "psram_window", "final_altfn"}
+    assert set(built["irq_timer"]) == common  # the timer interrupts them
+    assert set(built["irq_stress"]) == common | {"max_cycles"}
+    assert built["irq_stress"]["max_cycles"] == 200_000_000  # ruling R35
+    assert all("max_cycles" not in built[p] for p in ALL if p != "irq_stress")
 
 
 # ---- random streams: what gen_random.py promises ------------------------------------------------
@@ -224,7 +227,8 @@ def test_random_streams_cover_the_v3_map(built, seed):
 
 # ---- progsim: the peripheral programs at several core speeds ------------------------------------
 def progsim(prog: str, cpi: str, *extra: str) -> dict:
-    cmd = [str(PROGSIM), str(OUT / f"{prog}.hex"), "--cpi", cpi, "--max-cycles", "700000000",
+    budget = json.loads((OUT / f"{prog}.expect.json").read_text()).get("max_cycles", BUDGET)
+    cmd = [str(PROGSIM), str(OUT / f"{prog}.hex"), "--cpi", cpi, "--max-cycles", str(budget),
            *extra]
     if (OUT / f"{prog}.stim").stat().st_size:
         cmd += ["--stim", str(OUT / f"{prog}.stim")]
@@ -232,9 +236,7 @@ def progsim(prog: str, cpi: str, *extra: str) -> dict:
     res = json.loads(p.stdout.strip().splitlines()[-1])
     assert res["end"] == "selfloop" and res["gpio_out"] == PASS, (res, p.stderr[-2000:])
     assert not res["uninit_read"], f"read before write at pc {res['uninit_pc']:#x}"
-    if not cpi.startswith("rand"):
-        assert res["cycles"] <= BUDGET, f"{res['cycles']} cycles: over the harness budget"
-    return res
+    return res  # within the budget: progsim stopped at max_cycles otherwise (end = max)
 
 
 def symbols(prog: str) -> dict:
@@ -263,6 +265,9 @@ def test_progsim_event_programs_pass(built, prog, cpi):
         pcs = [pc for pc, _ in res["intr_pcs"]]
         assert sum(sym["steps"] <= pc < sym["steps_end"] for pc in pcs) >= 40
         assert sym["wfi_poll"] in pcs, "no interrupt landed right after the WFI"
+        # the forced pending interrupt lands right after the CSRRSI and the MRET (progsim takes
+        # it at once)
+        assert sym["force_en"] in pcs and sym["force_mret"] in pcs
 
 
 @pytest.mark.parametrize("cpi", ["12", "800", "rand:20:2048"])
