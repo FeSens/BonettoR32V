@@ -59,7 +59,7 @@ the lead; don't route around it.
 | `make arch` | riscv-arch-test, all 53 RV32E and privilege tests under seeds 1-4, on one host with GCC, spike and Verilator (hwe-bench, `tools/hwe_run.sh --third-party`) |
 | `make gl` | the TT test (test/, the QSPI Pmod model) on the synthesized netlist (`GATES=yes`) |
 | `make equiv` | the RVFI-stripped build equals the plain build |
-| `make area` | sky130 cell area, broken down (the tiebreak), and the `fits` pre-filter (1x2, 22,000 µm²: the seed, 20,442, signs off at utilization 0.728) |
+| `make area` | sky130 cell area, broken down (the tiebreak), and the `fits` pre-filter (1x2, 23,100 µm²: hyp 112's a85f6cb, 23,073, signs off at utilization 0.803) |
 | `make eval` | every gate plus the score, cheapest first, writing `build/eval.json`. `MIN_IPS=<champion coremark_ips>` (full precision, from `tools/ledger.py show --json`) stops a slower candidate right after cosim; a tie runs on, since area breaks it. Formal is skipped unless `FORMAL=1` |
 | `make eval FORMAL=1` | the same plus formal last: at every 10th merged improvement (run in parallel while development continues) and at signoff |
 | `make harden` | TT 1x2 hardening (LibreLane), signoff at `CLOCK_PERIOD` (20 ns, 50 MHz) |
