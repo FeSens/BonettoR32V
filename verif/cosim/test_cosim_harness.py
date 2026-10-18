@@ -626,6 +626,32 @@ def test_spi_transfer_in_flight_at_end_fails(tools, tmp_path):
         r["error"]), r["error"]
 
 
+def test_spi_transfer_done_before_its_write_retires(tools, tmp_path):
+    """rvfi mode (L4, found by hyp 105): a transfer that starts and ends on the pins while its
+    SPI_DATA store is still executing belongs to that store when it retires: its byte is checked
+    there, and BUSY reads 0 after it. The checker used to keep such a transfer in flight forever
+    (a false "BUSY read 0" failure) and never compared its byte."""
+    prog = PROG_SPI[:7] + [addi(5, 0, 0), lw(4, SPI_CTRL, 1)] + PROG_SPI[7:]  # BUSY read at #8
+    hexf = flash_hex(tmp_path / "spiearly.hex", {0: prog})
+    exp = {"spi_div_d": 1, "result_gpio": 0x5A}
+
+    def run(byte, busy):
+        pins = Pins().set_uo(301, 0x10).set_uo(501, 0x00)
+        assert pins.spi_xfer(602, byte, 2, 0x00) == 634  # #5 retires at 600, the store #6 at 700
+        pins.set_uo(1001, 0x00).set_uo(1201, 0x5A)
+        rets = iss_log(hexf, "--vread", f"14={0x12 if busy else 0x02}")
+        assert len(rets) == 14 and rets[8]["mrdata"] == (0x12 if busy else 0x02)
+        return stub("rvfi", hexf, tmp_path, pins, rets, every(14), exp)
+
+    r = run(0xA5, False)
+    assert r["pass"], r["error"]
+    r = run(0xA5, True)
+    assert not r["pass"] and "BUSY (SPI_CTRL[4]) read 1" in r["error"], r["error"]
+    r = run(0xA4, False)
+    assert not r["pass"] and "SPI MOSI sent 0xa4 (started at cycle 604)" in r["error"], r["error"]
+    assert "the program wrote 0xa5" in r["error"], r["error"]
+
+
 PROG_UART = [lui(1, 0x80000), addi(2, 0, 1), sw(2, ALTFN, 1),      # ALTFN = 1: uo[0] is UART TX
              addi(2, 0, 16), sw(2, UART_CTRL, 1),                  # DIV = 16
              addi(2, 0, 0x55), sw(2, UART_DATA, 1),                # send 'U' (retires at 700)

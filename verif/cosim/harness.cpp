@@ -667,8 +667,11 @@ struct XferTrack {
     size_t ep = 0;
   } pend;
   bool orphan = false;  // a transfer started on the pins before its write retired
+  bool orphan_done = false;  // ... and also ended before it: its byte is checked at the write
   uint64_t orphan_t0 = 0;
   size_t orphan_ep = 0;
+  uint8_t orphan_byte = 0;
+  const char* orphan_what = "";
   struct Fly {
     uint64_t t0;
     int byte;  // -1: unknown (started while unattributable)
@@ -1259,7 +1262,7 @@ void Harness::xfer_gate(XferTrack& x, bool gate, uint64_t settle) {
   if (!gate) {
     x.gated = false;
     x.ungated_writes = (x.pend.active || x.orphan || !x.fly.empty()) ? 1 : 0;
-    x.pend.active = x.orphan = false;
+    x.pend.active = x.orphan = x.orphan_done = false;
     x.fly.clear();
     x.unknown_to = INF;
     x.unknown_from = t_;
@@ -1287,8 +1290,16 @@ bool Harness::xfer_write(XferTrack& x, uint64_t p, uint64_t s, uint8_t byte, uin
   if (x.orphan && x.orphan_t0 >= p) {  // the transfer started before its write retired
     BusyTrack::Ep& e = x.busy.ep(x.orphan_ep);
     e.ps = std::max(e.ps, lo);
-    x.fly.push_back(XferTrack::Fly{x.orphan_t0, byte, x.orphan_ep});
     x.orphan = false;
+    if (x.orphan_done) {  // it already ended (xfer_done closed its episode): check its byte here
+      x.orphan_done = false;
+      if (x.orphan_byte != byte)
+        return fail(fmt("%s sent 0x%02x (started at cycle %llu), but the program wrote 0x%02x",
+                        x.orphan_what, x.orphan_byte, (unsigned long long)rel(x.orphan_t0),
+                        byte));
+      return true;
+    }
+    x.fly.push_back(XferTrack::Fly{x.orphan_t0, byte, x.orphan_ep});
     return true;
   }
   const int m = x.busy.must(p + 1, s);
@@ -1332,7 +1343,19 @@ bool Harness::xfer_start(XferTrack& x, uint64_t t0, uint64_t lead, const char* w
 }
 
 bool Harness::xfer_done(XferTrack& x, uint64_t t0, uint64_t end, uint8_t byte, const char* what) {
-  if (!x.gated || x.fly.empty()) return true;
+  if (!x.gated) return true;
+  if (x.fly.empty()) {
+    if (!x.orphan || x.orphan_done) return true;
+    // the transfer ended before its write retired: close its episode now; xfer_write checks the
+    // byte (and the next retirement must be that write, or the orphan check fails)
+    BusyTrack::Ep& e = x.busy.ep(x.orphan_ep);
+    e.de = end > BUSY_SLACK ? end - BUSY_SLACK : 0;
+    e.pe = end + BUSY_SLACK;
+    x.orphan_done = true;
+    x.orphan_byte = byte;
+    x.orphan_what = what;
+    return true;
+  }
   const XferTrack::Fly f = x.fly.front();
   x.fly.pop_front();
   BusyTrack::Ep& e = x.busy.ep(f.ep);
