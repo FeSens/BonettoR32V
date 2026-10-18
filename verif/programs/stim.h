@@ -39,6 +39,61 @@
 #define PWM_TMR_CMP 300           /* uo7 high while CNT < 300, of every 65,536 cycles */
 #define PWM_HOLD 4                /* timer compare matches the program waits after MARK_PWM */
 
+/* ---- pwm10: the full 10-bit range, Q = 0, after a mid-run change ---------------------------- */
+#define P10_PRE_PER 99            /* running before the change: period 100 cycles (<= the new one) */
+#define P10_PRE_DUTY 50
+#define P10_PER 1023              /* PER bits 8-9 set: period 1,024 cycles */
+#define P10_Q 0
+#define P10_DUTY_0 1              /* high 1 cycle of 1,024 */
+#define P10_DUTY_1 512            /* duty bit 9 */
+#define P10_DUTY_2 1023           /* = PER: high 1,023 of 1,024 */
+#define P10_TMR_P 0
+#define P10_TMR_CMP 0xC000        /* timer PWM mode, CMP bit 15: high 49,152 of 65,536 cycles */
+#define P10_HOLD 6                /* timer compare matches the program waits after MARK_PWM */
+
+/* ---- pwm10q: Q > 0, duty above PER and = PER, timer auto-reload at a high CMP ------------- */
+#define P10Q_PRE_PER 1023         /* running before the change: Q = 1, period 2,048 cycles */
+#define P10Q_PRE_Q 1
+#define P10Q_PER 1000             /* PER decreases mid-run: period 1,001 x 8 = 8,008 cycles */
+#define P10Q_Q 3
+#define P10Q_DUTY_0 1023          /* above PER: always 1 */
+#define P10Q_DUTY_1 1000          /* = PER: high 8,000 of 8,008 */
+#define P10Q_DUTY_2 0x155         /* 341: bit 8 set, high 2,728 of 8,008 */
+#define P10Q_TMR_P 1
+#define P10Q_TMR_CMP 0xA000       /* PWM mode, auto-reload at 40,960: high 40,960 of 40,961 ticks */
+#define P10Q_HOLD 6
+
+/* ---- timer16: the 16-bit timer over its full range (uo7 looped back to ui0) ---------------- */
+#define T16_CMP_A 0xBEEF          /* register readback with bit 15 set */
+#define T16_CNT_A 0xA5C3
+#define T16_CMP_AR 0xC350         /* auto-reload at 50,000 (P = 1) */
+#define T16_AR_START 0xC300       /* the first reload 80 ticks after the start */
+#define T16_AR_PERIODS 3
+#define T16_CAP_P 3               /* 16-bit captures: a tick (8 cycles) outlasts the loop latency */
+#define T16_CAP_CNT0 0x8000
+#define T16_CAP_CMP1 0x8001       /* rising edge: CAP = 0x8002 (+-1) */
+#define T16_CAP_CMP2 0xC3C3       /* falling edge: CAP = 0xC3C4 (+-1) */
+#define T16_P15_DIV 8191          /* UART stopwatch: one frame = 81,920 cycles = 2.5 ticks at P = 15 */
+#define T16_RS_DIV_A 2599         /* restart test: a 26,000-cycle frame after a tick ... */
+#define T16_RS_DIV_B 1199         /* ... then a 12,000-cycle frame after the CNT write */
+#define T16_RS_CNT0 0x7FF0
+#define T16_RS_CNT 0x1234
+
+/* ---- ir_gate: a 38 kHz carrier on PWM0, gated by the timer's toggle output (IR remote) ----- */
+#define IRG_PER 657               /* Q = 1: period 1,316 cycles, 37.99 kHz at 50 MHz */
+#define IRG_Q 1
+#define IRG_DUTY 219              /* high 438 cycles: duty 1/3 */
+#define IRG_P 8                   /* timer: a tick every 256 cycles */
+#define IRG_LEAD 400              /* ticks from the start to the first mark (102,400 cycles) */
+#define IRG_MARK 300              /* mark: 300 ticks = 76,800 cycles (58 carrier periods) */
+#define IRG_SPACE0 300            /* spaces alternate 300 and 900 ticks (NEC-like 1:1 and 1:3) */
+#define IRG_SPACE1 900
+#define IRG_MARKS 8               /* marks the harness checks (expect.json ir_gate) */
+#define IRG_EDGES 24              /* timer edges the program makes in all (12 marks) */
+#define IRG_WITHIN 3000000        /* cycles after MARK_IR by which the 8 marks have passed (the
+                                     8th ends 6,700 ticks = 1,715,200 cycles after the start) */
+#define IRG_HOLD 4                /* edges with the gate off after MARK_PWM (pwm check of PWM0) */
+
 /* ---- ir_loop: timer toggle output on uo7 looped back to ui0, capture --------------------- */
 #define IR_P 4                    /* a tick every 16 cycles */
 #define IR_CMP_ABS 500            /* phase A: one match, no auto-reload: CAP = CMP + 1 (+-1) */

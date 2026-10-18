@@ -2,7 +2,7 @@
 // docs/cosim.md).
 //
 //   harness <prog.hex> [--seed S] [--expect PATH] [--clk-ns 25] [--max-cycles C] [--trace PATH]
-//           [--dump-psram PATH] [-v]
+//           [--dump-psram PATH] [--dump-pins PATH] [-v]
 //   harness --fuzz-liveness K [--fuzz-cap N] [--seed S] [--clk-ns 25]
 //   Arguments starting with '+' go to the design ($value$plusargs; the test fixtures use them).
 //
@@ -40,6 +40,9 @@
 // mark), and CoreMark timing marks (the GPIO-mode pins change to 0xC0, then 0xC1;
 // coremark_cycles_per_iter = the cycles between them / expect.json coremark_iters). The marks
 // are masked with ALTFN (R24) and looked for only when expect.json lists pwm / coremark_iters.
+// Opt-in: expect.json ir_gate checks the IR gate (contract 5.2) after the 0xA6 mark
+// (periph_models.h IrGateMeter); --dump-pins PATH writes every uo_out change with its cycle
+// (observation only: no check reads it).
 //
 // The last stdout line is a JSON summary. Exit 0 = pass, 1 = fail, 2 = usage or setup error.
 #include <verilated.h>
@@ -79,6 +82,7 @@ constexpr uint64_t DRAIN = 2048;    // cycles after the program end before the m
 constexpr uint64_t INF = ~0ull;
 constexpr uint32_t INSN_WFI = 0x10500073u;
 constexpr uint8_t GPIO_FAIL = 0xEE, PWM_MARKER = 0xA5, CM_START = 0xC0, CM_END = 0xC1;
+constexpr uint8_t IR_MARKER = 0xA6;  // expect.json ir_gate: the IR gate meter starts here
 constexpr uint64_t BUSY_SLACK = 2;            // sampling slack for TX_BUSY / BUSY reads (R20)
 constexpr uint64_t DEFAULT_BUDGET = 50000000;  // cycles, for programs the ISS can't run alone
 constexpr uint64_t PRE_RUN_CAP = 200000000;    // standalone ISS retirements
@@ -122,6 +126,7 @@ struct Opts {
   const char* expect = nullptr;
   const char* trace = nullptr;
   const char* dump_psram = nullptr;
+  const char* dump_pins = nullptr;  // every uo_out change: "cycle value" lines (observation only)
   uint32_t seed = 1;
   double clk_ns = 25.0;
   uint64_t max_cycles = 0;
@@ -271,6 +276,11 @@ struct Expect {
     uint32_t per, q, duty;
   };
   std::vector<Pwm> pwm;
+  struct IrGate {  // opt-in: the IR gate meter after the 0xA6 mark (periph_models.h)
+    bool on = false;
+    uint32_t per = 0, q = 0, duty = 0;
+    uint64_t marks = 0, within = 0;
+  } ir_gate;
   bool loop_uo7_to_ui0 = false;
   std::vector<std::pair<uint64_t, uint8_t>> gpio_script;
   bool have_result = false;
@@ -363,6 +373,17 @@ bool load_expect(const char* path, Expect* ex, std::string* err) {
         return bad("pwm", "a list of {ch: 0-2 or 7, per, q, duty}");
       ex->pwm.push_back(Expect::Pwm{(int)ch, (uint32_t)per, (uint32_t)q, (uint32_t)duty});
     }
+  }
+  if (const JVal* v = j.get("ir_gate"); v && v->t != JVal::Null) {
+    uint64_t per, q, duty, marks, within;
+    if (v->t != JVal::Obj || !uint_of(v->get("per"), &per) || !uint_of(v->get("q"), &q) ||
+        !uint_of(v->get("duty"), &duty) || !uint_of(v->get("marks"), &marks) ||
+        !uint_of(v->get("within"), &within) || per > 1023 || q > 7 || duty < 1 || duty > per ||
+        marks < 1 || within < 1)
+      return bad("ir_gate",
+                 "{per: 1-1023, q: 0-7, duty: 1-per (a carrier with 0 < high < period), marks: "
+                 ">= 1, within: >= 1}");
+    ex->ir_gate = Expect::IrGate{true, (uint32_t)per, (uint32_t)q, (uint32_t)duty, marks, within};
   }
   if (const JVal* v = j.get("loop_uo7_to_ui0"); v && v->t != JVal::Null) {
     if (v->t != JVal::Bool) return bad("loop_uo7_to_ui0", "true or false");
@@ -725,6 +746,12 @@ class Harness {
   XorShift noise_;
   std::vector<periph::PwmMeter> meters_;
   std::vector<uint8_t> meter_pin_;
+  std::unique_ptr<periph::IrGateMeter> ir_;
+  uint64_t ir_marker_ = INF;
+  bool ir_marker_was_ = false;  // rvfi: GPIO_OUT showed 0xA6 last time
+  FILE* pins_dump_ = nullptr;
+  bool pins_dumped_ = false;
+  uint8_t pins_last_ = 0;
   std::string error_;
   uint64_t t_ = 0, reset_edges_ = 1;
 
@@ -807,6 +834,7 @@ class Harness {
   bool pre_run_body();
   void set_anchor(uint64_t t);
   void start_meters(uint64_t t);
+  void start_ir(uint64_t t);
   bool check_psram_writes(bool all);
   bool peripherals(uint8_t uo);
   bool end_ready();
@@ -942,6 +970,14 @@ void Harness::start_meters(uint64_t t) {
   }
 }
 
+void Harness::start_ir(uint64_t t) {
+  if (ir_marker_ != INF) return;
+  ir_marker_ = t;
+  const Expect::IrGate& g = ex_.ir_gate;
+  const uint64_t scale = 1ull << g.q, period = ((uint64_t)g.per + 1) * scale;
+  ir_.reset(new periph::IrGateMeter(period, (uint64_t)g.duty * scale, g.marks, t, g.within));
+}
+
 // Contract 8: every PSRAM write outside the core region writes a byte some store wrote at that
 // address. rvfi mode checks writes up to the current edge at each retirement (the store set then
 // holds every store retired so far, the one in flight included); pins mode checks each write
@@ -1010,6 +1046,7 @@ uint8_t Harness::mark_alt() const {
   if (det_) return gpio_.current().a;
   uint8_t a = ex_.final_altfn;
   for (const Expect::Pwm& p : ex_.pwm) a |= (uint8_t)(1u << (p.ch == 7 ? 7 : p.ch + 1));
+  if (ex_.ir_gate.on) a |= 0x82;  // uo[1] (gated PWM0) and uo[7] (timer output)
   return a;
 #endif
 }
@@ -1123,6 +1160,21 @@ bool Harness::peripherals(uint8_t uo) {
         return fail(m.name() + ": the measurement did not finish");
     }
   }
+  if (ex_.ir_gate.on) {
+#ifndef RVFI_MODE
+    if (ir_marker_ == INF && gmatch(uo, IR_MARKER, mark_alt())) start_ir(t_);
+#endif
+    if (ir_ && !ir_->done()) {
+#ifdef RVFI_MODE
+      if ((alt & 0x82) != 0x82)
+        return fail(fmt("IR gate: ALTFN = 0x%02x cleared bit 1 or 7 before the measurement "
+                        "finished (after the 0xA6 marker uo[1] must carry the gated PWM0 and uo[7] "
+                        "the timer output until %llu marks have passed)",
+                        alt, (unsigned long long)ex_.ir_gate.marks));
+#endif
+      if (!ir_->step(t_, (uo >> 1) & 1, (uo >> 7) & 1)) return fail(ir_->error());
+    }
+  }
   if (ex_.coremark_iters) {  // R21, R24: the marks on the GPIO-mode pins
     const uint8_t ma = mark_alt();
     const bool m0 = gmatch(uo, CM_START, ma), m1 = gmatch(uo, CM_END, ma);
@@ -1172,6 +1224,7 @@ bool Harness::end_ready() {
 #endif
   for (const periph::PwmMeter& m : meters_)
     if (!m.done() && t_ <= m.deadline()) return false;
+  if (ir_ && !ir_->done() && t_ <= ir_->deadline() + periph::IrGateMeter::SKEW + 1) return false;
   return true;
 }
 
@@ -1244,6 +1297,14 @@ bool Harness::final_checks() {
       return fail("expect.json lists pwm checks, but the program never wrote GPIO_OUT = 0xa5");
     for (const periph::PwmMeter& m : meters_)
       if (!m.done()) return fail(m.name() + ": the measurement did not finish");
+  }
+  if (ex_.ir_gate.on) {
+    if (ir_marker_ == INF)
+      return fail("expect.json has ir_gate, but the program never wrote GPIO_OUT = 0xa6");
+    if (!ir_->done())
+      return fail(fmt("IR gate: the measurement did not finish (%llu of %llu marks)",
+                      (unsigned long long)ir_->marks_seen(),
+                      (unsigned long long)ex_.ir_gate.marks));
   }
   return true;
 }
@@ -1588,6 +1649,9 @@ bool Harness::retirement() {
   const bool mk = gmatch(go, PWM_MARKER, iss_.io().altfn());
   if (!ex_.pwm.empty() && mk && !marker_was_) start_meters(t_);
   marker_was_ = mk;
+  const bool imk = gmatch(go, IR_MARKER, iss_.io().altfn());
+  if (ex_.ir_gate.on && imk && !ir_marker_was_) start_ir(t_);
+  ir_marker_was_ = imk;
   const bool fl = gmatch(go, GPIO_FAIL, ex_.final_altfn);
   if (ex_.have_result && !gmatch(ex_.result_gpio, GPIO_FAIL, ex_.final_altfn) && fl &&
       !fail_was_)
@@ -1634,12 +1698,17 @@ int Harness::run() {
   }
 #endif
   reset_edges_ = 1 + ((o_.seed + 8) * 5) % 9;  // seed 1: the minimum, one edge
+  if (o_.dump_pins && !(pins_dump_ = std::fopen(o_.dump_pins, "w"))) {
+    std::fprintf(stderr, "cannot write %s\n", o_.dump_pins);
+    return 2;
+  }
   last_ret_ = reset_edges_ - 1;
   if (pre_run()) {
 #ifdef RVFI_MODE
     gpio_.init(iss_gpio());
     gpio_.set_alts(predictions());  // ALTFN resets to 0: no UART soft window yet
     marker_was_ = gmatch(iss_.io().gpio_out(), PWM_MARKER, iss_.io().altfn());
+    ir_marker_was_ = gmatch(iss_.io().gpio_out(), IR_MARKER, iss_.io().altfn());
     fail_was_ = gmatch(iss_.io().gpio_out(), GPIO_FAIL, ex_.final_altfn);
     uart_.set_strict(true);  // ALTFN is known: a stop bit of 0 is a framing error
 #else
@@ -1670,6 +1739,12 @@ int Harness::run() {
     const uint32_t out = outputs();
     const uint8_t uo = top_->uo_out, uio = top_->uio_out, oe = top_->uio_oe;
     const bool in_reset = t_ < reset_edges_;
+    if (pins_dump_ && !in_reset && (!pins_dumped_ || uo != pins_last_)) {
+      // observation only: "cycle uo_out" (hex), cycles counted as in error messages
+      std::fprintf(pins_dump_, "%llu %02x\n", (unsigned long long)rel(t_), uo);
+      pins_dumped_ = true;
+      pins_last_ = uo;
+    }
     if (in_reset && ((uio & 0x41) != 0x41 || (uio & 0x08) || uo)) {
       fail(fmt("during reset both CS_n must be 1, SCK 0 and uo_out 0 (section 1): uio_out = "
                "0x%02x, uo_out = 0x%02x",
@@ -1760,6 +1835,10 @@ int Harness::run() {
       std::fwrite(m.data(), 1, m.size(), f);
       std::fclose(f);
     }
+  }
+  if (pins_dump_) {
+    std::fprintf(pins_dump_, "%llu end\n", (unsigned long long)rel(t_));
+    std::fclose(pins_dump_);
   }
 #ifdef HARNESS_TRACE
   if (tfp_) tfp_->close();
@@ -2145,7 +2224,8 @@ int fuzz_main(const Opts& o) {
 int usage() {
   std::fprintf(stderr,
                "usage: harness <prog.hex> [--seed S] [--expect PATH] [--clk-ns 25] "
-               "[--max-cycles C] [--trace PATH] [--dump-psram PATH] [-v] [+PLUSARG...]\n"
+               "[--max-cycles C] [--trace PATH] [--dump-psram PATH] [--dump-pins PATH] [-v] "
+               "[+PLUSARG...]\n"
                "       harness --fuzz-liveness K [--fuzz-cap N] [--seed S] [--clk-ns 25]\n");
   return 2;
 }
@@ -2168,6 +2248,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-cycles") o.max_cycles = std::strtoull(next(), nullptr, 0);
     else if (a == "--trace") o.trace = next();
     else if (a == "--dump-psram") o.dump_psram = next();
+    else if (a == "--dump-pins") o.dump_pins = next();
     else if (a == "-v") o.verbose++;
     else if (a == "--fuzz-liveness") o.fuzz_runs = (uint32_t)std::strtoul(next(), nullptr, 0);
     else if (a == "--fuzz-cap") o.fuzz_cap = std::strtoull(next(), nullptr, 0);

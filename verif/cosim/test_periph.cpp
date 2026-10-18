@@ -350,6 +350,76 @@ std::string pwm_meter() {
   return "";
 }
 
+// ---- IR gate meter ----------------------------------------------------------------------------
+// A synthetic IR waveform: the timer output T has marks of `mark` cycles and spaces alternating
+// `space1` / `space2`, starting at cycle 300; the carrier C has period P, high H. kind selects
+// the uo[1] waveform: 0 = C AND T (right), 1 = C AND T one cycle late, 2 = C (no gating),
+// 3 = C AND NOT T, 4 = the carrier restarting at each mark, 5 = carrier period P + 1,
+// 6 = T stuck low, 7 = uo[1] stuck 0 (no carrier at all).
+struct IrWave {
+  uint64_t P, H, mark, space1, space2;
+  bool t_at(uint64_t t, uint64_t* mark_start) const {
+    if (t < 300) return false;
+    uint64_t x = t - 300, k = 0;
+    while (true) {
+      const uint64_t sp = (k % 2) ? space2 : space1;
+      if (x < mark) {
+        *mark_start = t - x;
+        return true;
+      }
+      if (x < mark + sp) return false;
+      x -= mark + sp;
+      k++;
+    }
+  }
+};
+
+std::string run_ir(const IrWave& w, int kind, uint64_t marks, uint64_t within) {
+  IrGateMeter m(w.P, w.H, marks, 100, within);
+  bool prev_g = false;
+  for (uint64_t t = 0; t < 100 + within + 10; t++) {
+    uint64_t ms = 0;
+    bool tm = kind == 6 ? false : w.t_at(t, &ms);
+    const uint64_t P = kind == 5 ? w.P + 1 : w.P;
+    const bool c = ((t + 17) % P) < w.H;
+    bool g = c && tm;
+    if (kind == 1) g = prev_g;
+    if (kind == 2) g = c;
+    if (kind == 3) g = c && !tm;
+    if (kind == 4) g = tm && ((t - ms) % w.P) < w.H;
+    if (kind == 7) g = false;
+    prev_g = c && tm;
+    if (!m.step(t, g, tm)) return m.error();
+    if (m.done()) return "";
+  }
+  return "measurement did not finish";
+}
+
+std::string ir_gate_meter() {
+  // carrier P = 20, H = 7 (PER 9, Q 1, duty 3.5 rounded: 7 cycles); marks 93 cycles, spaces
+  // 61 / 187 (not multiples of P: the gate cuts the carrier at varying phases)
+  const IrWave w{20, 7, 93, 61, 187};
+  std::string e;
+  if (!(e = run_ir(w, 0, 6, 2000)).empty()) return "right: " + e;
+  if (!(e = run_ir(w, 1, 6, 2000)).empty()) return "one cycle late: " + e;
+  if (run_ir(w, 2, 6, 2000).find("while the timer output uo[7] is 0") == std::string::npos)
+    return "ungated carrier accepted: " + run_ir(w, 2, 6, 2000);
+  if (run_ir(w, 3, 6, 2000).find("while the timer output uo[7] is 0") == std::string::npos)
+    return "inverted gate accepted: " + run_ir(w, 3, 6, 2000);
+  if (run_ir(w, 4, 6, 2000).find("keeps its phase across marks") == std::string::npos)
+    return "carrier restarting per mark accepted: " + run_ir(w, 4, 6, 2000);
+  if (run_ir(w, 5, 6, 2000).find("inside a mark (uo[7] = 1), expected") == std::string::npos)
+    return "carrier period 21 accepted: " + run_ir(w, 5, 6, 2000);
+  if (run_ir(w, 6, 6, 2000).find("saw 0 of 6 complete marks") == std::string::npos)
+    return "no marks accepted: " + run_ir(w, 6, 6, 2000);
+  if (run_ir(w, 7, 6, 2000).find("never showed a carrier rising edge") == std::string::npos)
+    return "no carrier accepted: " + run_ir(w, 7, 6, 2000);
+  // too few marks before the deadline: 6 marks take about 300 + 6 * 93 + 3 * 248 = 1,602 cycles
+  if (run_ir(w, 0, 6, 1200).find("complete marks") == std::string::npos)
+    return "deadline: " + run_ir(w, 0, 6, 1200);
+  return "";
+}
+
 std::string gpio_stim_and_loop() {
   GpioStim g({{50, 0x0F}, {10, 0x01}, {100, 0xF0}});
   if (g.value(0) != UI_IDLE || UI_IDLE != 0x02 || g.value(9) != 0x02 || g.value(10) != 0x01 ||
@@ -370,6 +440,7 @@ int main() {
   report("spi_device_mode0", spi_device_mode0());
   report("spi_device_errors", spi_device_errors());
   report("pwm_meter", pwm_meter());
+  report("ir_gate_meter", ir_gate_meter());
   report("gpio_stim_and_loop", gpio_stim_and_loop());
   return fails ? 1 : 0;
 }

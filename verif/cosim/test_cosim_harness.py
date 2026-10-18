@@ -871,6 +871,121 @@ def test_pwm_through_the_harness(tools, tmp_path, mode):
             r["error"])
 
 
+PROG_IR = ([lui(1, 0x80000), addi(2, 0, 0x82), sw(2, ALTFN, 1),      # uo1 = PWM0, uo7 = timer
+            addi(3, 0, 0xA6), sw(3, GPIO_OUT, 1)]                     # the 0xA6 mark (#4, 500)
+           + [addi(5, 0, 0)] * 24                                      # #5..#28: 600..2900
+           + [addi(3, 0, 0x5A), sw(3, GPIO_OUT, 1), sw(0, ALTFN, 1),  # #30 3100, #31 3200
+              SELF])
+IR_EXP = {"ir_gate": {"per": 9, "q": 1, "duty": 3, "marks": 6, "within": 2400},
+          "result_gpio": 0x5A}
+
+
+def ir_uo(c, kind="right"):
+    """uo for the IR gate scenario at cycle c: GPIO pins (uo[1] and uo[7] are alternate from 301)
+    show 0xA6 & ~0x82 from 501 and 0x5A from 3101 (all 8 pins from 3201); the timer output uo[7]
+    has marks of 93 cycles from 600, spaces alternating 61 / 187; the carrier (PER 9, Q 1:
+    period 20, duty 3: high 6) is free-running. kind: right, ungated (carrier in the spaces too),
+    restart (the carrier restarts at each mark), period21, stuck (uo[7] never rises)."""
+    if c >= 3201:
+        return 0x5A
+    base = 0x58 if c >= 3101 else 0x24 if c >= 501 else 0x00
+    if c < 301:
+        return base
+    t, x, k, ms = False, c - 600, 0, 0
+    while x >= 0:
+        if x < 93:
+            t, ms = True, c - x
+            break
+        x -= 93 + (61 if k % 2 == 0 else 187)
+        k += 1
+    if kind == "stuck":
+        t = False
+    period = 21 if kind == "period21" else 20
+    carrier = ((c + 7) % period) < 6
+    if kind == "restart" and t:
+        carrier = ((c - ms) % 20) < 6
+    g = carrier if kind == "ungated" else carrier and t
+    return base | (0x02 if g else 0) | (0x80 if t else 0)
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_ir_gate_through_the_harness(tools, tmp_path, mode):
+    """expect.json ir_gate (contract 5.2: uo[1] = PWM0 AND the timer output): after the 0xA6 mark
+    every cycle of 6 marks must show uo[1] = carrier AND uo[7], the carrier exact and phase-locked
+    across marks. Planted wrong waveforms fail: the carrier in the spaces, a carrier restarting at
+    each mark, the wrong carrier period, a timer output that never toggles (deadline); rvfi mode
+    also fails ALTFN cleared before the measurement ends."""
+    hexf = flash_hex(tmp_path / "ir.hex", {0: PROG_IR})
+    rets = iss_log(hexf)
+    assert len(rets) == 34
+
+    def run(kind="right", exp=IR_EXP, cycles=None):
+        pins = wave(Pins(), 1, 3400, lambda c: ir_uo(c, kind))
+        return stub(mode, hexf, tmp_path, pins, rets, cycles or every(34), exp)
+
+    r = run()
+    assert r["pass"], r["error"]
+    r = run("ungated")
+    assert not r["pass"] and "while the timer output uo[7] is 0" in r["error"], r["error"]
+    r = run("restart")
+    assert not r["pass"] and "keeps its phase across marks" in r["error"], r["error"]
+    r = run("period21")
+    assert not r["pass"] and "inside a mark (uo[7] = 1), expected" in r["error"], r["error"]
+    r = run("stuck")
+    assert not r["pass"] and "saw 0 of 6 complete marks" in r["error"], r["error"]
+    r = run(exp=dict(IR_EXP, ir_gate=dict(IR_EXP["ir_gate"], per=10)))  # expects period 22
+    assert not r["pass"] and "IR gate" in r["error"], r["error"]
+    r = run(exp={"ir_gate": dict(IR_EXP["ir_gate"], marks=40), "result_gpio": 0x5A})
+    assert not r["pass"] and "complete marks" in r["error"], r["error"]
+    if mode == "rvfi":  # GPIO_OUT = 0x5A retires at 960, ALTFN = 0 at 978: during the marks
+        cycles = every(5) + every(29, step=18, first=510)
+        assert cycles[30] == 960 and cycles[31] == 978
+
+        def early(c):
+            return ir_uo(c) if c < 961 else (ir_uo(c) & 0x82) | 0x58 if c < 979 else 0x5A
+
+        r = stub(mode, hexf, tmp_path, wave(Pins(), 1, 3400, early), rets, cycles, IR_EXP)
+        assert not r["pass"] and "cleared bit 1 or 7 before the measurement" in r["error"], (
+            r["error"])
+
+
+def test_ir_gate_setup_errors(tools, tmp_path):
+    """ir_gate needs a real carrier (0 < high < period) and positive marks and within."""
+    hexf = flash_hex(tmp_path / "loop.hex", {0: PROG_LOOP})
+    for bad in ({"per": 9, "q": 1, "duty": 0, "marks": 1, "within": 9},
+                {"per": 9, "q": 1, "duty": 10, "marks": 1, "within": 9},
+                {"per": 9, "q": 8, "duty": 3, "marks": 1, "within": 9},
+                {"per": 9, "q": 1, "duty": 3, "marks": 0, "within": 9},
+                {"per": 9, "q": 1, "duty": 3, "marks": 1}):
+        err = stub_setup_error("pins", hexf, tmp_path, {"ir_gate": bad})
+        assert "field ir_gate must be" in err, (bad, err)
+
+
+@pytest.mark.parametrize("mode", ["rvfi", "pins"])
+def test_dump_pins(tools, tmp_path, mode):
+    """--dump-pins (observation only): one "cycle hex" line for the first cycle after reset and
+    for every uo_out change, at the cycles the error messages use, then "cycle end"; the verdict
+    is the same with and without it."""
+    hexf = flash_hex(tmp_path / "ir.hex", {0: PROG_IR})
+    rets = iss_log(hexf)
+    pins = wave(Pins(), 1, 3400, ir_uo)
+    dump = tmp_path / "pins.txt"
+    r = stub(mode, hexf, tmp_path, pins, rets, every(34), IR_EXP, extra=("--dump-pins", str(dump)))
+    assert r["pass"], r["error"]
+    lines = dump.read_text().split("\n")
+    assert lines[-1] == "" and lines[-2].endswith(" end"), lines[-3:]
+    got = [(int(c), int(v, 16)) for c, v in (ln.split() for ln in lines[:-2])]
+    want, prev = [], None
+    for c in range(1, int(lines[-2].split()[0]) + 1):
+        v = ir_uo(c) if c < 3400 else ir_uo(3399)
+        if v != prev:
+            want.append((c, v))
+            prev = v
+    assert got == want, (got[:8], want[:8])
+    r2 = stub(mode, hexf, tmp_path, wave(Pins(), 1, 3400, ir_uo), rets, every(34), IR_EXP)
+    assert r2["pass"] and r2["cycles"] == r["cycles"]
+
+
 def test_uart_pins_lenient_cut_frame(tools, tmp_path):
     """pins mode, a program the ISS can't run alone (its ALTFN writes are unknown): a frame whose
     stop bit is 0 and whose line then rises may be the pin going to GPIO 0 and back, so it is
