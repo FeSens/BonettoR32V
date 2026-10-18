@@ -42,6 +42,9 @@ the lead; don't route around it.
 - `src/**`, except `src/config.json`. That covers any restructuring: merge or split modules,
   rename files, serial or parallel datapaths, caches and prefetch (coherent, contract section 3),
   sky130 cell instances.
+- Cell instances: only the cells in `CELL_WHITELIST` (`tools/src_check.py`), with named ports and
+  no power pins or parameters; their behavioral models live in `verif/cells/`. For an sdfxtp
+  enable flop, feed Q back through SCD (a Q-to-D loop costs hold buffers after place and route).
 - Their own unit tests in `src/test_*` (optional).
 - `physical/**` only when the lead assigns a physical hypothesis.
 
