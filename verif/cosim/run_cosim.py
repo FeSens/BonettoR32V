@@ -251,7 +251,7 @@ FUZZ_KEYS = ["prog", "mode", "seed", "pass", "liveness_checked", "runs", "walks"
 
 
 def run_fuzz(mode: str, seed: int, runs: int = FUZZ_RUNS, cap: int = FUZZ_CAP, src: Path = SRC,
-             vflags: str = "") -> dict:
+             vflags: str = "", clk_ns: float = CLK_NS) -> dict:
     """The liveness fuzz (harness --fuzz-liveness): `runs` probe sub-runs plus runs/256 walk
     sub-runs from reset on random flash images (reserved encodings included), checking only
     liveness (rvfi mode) and the pin rules. Returns the summary dict with FUZZ_KEYS ("runs"
@@ -265,7 +265,8 @@ def run_fuzz(mode: str, seed: int, runs: int = FUZZ_RUNS, cap: int = FUZZ_CAP, s
         return s
     try:
         p = subprocess.run([str(exe), "--fuzz-liveness", str(runs), "--fuzz-cap", str(cap),
-                            "--seed", str(seed)], capture_output=True, text=True, timeout=7200)
+                            "--seed", str(seed), "--clk-ns", str(clk_ns)],
+                           capture_output=True, text=True, timeout=7200)
     except subprocess.TimeoutExpired:
         s["error"] = "harness wall-clock timeout (2 h)"
         return s
@@ -296,7 +297,7 @@ def missing_plan_programs(progs) -> list:
     return [p for p in PLAN_PROGRAMS if p not in set(progs)]
 
 
-def run_all(src: Path, jobs: int, make: bool = True) -> int:
+def run_all(src: Path, jobs: int, make: bool = True, clk_ns: float = CLK_NS) -> int:
     """The cosim gate: every program `make list` reports (a superset of PLAN_PROGRAMS) x both
     modes x seeds 1-4, plus the rvfi-mode liveness fuzz under seeds 1-5. Writes build/cosim.json."""
     t0 = time.time()
@@ -337,8 +338,9 @@ def run_all(src: Path, jobs: int, make: bool = True) -> int:
         results.append(r)
     fuzz = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = {ex.submit(run_one, m, h, s, src=src): "run" for m, h, s in runs}
-        futs.update({ex.submit(run_fuzz, "rvfi", s, src=src): "fuzz" for s in FUZZ_SEEDS})
+        futs = {ex.submit(run_one, m, h, s, src=src, clk_ns=clk_ns): "run" for m, h, s in runs}
+        futs.update({ex.submit(run_fuzz, "rvfi", s, src=src, clk_ns=clk_ns): "fuzz"
+                     for s in FUZZ_SEEDS})
         for f in concurrent.futures.as_completed(futs):
             if futs[f] == "fuzz":
                 s = f.result()
@@ -354,7 +356,8 @@ def run_all(src: Path, jobs: int, make: bool = True) -> int:
     ok = (not missing and len(results) == len(runs) and all(r["pass"] for r in results)
           and len(fuzz) == len(FUZZ_SEEDS)
           and all(f["pass"] and f["liveness_checked"] for f in fuzz))
-    out = {"pass": ok, "contract": "v3", "runs": results, "fuzz": fuzz, "programs": progs,
+    out = {"pass": ok, "contract": "v3", "clk_ns": clk_ns, "runs": results, "fuzz": fuzz,
+           "programs": progs,
            "seeds": list(SEEDS), "fuzz_seeds": list(FUZZ_SEEDS),
            "runtime_s": round(time.time() - t0, 1)}
     out_path.write_text(json.dumps(out, indent=1) + "\n")
@@ -398,11 +401,12 @@ def main() -> int:
             ap.error("--fuzz-liveness takes no --prog or --all (it makes its own images)")
         if a.seed <= 0 or a.fuzz_runs <= 0 or a.fuzz_cap <= 0:
             ap.error("--seed, --fuzz-runs and --fuzz-cap must be positive")
-        summary = run_fuzz(a.mode or "rvfi", a.seed, a.fuzz_runs, a.fuzz_cap, a.src, a.vflags)
+        summary = run_fuzz(a.mode or "rvfi", a.seed, a.fuzz_runs, a.fuzz_cap, a.src, a.vflags,
+                           clk_ns=a.clk_ns)
         print(json.dumps({k: summary[k] for k in FUZZ_KEYS}))
         return 0 if summary["pass"] else 1
     if a.all:
-        return run_all(a.src, a.jobs, make=not a.no_make)
+        return run_all(a.src, a.jobs, make=not a.no_make, clk_ns=a.clk_ns)
     if not a.mode or not a.prog:
         ap.error("--mode and --prog are required (or --all)")
     if a.seed <= 0:

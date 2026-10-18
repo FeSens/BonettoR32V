@@ -666,6 +666,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--all", action="store_true")
 ap.add_argument("--no-make", action="store_true")
 ap.add_argument("--jobs", type=int, required=True)
+ap.add_argument("--clk-ns", type=float, required=True)
 a = ap.parse_args()   # anything else (--mode, --max-cycles, --v3, ...) is an argparse error
 assert a.all and a.no_make and a.jobs > 0
 env = os.environ.get
@@ -699,7 +700,8 @@ fuzz = [{"prog": "fuzz_liveness", "mode": "rvfi", "seed": s, "pass": bad != "fai
 ok = all(r["pass"] for r in runs) and all(f["pass"] and f["liveness_checked"] for f in fuzz)
 if env("FAKE_LIE"):
     ok = True                                   # a runner that claims a pass it didn't earn
-doc = {"pass": ok, "contract": env("FAKE_CONTRACT", "v3"), "runs": runs, "fuzz": fuzz,
+clk = float(env("FAKE_CLK_NS", a.clk_ns))      # a runner that ignores --clk-ns
+doc = {"pass": ok, "contract": env("FAKE_CONTRACT", "v3"), "clk_ns": clk, "runs": runs, "fuzz": fuzz,
        "programs": json.loads(env("FAKE_PROGRAMS", json.dumps(progs))), "seeds": seeds,
        "fuzz_seeds": [f["seed"] for f in fuzz], "runtime_s": 1.0}
 if env("FAKE_SETUP_ERROR"):
@@ -717,6 +719,8 @@ sys.exit(0 if ok else 1)
 def cosim_repo(repo):
     put(repo, "verif/programs/Makefile", PROGRAMS_MAKEFILE)
     put(repo, "verif/cosim/run_cosim.py", FAKE_COSIM)
+    if not (repo / "src" / "config.json").exists():
+        put(repo, "src/config.json", '{"CLOCK_PERIOD": 25}\n')
     return repo
 
 
@@ -752,6 +756,7 @@ def test_cosim_constants_are_contract_v3():
     ({"FAKE_DUP": "selftest/rvfi/2"}, "extra or repeated [('selftest', 'rvfi', 2)]"),
     ({"FAKE_PROGRAMS": '["selftest"]'}, "differ from `make -C verif/programs list`"),
     ({"FAKE_CONTRACT": "v2"}, "not 'v3'"),
+    ({"FAKE_CLK_NS": "50"}, "used clk_ns 50.0, not the signoff CLOCK_PERIOD 25 ns"),
     ({"FAKE_NO_JSON": "1"}, "runner wrote no build/cosim.json"),
     ({"FAKE_SETUP_ERROR": "program build failed: boom"}, "program build failed: boom"),
 ])
@@ -852,7 +857,9 @@ def test_coremark_ips_null_without_cycles(cosim_repo, monkeypatch):
 ], ids=["zero", "string", "bool", "no-config", "period-0", "period-string", "no-period",
         "config-not-json"])
 def test_coremark_ips_bad_inputs_fail(cosim_repo, monkeypatch, cycles, config, msg):
-    if config is not None:
+    if config is None:
+        (cosim_repo / "src" / "config.json").unlink()
+    else:
         put(cosim_repo, "src/config.json", config)
     monkeypatch.setenv("FAKE_CM_CYCLES", cycles)
     res = run_gate(cosim_repo, "cosim")
