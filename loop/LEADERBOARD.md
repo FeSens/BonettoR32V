@@ -26,6 +26,7 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1081 | 2026-10-18 | hyp/108b-a1-on-die | rejected | - | - | - | - | - | - | n/a | Register x11 on the die with a rotating a1r shift chain (sdfxtp) on... | Agent-measured: all gates pass, coremark_ips 0.61307 (+12.47%), are... |
 | 111 | 2026-10-18 | hyp/108c-a1-indexed | merged | 0.6131 | +0.0680 | 20 | 21,986.1 | +1,221.2 | skipped | - | Register x11 (a1) on the die, indexed (108 revived as 108c on the 1... | Ledger id 111 = hyp 108c (108: blocked by area on the 107 core; 108... |
 | 110 | 2026-10-18 | hyp/110-core-area-diet | merged | 0.5451 | +0.0000 | 20 | 20,764.9 | -1,039.7 | skipped | - | Core area diet at identical cycles: 116 core enable flops (ring, ir... | Lead re-eval on hwe-bench (f71a9ca, clean, MIN_IPS=0.54507489187294... |
 | 108 | 2026-10-18 | hyp/108-a1-on-die | rejected | - | - | - | - | - | - | n/a | Register x11 (a1) on the die: a1r 32-bit nibble shift register; x11... | BLOCKED BY AREA, not refuted; revive when ~1,150 um2 is freed. Agen... |
