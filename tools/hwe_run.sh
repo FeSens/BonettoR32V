@@ -47,10 +47,16 @@ rsync -a --delete \
   --exclude '__pycache__' --exclude '/test/sim_build' \
   "$root/" "$HOST:$remote/"
 
+# The mirror has no .git: pass the checkout's sha and dirty state for tools/eval.py's provenance.
+sha="$(git -C "$root" rev-parse HEAD 2>/dev/null || true)"
+dirty=""
+if st="$(git -C "$root" status --porcelain --ignore-submodules=untracked 2>/dev/null)"; then
+  if [ -n "$st" ]; then dirty=1; else dirty=0; fi
+fi
 cmd="$(printf '%q ' "$@")"
 set +e
 ssh -o ConnectTimeout=15 "$HOST" \
-  "cd ~/$remote && export PATH=\$HOME/bonetto-venv/bin:\$HOME/bonetto-tools/bin:/opt/hwe-toolchain/oss-cad-suite/bin:/opt/hwe-toolchain/bin:\$PATH && $cmd"
+  "cd ~/$remote && export BONETTO_GIT_SHA=$sha BONETTO_GIT_DIRTY=$dirty PATH=\$HOME/bonetto-venv/bin:\$HOME/bonetto-tools/bin:/opt/hwe-toolchain/oss-cad-suite/bin:/opt/hwe-toolchain/bin:\$PATH && $cmd"
 status=$?
 set -e
 

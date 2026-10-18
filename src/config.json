@@ -20,8 +20,11 @@
   "CLOCK_PERIOD": 25,
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
-  "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,
-  "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.05,
+  "//": "BonettoR32V (lead, 2026-10-18 sweep on the v3 seed in 1x2): 0.1/0.05 added ~320 hold buffers",
+  "//": "chasing the margin (21 real violators) and left the core too full to route; 0.03/0.02 signs",
+  "//": "off clean with hold slack +0.039 ns at every corner (sweep point S9).",
+  "PL_RESIZER_HOLD_SLACK_MARGIN": 0.03,
+  "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.02,
 
   "//": "RUN_LINTER, LINTER_INCLUDE_PDK_MODELS - Disabling the linter is not recommended!",
   "RUN_LINTER": 1,
@@ -30,6 +33,11 @@
   "//": "If you need a custom clock configuration, read the following documentation first:",
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
   "CLOCK_PORT": "clk",
+
+  "//": "BonettoR32V (lead, 2026-10-18 sweep S9): routability-driven global placement checks",
+  "//": "routability from 15% overflow (OpenROAD gpl -routability_check_overflow, default 30%); with",
+  "//": "the hold margins above it takes global-routing overflow to 0 and detailed routing to 0.",
+  "PL_ROUTABILITY_OVERFLOW_THRESHOLD": 0.15,
 
   "//": "BonettoR32V (hypothesis 004, docs/synth-cells.md): synthesis cell set and ABC strategy.",
   "//": "EXTRA_EXCLUDED_CELLS - each '!' entry is a deny wildcard of LibreLane 3.0.14's cell filter",

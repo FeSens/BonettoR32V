@@ -8,7 +8,7 @@ Gate order (docs/eval.md): cheapest first, so a bad candidate retires early.
 The score is coremark_ips = f_clk / CoreMark cycles per iteration (contract section 7): the
 cosim gate reads the cycles from the CoreMark runs and f_clk from src/config.json CLOCK_PERIOD.
 The area gate includes the `fits` pre-filter for the 1x2 tile: synth area above FIT_AREA_UM2
-(provisional 24,000 um2) fails (a 1x2 harden confirms).
+(22,000 um2) fails (a 1x2 harden confirms).
 With --min-ips X, a candidate whose coremark_ips is below X (or null) stops right after the cosim
 gate ("NO_GAIN", exit 3): it cannot win, so the rest of its gates are not worth running. A tie
 continues through every gate: the contract's tiebreak (smaller synth area) may still make it win.
@@ -53,10 +53,11 @@ TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-
 TOP = "tt_um_fesens_r32v"
 ORDER = ["lint", "area", "cosim", "arch", "equiv", "gl"]
 FORMAL_GATE = "formal"                  # appended to ORDER only with --formal
-# The `fits` pre-filter for one 1x2 tile (contract section 7). PROVISIONAL: the lead confirms the
-# threshold from a 1x2 harden of the seed (ledger: the user's 1x2 decision; the seed's synth area
-# is about 20,300 um2) and the harden in a champion round has the last word.
-FIT_AREA_UM2 = 24000.0
+# The `fits` pre-filter for one 1x2 tile (contract section 7). The seed (LibreLane synth 20,442 um2)
+# signs off in 1x2 at utilization 0.728 with src/config.json's routing settings (2026-10-18 sweep);
+# nothing larger has been shown to route yet, so the pre-filter allows ~7.5% growth. The harden in a
+# champion round has the last word; the lead raises this once a tile-fit search shows more room.
+FIT_AREA_UM2 = 22000.0
 FIT_TILES = "1x2"
 COREMARK_PROG = "coremark"              # the program whose runs carry the score
 # One heavy job at a time on the Mac. The path is overridable only so tests don't queue behind a
@@ -588,11 +589,17 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     ctx = Ctx(args.repo, verbose=args.verbose or bool(args.gate))
-    sha = git(ctx.repo, "rev-parse", "HEAD") or "unknown"
+    sha = git(ctx.repo, "rev-parse", "HEAD")
     # Untracked scratch files inside a submodule don't change what is evaluated; a moved
     # submodule commit or an edited tracked file does.
     status = git(ctx.repo, "status", "--porcelain", "--ignore-submodules=untracked")
     dirty = None if status is None else bool(status)
+    if sha is None:
+        # A tools/hwe_run.sh mirror has no .git: that script passes the checkout's own sha and
+        # dirty state, computed where the checkout lives.
+        sha = os.environ.get("BONETTO_GIT_SHA") or "unknown"
+        env_dirty = os.environ.get("BONETTO_GIT_DIRTY")
+        dirty = None if env_dirty not in ("0", "1") else env_dirty == "1"
     t0 = time.time()
 
     if args.gate:

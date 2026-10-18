@@ -100,6 +100,8 @@ def eval_doc(repo):
 
 
 def test_all_gates_pass(repo, monkeypatch):
+    monkeypatch.delenv("BONETTO_GIT_SHA", raising=False)
+    monkeypatch.delenv("BONETTO_GIT_DIRTY", raising=False)
     calls = fake_gates(monkeypatch)
     assert ev.main(["--repo", str(repo)]) == 0
     assert calls == ev.ORDER == V3_ORDER
@@ -113,6 +115,17 @@ def test_all_gates_pass(repo, monkeypatch):
         == (2.5, 16e6, 25)
     assert all(doc["gates"][g]["pass"] is True for g in ev.ORDER)
     assert doc["sha"] == "unknown" and doc["dirty"] is None   # not a git repo
+
+
+@pytest.mark.parametrize("dirty_env,dirty", [("0", False), ("1", True), ("", None)])
+def test_sha_from_hwe_run_env_without_git(repo, monkeypatch, dirty_env, dirty):
+    # A tools/hwe_run.sh mirror has no .git; the script passes the checkout's sha and dirty state.
+    monkeypatch.setenv("BONETTO_GIT_SHA", "f" * 40)
+    monkeypatch.setenv("BONETTO_GIT_DIRTY", dirty_env)
+    fake_gates(monkeypatch)
+    assert ev.main(["--repo", str(repo)]) == 0
+    doc = eval_doc(repo)
+    assert doc["sha"] == "f" * 40 and doc["dirty"] is dirty
 
 
 def test_v3_order_and_formal_skipped(repo, monkeypatch):
@@ -553,12 +566,12 @@ def test_area_adapter(repo, change, ok, msg):
     assert res["pass"] is ok and msg in res["detail"], res["detail"]
 
 
-def test_fits_is_the_provisional_1x2_threshold():
-    # contract section 7: 1x2 tile; the lead confirms the value from a 1x2 harden
-    assert (ev.FIT_AREA_UM2, ev.FIT_TILES) == (24000.0, "1x2")
+def test_fits_is_the_1x2_threshold():
+    # contract section 7: 1x2 tile; the seed (20,442 um2) signs off in 1x2 (2026-10-18 sweep)
+    assert (ev.FIT_AREA_UM2, ev.FIT_TILES) == (22000.0, "1x2")
 
 
-@pytest.mark.parametrize("area,ok", [(24001, False), (24000.01, False), (24000, True),
+@pytest.mark.parametrize("area,ok", [(22001, False), (22000.01, False), (22000, True),
                                      (20288.0, True), (4780.0, True)])
 def test_fits_prefilter(repo, area, ok):
     put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
@@ -566,9 +579,9 @@ def test_fits_prefilter(repo, area, ok):
     res = run_gate(repo, "area")
     assert res["pass"] is ok, res["detail"]
     if ok:
-        assert "fits 1x2 (<= 24,000 um2)" in res["detail"] and res["data"]["fits"] is True
+        assert "fits 1x2 (<= 22,000 um2)" in res["detail"] and res["data"]["fits"] is True
     else:
-        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 24,000 um2, "
+        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 22,000 um2, "
                                         f"the 1x2 pre-filter")
 
 
