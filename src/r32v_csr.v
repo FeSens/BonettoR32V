@@ -45,7 +45,7 @@ module r32v_csr (
     input  wire        seq_end,    // the trap or interrupt sequence's C ends
     input  wire        irq,        // mip.MEIP
     output reg         tm,         // in a trap or interrupt sequence
-    output reg         intr,       // ... entered by an interrupt
+    output wire        intr,       // ... entered by an interrupt (valid while tm)
     output wire        take        // an interrupt is taken at this retirement
 );
 
@@ -98,7 +98,6 @@ module r32v_csr (
             mpie <= 1'b0;                               // arbitrary by contract; 0 matches the ISSs
             meie <= 1'b0;
             tm   <= 1'b0;
-            intr <= 1'b0;
         end else begin
             mie  <= go ? 1'b0 : mie_n;
             meie <= meie_n;
@@ -108,13 +107,10 @@ module r32v_csr (
                 mpie <= wb[4];
             else if (retire & p_mret)
                 mpie <= 1'b1;
-            if (go) begin
-                tm   <= 1'b1;
-                intr <= irq_take;
-            end else if (seq_end) begin
-                tm   <= 1'b0;
-                intr <= 1'b0;
-            end
+            if (go)
+                tm <= 1'b1;
+            else if (seq_end)
+                tm <= 1'b0;
         end
     end
     // mcause: scan flops holding through SCD (D = the next value, SCD = Q, SCE = hold)
@@ -129,6 +125,8 @@ module r32v_csr (
         end
     endgenerate
     assign {mc31, mc} = mc_q;
+    // nothing writes mcause during a sequence, so its bit 31 tells an interrupt entry
+    assign intr = mc31;
 
 endmodule
 

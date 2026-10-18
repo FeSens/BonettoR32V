@@ -24,8 +24,9 @@
  * from it. After 8 strobes a value sits with nibble k at ring[4k+3:4k]. Core-region words are
  * stored LSB nibble first; program data arrives high nibble first in each byte, so loads (in W)
  * and stores (in M) emit ring[7:4] on even strobes and ring[31:28] on odd ones. Loads always
- * read 4 bytes. Shifts: W rotates the ring by q nibbles (shamt = 4q + r) during its own header,
- * then emits ({ring[7:4], ring[3:0]} >> r) with zero or sign fill.
+ * read 4 bytes. Shifts: W rotates the ring by q nibbles (shamt = 4q + r) during its own header
+ * (a right shift brings in the zero or sign fill at the top instead), then emits
+ * ({ring[7:4], ring[3:0]} >> r) with zero or sign fill.
  *
  * pc. pcr is a second 8-nibble shift register: it holds the pc with nibble k at pcr[4k+3:4k],
  * so the fetch header reads its address nibbles (and bit 24, the chip) straight from it. A slot
@@ -329,8 +330,9 @@ module tt_um_fesens_r32v (
     wire [1:0] nm1_l  = io ? {1'b0, nm1[0]} : nm1;
     wire       ldfill = (n[2:1] > nm1_l);
     wire       fillv  = ~f3[2] & cy & ~(io & f3[1]);
-    // shifts: shamt = 4q + r; right: the ring is rotated by q, emit ({next, head} >> r);
-    // left: rotated by -q - (r != 0), emit ({next, head} >> (4 - r) mod 4)
+    // shifts: shamt = 4q + r; right: the ring is shifted by q with the fill coming in at the top,
+    // emit ({next, head} >> r) (next is the fill at n = 7); left: rotated by -q - (r != 0), emit
+    // ({next, head} >> (4 - r) mod 4) with zeros below the shifted value
     wire [4:0] shamt  = c_op ? pcr[4:0] : insn[24:20];
     wire [2:0] q      = shamt[4:2];
     wire [1:0] r      = shamt[1:0];
@@ -338,8 +340,8 @@ module tt_um_fesens_r32v (
     wire [2:0] rotn   = sh_left ? (~q + {2'b00, ~rnz}) : q;
     wire [1:0] amt    = sh_left ? (~r + 2'd1) : r;
     wire [3:0] qh     = {1'b0, q} + {3'b000, rnz};
-    wire       hv     = sh_left ? ({1'b0, n} >= qh) : (n <= ~q);
-    wire       nv     = sh_left ? (n >= q) : (n < ~q);
+    wire       hv     = ~sh_left | ({1'b0, n} >= qh);
+    wire       nv     = sh_left ? (n >= q) : (n != 3'd7);
     wire       shf    = ~sh_left & insn[30] & cmp;      // SRA fill: rs1[31], latched in A
     wire [3:0] hd     = hv ? ring[3:0] : {4{shf}};
     wire [2:0] nx     = nv ? ring[6:4] : {3{shf}};
@@ -494,9 +496,11 @@ module tt_um_fesens_r32v (
     // SCD = Q, SCE = hold (contract section 1, CLAUDE.md).
     // ------------------------------------------------------------------------------------
     // ring: an IO load's capture (low half), else a shift in or a rotation (never both at once:
-    // the top nibble takes din4 unless rotating)
+    // the top nibble takes din4 unless rotating; a right shift's header rotation brings in the
+    // fill)
     wire        ring_sh = ring_in | ring_rot;
-    wire [31:0] ring_d  = {(ring_rot ? ring[3:0] : din4), ring[31:20],
+    wire [31:0] ring_d  = {((hrot & ~sh_left) ? {4{shf}} : ring_rot ? ring[3:0] : din4),
+                           ring[31:20],
                            (io_re ? {iob1[3:0], iob1[7:4], iob0[3:0], iob0[7:4]} : ring[19:4])};
     wire [31:0] ring_h  = {{16{io_re | ~ring_sh}}, {16{~(io_re | ring_sh)}}};
     wire [31:0] ir_d    = {ir[27:0], nib_m};
