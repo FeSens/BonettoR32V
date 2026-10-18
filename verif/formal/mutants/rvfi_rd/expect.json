@@ -3,7 +3,8 @@
   "checks": [
     "insn_xor"
   ],
-  "description": "RVFI reports XOR results with bit 0 flipped (the register file gets the right value).",
+  "assertion": "insn_rd_wdata",
+  "description": "RVFI reports XOR results with bit 0 flipped (the register gets the right value).",
   "expect": "fail",
   "deep": false
 }

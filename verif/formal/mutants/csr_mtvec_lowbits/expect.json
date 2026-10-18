@@ -1,0 +1,10 @@
+{
+  "class": "mtvec and mepc bits 1:0 read back",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_read",
+  "description": "The read mask of mtvec and mepc bits 1:0 is gone.",
+  "expect": "fail",
+  "deep": false
+}

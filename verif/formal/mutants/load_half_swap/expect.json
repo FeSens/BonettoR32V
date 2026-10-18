@@ -1,9 +1,0 @@
-{
-  "class": "halfword load bytes swapped",
-  "checks": [
-    "bus_dmem"
-  ],
-  "description": "LH/LHU from RAM return their two bytes swapped, in the register and in RVFI alike.",
-  "expect": "fail",
-  "deep": false
-}

@@ -1,0 +1,10 @@
+{
+  "class": "SD0 changes at a rising SCK edge",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_rule4",
+  "description": "SD0 is XORed with SCK, so it changes at every rising edge it is driven at (contract 2.1.4).",
+  "expect": "fail",
+  "deep": false
+}

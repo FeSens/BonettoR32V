@@ -1,9 +1,10 @@
 {
-  "class": "writes the wrong register",
+  "class": "writes go to an odd register",
   "checks": [
     "reg"
   ],
-  "description": "Even destination registers are written one register up (x2 writes x3); RVFI reports x2.",
+  "assertion": "reg_rs1",
+  "description": "W and W4 address register rd | 1 (RVFI reports rd).",
   "expect": "fail",
   "deep": false
 }

@@ -1,0 +1,10 @@
+{
+  "class": "both CS_n low",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_rule1",
+  "description": "The PSRAM CS_n falls with every transaction, the flash's too (contract 2.1.1).",
+  "expect": "fail",
+  "deep": false
+}

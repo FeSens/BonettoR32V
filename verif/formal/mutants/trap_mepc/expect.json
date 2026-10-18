@@ -1,0 +1,10 @@
+{
+  "class": "a trap writes the ring to mepc",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_read",
+  "description": "A trap sequence's WC writes the ring, not the pc, to mepc.",
+  "expect": "fail",
+  "deep": false
+}

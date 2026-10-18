@@ -1,0 +1,10 @@
+{
+  "class": "M = 0x30 in the flash header",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_cmd_flash",
+  "description": "The fetch header's M byte is 0x30, so the flash leaves continuous read and takes the next header as a command (contract 2.2).",
+  "expect": "fail",
+  "deep": false
+}

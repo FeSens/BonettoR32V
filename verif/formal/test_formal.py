@@ -2,17 +2,18 @@
 
   pytest verif/formal/test_formal.py -v
 
-- The rv32e ISA files are up to date with gen_isa_rv32e.py.
-- The SPI monitor decodes a hand-written SPI waveform (a stub driver with MISO noise
-  while SCK is low) into exactly the expected events.
-- The depth policy and timing summary.
+- The rv32e ISA files are up to date with gen_isa_rv32e.py (contract v3: the 40 base
+  instructions, the six CSR instructions, MRET and WFI).
+- The QSPI chip monitors decode a hand-written Pmod waveform (both power-up modes) into
+  exactly the events contract 2.2 and 2.3 imply, violations included.
+- The depth policy (depth=short, cpi=N), the Pmod limits at the signoff period, the timing
+  summary.
 - The verdict aggregation (a group counterexample, SKIPPED tasks).
 - Every mutant in mutants/ FAILS the checks its expect.json names, with a
-  counterexample, at the seed's depth (or the depth of the design its "timing" names);
-  the legal variants ("expect": "pass") PASS ("checks": "all": the whole fast suite).
-  Mutants marked "slow" (the hyp/002 cores, hours each) run only with
+  counterexample, at the champion's depth (proof tasks only); mutants marked "pass"
+  PASS ("checks": "all": the whole fast suite). Mutants marked "slow" run only with
   BONETTO_FORMAL_SLOW=1.
-- The seed (src/) PASSES the fast suite (checks.cfg). Set BONETTO_SKIP_SEED=1 to skip.
+- The champion (src/) PASSES the fast suite (checks.cfg). Set BONETTO_SKIP_SEED=1 to skip.
 
 With BONETTO_FORMAL_HOST set, every formal run goes to that host (its own lock).
 
@@ -76,7 +77,8 @@ def test_isa_generated_up_to_date():
                        capture_output=True, text=True)
     assert p.returncode == 0, p.stdout + p.stderr
     insns = open(os.path.join(HERE, "isa_rv32e.txt")).read().split()
-    assert len(insns) == 40 and {"fence", "ecall", "ebreak", "sub", "lw"} <= set(insns)
+    assert len(insns) == 48 and {"fence", "ecall", "ebreak", "sub", "lw", "csrrw", "csrrci",
+                                 "mret", "wfi"} <= set(insns)
 
 
 def test_depth_policy():
@@ -85,17 +87,6 @@ def test_depth_policy():
     assert dmin == 1 + 230 + 230 + 2 and d == dmin
     cfg["depth_floor"] = 600
     assert run_formal.pick_depth(cfg, {"first_retire_cycle": 114, "max_cycles_per_insn": 230})[0] == 600
-    t = run_formal.timing_from_retires([(114, 0x00000013, 0), (344, 0x00002083, 0), (460, 0x00100073, 1)])
-    assert t["first_retire_cycle"] == 114 and t["max_cycles_per_insn"] == 230
-    assert t["per_class"]["load"]["max_cycles"] == 230
-    # depth=short: reset + first retirement + the group's slowest class + margin.
-    t = {"first_retire_cycle": 319, "max_cycles_per_insn": 736,
-         "per_class": {"alu_reg": {"max_cycles": 416}, "load": {"max_cycles": 736},
-                       "branch": {"max_cycles": 320}}}
-    assert run_formal.short_depth(cfg, t) == 1 + 319 + 736 + 2
-    assert run_formal.short_depth(cfg, t, ["add", "sub"]) == 1 + 319 + 416 + 2
-    assert run_formal.short_depth(cfg, t, ["beq", "lw"]) == 1 + 319 + 736 + 2
-    assert run_formal.short_depth(cfg, t, ["jal"]) == 1 + 319 + 736 + 2   # class not measured
     assert sorted(sum(run_formal.CLASS_GROUPS, [])) == sorted(run_formal.isa_insns())
     # The cosim's per_class format ({class: cycles}, its own class names).
     t = {"first_retire_cycle": 116, "max_cycles_per_insn": 230,
@@ -105,6 +96,25 @@ def test_depth_policy():
     assert run_formal.short_depth(cfg, t, ["lw"]) == 1 + 116 + 230 + 2
     assert run_formal.short_depth(cfg, t, ["beq"]) == 1 + 116 + 116 + 2
     assert run_formal.short_depth(cfg, t, ["sw"]) == 1 + 116 + 230 + 2   # store not measured
+    assert run_formal.short_depth(cfg, t, ["csrrw"]) == 1 + 116 + 230 + 2   # csr not measured
+    t["per_class"]["csr"] = 120
+    assert run_formal.short_depth(cfg, t, ["csrrw", "csrrsi"]) == 1 + 116 + 120 + 2
+    # cpi=N: reset + first retirement + N x the slowest class + margin; the option picks it.
+    assert run_formal.cpi_depth(cfg, t, 4) == 1 + 116 + 4 * 230 + 2
+    assert run_formal.base_depth(cfg, t, {"cpi": "2"}, 999) == 1 + 116 + 2 * 230 + 2
+    assert run_formal.base_depth(cfg, t, {"depth": "short"}, 999, ["add"]) == 1 + 116 + 116 + 2
+    assert run_formal.base_depth(cfg, t, {}, 999) == 999
+
+
+def test_pmod_limits():
+    """tCEM = floor(8000 / T), tRST = ceil(50 / T) cycles (contract 2.1.7, 2.3); a period whose
+    2-cycle SCK would beat the slowest command's 33 MHz is refused (the monitor counts edges,
+    not SCK phases)."""
+    assert run_formal.pmod_limits(20.0) == (400, 3)
+    assert run_formal.pmod_limits(25.0) == (320, 2)
+    assert run_formal.pmod_limits(15.2) == (526, 4)
+    with pytest.raises(SystemExit):
+        run_formal.pmod_limits(15.0)
 
 
 def test_check_verdicts():
@@ -196,16 +206,17 @@ def test_remote_launch_and_stop(tmp_path):
 
 
 def test_mem_jobs(monkeypatch):
-    """Jobs are capped by memory at the deepest task's depth: the seed (348) fits 18 jobs
-    in 50 GB, V2 (1,623, about 6.4 GB per task) only 7, the Mac's 16 GB 2; at least 1."""
-    assert run_formal.mem_jobs(348, 18, budget=50.0)[0] == 18
-    assert run_formal.mem_jobs(1623, 18, budget=50.0)[0] == 7
-    assert run_formal.mem_jobs(1623, 8, budget=16.0)[0] == 2
+    """Jobs are capped by memory at the deepest task's depth (0.4 GB + 9.5 MB per step, the
+    v3 champion's worst): the champion's short depth (581, about 5.9 GB) fits 8 jobs in 50 GB,
+    its irq depth (1,448, about 14.2 GB) 3, the Mac's 16 GB 1; at least 1."""
+    assert run_formal.mem_jobs(581, 18, budget=50.0)[0] == 8
+    assert run_formal.mem_jobs(1448, 18, budget=50.0)[0] == 3
+    assert run_formal.mem_jobs(1448, 8, budget=16.0)[0] == 1
     assert run_formal.mem_jobs(5000, 8, budget=4.0)[0] == 1
     monkeypatch.setenv("BONETTO_FORMAL_MEM_GB", "13")
     assert run_formal.mem_budget_gb() == 13.0
-    # reset counts five times (22 GB seen at depth 1,222); reach tasks like their check.
-    assert abs(run_formal.task_mem_gb("reset", 1222) - 5 * run_formal.task_mem_gb("reg", 1222)) < 1e-9
+    # reset counts twice (22 GB seen at depth 1,222 on a v2 core); reach tasks like their check.
+    assert abs(run_formal.task_mem_gb("reset", 1222) - 2 * run_formal.task_mem_gb("reg", 1222)) < 1e-9
     assert run_formal.task_mem_gb("reset_reach", 1222) == run_formal.task_mem_gb("reset", 1222)
     # The gate: a task waits while it does not fit next to the running ones.
     import threading
@@ -284,8 +295,8 @@ def test_aggregate_skipped():
     misses a trigger, or FAIL if its reach task timed out or errored."""
     det = lambda *l: {"failed": list(l), "traces": {}, "errors": []}
     res = {
-        "spi": ("spi", "FAIL", 9.0, det("spi_rule2")),
-        "spi_reach": ("spi_reach", "SKIPPED", 0.0, det()),
+        "qspi": ("qspi", "FAIL", 9.0, det("qspi_rule2")),
+        "qspi_reach": ("qspi_reach", "SKIPPED", 0.0, det()),
         "gpio": ("gpio", "SKIPPED", 0.0, det()),
         "gpio_reach": ("gpio_reach", "FAIL", 3.0, det("reach_gpio_load", "reach_gpio_store")),
         "reg": ("reg", "PASS", 20.0, det()),
@@ -295,16 +306,16 @@ def test_aggregate_skipped():
         "rvfi": ("rvfi", "SKIPPED", 0.0, det()),
         "rvfi_reach": ("rvfi_reach", "TIMEOUT", 99.0, det()),
     }
-    units = [("spi", [("spi", ["reach_spi_end_read"])]),
+    units = [("qspi", [("qspi", ["reach_qspi_flash_read"])]),
              ("gpio", [("gpio", ["reach_gpio_load", "reach_gpio_store"])]),
              ("reg", [("reg", ["reach_reg"])]),
              ("ill", [("ill", ["reach_ill_zero", "reach_ill_ones"])]),
              ("rvfi", [("rvfi", ["reach_rvfi"])])]
     checks, _, failures, _, skipped = run_formal.aggregate(units, res)
-    assert checks == {"spi": "FAIL", "gpio": "SKIPPED", "reg": "SKIPPED", "ill": "UNREACHED",
+    assert checks == {"qspi": "FAIL", "gpio": "SKIPPED", "reg": "SKIPPED", "ill": "UNREACHED",
                       "rvfi": "FAIL"}
     assert failures["rvfi"]["why"] == "reach task TIMEOUT"
-    assert failures["spi"]["assertions"] == ["spi_rule2"]
+    assert failures["qspi"]["assertions"] == ["qspi_rule2"]
     assert failures["ill"]["unreached"] == ["reach_ill_ones"]
     assert sorted(skipped) == ["gpio", "reg"]
 
@@ -348,7 +359,8 @@ def test_reap_remote_orphans(tmp_path, monkeypatch):
 
 def test_stage_takes_every_top_level_v(tmp_path):
     """Contract section 1: every top-level src/*.v is design, test_*.v included;
-    subdirectories are not."""
+    subdirectories are not. The whitelisted sky130 cells' behavioral models (verif/cells)
+    come after the design."""
     src = tmp_path / "src"
     (src / "test_unit").mkdir(parents=True)
     for n in ("tt_um_fesens_r32v.v", "test_helper.v", "r32v_alu.v"):
@@ -356,201 +368,310 @@ def test_stage_takes_every_top_level_v(tmp_path):
     (src / "test_unit" / "tb.v").write_text("// x\n")
     (src / "notes.md").write_text("x\n")
     _, rtl = run_formal.stage(str(src), str(tmp_path / "work"))
-    assert [os.path.basename(f) for f in rtl] == ["r32v_alu.v", "test_helper.v",
-                                                  "tt_um_fesens_r32v.v"]
+    names = [os.path.basename(f) for f in rtl]
+    cells = sorted(f for f in os.listdir(os.path.join(ROOT, "verif", "cells")) if f.endswith(".v"))
+    assert names == ["r32v_alu.v", "test_helper.v", "tt_um_fesens_r32v.v"] + cells
+    assert "sky130_fd_sc_hd__sdfxtp_1.v" in cells
 
 
 def test_reach_and_proof_tasks_are_separate(tmp_path):
     """The proof task has no reach statements; the reach task keeps only them."""
     run_formal.setup_path()
-    p = run_formal.write_sby(str(tmp_path), "x", "bonetto_spi_check", 100,
-                             "smtbmc yices step=all", 60)
-    r = run_formal.write_sby(str(tmp_path), "x_reach", "bonetto_spi_check", 100,
-                             "smtbmc yices step=29", 60, role="reach",
-                             reach=["reach_spi_end_read", "reach_spi_end_write"])
+    p = run_formal.write_sby(str(tmp_path), "x", "bonetto_qspi_check", 100,
+                             "smtbmc bitwuzla step=all", 60,
+                             extra_defines=["`define BONETTO_TCEM 400"])
+    r = run_formal.write_sby(str(tmp_path), "x_reach", "bonetto_qspi_check", 100,
+                             "smtbmc bitwuzla step=29", 60, role="reach",
+                             reach=["reach_qspi_flash_read", "reach_qspi_psram_write"])
     pt, rt = open(p).read(), open(r).read()
     assert "chformal -cover -remove" in pt and "BONETTO_REACH_AS_ASSERT" not in pt
     assert "--keep-going" not in pt and "-t 0:100:100" in pt
+    assert "`define BONETTO_TCEM 400" in pt
     assert "BONETTO_REACH_AS_ASSERT" in rt
-    assert "select -set keep c:*.reach_spi_end_read c:*.reach_spi_end_write" in rt
+    assert "select -set keep c:*.reach_qspi_flash_read c:*.reach_qspi_psram_write" in rt
     assert "chformal -assert -remove c:* @keep %d" in rt
-    assert "smtbmc --keep-going --nopresat yices -- -t 0:29:100" in rt
+    assert "smtbmc --keep-going --nopresat bitwuzla -- -t 0:29:100" in rt
 
 
 # ---------------------------------------------------------------------------
-# SPI monitor against a hand-written stub driver.
+# QSPI chip monitors (wrapper.sv bonetto_qspi_chip) against a hand-written stub driver.
+# The expected events come from a Python reading of contract 2.2 and 2.3 (the tables below),
+# not from the Verilog.
 
-def _stub_waveform():
-    """Steps of (cs, sck, mosi, miso) and the events the contract implies."""
-    steps = []
-    events = {}   # step -> dict of expected event fields
+# command: (address edges (24 single or 6 quad), mode edges, dummy/wait edges, data kind);
+# None: no fields. Data kinds: os/oq data out single/quad, is/iq data in single/quad.
+QSPI_FLASH = {0x03: (24, 0, 0, "os"), 0x0B: (24, 0, 8, "os"), 0x6B: (24, 0, 8, "oq"),
+              0xEB: (6, 2, 4, "oq"), 0xFF: None, 0x02: (24, 0, 0, "is")}
+QSPI_PSPI = {0x03: (24, 0, 0, "os"), 0x0B: (24, 0, 8, "os"), 0xEB: (6, 0, 6, "oq"),
+             0x02: (24, 0, 0, "is"), 0x38: (6, 0, 0, "iq"), 0x35: None, 0x66: None, 0x99: None}
+QSPI_PQPI = {0x0B: (6, 0, 4, "oq"), 0xEB: (6, 0, 6, "oq"), 0x02: (6, 0, 0, "iq"),
+             0x38: (6, 0, 0, "iq"), 0xF5: None, 0x66: None, 0x99: None}
+QSPI_TCEM, QSPI_TRST = 40, 3     # small, so the stub stays short
+QSPI_SIGS = ["dout", "rd", "wb", "fin", "fin_rd", "fin_wr", "bad_cmd", "bad_extra", "bad_wend",
+             "bad_trst", "bad_cem"]
 
-    def put(cs, sck, mosi, miso):
-        steps.append((cs, sck, mosi, miso))
+
+class _QspiChip:
+    """The contract's view of one chip: its mode, and the events of each transaction."""
+
+    def __init__(self, psram, mode0):
+        self.psram = psram
+        self.cont = not psram and mode0
+        self.qpi = psram and mode0
+        self.init = self.rsten = False
+        self.reset_end = None      # step a 0x99 ended at, until the next CS_n fall
+        self.p = "r_" if psram else "f_"
+
+    def put(self, ev, st, **kw):
+        ev.setdefault(st, {}).update({self.p + k: v for k, v in kw.items()})
+
+    def fall(self, ev, st):
+        if self.psram and self.reset_end is not None and st - self.reset_end < QSPI_TRST:
+            self.put(ev, st, bad_trst=1)
+        self.reset_end = None
+
+    def txn(self, ev, edges, end):
+        """edges: [(step, nibble)] at the rising edges of one CS_n-low window; end: the step
+        CS_n is high again."""
+        if not self.psram and self.cont:
+            cmd, rest, fields = 0xEB, edges, QSPI_FLASH[0xEB]
+        else:
+            quad = self.psram and self.qpi
+            clen = 2 if quad else 8
+            if len(edges) < clen:
+                return                                  # ends inside the command: ignored
+            cmd = 0
+            for _, nb in edges[:clen]:
+                cmd = ((cmd << 4) | nb) & 0xFF if quad else ((cmd << 1) | (nb & 1)) & 0xFF
+            table = QSPI_FLASH if not self.psram else QSPI_PQPI if self.qpi else QSPI_PSPI
+            legal = cmd in table
+            if self.psram and legal:
+                legal = (cmd == 0x99) == self.rsten and (table[cmd] is None or self.init)
+            rest = edges[clen:]
+            if not legal:
+                self.put(ev, edges[clen - 1][0], bad_cmd=1)
+                assert not rest, "the stub ends an illegal command at its last edge"
+                fields = "bad"
+            else:
+                fields = table[cmd]
+        kind, nbytes, mval, mseen, partial, short = None, 0, 0, 0, False, False
+        if fields is None:
+            for st, _ in rest:
+                self.put(ev, st, bad_extra=1)
+        elif fields != "bad":
+            alen, mlen, dlen, kind = fields
+            addr = 0
+            for _, nb in rest[:alen]:
+                addr = ((addr << 4) | nb) if alen == 6 else ((addr << 1) | (nb & 1))
+            short = len(rest) < alen
+            for _, nb in rest[alen:alen + mlen]:
+                mval, mseen = ((mval << 4) | nb) & 0xFF, mseen + 1
+            data = rest[alen + mlen + dlen:]
+            quad = kind in ("oq", "iq")
+            per = 2 if quad else 8
+            byte = 0
+            for j, (st, nb) in enumerate(data):
+                k, idx = divmod(j, per)
+                a = (addr + k) & (0x7FFFFF if self.psram else 0xFFFFFF)
+                if kind[0] == "o":
+                    self.put(ev, st, rd=1, rd_addr=a, rd_quad=int(quad), rd_idx=idx)
+                else:
+                    byte = ((byte << 4) | nb) & 0xFF if quad else ((byte << 1) | (nb & 1)) & 0xFF
+                    if idx == per - 1:
+                        self.put(ev, st, wb=1, wb_addr=a, wb_data=byte)
+                        nbytes += 1
+            if kind[0] == "o" and data:
+                for st in range(data[0][0], end):
+                    self.put(ev, st, dout=1, dquad=int(quad))
+            partial = kind[0] == "i" and len(data) % per != 0
+        self.put(ev, end, fin=1, fin_rd=int(kind is not None and kind[0] == "o" and
+                                             len(rest) > sum(fields[:3])),
+                 fin_wr=int(nbytes > 0),
+                 bad_wend=int(kind is not None and kind[0] == "i" and (short or partial)))
+        if not self.psram:
+            if mseen == 2:
+                self.cont = (mval >> 4) & 3 == 2
+        else:
+            self.rsten = cmd == 0x66
+            if cmd == 0x99:
+                self.init, self.qpi, self.reset_end = True, False, end
+            elif cmd == 0x35:
+                self.qpi = True
+            elif cmd == 0xF5:
+                self.qpi = False
+
+
+def _qspi_stub(fcont, pqpi):
+    """Steps of (cf, cr, sck, nibble) and the expected events {step: {signal: value}}."""
+    steps, ev = [], {}
+    chips = {"f": _QspiChip(False, fcont), "r": _QspiChip(True, pqpi)}
+
+    def put(cf, cr, sck, nb):
+        steps.append((cf, cr, sck, nb))
         return len(steps) - 1
 
     def idle(n):
         for _ in range(n):
-            put(1, 0, 0, 1)
+            put(1, 1, 0, 0xA)
 
-    def txn(cmd, addr, data_bits, write, half=1, mem=None, stop_bits=None):
-        """data_bits: list of MOSI bits (write) or None (read, MISO from mem)."""
-        hdr = [(cmd >> (7 - i)) & 1 for i in range(8)] + [(addr >> (15 - i)) & 1 for i in range(16)]
-        nbits = len(hdr) + (len(data_bits) if write else len(mem) * 8)
-        if stop_bits is not None:
-            nbits = stop_bits
-        put(0, 0, hdr[0], 0)   # CS falls with SCK low
-        for i in range(nbits):
-            if i < 24:
-                mo, mi = hdr[i], None
-            else:
-                k, b = divmod(i - 24, 8)
-                if write:
-                    mo, mi = data_bits[i - 24], None
-                else:
-                    mo, mi = 0, (mem[k] >> (7 - b)) & 1
-            for _ in range(half):       # low phase: MOSI set up, MISO noise
-                put(0, 0, mo, 1 - (mi if mi is not None else 0))
-            rise = None
-            for j in range(half):       # high phase: memory drives the bit
-                s = put(0, 1, mo, mi if mi is not None else (j & 1))
-                if rise is None:
-                    rise = s
-            ev = events.setdefault(rise, {})
-            if i == 7:
-                ev["cmd"] = cmd
-            if i >= 24:
-                k, b = divmod(i - 24, 8)
-                a = (addr + k) & 0xffff
-                if not write:
-                    ev["rd"] = (a, b, mi)
-                if b == 7:
-                    byte = mem[k] if not write else int("".join(map(str, data_bits[8*k:8*k+8])), 2)
-                    ev["byte"] = (int(write), a, byte)
-        put(0, 0, 0, 1)                 # SCK low before CS rises
-        end = put(1, 0, 0, 1)
-        data = max(0, nbits - 24)
-        events.setdefault(end, {})["end"] = (int(nbits >= 24), int(write), int(data >= 8), data % 8)
-        if nbits >= 24:
-            # Section 6 classes: the bytes with at least one data bit (a partial last byte
-            # counts); none: a region transaction iff A is in the region.
-            byts = {(addr + k) & 0xffff for k in range((data + 7) // 8)}
-            reg = {b for b in byts if b >= 0xff80}
-            region = int(bool(reg) and reg == byts) if byts else int(addr >= 0xff80)
-            mixed = int(bool(reg) and reg != byts)
-            events[end]["cls"] = (addr, min(data, 1023), region, mixed)
+    def txn(chip, nibs, high=1, low_only=0):
+        """One CS_n-low window clocking `nibs` (one per rising edge); SCK high phases of
+        `high` steps; low_only: a window of that many steps with no edge."""
+        cf, cr = (0, 1) if chip == "f" else (1, 0)
+        st0 = put(cf, cr, 0, nibs[0] if nibs else 0)    # CS_n falls with SCK low
+        chips[chip].fall(ev, st0)
+        for _ in range(low_only - 1):
+            put(cf, cr, 0, 0x5)
+        edges = []
+        for k, nb in enumerate(nibs):
+            edges.append((put(cf, cr, 1, nb), nb))      # the rising edge
+            for _ in range(high - 1):
+                put(cf, cr, 1, nb)                      # held while SCK is high
+            put(cf, cr, 0, nibs[k + 1] if k + 1 < len(nibs) else 0x3)
+        end = put(1, 1, 0, 0xC)
+        if chip == "r":                                 # tCEM: low for more than QSPI_TCEM steps
+            for i in range(QSPI_TCEM, end - st0):
+                chips["r"].put(ev, st0 + i, bad_cem=1)
+        chips[chip].txn(ev, edges, end)
+
+    def single(byte, other=0xA):
+        """8 single edges (MSB first on SD0); the other lines carry `other`'s bits."""
+        return [(other & 0xE) | ((byte >> (7 - i)) & 1) for i in range(8)]
+
+    def addr_s(a):
+        return [(0x6 & 0xE) | ((a >> (23 - i)) & 1) for i in range(24)]
+
+    def nibs(x, n):
+        return [(x >> (4 * (n - 1 - i))) & 0xF for i in range(n)]
 
     idle(3)
-    txn(0x03, 0xfffe, None, False, half=1, mem=[0x5a, 0xc3, 0x81])          # READ wraps to 0x0000
+    txn("f", [0xF] * 8)                                         # 2.4 step 1
+    idle(1)
+    txn("r", [0xF, 0x5])                                        # QPI-form 0xF5
+    idle(1)
+    txn("r", single(0x66))
+    txn("r", single(0x99))
+    idle(QSPI_TRST - 1)                                         # high for exactly tRST
+    txn("r", single(0x35))                                      # QPI from here
+    idle(1)
+    txn("r", nibs(0x38, 2) + nibs(0xFFFFFE, 6) + nibs(0xA53C81, 6))   # A[23] ignored, wraps
+    idle(1)
+    txn("r", nibs(0x0B, 2) + nibs(0x123456, 6) + [0x9] * 4 + nibs(0x5AC37, 5), high=2)
+    idle(1)
+    txn("r", nibs(0x02, 2) + nibs(0x000010, 6) + nibs(0x123, 3))     # ends mid-byte
+    idle(1)
+    txn("r", nibs(0x02, 2) + nibs(0x0000, 4))                   # ends in the address
+    idle(1)
+    txn("f", single(0xEB) + nibs(0x00ABCD, 6) + nibs(0x20, 2) + [0x0] * 4 + nibs(0x1234, 4))
+    idle(1)
+    txn("f", nibs(0xFFFFFF, 6) + nibs(0x20, 2) + [0x0] * 4 + nibs(0x9876, 4))   # wraps
+    idle(1)
+    txn("f", nibs(0x000100, 6) + nibs(0xFF, 2) + [0x0] * 2)     # M = 0xFF, ends in dummy
+    idle(1)
+    txn("f", single(0x03) + addr_s(0x0F00F0) + single(0xC3)[:8] + [0x2, 0x0])   # 10 bits
+    idle(1)
+    txn("f", single(0x6B) + addr_s(0x000004) + [0x0] * 8 + nibs(0xE1, 2))
+    idle(1)
+    txn("f", single(0x02) + addr_s(0x000040) + single(0x5A))    # page program, ignored
+    idle(1)
+    txn("f", single(0x9F))                                      # not listed
+    idle(1)
+    txn("f", single(0xFF) + [0x1])                              # 0xFF takes no fields
+    idle(1)
+    txn("r", nibs(0x0C, 2))                                     # not listed in QPI mode
+    idle(1)
+    txn("r", nibs(0x66, 2) + [0x0])                             # an edge after 0x66
+    idle(1)
+    txn("r", nibs(0x99, 2))                                     # reset (QPI form): SPI mode
+    txn("r", single(0x35))                                      # CS_n high 1 step: tRST
+    idle(1)
+    txn("r", [], low_only=QSPI_TCEM + 2)                        # CS_n low past tCEM
+    idle(1)
+    txn("f", [0x1] * 3)                                         # ends in the command
     idle(2)
-    bits = [int(c) for c in "1010010100111100"]                              # 0xA5, 0x3C
-    txn(0x02, 0x1234, bits, True, half=2)                                    # stretched phases
-    idle(1)
-    txn(0x03, 0x00ff, None, False, half=1, mem=[0x96], stop_bits=24 + 5)     # READ ends mid-byte
-    idle(1)
-    txn(0x02, 0x0010, [1] * 16, True, half=1, stop_bits=24 + 11)             # WRITE ends mid-byte
-    idle(1)
-    txn(0x03, 0x0000, None, False, half=1, mem=[0], stop_bits=10)            # header incomplete
-    idle(1)
-    txn(0x03, 0xff80, None, False, half=1, mem=[0x11, 0x22])                 # region READ
-    idle(1)
-    txn(0x03, 0xfff0, None, False, half=1, mem=[0], stop_bits=24)            # null READ, region
-    idle(1)
-    txn(0x03, 0x4000, None, False, half=1, mem=[0], stop_bits=24)            # null READ, program
-    idle(1)
-    txn(0x03, 0xffff, None, False, half=1, mem=[0x33, 0x44], stop_bits=24 + 9)  # one bit past 0xFFFF
-    idle(1)
-    txn(0x02, 0xfffe, [0, 1] * 8, True, half=1)                              # region WRITE
-    idle(2)
-    return steps, events
+    return steps, ev
 
 
-def _stub_verilog(steps, events):
+def _qspi_tb(steps, ev, fcont, pqpi):
     lines = ["module stub_tb (input clock);",
              "  reg [15:0] step = 16'd0;",
              "  always @(posedge clock) step <= step + 16'd1;",
-             "  reg cs, sck, mosi, miso;",
+             "  reg cf, cr, sck; reg [3:0] nib;",
              "  always @* begin",
-             "    {cs, sck, mosi, miso} = 4'b1001;",
+             "    {cf, cr, sck, nib} = 7'b1100000;",
              "    case (step)"]
-    for i, (c, s, mo, mi) in enumerate(steps):
-        lines.append(f"      {i}: {{cs, sck, mosi, miso}} = 4'b{c}{s}{mo}{mi};")
+    for i, (cf, cr, s, nb) in enumerate(steps):
+        lines.append(f"      {i}: {{cf, cr, sck, nib}} = {{1'b{cf}, 1'b{cr}, 1'b{s}, 4'h{nb:x}}};")
     lines += ["    endcase", "  end",
-              "  wire mon_en, mon_pair, mon_cs, mon_sck, mon_mosi, mon_miso, mon_pcs, mon_psck, mon_pmosi, mon_rise;",
-              "  wire ev_cmd_done, ev_rd_bit, ev_rd_val, ev_byte, ev_byte_wr, ev_end, ev_end_hdr, ev_end_write, ev_end_bytes;",
-              "  wire [7:0] ev_cmd, ev_byte_data; wire [15:0] ev_rd_addr, ev_byte_addr; wire [2:0] ev_rd_idx, ev_end_bit;",
-              "  wire [15:0] ev_end_addr; wire [9:0] ev_end_nbits; wire ev_end_region, ev_end_mixed;",
-              "  bonetto_spi_monitor m (.clock(clock), .reset(step == 16'd0), .cs(cs), .mosi(mosi), .sck(sck), .miso(miso),",
-              "    .mon_en(mon_en), .mon_pair(mon_pair), .mon_cs(mon_cs), .mon_sck(mon_sck), .mon_mosi(mon_mosi),",
-              "    .mon_miso(mon_miso), .mon_pcs(mon_pcs), .mon_psck(mon_psck), .mon_pmosi(mon_pmosi), .mon_rise(mon_rise),",
-              "    .ev_cmd_done(ev_cmd_done), .ev_cmd(ev_cmd), .ev_rd_bit(ev_rd_bit), .ev_rd_addr(ev_rd_addr),",
-              "    .ev_rd_idx(ev_rd_idx), .ev_rd_val(ev_rd_val), .ev_byte(ev_byte), .ev_byte_wr(ev_byte_wr),",
-              "    .ev_byte_addr(ev_byte_addr), .ev_byte_data(ev_byte_data), .ev_end(ev_end), .ev_end_hdr(ev_end_hdr),",
-              "    .ev_end_write(ev_end_write), .ev_end_bytes(ev_end_bytes), .ev_end_bit(ev_end_bit),",
-              "    .ev_end_addr(ev_end_addr), .ev_end_nbits(ev_end_nbits), .ev_end_region(ev_end_region),",
-              "    .ev_end_mixed(ev_end_mixed));",
-              "  always @* begin",
-              "    if (step > 16'd0) case (step)"]
-    for st in sorted(events):
-        ev = events[st]
-        a = [f"ev_cmd_done == {int('cmd' in ev)}", f"ev_rd_bit == {int('rd' in ev)}",
-             f"ev_byte == {int('byte' in ev)}", f"ev_end == {int('end' in ev)}"]
-        if "cmd" in ev:
-            a.append(f"ev_cmd == 8'h{ev['cmd']:02x}")
-        if "rd" in ev:
-            addr, idx, val = ev["rd"]
-            a += [f"ev_rd_addr == 16'h{addr:04x}", f"ev_rd_idx == {idx}", f"ev_rd_val == {val}"]
-        if "byte" in ev:
-            w, addr, data = ev["byte"]
-            a += [f"ev_byte_wr == {w}", f"ev_byte_addr == 16'h{addr:04x}", f"ev_byte_data == 8'h{data:02x}"]
-        if "end" in ev:
-            h, w, b, bit = ev["end"]
-            a += [f"ev_end_hdr == {h}", f"ev_end_write == {w}", f"ev_end_bytes == {b}", f"ev_end_bit == {bit}"]
-        if "cls" in ev:
-            addr, nb, region, mixed = ev["cls"]
-            a += [f"ev_end_addr == 16'h{addr:04x}", f"ev_end_nbits == {nb}",
-                  f"ev_end_region == {region}", f"ev_end_mixed == {mixed}"]
-        elif "end" in ev:
-            a += ["!ev_end_region"]
-        lines.append(f"      {st}: assert ({' && '.join(a)});")
-    lines += ["      default: assert (!ev_cmd_done && !ev_rd_bit && !ev_byte && !ev_end);",
-              "    endcase",
-              "  end",
-              "endmodule"]
+              "  reg psck = 1'b0;",
+              "  always @(posedge clock) psck <= sck;",
+              "  wire reset = step == 16'd0, en = step >= 16'd2, rise = en && !psck && sck;"]
+    for p, ps, m0 in (("f_", 0, fcont), ("r_", 1, pqpi)):
+        lines += [f"  wire {', '.join(p + s for s in QSPI_SIGS)}, {p}dquad, {p}rd_quad;",
+                  f"  wire [23:0] {p}rd_addr, {p}wb_addr; wire [2:0] {p}rd_idx; "
+                  f"wire [7:0] {p}wb_data;",
+                  f"  bonetto_qspi_chip #(.PSRAM({ps})) {p}chip (.clock(clock), .reset(reset), "
+                  f".en(en), .cs({'cf' if ps == 0 else 'cr'}), .rise(rise), .nib(nib), "
+                  f".mode0(1'b{int(m0)}),",
+                  "    " + ", ".join(f".{s}({p}{s})" for s in QSPI_SIGS + [
+                      "dquad", "rd_addr", "rd_quad", "rd_idx", "wb_addr", "wb_data"]) + ");"]
+    lines += ["  always @* begin", "    if (en) case (step)"]
+
+    def conds(e):
+        c = []
+        for p in ("f_", "r_"):
+            c += [f"{p}{s} == {e.get(p + s, 0)}" for s in QSPI_SIGS]
+            if e.get(p + "dout"):
+                c.append(f"{p}dquad == {e[p + 'dquad']}")
+            if e.get(p + "rd"):
+                m = "[22:0]" if p == "r_" else ""
+                c += [f"{p}rd_addr{m} == 24'h{e[p + 'rd_addr']:06x}",
+                      f"{p}rd_quad == {e[p + 'rd_quad']}", f"{p}rd_idx == {e[p + 'rd_idx']}"]
+            if e.get(p + "wb"):
+                c += [f"{p}wb_addr == 24'h{e[p + 'wb_addr']:06x}",
+                      f"{p}wb_data == 8'h{e[p + 'wb_data']:02x}"]
+        return " && ".join(c)
+    for st in sorted(ev):
+        lines.append(f"      {st}: assert ({conds(ev[st])});")
+    lines += [f"      default: assert ({conds({})});", "    endcase", "  end", "endmodule"]
     return "\n".join(lines) + "\n"
 
 
-def test_monitor_decodes_stub(tmp_path):
+@pytest.mark.parametrize("fcont,pqpi", [(True, True), (False, False)])
+def test_qspi_monitor_decodes_stub(tmp_path, fcont, pqpi):
+    """Both chip monitors decode a stub waveform (every listed command family, quad and single
+    fields, stretched SCK phases, A[23] and burst wrap, M = 0x20 and 0xFF, reads ending
+    mid-byte, and one of each violation: unlisted command, edge after a no-field command,
+    write ending mid-byte or in its address, tRST, tCEM) into exactly the expected events,
+    from both power-up modes."""
     run_formal.setup_path()
-    steps, events = _stub_waveform()
-    assert sum(1 for e in events.values() if "byte" in e) == 3 + 2 + 0 + 1 + 2 + 1 + 2
-    (tmp_path / "stub_tb.v").write_text(_stub_verilog(steps, events))
-    depth = len(steps) + 2
+    steps, ev = _qspi_stub(fcont, pqpi)
+    flags = {k for e in ev.values() for k, v in e.items() if v and k[2:].startswith("bad_")}
+    assert flags == {"f_bad_cmd", "f_bad_extra", "r_bad_cmd", "r_bad_extra", "r_bad_wend",
+                     "r_bad_trst", "r_bad_cem"}
+    assert sum(1 for e in ev.values() if e.get("r_wb")) == 4       # 3 + 1 of the mid-byte write
+    (tmp_path / "stub_tb.v").write_text(_qspi_tb(steps, ev, fcont, pqpi))
+    (tmp_path / "defs.vh").write_text(f"`define BONETTO_TCEM {QSPI_TCEM}\n"
+                                      f"`define BONETTO_TRST {QSPI_TRST}\n")
     (tmp_path / "stub.sby").write_text(f"""[options]
 mode bmc
-depth {depth}
+depth {len(steps) + 2}
 
 [engines]
-smtbmc yices
+smtbmc bitwuzla
 
 [script]
-read -formal bonetto_macros.vh wrapper.sv stub_tb.v
+read -formal -D RISCV_FORMAL -D RISCV_FORMAL_NRET=1 -D RISCV_FORMAL_XLEN=32 -D RISCV_FORMAL_ILEN=32 defs.vh rvfi_macros.vh bonetto_macros.vh wrapper.sv stub_tb.v
 hierarchy -top stub_tb
 prep -flatten -nordff -top stub_tb
 
 [files]
+{tmp_path / "defs.vh"}
 {os.path.join(HERE, "checks", "bonetto_macros.vh")}
 {os.path.join(HERE, "wrapper.sv")}
 {os.path.join(ROOT, "third_party", "riscv-formal", "checks", "rvfi_macros.vh")}
 {tmp_path / "stub_tb.v"}
 """)
-    # wrapper.sv's rvfi_wrapper needs the RVFI macros even though only the monitor is used.
-    (tmp_path / "defs.vh").write_text("")
-    sby = (tmp_path / "stub.sby").read_text().replace(
-        "read -formal bonetto_macros.vh wrapper.sv stub_tb.v",
-        "read -formal -D RISCV_FORMAL -D RISCV_FORMAL_NRET=1 -D RISCV_FORMAL_XLEN=32 "
-        "-D RISCV_FORMAL_ILEN=32 rvfi_macros.vh bonetto_macros.vh wrapper.sv stub_tb.v")
-    (tmp_path / "stub.sby").write_text(sby)
     p = subprocess.run(["sby", "-f", "stub.sby"], cwd=tmp_path, capture_output=True, text=True)
     assert "DONE (PASS" in p.stdout, p.stdout[-3000:]
 
@@ -607,8 +728,8 @@ def _expect(mutant):
         reason="slow (hours): BONETTO_FORMAL_SLOW=1")) for m in mutants()])
 def test_mutant_fails(mutant, tmp_path, tmp_path_factory, seed_timing, heavy_lock):
     """Each mutant FAILS (a counterexample) in the checks its expect.json names, at the
-    seed's depth (or its "timing" design's); the legal variants and the liveness boundary
-    mutants marked "pass" PASS ("checks": "all": the whole fast suite). A check that is
+    champion's depth (or its "timing" design's), proof tasks only; mutants marked "pass"
+    PASS ("checks": "all": the whole fast suite, reach tasks included). A check that is
     only in the deep config runs with --deep. "rtl" points at a shared cosim mutant."""
     mdir = os.path.join(MUT_DIR, mutant)
     expect = _expect(mutant)
@@ -616,6 +737,8 @@ def test_mutant_fails(mutant, tmp_path, tmp_path_factory, seed_timing, heavy_loc
     timing = design_timing(expect["timing"], tmp_path_factory) if expect.get("timing") else seed_timing
     out = tmp_path / "formal.json"
     args = ["--src", str(src), "--timing", timing, "--out", str(out), "--keep-going"]
+    if expect.get("expect", "fail") == "fail":
+        args += ["--tasks", "proof"]
     if expect["checks"] != "all":
         args += ["--only", "^(" + "|".join(expect["checks"]) + ")$"]
         if expect.get("deep") or not set(expect["checks"]) <= fast_checks():
@@ -651,6 +774,10 @@ def test_seed_passes(tmp_path, heavy_lock):
     rc, text = formal(["--out", str(out)])
     res = json.load(open(out))
     assert rc == 0 and res["pass"], f"{res.get('checks')}\n{res.get('failures')}\n{text[-3000:]}"
-    # The fast config runs every check at the short depth, the deepest class group's.
-    assert res["depth"] == res["depth_policy"]["d_short"] == max(res["per_check_depth"].values())
+    # The fast config: the short depth for most checks, cpi=2 for coherence and csr, cpi=4
+    # for irq (the deepest).
+    pcd = res["per_check_depth"]
+    assert res["depth"] == max(pcd.values()) == pcd["irq"]
+    assert pcd["qspi"] == res["depth_policy"]["d_short"]
+    assert pcd["irq"] > pcd["csr"] == pcd["coherence"] > pcd["qspi"]
     assert all(v == "PASS" for v in res["checks"].values())

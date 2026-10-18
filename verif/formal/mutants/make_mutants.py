@@ -1,428 +1,420 @@
 #!/usr/bin/env python3
-"""Regenerate verif/formal/mutants/<name>/ from the seed (src/tt_um_fesens_r32v.v).
+"""Regenerate verif/formal/mutants/<name>/ from the champion (src/, contract v3).
 
-Each mutant is a full copy of the seed's top file with exactly one change, plus
-expect.json naming the formal check(s) that must FAIL on it ("expect": "fail"), or that
-must PASS ("expect": "pass": the legal variants; "checks": "all" is the whole fast
-suite). test_formal.py runs those checks on each mutant at the seed's depth. The
-liveness boundary pairs (stall_*) are not bugs on one side: a core whose worst-case
-retirement comes exactly 1,024 edges after reset or after the previous retirement must
-PASS, one edge later must FAIL (contract section 4, latency cap). They run in the deep
-config, where liveness lives.
+Each mutant is a copy of the champion's design files that the mutation touches (test_formal.py
+lays them over a copy of src/), each with exactly one change, plus expect.json naming the formal
+check(s) that must FAIL on it ("expect": "fail") and the assertion the change targets
+("assertion", for the record; the gate only needs one of "checks" to fail with a
+counterexample). test_formal.py runs those checks on each mutant at the champion's depth
+(the cosim timing of src/). "deep" mutants run in the deep config (liveness lives there).
 
-SHARED lists the mutants whose RTL is the cosim's (verif/cosim/mutants/<name>/), so
-both gates test the same designs: their expect.json has "rtl" and no copy of the RTL.
-"timing" names a design whose cosim timing sets the depth (for mutants of the hyp/002
-cores), "slow" marks the runs of hours (skipped unless BONETTO_FORMAL_SLOW=1).
+The set: the contract-v2 mutants re-derived on the champion where their rule still exists
+(miso_low is sd_low, mosi_rise is sd_rise, and so on; the v2 transaction-attribution and halt
+mutants have no v3 rule: caches, prefetch and repeated accesses are legal, and traps go to
+mtvec), and one mutant per contract-v3 rule: each QSPI rule, PSRAM write attribution,
+coherence (fetch and load), each CSR check, the trap, MRET and interrupt targets, liveness, the
+GPIO timing and the peripheral registers.
 
-  python3 verif/formal/mutants/make_mutants.py [seed.v]
+SHARED lists the mutants whose RTL is the cosim's (verif/cosim/mutants/<name>/), so both gates
+test the same designs: their expect.json has "rtl" and no copy of the RTL.
 
-Each substitution must match exactly once, so a changed seed fails loudly here
-instead of producing a mutant that is not the intended bug.
+  python3 verif/formal/mutants/make_mutants.py [src_dir]
+
+Each substitution must match exactly once, so a changed champion fails loudly here instead of
+producing a mutant that is not the intended bug.
 """
 import json
 import os
+import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-TOPFILE = "tt_um_fesens_r32v.v"
+TOP = "tt_um_fesens_r32v.v"
+MEM = "r32v_mem.v"
+CSR = "r32v_csr.v"
+PER = "r32v_periph.v"
 
-# name: (class, expected failing checks, description, [(old, new), ...])
+# name: (summary, checks, assertion, description, [(file, old, new), ...], {options})
 MUTANTS = {
-    "miso_low": (
-        "samples MISO while SCK is low",
-        ["bus_imem"],
-        "MISO goes through an extra flip-flop, so the falling-edge capture reads the value "
-        "from the cycle where SCK was low (noise).",
-        [("    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n",
-          "    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n"
-          "    reg         miso_q;\n    always @(posedge clk) miso_q <= uio_in[2];\n"),
-         ("sr     <= {sr[54:0], miso & ~bitcnt[5]};", "sr     <= {sr[54:0], miso_q & ~bitcnt[5]};")],
+    # ---- QSPI rules (contract 1 and 2), check qspi -----------------------------------------
+    "oe_sck_reset": (
+        "SCK's output enable is off during the reset sequence", ["qspi"], "qspi_oe_fixed",
+        "uio_oe[3] follows the reset sequence's done flag (contract 1: always 1).",
+        [(MEM, "    assign uio_oe  = {2'b11, oe, oe, 1'b1, oe, oe, 1'b1};",
+          "    assign uio_oe  = {2'b11, oe, oe, done, oe, oe, 1'b1};")],
     ),
-    "mosi_rise": (
-        "changes MOSI on the rising SCK edge",
-        ["spi"],
-        "MOSI is XORed with the next bit while SCK is high.",
-        [("wire mosi = sr[55] & ~cs_n;", "wire mosi = (sr[55] ^ (sck & sr[54])) & ~cs_n;")],
+    "reset_cs_low": (
+        "flash CS_n low while rst_n is low", ["reset"], "qspi_reset_cs",
+        "The flash CS_n is forced low while rst_n is low (contract 1: both CS_n high). Only the "
+        "reset check sees it: with the one-edge reset of the other checks, rst_n is already "
+        "high in step 1, the first step the pins are compared.",
+        [(MEM, "    wire       csf = done ? ~(active & flash) : bcsf;",
+          "    wire       csf = done ? ~(active & flash) : (bcsf & rst_n);")],
+    ),
+    "cs_both": (
+        "both CS_n low", ["qspi"], "qspi_rule1",
+        "The PSRAM CS_n falls with every transaction, the flash's too (contract 2.1.1).",
+        [(MEM, "    wire       csr = done ? ~(active & ~flash) : bcsr;",
+          "    wire       csr = done ? ~active : bcsr;")],
     ),
     "cs_sck_high": (
-        "CS_n toggles while SCK is high",
-        ["spi"],
-        "CS_n rises on the edge where SCK falls after the last bit.",
-        [("                    if (sck && bitcnt == 6'd0)\n"
-          "                        state <= (state == S_FSPI) ? S_FEND : S_MEND;",
-          "                    if (sck && bitcnt == 6'd0) begin\n"
-          "                        state <= (state == S_FSPI) ? S_FEND : S_MEND;\n"
-          "                        cs_n  <= 1'b1;\n"
-          "                    end")],
+        "CS_n rises while SCK is high", ["qspi"], "qspi_rule2",
+        "The memory controller sees the slot end one clock early (at its tail), so CS_n rises "
+        "at the clock where SCK falls after the last data edge (contract 2.1.2).",
+        [(TOP, "        .active(active), .prog(fM), .fetch(sF),",
+          "        .active(active & ~e_end), .prog(fM), .fetch(sF),")],
+    ),
+    "sck_masked": (
+        "SCK toggles with both CS_n high", ["qspi"], "qspi_rule3",
+        "A masked slot's strobes reach the SCK pin (contract 2.1.3: SCK 0 while both CS_n "
+        "are high).",
+        [(MEM, "    wire       sk  = done ? (sck & active) : bsck;",
+          "    wire       sk  = done ? sck : bsck;")],
+    ),
+    "sd_rise": (
+        "SD0 changes at a rising SCK edge", ["qspi"], "qspi_rule4",
+        "SD0 is XORed with SCK, so it changes at every rising edge it is driven at "
+        "(contract 2.1.4).",
+        [(MEM, "    wire [3:0] sd  = done ? sdo : bsd;",
+          "    wire [3:0] sd  = done ? (sdo ^ {3'b000, sk}) : bsd;")],
+    ),
+    "contention": (
+        "drives SD0-SD3 during a read's data phase", ["qspi"], "qspi_rule6_psram",
+        "SD0-SD3 are never released after a read's header (contract 2.1.6).",
+        [(MEM, "        else if (oe_off)\n", "        else if (oe_off & 1'b0)\n")],
+    ),
+    "flash_no_exit": (
+        "the reset sequence skips the flash's continuous-read exit", ["qspi"],
+        "qspi_rule6_flash",
+        "Window w0 (8 edges with SD0-SD3 high) is gone: a flash that powers up in continuous "
+        "read takes the 0xEB command as an address and M byte and drives data while the core "
+        "still drives SD0-SD3 (contract 2.1.6, 2.4).",
+        [(MEM, "    wire       blo  = ~done & (fe ? lo16 : (w == 3'd1) ? lo2 : (w != 3'd7) & lo8);",
+          "    wire       blo  = ~done & (fe ? lo16 : (w == 3'd1) ? lo2 : (w != 3'd7) & (w != 3'd0)"
+          " & lo8);")],
+    ),
+    "flash_m_byte": (
+        "M = 0x30 in the flash header", ["qspi"], "qspi_cmd_flash",
+        "The fetch header's M byte is 0x30, so the flash leaves continuous read and takes the "
+        "next header as a command (contract 2.2).",
+        [(MEM, "            4'b1110: hn = 4'h2;                         // M = 0x20: stay in "
+               "continuous read",
+          "            4'b1110: hn = 4'h3;                         // M = 0x20: stay in "
+          "continuous read")],
+    ),
+    "psram_cmd": (
+        "PSRAM read command 0x0C", ["qspi"], "qspi_cmd_psram",
+        "A PSRAM read sends 0x0C, not 0x0B (contract 2.3).",
+        [(MEM, "            4'b0001: hn = h_wr ? 4'h2 : 4'hB;",
+          "            4'b0001: hn = h_wr ? 4'h2 : 4'hC;")],
+    ),
+    "psram_no_reset": (
+        "no PSRAM reset", ["qspi"], "qspi_cmd_psram",
+        "Windows w2 and w3 (0x66, 0x99) keep the PSRAM CS_n high: the first access comes "
+        "before the PSRAM's reset (contract 2.3, 2.4).",
+        [(MEM, "    wire       blo  = ~done & (fe ? lo16 : (w == 3'd1) ? lo2 : (w != 3'd7) & lo8);",
+          "    wire       blo  = ~done & (fe ? lo16 : (w == 3'd1) ? lo2 : (w != 3'd7) & "
+          "(w[2:1] != 2'b01) & lo8);")],
+    ),
+    "trst_short": (
+        "CS_n high for one cycle after 0x99", ["qspi"], "qspi_trst",
+        "The PSRAM CS_n pulses low again two cycles after 0x99 ends (contract 2.3: high for "
+        "tRST = 3 cycles at 20 ns).",
+        [(MEM, "    wire       bcsr = ~(blo & ~fl);",
+          "    wire       bcsr = ~((blo & ~fl) | ((w == 3'd3) & (p == 5'd18)));")],
+    ),
+    "cmd_extra_edge": (
+        "a ninth edge after 0x66", ["qspi"], "qspi_extra",
+        "Window w2 clocks one more edge after 0x66, which takes no fields (contract 2.1.10).",
+        [(MEM, "    wire       lo8  = ~p[4] | (p[3:0] == 4'd0);",
+          "    wire       lo8  = ~p[4] | (p[3:0] == 4'd0) | ((w == 3'd2) & ((p == 5'd17) | "
+          "(p == 5'd18)));")],
     ),
     "write_midbyte": (
-        "WRITE ends mid-byte",
-        ["spi", "bus_dmem"],
-        "Store transactions send one data bit fewer than the access size.",
-        [("wire [5:0] mem_bits = (msize == 2'b00) ? 6'd31 : (msize == 2'b01) ? 6'd39 : 6'd55;",
-          "wire [5:0] mem_bits = ((msize == 2'b00) ? 6'd31 : (msize == 2'b01) ? 6'd39 : 6'd55) "
-          "- {5'd0, is_store};")],
+        "a store ends mid-byte", ["qspi"], "qspi_wend",
+        "A store's data phase ends one nibble early (contract 2.1.9).",
+        [(TOP, "    wire [2:0] nlast = (sM & c_st) ? {nm1, 1'b1} : 3'd7;",
+          "    wire [2:0] nlast = (sM & c_st) ? {nm1, 1'b0} : 3'd7;")],
     ),
-    "rvfi_rd": (
-        "a wrong RVFI rd value",
-        ["insn_xor"],
-        "RVFI reports XOR results with bit 0 flipped (the register file gets the right value).",
-        [("assign rvfi_rd_wdata  = rd_we ? rd_wdata : 32'd0;",
-          "assign rvfi_rd_wdata  = rd_we ? (rd_wdata ^ {31'd0, is_op & (funct3 == 3'b100)}) : 32'd0;")],
+    # ---- PSRAM write attribution (contract 8), check psram_write ---------------------------
+    "store_extra_byte": (
+        "SB writes two bytes", ["psram_write"], "psram_write_attr",
+        "A byte store writes the next byte too (rs2's second byte).",
+        [(TOP, "    wire [2:0] nlast = (sM & c_st) ? {nm1, 1'b1} : 3'd7;",
+          "    wire [2:0] nlast = (sM & c_st) ? {nm1 | {1'b0, ~nm1[0]}, 1'b1} : 3'd7;")],
     ),
-    "norvfi_diff": (
-        "a behavior difference only without RVFI",
-        ["equiv"],
-        "uo_out is inverted in the plain build only.",
-        [("    assign uo_out  = gpio_out;\n",
-          "`ifdef RISCV_FORMAL\n    assign uo_out  = gpio_out;\n`else\n    assign uo_out  = ~gpio_out;\n`endif\n")],
+    "store_data_flip": (
+        "a store writes a wrong bit", ["psram_write"], "psram_write_attr",
+        "Bit 0 of a store's data nibble 1 is flipped on the bus (RVFI reports rs2).",
+        [(TOP, "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk) ? pk4 : ring[3:0];",
+          "    wire [3:0] wdo4   = sW ? wd4 : fM ? (tap4 ^ {3'b000, n == 3'd1}) : "
+          "(sWC & tm & ~tk) ? pk4 : ring[3:0];")],
+    ),
+    "region_wrap": (
+        "core-region words at a 2-byte offset", ["psram_write"], "psram_write_attr",
+        "Core-region word addresses get bit 1 set: x15's word (0x7FFFFC) is written at "
+        "0x7FFFFE and wraps to PSRAM 0x000000-0x000001, outside the core region.",
+        [(MEM, "            4'b0111: hn = prog ? an : {h_reg[1:0], 2'b00};",
+          "            4'b0111: hn = prog ? an : {h_reg[1:0], 2'b10};")],
+    ),
+    # ---- coherence (contract 3), check coherence -------------------------------------------
+    "sd_low": (
+        "samples SD0-SD3 while SCK is low", ["coherence"], "coherence_fetch",
+        "The data nibble goes through an extra flip-flop, so a strobe reads the value from the "
+        "clock before the rising edge (noise). The v2 miso_low.",
+        [(TOP, "    wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   "
+               "// {SD3, SD2, SD1, SD0}",
+          "    reg  [3:0] nib_q;\n"
+          "    always @(posedge clk) nib_q <= {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};\n"
+          "    wire [3:0] nib   = nib_q;")],
+    ),
+    "store_dropped": (
+        "stores issue nothing", ["coherence"], "coherence_load",
+        "Every store's M slot is masked (as a store to flash is): a later load of the byte "
+        "returns the old value.",
+        [(TOP, "                (sM & c_st & ~ps) |                     // a store to flash "
+               "issues nothing",
+          "                (sM & c_st) |                           // a store to flash "
+          "issues nothing")],
+    ),
+    "fetch_wrong_chip": (
+        "fetches always read the flash", ["coherence"], "coherence_fetch",
+        "A fetch from PSRAM reads the flash byte at the same low address.",
+        [(TOP, "        .pa24(tk ? ring[24] : pcr[24]),", "        .pa24(1'b0),")],
+    ),
+    # ---- CSRs, traps and the interrupt (contract 4), checks csr and irq ---------------------
+    "trap_target": (
+        "a trap jumps through the wrong core-region word", ["csr"], "csr_trap_target",
+        "A trap sequence's C reads core-region CSR word 0, not mtvec.",
+        [(CSR, "    assign idx      = tm ? {s_wc, 1'b1} : p_mret ? 2'b11 : {b6, b0};",
+          "    assign idx      = tm ? {s_wc, s_wc} : p_mret ? 2'b11 : {b6, b0};")],
+    ),
+    "mret_target": (
+        "MRET jumps to mtvec", ["csr"], "csr_mret_target",
+        "MRET's C reads mtvec's word, not mepc's.",
+        [(CSR, "    assign idx      = tm ? {s_wc, 1'b1} : p_mret ? 2'b11 : {b6, b0};",
+          "    assign idx      = tm ? {s_wc, 1'b1} : p_mret ? 2'b01 : {b6, b0};")],
+    ),
+    "irq_target": (
+        "an interrupt jumps to mepc", ["irq"], "csr_irq_target",
+        "An interrupt sequence's C reads mepc's word, not mtvec's.",
+        [(CSR, "    assign idx      = tm ? {s_wc, 1'b1} : p_mret ? 2'b11 : {b6, b0};",
+          "    assign idx      = tm ? {s_wc, s_wc | ~intr} : p_mret ? 2'b11 : {b6, b0};")],
+    ),
+    "irq_masked": (
+        "the interrupt ignores mstatus.MIE", ["irq"], "csr_irq_enabled",
+        "An interrupt is taken with MIE = 0.",
+        [(CSR, "    wire irq_take = retire & ~tm & mie_n & meie_n & irq;",
+          "    wire irq_take = retire & ~tm & meie_n & irq;")],
+    ),
+    "csr_mtvec_lowbits": (
+        "mtvec and mepc bits 1:0 read back", ["csr"], "csr_read",
+        "The read mask of mtvec and mepc bits 1:0 is gone.",
+        [(CSR, "    assign mask_lo2 = idx[0] & n0;", "    assign mask_lo2 = 1'b0;")],
+    ),
+    "csr_mpp": (
+        "mstatus.MPP bit 12 reads 0", ["csr"], "csr_read",
+        "mstatus bit 12 (MPP = 3, read-only) reads 0.",
+        [(CSR, "    assign rd_die[0] = (c_mstatus & n3) | (mc_lo & mc[0]);",
+          "    assign rd_die[0] = (mc_lo & mc[0]);")],
+    ),
+    "mret_mpie": (
+        "MRET leaves MPIE", ["csr"], "csr_read",
+        "MRET does not set mstatus.MPIE.",
+        [(CSR, "            else if (retire & p_mret)\n                mpie <= 1'b1;\n",
+          "            else if (retire & p_mret)\n                mpie <= mpie;\n")],
+    ),
+    "trap_cause": (
+        "EBREAK's mcause is 11", ["csr"], "csr_read",
+        "The cause decode drops insn[20]: EBREAK records cause 11 (ECALL's).",
+        [(TOP, "    wire [3:0] cause = {p_trap & ~trap_ill & ~insn[20], 1'b0, trap_ill | p_trap, "
+               "p_trap & ~trap_ill};",
+          "    wire [3:0] cause = {p_trap & ~trap_ill, 1'b0, trap_ill | p_trap, "
+          "p_trap & ~trap_ill};")],
+    ),
+    "trap_mepc": (
+        "a trap writes the ring to mepc", ["csr"], "csr_read",
+        "A trap sequence's WC writes the ring, not the pc, to mepc.",
+        [(TOP, "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk) ? pk4 : ring[3:0];",
+          "    wire [3:0] wdo4   = sW ? wd4 : fM ? tap4 : (sWC & tm & ~tk & 1'b0) ? pk4 : "
+          "ring[3:0];")],
+    ),
+    # ---- liveness (contract 4), deep --------------------------------------------------------
+    "hang_reserved": (
+        "custom-0 encodings hang", ["liveness"], "liveness",
+        "An instruction with opcode 0001011 fetches itself again forever (nothing retires).",
+        [(TOP, "                    nsl = c_jal ? SL_W4 : p_mret ? SL_C : (c_fence | priv) ? SL_X :",
+          "                    nsl = (insn[6:0] == 7'b0001011) ? SL_F : c_jal ? SL_W4 : p_mret ? "
+          "SL_C : (c_fence | priv) ? SL_X :")],
+        {"deep": True},
+    ),
+    # ---- GPIO and peripherals (contract 5, 6), checks gpio and periph ------------------------
+    "gpio_any_byte": (
+        "a store to any byte of GPIO_OUT writes it", ["gpio", "periph"], "gpio_uo_hold",
+        "Byte 0 write enables ignore the offset: SB to GPIO_OUT + 1 writes GPIO_OUT (and every "
+        "other slot's byte 0).",
+        [(PER, "    wire       be0 = we & (off == 2'd0);", "    wire       be0 = we;")],
+    ),
+    "uo_glitch": (
+        "uo_out[0] glitches at a GPIO_OUT store", ["gpio"], "gpio_uo_hold",
+        "uo_out[0] is inverted for the clock of the store's write enable.",
+        [(PER, "    assign uo_out = (alt & fn) | (~alt & gpo);",
+          "    assign uo_out = ((alt & fn) | (~alt & gpo)) ^ {7'd0, we & s_gpo};")],
+    ),
+    "uo_late": (
+        "uo_out takes GPIO_OUT two clocks late", ["gpio"], "gpio_uo_hold",
+        "GPIO_OUT reaches the pins through two more flip-flops (contract 6: no later than one "
+        "cycle after the store retires).",
+        [(PER, "    assign uo_out = (alt & fn) | (~alt & gpo);",
+          "    reg [7:0] gpo_d1, gpo_d2;\n"
+          "    always @(posedge clk) begin\n"
+          "        gpo_d1 <= rst_n ? gpo : 8'd0;\n"
+          "        gpo_d2 <= rst_n ? gpo_d1 : 8'd0;\n"
+          "    end\n"
+          "    assign uo_out = (alt & fn) | (~alt & gpo_d2);")],
+    ),
+    "periph_wmask": (
+        "TIMER_CMP's high byte is not writable", ["periph"], "periph_read",
+        "TIMER_CMP[15:8] only takes the reset value.",
+        [(PER, "        if (w1 & (s_tcmp | rst)) tcmp[15:8] <= z1;",
+          "        if (rst) tcmp[15:8] <= z1;")],
+    ),
+    "uart_any_byte": (
+        "a store to UART_DATA byte 1 starts a transmission", ["periph"], "periph_read",
+        "TX starts on a write of either byte of UART_DATA (contract 5: byte 0 only); "
+        "UART_CTRL.TX_BUSY then reads 1.",
+        [(PER, "    wire        tx_go   = be0 & s_udat & ~tx_busy;",
+          "    wire        tx_go   = (be0 | be1) & s_udat & ~tx_busy;")],
+    ),
+    # ---- RVFI conventions (contract 8), check rvfi; illegal encodings, check ill -----------
+    "rvfi_halt": (
+        "rvfi_halt at a trap", ["rvfi"], "conv_halt",
+        "rvfi_halt is 1 at every trap retirement (contract 8: always 0; nothing halts).",
+        [(TOP, "    assign rvfi_halt      = 1'b0;", "    assign rvfi_halt      = r_tr;")],
+    ),
+    "intr_after_trap": (
+        "rvfi_intr only after an interrupt", ["rvfi"], "conv_intr_trap",
+        "The handler's first instruction after a synchronous trap reports rvfi_intr = 0.",
+        [(TOP, "            if (e_end & sC & tm)\n                r_ipend <= 1'b1;\n",
+          "            if (e_end & sC & tm)\n                r_ipend <= intr;\n")],
+    ),
+    "trap_writes_rd": (
+        "a trap reports rd", ["rvfi"], "conv_trap_rd_addr",
+        "A trapping instruction reports its rd field and a write (contract 8: rd 0 on a trap).",
+        [(TOP, "    wire        r_rde  = ~r_tr & (c_alu | c_u | c_jal | c_jalr | c_ld | c_csr) & "
+               "(rd_f != 4'd0);",
+          "    wire        r_rde  = (c_alu | c_u | c_jal | c_jalr | c_ld | c_csr) & "
+          "(rd_f != 4'd0);")],
+    ),
+    "zero_init": (
+        "the pc is not cleared", ["rvfi"], "conv_first_pc",
+        "The reset sequence no longer shifts zeros into the pc register (no reset), so the "
+        "first fetch is from its power-up value (contract 1, invariant 6).",
+        [(TOP, "    wire       pwe  = (dstb & (pwr | prot)) | rot_hdr | booting;",
+          "    wire       pwe  = (dstb & (pwr | prot)) | rot_hdr;")],
+    ),
+    "ill_zero": (
+        "the all-zeros word executes", ["ill"], "ill_trap",
+        "Only the all-ones word traps as illegal; the all-zeros word runs as LB x0, 0(x0). "
+        "(Dropping the all-ones term instead is not an ill bug: 0xFFFFFFFF then decodes as a "
+        "JAL with imm[1] = 1, which still traps, with mcause 0.)",
+        [(TOP, "    wire trap_ill = ~insn[0] | (insn[6] & insn[4] & insn[2]);",
+          "    wire trap_ill = (insn[6] & insn[4] & insn[2]);")],
+    ),
+    # ---- registers and instructions ---------------------------------------------------------
+    "reg_wrong_index": (
+        "writes go to an odd register", ["reg"], "reg_rs1",
+        "W and W4 address register rd | 1 (RVFI reports rd).",
+        [(TOP, "    wire [3:0] rsel = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | sW4) ? rd_f :",
+          "    wire [3:0] rsel = sA ? rs1_f : (sB | sBS) ? rs2_f : (sW | sW4) ? "
+          "{rd_f[3:1], 1'b1} :")],
     ),
     "sub_decode": (
-        "a decoder bug in SUB",
-        ["insn_sub", "insn_add"],   # a two-member group: the counterexample is SUB's
-        "SUB (funct3 000) is decoded as ADD.",
-        [("wire        alu_sub = is_op & ir[30];", "wire        alu_sub = is_op & ir[30] & funct3[0];")],
+        "SUB adds", ["insn_sub"], "insn_rd_wdata",
+        "The subtract decode needs funct3[0] = 1 too, so SUB adds.",
+        [(TOP, "(~f3[2] & (f3[1] | insn[30])))) |", "(~f3[2] & (f3[1] | (insn[30] & f3[0])))))"
+          " |")],
     ),
-    "gpio_any_byte": (
-        "GPIO store ignores the byte address",
-        ["gpio"],
-        "Any IO store sets uo_out, even when it writes no byte with X[1:0] = 0.",
-        [("wire        io_write = ~trap & is_store & is_io & io_hit;",
-          "wire        io_write = ~trap & is_store & is_io;")],
-    ),
-    "trap_continues": (
-        "keeps executing after a fatal trap",
-        ["silent"],
-        "A misaligned jump or branch target retires with trap = halt = 1, then the core fetches again.",
-        [("state <= trap ? S_HALT : S_FETCH;", "state <= (trap & ~misaligned) ? S_HALT : S_FETCH;")],
-    ),
-    "hang_reserved": (
-        "hangs on a reserved encoding",
-        ["liveness"],
-        "The custom-0 opcode (0001011) stays in EXEC forever instead of trapping.",
-        [("                    if (trap) begin\n                        state <= S_WB;",
-          "                    if (trap) begin\n"
-          "                        state <= (opcode == 7'b0001011) ? S_EXEC : S_WB;")],
-    ),
-    "reg_wrong_index": (
-        "writes the wrong register",
-        ["reg"],
-        "Even destination registers are written one register up (x2 writes x3); RVFI reports x2.",
-        [("regs[rd[3:0]] <= rd_wdata;", "regs[{rd[3:1], 1'b1}] <= rd_wdata;")],
-    ),
-    "load_half_swap": (
-        "halfword load bytes swapped",
-        ["bus_dmem"],
-        "LH/LHU from RAM return their two bytes swapped, in the register and in RVFI alike.",
-        [("                2'b01:   swap_n = {16'd0, x[7:0], x[15:8]};",
-          "                2'b01:   swap_n = {16'd0, x[15:8], x[7:0]};")],
+    "rvfi_rd": (
+        "a wrong RVFI rd value", ["insn_xor"], "insn_rd_wdata",
+        "RVFI reports XOR results with bit 0 flipped (the register gets the right value).",
+        [(TOP, "    assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;",
+          "    assign rvfi_rd_wdata  = r_rde ? (r_rd ^ {31'd0, c_op & (f3 == 3'b100)}) : 32'd0;")],
     ),
     "claim_region_stop": (
-        "claims a region access to escape the checks",
-        ["insn_add"],
-        "On an OP instruction with rs1 == rs2 the result has bit 0 flipped (in the register "
-        "and in RVFI), and RVFI claims a 1-byte read at 0xFF80 (rmask 0001). The region stop "
-        "comes from the spec's address only (contract section 3), so the claim must not stop "
-        "the checks.",
-        [("                           is_load             ? load_val : alu_res;",
-          "                           is_load             ? load_val : "
-          "(alu_res ^ {31'd0, is_op & (rs1 == rs2)});"),
-         ("assign rvfi_mem_rmask = (r_mem & is_load) ? r_mask : 4'd0;",
-          "assign rvfi_mem_rmask = ((r_mem & is_load) ? r_mask : 4'd0) | "
-          "{3'd0, is_op & (rs1 == rs2)};"),
-         ("assign rvfi_mem_addr  = r_mem ? mem_addr : 32'd0;",
-          "assign rvfi_mem_addr  = (is_op & (rs1 == rs2)) ? 32'h0000ff80 : "
-          "(r_mem ? mem_addr : 32'd0);")],
+        "claims a core-region address to stop the checks", ["insn_add"], "insn_rd_wdata",
+        "ADD reports a wrong rd value and claims a core-region access (0x017FFF80): the "
+        "UNSPECIFIED stop uses the spec's address for a specified instruction, so the claim "
+        "stops nothing.",
+        [(TOP, "    assign rvfi_rd_wdata  = r_rde ? r_rd : 32'd0;",
+          "    assign rvfi_rd_wdata  = r_rde ? (r_rd ^ {31'd0, c_op & (f3 == 3'b000) & ~insn[30]})"
+          " : 32'd0;"),
+         (TOP, "    assign rvfi_mem_addr  = r_mem ? maddr : 32'd0;",
+          "    assign rvfi_mem_addr  = r_mem ? maddr : c_op ? 32'h017fff80 : 32'd0;")],
     ),
-    "refetch": (
-        "fetches every instruction twice",
-        ["bus_imem"],
-        "After the fetch READ the core sends the same 4-byte READ at pc again before it "
-        "executes (contract section 6: exactly one fetch; a re-fetch fails).",
-        [("    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n",
-          "    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n"
-          "    reg         refetched;\n"),
-         ("            gpio_out <= 8'd0;\n        end else begin\n",
-          "            gpio_out <= 8'd0;\n            refetched <= 1'b0;\n        end else begin\n"),
-         ("                S_FEND: begin\n"
-          "                    cs_n  <= 1'b1;\n"
-          "                    state <= S_EXEC;\n",
-          "                S_FEND: begin\n"
-          "                    cs_n      <= 1'b1;\n"
-          "                    refetched <= ~refetched;\n"
-          "                    state     <= refetched ? S_EXEC : S_FETCH;\n")],
+    "norvfi_diff": (
+        "a behavior difference only without RVFI", ["equiv"], "equiv",
+        "uo_out is inverted in the plain build only.",
+        [(PER, "    assign uo_out = (alt & fn) | (~alt & gpo);",
+          "`ifdef RISCV_FORMAL\n    assign uo_out = (alt & fn) | (~alt & gpo);\n`else\n"
+          "    assign uo_out = ~((alt & fn) | (~alt & gpo));\n`endif")],
     ),
 }
 
-
-
-def _trap_txn(cmd, addr, bits):
-    """A trapping instruction makes one SPI transaction before it retires: the given
-    command and address, `bits` + 1 bits in all (24 header bits + data)."""
-    return [("                    if (trap) begin\n                        state <= S_WB;",
-             "                    if (trap) begin\n                        cs_n  <= 1'b0;\n"
-             "                        state <= S_MSPI;   // MUTANT: a transaction on a trap"),
-            ("            S_EXEC: begin\n                if (is_load | is_store) begin",
-             "            S_EXEC: begin\n                if (trap) begin\n"
-             f"                    sr     <= {{8'h{cmd:02x}, 16'h{addr:04x}, 32'd0}};\n"
-             f"                    bitcnt <= 6'd{bits};\n"
-             "                end else if (is_load | is_store) begin")]
-
-
-def _junk_trap_fields(cond):
-    return [("    assign rvfi_rs1_addr  = r_rs1 ? rs1 : 5'd0;",
-             f"    assign rvfi_rs1_addr  = ({cond}) ? 5'd7 : r_rs1 ? rs1 : 5'd0;"),
-            ("    assign rvfi_rs2_addr  = r_rs2 ? rs2 : 5'd0;",
-             f"    assign rvfi_rs2_addr  = ({cond}) ? 5'd9 : r_rs2 ? rs2 : 5'd0;"),
-            ("    assign rvfi_rs1_rdata = r_rs1 ? rs1_val : 32'd0;",
-             f"    assign rvfi_rs1_rdata = ({cond}) ? 32'hdeadbeef : r_rs1 ? rs1_val : 32'd0;"),
-            ("    assign rvfi_rs2_rdata = r_rs2 ? rs2_val : 32'd0;",
-             f"    assign rvfi_rs2_rdata = ({cond}) ? 32'h0badf00d : r_rs2 ? rs2_val : 32'd0;"),
-            ("    assign rvfi_rd_wdata  = rd_we ? rd_wdata : 32'd0;",
-             "    assign rvfi_rd_wdata  = trap ? 32'h00001234 : rd_we ? rd_wdata : 32'd0;"),
-            ("    assign rvfi_pc_wdata  = npc;",
-             "    assign rvfi_pc_wdata  = trap ? 32'h00000002 : npc;")]
-
-
-MUTANTS.update({
-    "trap_fields_brj": (
-        "junk register fields on a trapping branch or JALR",
-        ["insn_jalr"],
-        "Every trapping retirement reports arbitrary rs1/rs2 fields (the cosim's v1 "
-        "legal_trap_fields). Contract v2 section 6: a trapping branch or JALR must report its "
-        "operands truthfully.",
-        _junk_trap_fields("trap"),
-    ),
-    "legal_trap_fields_nb": (
-        "legal: junk fields on non-branch traps",
-        "all",
-        "Trapping retirements other than a branch or JALR report arbitrary rs1/rs2 fields, "
-        "rd_wdata and pc_wdata; contract section 6 compares none of them. Expect PASS.",
-        _junk_trap_fields("trap & ~(is_branch | is_jalr)"),
-        {"expect": "pass"},
-    ),
-    "legal_uo_early": (
-        "legal: uo_out changes in the retirement cycle",
-        "all",
-        "An IO store sets uo_out on the edge that enters its retirement cycle (allowed: "
-        "section 3 only bounds it by one cycle after the retirement), misaligned IO stores "
-        "included (unspecified). The review's variant. Expect PASS.",
-        [("                    end else begin\n                        state <= S_WB;\n"
-          "                    end\n                end\n                S_MEND: begin",
-          "                    end else begin\n                        if (io_write)\n"
-          "                            gpio_out <= io_wbyte;   // MUTANT: in the retirement cycle\n"
-          "                        state <= S_WB;\n"
-          "                    end\n                end\n                S_MEND: begin"),
-         ("                    pc <= npc;\n                    if (io_write)\n"
-          "                        gpio_out <= io_wbyte;\n",
-          "                    pc <= npc;\n")],
-        {"expect": "pass"},
-    ),
-    "trap_program_write": (
-        "a program WRITE on a trapping instruction",
-        ["bus_dmem"],
-        "Before a trapping instruction retires, the core WRITEs one byte at 0x0100 (contract "
-        "section 4: no program-memory write on a trap).",
-        _trap_txn(0x02, 0x0100, 31),
-    ),
-    "trap_region_wrap": (
-        "a region READ that wraps out of the region",
-        ["bus_dmem"],
-        "Before a trapping instruction retires, the core READs 4 bytes at 0xFFFE: 0xFFFE, "
-        "0xFFFF, 0x0000, 0x0001 (contract section 6: a region transaction may not wrap out of "
-        "the region).",
-        _trap_txn(0x03, 0xfffe, 55),
-    ),
-    "trap_region_straddle": (
-        "a READ that straddles into the region",
-        ["bus_dmem"],
-        "Before a trapping instruction retires, the core READs 4 bytes at 0xFF7E: two program "
-        "bytes and two region bytes in one transaction.",
-        _trap_txn(0x03, 0xff7e, 55),
-    ),
-    "legal_trap_region": (
-        "legal: a region READ on a trap",
-        "all",
-        "Before a trapping instruction retires, the core READs 4 bytes at 0xFF80 (contract "
-        "section 4: a trapping instruction may make core-region transactions). Expect PASS.",
-        _trap_txn(0x03, 0xff80, 55),
-        {"expect": "pass"},
-    ),
-    "legal_null_read": (
-        "legal: a null READ",
-        "all",
-        "Before a trapping instruction retires, the core sends a READ header for 0x1234 and "
-        "raises CS_n with no data bit (contract section 6: null READs are allowed anywhere). "
-        "Expect PASS.",
-        _trap_txn(0x03, 0x1234, 23),
-        {"expect": "pass"},
-    ),
-    "region_write_after_halt": (
-        "a region WRITE after the halt",
-        ["silent"],
-        "After the halting retirement the core WRITEs one byte at 0xFF80 (contract section 4: "
-        "never another SPI WRITE after the halt, core region included).",
-        [("                     S_HALT  = 4'd8;   // after a fatal trap: never leaves (until reset)",
-          "                     S_HALT  = 4'd8,   // after a fatal trap: never leaves (until reset)\n"
-          "                     S_HW = 4'd9, S_HSPI = 4'd10, S_HEND = 4'd11;   // MUTANT"),
-         ("                S_FSPI, S_MSPI: begin\n                    sck <= ~sck;\n"
-          "                    if (sck && bitcnt == 6'd0)\n"
-          "                        state <= (state == S_FSPI) ? S_FEND : S_MEND;",
-          "                S_FSPI, S_MSPI, S_HSPI: begin\n                    sck <= ~sck;\n"
-          "                    if (sck && bitcnt == 6'd0)\n"
-          "                        state <= (state == S_FSPI) ? S_FEND :\n"
-          "                                 (state == S_MSPI) ? S_MEND : S_HEND;"),
-         ("state <= trap ? S_HALT : S_FETCH;", "state <= trap ? S_HW : S_FETCH;"),
-         ("                default: state <= state;   // S_HALT",
-          "                S_HW: begin\n                    cs_n  <= 1'b0;\n"
-          "                    state <= S_HSPI;\n                end\n"
-          "                S_HEND: begin\n                    cs_n  <= 1'b1;\n"
-          "                    state <= S_HALT;\n                end\n"
-          "                default: state <= state;   // S_HALT"),
-         ("            S_FSPI, S_MSPI: begin\n                if (sck) begin",
-          "            S_FSPI, S_MSPI, S_HSPI: begin\n                if (sck) begin"),
-         ("            S_FEND: ir <= fetch_word;",
-          "            S_HW: begin\n                sr     <= {8'h02, 16'hff80, 32'd0};\n"
-          "                bitcnt <= 6'd31;\n            end\n"
-          "            S_FEND: ir <= fetch_word;")],
-    ),
-})
-
-# The cosim's mutants (verif/cosim/mutants/<name>/tt_um_fesens_r32v.v), shared:
-# name: (expected checks, options)
+# Shared with the cosim (verif/cosim/mutants/<name>/): name: (checks, assertion, description)
 SHARED = {
-    "cs_open_at_retire": (["spi"], {}),
-    "fetch_extra_byte": (["bus_imem", "bus_dmem"], {}),
-    "load_own_fetch": (["bus_dmem"], {}),
-    "zero_init": (["rvfi", "bus_imem"], {}),
-    "trap_writes_rd": (["insn_jal", "rvfi"], {}),
-    "uo_glitch": (["gpio"], {}),
-    "uo_late": (["gpio"], {}),
-    "no_halt": (["silent"], {}),
-    "store_twice": (["bus_dmem"], {}),
-    "store_extra_byte": (["bus_dmem"], {}),
-    "load_skip_byte": (["bus_dmem"], {}),
-    "legal_mosi_echo": ("all", {"expect": "pass"}),
-    "legal_split_store": ("all", {"expect": "pass"}),
-    "region_wrap": (["bus_dmem"], {"timing": "legal_h002_rf", "slow": True}),
-    "region_straddle": (["bus_dmem"], {"timing": "legal_h002_rf", "slow": True}),
-    "region_zero_init": (["rvfi", "bus_imem"], {"timing": "legal_h002_pcram", "slow": True}),
-    "legal_h002_rf": ("all", {"expect": "pass", "timing": "legal_h002_rf", "slow": True}),
-    "legal_h002_pcram": ("all", {"expect": "pass", "timing": "legal_h002_pcram", "slow": True}),
+    "tcem_stall": (["qspi"], "qspi_tcem",
+                   "The cosim's tCEM stub: a PSRAM read that holds CS_n low with SCK paused for "
+                   "400 cycles (about 480 cycles low, tCEM = 400 cycles at 20 ns)."),
 }
-
-# Liveness boundary (contract section 4 edge count, as the cosim counts it). Measured
-# on the seed (cosim --timing-json: first retirement at edge 115, a 4-byte RAM access
-# takes 230 edges, everything else 116): the latest first retirement is a 4-byte RAM
-# access at edge 229, and the longest gap between retirements is 230 edges. A fetch
-# stall of N cycles moves the latest first retirement to edge 229 + N (stall_first;
-# N = 795 gives 1,024, N = 796 gives 1,025) or the longest gap after the first
-# retirement to 230 + N (stall_later; N = 794 gives 1,024, N = 795 gives 1,025). Each
-# pair also pins formal's count: the PASS/FAIL flip is at exactly one cycle.
-_DECL = ("    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n",
-         "    reg  [31:0] regs [1:15]; // x1..x15; x0 reads as zero\n"
-         "    reg  [10:0] stall_n;     // MUTANT: fetch stall counter\n"
-         "    reg         armed;\n")
-_FETCH = ("                S_FETCH: begin\n"
-          "                    cs_n  <= 1'b0;\n"
-          "                    state <= S_FSPI;\n"
-          "                end\n",
-          "                S_FETCH: begin\n"
-          "                    if (stall_n != 11'd0) begin\n"
-          "                        stall_n <= stall_n - 11'd1;\n"
-          "                    end else begin\n"
-          "                        cs_n  <= 1'b0;\n"
-          "                        state <= S_FSPI;\n"
-          "                    end\n"
-          "                end\n")
-
-
-def _reset(first_n):
-    return ("            gpio_out <= 8'd0;\n        end else begin\n",
-            "            gpio_out <= 8'd0;\n"
-            f"            stall_n  <= 11'd{first_n};\n"
-            "            armed    <= 1'b1;\n"
-            "        end else begin\n")
-
-
-def _wb(later_n):
-    return ("                S_WB: begin\n                    pc <= npc;\n",
-            "                S_WB: begin\n                    pc <= npc;\n"
-            "                    if (armed) begin\n"
-            f"                        stall_n <= 11'd{later_n};\n"
-            "                        armed   <= 1'b0;\n"
-            "                    end\n")
-
-
-for _n, _exp in ((795, "pass"), (796, "fail")):
-    MUTANTS[f"stall_first_{229 + _n}"] = (
-        f"first retirement at edge {229 + _n} at the latest",
-        ["liveness"],
-        f"The first fetch waits {_n} extra cycles after reset: the latest first retirement "
-        f"(a 4-byte RAM access) is at edge {229 + _n}. Expect {_exp.upper()}.",
-        [_DECL, _reset(_n), _FETCH],
-        {"expect": _exp, "deep": True},
-    )
-for _n, _exp in ((794, "pass"), (795, "fail")):
-    MUTANTS[f"stall_later_{230 + _n}"] = (
-        f"second retirement {230 + _n} edges after the first at the latest",
-        ["liveness"],
-        f"The second fetch waits {_n} extra cycles: the longest gap (a 4-byte RAM access "
-        f"second) is {230 + _n} edges. Expect {_exp.upper()}.",
-        [_DECL, _reset(0), _FETCH, _wb(_n)],
-        {"expect": _exp, "deep": True},
-    )
 
 
 def main():
-    seed = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "src", TOPFILE)
-    text = open(seed).read()
+    src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "src")
+    texts = {}
+    for name in os.listdir(HERE):
+        if os.path.isdir(os.path.join(HERE, name)) and name != "__pycache__":
+            shutil.rmtree(os.path.join(HERE, name))
     for name, spec in MUTANTS.items():
-        cls, checks, desc, subs = spec[:4]
-        opts = spec[4] if len(spec) > 4 else {}
-        m = text
-        for old, new in subs:
+        summary, checks, assertion, desc, subs = spec[:5]
+        opts = spec[5] if len(spec) > 5 else {}
+        files = {}
+        for fname, old, new in subs:
+            if fname not in texts:
+                texts[fname] = open(os.path.join(src, fname)).read()
+            m = files.get(fname, texts[fname])
             n = m.count(old)
             if n != 1:
-                sys.exit(f"{name}: pattern found {n} times (expected 1): {old[:60]!r}")
-            m = m.replace(old, new)
+                sys.exit(f"{name}: pattern found {n} times in {fname} (expected 1): {old[:70]!r}")
+            files[fname] = m.replace(old, new)
         d = os.path.join(HERE, name)
-        os.makedirs(d, exist_ok=True)
-        hdr = f"// MUTANT {name}: {cls}. {desc}\n// Generated by verif/formal/mutants/make_mutants.py from the seed.\n"
-        with open(os.path.join(d, TOPFILE), "w") as f:
-            f.write(hdr + m)
-        with open(os.path.join(d, "expect.json"), "w") as f:
-            json.dump({"class": cls, "checks": checks, "description": desc,
-                       "expect": opts.get("expect", "fail"), "deep": opts.get("deep", False)},
-                      f, indent=2)
-            f.write("\n")
-        print(f"wrote mutants/{name} (expect {opts.get('expect', 'fail').upper()} in "
-              f"{checks if isinstance(checks, str) else ', '.join(checks)})")
-    cosim = os.path.join(ROOT, "verif", "cosim", "mutants")
-    with open(os.path.join(cosim, "MANIFEST.json")) as f:
-        manifest = json.load(f)
-    for name, (checks, opts) in SHARED.items():
-        rtl = os.path.join(cosim, name)
-        if not os.path.isfile(os.path.join(rtl, TOPFILE)):
-            sys.exit(f"{name}: no {TOPFILE} in verif/cosim/mutants/{name}")
-        d = os.path.join(HERE, name)
-        os.makedirs(d, exist_ok=True)
-        for f in os.listdir(d):
-            if f.endswith((".v", ".sv")):
-                os.remove(os.path.join(d, f))   # the RTL is the cosim's
-        exp = {"class": name, "checks": checks,
-               "description": manifest.get(name, {}).get("desc", ""),
-               "expect": opts.get("expect", "fail"), "deep": opts.get("deep", False),
-               "rtl": f"verif/cosim/mutants/{name}"}
-        for k in ("timing", "slow"):
-            if k in opts:
-                exp[k] = opts[k]
+        os.makedirs(d)
+        for fname, m in files.items():
+            hdr = (f"// MUTANT {name}: {summary}. {desc}\n"
+                   f"// Generated by verif/formal/mutants/make_mutants.py from the champion.\n")
+            with open(os.path.join(d, fname), "w") as f:
+                f.write(hdr + m)
+        exp = {"class": summary, "checks": checks, "assertion": assertion,
+               "description": desc, "expect": opts.get("expect", "fail"),
+               "deep": opts.get("deep", False)}
         with open(os.path.join(d, "expect.json"), "w") as f:
             json.dump(exp, f, indent=2)
             f.write("\n")
-        print(f"wrote mutants/{name} (shared RTL, expect {exp['expect'].upper()})")
+        print(f"wrote mutants/{name} ({', '.join(sorted(files))}; expect "
+              f"{exp['expect'].upper()} in {', '.join(checks)})")
+    for name, (checks, assertion, desc) in SHARED.items():
+        rtl = os.path.join(ROOT, "verif", "cosim", "mutants", name)
+        if not os.path.isfile(os.path.join(rtl, TOP)):
+            sys.exit(f"{name}: no {TOP} in verif/cosim/mutants/{name}")
+        d = os.path.join(HERE, name)
+        os.makedirs(d)
+        exp = {"class": name, "checks": checks, "assertion": assertion, "description": desc,
+               "expect": "fail", "deep": False, "rtl": f"verif/cosim/mutants/{name}"}
+        with open(os.path.join(d, "expect.json"), "w") as f:
+            json.dump(exp, f, indent=2)
+            f.write("\n")
+        print(f"wrote mutants/{name} (shared RTL, expect FAIL in {', '.join(checks)})")
 
 
 if __name__ == "__main__":

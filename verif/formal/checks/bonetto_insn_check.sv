@@ -7,19 +7,21 @@
 // encodings are disjoint), so encodings whose used register fields name x16-x31 are
 // not checked here (they are reserved).
 //
-// Differences from the stock check (contract sections 4 and 6):
-//   - rvfi_halt must equal the spec's trap (fatal traps halt; nothing else halts).
-//   - A trapping retirement (contract section 6) is compared only on rvfi_trap,
-//     rvfi_halt and the absence of side effects: rd_addr = 0 and wmask = 0. Its
-//     rd_wdata, rmask and pc_wdata are not compared (insn and pc_rdata are checked by
-//     the pc and bus checks). Its register-read fields are compared only for a
-//     branch or JALR, whose operands decide the trap: rs1_addr / rs2_addr equal the
-//     spec's and x0 reads 0 (the reg check covers the values).
-//   - Up to the first region-touching retirement (contract section 3). At that
-//     retirement (unless its fetch touched the region) only what decided the stop and
+// Differences from the stock check (contract v3 sections 4 and 8):
+//   - rvfi_trap must equal the spec's trap (synchronous traps: ECALL, EBREAK, a jump or
+//     taken branch to a target with bit 1 set, the trap words; nothing else traps). A
+//     trapping retirement is compared only on rvfi_trap and the absence of side effects:
+//     rd_addr = 0 and wmask = 0. Its pc_wdata (mtvec) is the csr check's; its rd_wdata and
+//     rmask are not compared. Its register-read fields are compared only for a branch or
+//     JALR, whose operands decide the trap: rs1_addr / rs2_addr equal the spec's and x0
+//     reads 0 (the reg check covers the values). rvfi_halt is the rvfi check's (always 0).
+//   - A CSR instruction's rd_wdata (the old CSR value) and MRET's pc_wdata (mepc) come from
+//     CSR state the stock models cannot see: the csr check compares them with its shadow.
+//     Every other field of those instructions is compared here.
+//   - Up to the first UNSPECIFIED retirement (contract 3, bon_unspec_ret). At that
+//     retirement (unless its fetch is the UNSPECIFIED part) only what decided the stop and
 //     what reports the access is compared: rs1_addr (its value is the reg check's) and
-//     mem_addr, plus rmask / wmask unless the core trapped (section 3 lets a
-//     region-touching access trap and halt, and a trapping retirement reports wmask 0).
+//     mem_addr, plus rmask / wmask unless the core trapped.
 //   - Register fields of a non-trapping retirement: rs1_addr / rs2_addr equal the
 //     spec's (unused fields report 0).
 //   - Memory masks are exact (LSB-aligned 1/3/15 for the access size, 0 otherwise);
@@ -72,6 +74,10 @@ module bonetto_insn_check (
 		.spec_mem_wdata (spec_mem_wdata   )
 	);
 
+	// CSR instructions (rd gets the old CSR value) and MRET (pc = mepc): see the header.
+	wire csr_insn = rvfi_insn[6:0] == 7'b1110011 && rvfi_insn[14:12] != 3'd0;
+	wire mret_insn = rvfi_insn == 32'h30200073;
+
 	integer i;
 	always @* begin
 		// The triggers (one per instruction, plus a trapping retirement where the
@@ -80,18 +86,17 @@ module bonetto_insn_check (
 		if (!reset && check && !bon_stopped) begin
 			assume (spec_valid);
 		end
-		if (!reset && check && !bon_stopped && bon_region_ret && !bon_fetch_touch) begin
-			insn_region_rs1_addr: assert (rvfi_rs1_addr == spec_rs1_addr);
+		if (!reset && check && !bon_stopped && bon_unspec_ret && !bon_fetch_unspec) begin
+			insn_unspec_rs1_addr: assert (rvfi_rs1_addr == spec_rs1_addr);
 			if (spec_mem_rmask || spec_mem_wmask)
-				insn_region_mem_addr: assert (rvfi_mem_addr == spec_mem_addr);
+				insn_unspec_mem_addr: assert (rvfi_mem_addr == spec_mem_addr);
 			if (!rvfi_trap) begin
-				insn_region_rmask: assert (rvfi_mem_rmask == spec_mem_rmask);
-				insn_region_wmask: assert (rvfi_mem_wmask == spec_mem_wmask);
+				insn_unspec_rmask: assert (rvfi_mem_rmask == spec_mem_rmask);
+				insn_unspec_wmask: assert (rvfi_mem_wmask == spec_mem_wmask);
 			end
 		end
 		if (!reset && check && `BONETTO_FULL) begin
 			insn_trap: assert (rvfi_trap == spec_trap);
-			insn_halt: assert (rvfi_halt == spec_trap);
 
 			if (spec_trap) begin
 				insn_trap_rd_addr: assert (rvfi_rd_addr == 0);
@@ -108,8 +113,8 @@ module bonetto_insn_check (
 				insn_rs1_addr: assert (rvfi_rs1_addr == spec_rs1_addr);
 				insn_rs2_addr: assert (rvfi_rs2_addr == spec_rs2_addr);
 				insn_rd_addr: assert (rvfi_rd_addr == spec_rd_addr);
-				insn_rd_wdata: assert (rvfi_rd_wdata == spec_rd_wdata);
-				insn_pc_wdata: assert (rvfi_pc_wdata == spec_pc_wdata);
+				if (!csr_insn) insn_rd_wdata: assert (rvfi_rd_wdata == spec_rd_wdata);
+				if (!mret_insn) insn_pc_wdata: assert (rvfi_pc_wdata == spec_pc_wdata);
 				insn_rmask: assert (rvfi_mem_rmask == spec_mem_rmask);
 				insn_wmask: assert (rvfi_mem_wmask == spec_mem_wmask);
 				if (spec_mem_rmask || spec_mem_wmask)

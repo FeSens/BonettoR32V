@@ -1,9 +1,0 @@
-{
-  "class": "fetches every instruction twice",
-  "checks": [
-    "bus_imem"
-  ],
-  "description": "After the fetch READ the core sends the same 4-byte READ at pc again before it executes (contract section 6: exactly one fetch; a re-fetch fails).",
-  "expect": "fail",
-  "deep": false
-}

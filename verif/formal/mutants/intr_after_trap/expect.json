@@ -1,0 +1,10 @@
+{
+  "class": "rvfi_intr only after an interrupt",
+  "checks": [
+    "rvfi"
+  ],
+  "assertion": "conv_intr_trap",
+  "description": "The handler's first instruction after a synchronous trap reports rvfi_intr = 0.",
+  "expect": "fail",
+  "deep": false
+}

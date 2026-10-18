@@ -1,9 +1,10 @@
 {
-  "class": "CS_n toggles while SCK is high",
+  "class": "CS_n rises while SCK is high",
   "checks": [
-    "spi"
+    "qspi"
   ],
-  "description": "CS_n rises on the edge where SCK falls after the last bit.",
+  "assertion": "qspi_rule2",
+  "description": "The memory controller sees the slot end one clock early (at its tail), so CS_n rises at the clock where SCK falls after the last data edge (contract 2.1.2).",
   "expect": "fail",
   "deep": false
 }

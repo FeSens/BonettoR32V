@@ -1,0 +1,10 @@
+{
+  "class": "the all-zeros word executes",
+  "checks": [
+    "ill"
+  ],
+  "assertion": "ill_trap",
+  "description": "Only the all-ones word traps as illegal; the all-zeros word runs as LB x0, 0(x0). (Dropping the all-ones term instead is not an ill bug: 0xFFFFFFFF then decodes as a JAL with imm[1] = 1, which still traps, with mcause 0.)",
+  "expect": "fail",
+  "deep": false
+}

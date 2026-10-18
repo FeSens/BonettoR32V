@@ -1,293 +1,221 @@
-// BonettoR32V bus checks: RVFI against the SPI pins, with transaction identity
-// (contract v2, section 6). These replace riscv-formal's
-// checks/rvfi_bus_{imem,dmem}_check.sv (Copyright (C) 2017 Claire Xenia Wolf, ISC
-// license, see third_party/riscv-formal/COPYING), which shadow aligned words at full
-// 32-bit bus addresses, update the shadow only when rvfi_mem_addr equals the
-// shadowed address (wrong for misaligned accesses), and know nothing about GPIO or
-// SPI transactions.
-//
-// Model: one symbolic program byte address X (free constant, outside the core region
-// 0xFF80-0xFFFF, which the wrapper models as a real memory in every task) with a free
-// initial value (contract section 2: the contents are whatever the test loaded). The
-// monitor's WRITE bytes at X update it, and each READ data bit at X equals its current
-// bit. Bytes are compared on the 16-bit pin address, so the 64 KB alias and the
-// misaligned wrap are exact; GPIO accesses (addr[31] = 1) never appear on the pins.
-//
-// Transactions (classified by the monitor when CS_n rises): a region transaction
-// addresses only region bytes and is exempt; a mixed one (region and program bytes)
-// is forbidden; every other one is a program transaction. Per instruction (the SPI
-// traffic between the previous retirement and this one), with pc16 = the expected pc
-// (0 after reset, then the previous retirement's pc_wdata[15:0]; pc_bwd ties it to
-// pc_rdata) and ma = mem_addr[15:0]:
-//   - the fetch: a program READ of exactly 32 data bits at A = pc16 (an "F READ").
-//     There must be one. Another F READ is allowed only as a load READ (its 4 bytes are
-//     load bytes): a re-fetch fails.
-//   - every other program READ (split fetches, a fetch running on into more bytes, ...)
-//     reads only the load's bytes (ma + k, rmask[k], RAM, non-trapping);
-//   - each load byte is read in full by a READ other than the fetch (the fetch never
-//     counts toward a load: a second F READ may);
-//   - program WRITEs write only the store's bytes (ma + k, wmask[k], RAM,
-//     non-trapping), each exactly once (a store may be split over several WRITEs);
-//   - fetch and load bytes equal X's contents at the start of the window (the
-//     instruction executes and loads the memory as it was before it ran); a store byte
-//     is the value written.
-// All of it is checked at each compared retirement (not at or after the first
-// region-touching one, contract section 3), per byte X; X is free, so every byte is
-// covered. The fetch itself (bus_imem_pc, _fetch, _value) is also checked at the
-// region-touching retirement unless its fetch touched the region: its instruction word
-// decided the stop.
+// BonettoR32V bus checks (contract v3): the QSPI Pmod rules at the pins, PSRAM write attribution
+// and coherence. They replace riscv-formal's checks/rvfi_bus_{imem,dmem}_check.sv (Copyright (C)
+// 2017 Claire Xenia Wolf, ISC license, see third_party/riscv-formal/COPYING), which shadow
+// aligned words at full bus addresses and know nothing about the pins. Contract 8 removed v2's
+// per-instruction transaction attribution; in its place:
+//   qspi         contract 2 on every cycle (bonetto_qspi_check);
+//   psram_write  every PSRAM write writes only core-region bytes, or bytes of retired stores at
+//                their addresses with their data (bonetto_psram_write_check);
+//   coherence    every load and fetch returns the value most recently stored to that address,
+//                or the loaded image (bonetto_coherence_check).
 
 `include "bonetto_macros.vh"
 
-module bonetto_bus_track (
-	input clock,
-	input reset,
-	input rvfi_valid,
-	input [31:0] rvfi_pc_wdata,
-	input ev_rd_bit,
-	input [15:0] ev_rd_addr,
-	input [2:0] ev_rd_idx,
-	input ev_rd_val,
-	input ev_byte,
-	input ev_byte_wr,
-	input [15:0] ev_byte_addr,
-	input [7:0] ev_byte_data,
-	input ev_end,
-	input ev_end_hdr,
-	input ev_end_write,
-	input [15:0] ev_end_addr,
-	input [9:0] ev_end_nbits,
-	input ev_end_region,
-	input ev_end_mixed,
-	output [15:0] a,
-	output [15:0] pc16,    // the expected fetch address of the current window
-	output [7:0] mstart,   // contents of X at the start of the current window
-	output [1:0] n_fetch,  // F READs in the window (saturates at 3), this step included
-	output rd_nonf,        // a data bit of X read by a non-F program READ in the window
-	output full_nonf,      // X read in full (8 bits) by a non-F program READ
-	output [1:0] wr_cnt,   // program WRITE bytes at X in the window (saturates at 3)
-	output [7:0] wr_val,   // value of the last WRITE byte at X in the window
-	output mixed           // a mixed transaction in the window
+// Contract 1 (constant pins, reset state) and 2 (waveform rules, command legality, PSRAM
+// timing), on every cycle. Never stops: these hold after an UNSPECIFIED retirement too.
+module bonetto_qspi_check (
+	`BONETTO_CHECKER_PORTS
 );
-	`rvformal_rand_const_reg [15:0] addr;
-	always @* assume (addr[15:7] != 9'h1ff);   // the region is the wrapper's memory
-	reg [7:0] mem;  // current contents of RAM byte `addr`; free initial value
+	wire cf = pin_uio_out[0], cr = pin_uio_out[6], sck = pin_uio_out[3];
+	wire pcf = pin_puio_out[0], pcr = pin_puio_out[6], psck = pin_puio_out[3];
+	localparam [7:0] SDALL = 8'b0011_0110, SD1 = 8'b0000_0100;
 
-	wire rd_bit_hit = !reset && ev_rd_bit && ev_rd_addr == addr;
-	wire rd_byte_hit = !reset && ev_byte && !ev_byte_wr && ev_byte_addr == addr;
-	wire wr_hit = !reset && ev_byte && ev_byte_wr && ev_byte_addr == addr;
-	wire [7:0] mem_next = wr_hit ? ev_byte_data : mem;
-
-	// The memory drives each READ data bit from its current contents.
 	always @* begin
-		if (rd_bit_hit) assume (ev_rd_val == mem[3'd7 - ev_rd_idx]);
-	end
-	always @(posedge clock) mem <= mem_next;
-
-	// The current transaction's accesses to X (cleared when it ends).
-	reg c_rd, c_full;
-	reg [1:0] c_wr;
-	reg [7:0] c_wv;
-	always @(posedge clock) begin
-		if (reset || ev_end) begin
-			c_rd <= 1'b0;
-			c_full <= 1'b0;
-			c_wr <= 2'd0;
-		end else begin
-			if (rd_bit_hit) c_rd <= 1'b1;
-			if (rd_byte_hit) c_full <= 1'b1;
-			if (wr_hit) begin
-				c_wr <= (c_wr == 2'd3) ? 2'd3 : c_wr + 2'd1;
-				c_wv <= ev_byte_data;
-			end
+		if (mon_en) begin
+			// Section 1: uio_oe[0], [3], [6], [7] = 1 and uio_out[7] = 1 at all times.
+			qspi_oe_fixed: assert (pin_uio_oe[0] && pin_uio_oe[3] && pin_uio_oe[6] &&
+			                       pin_uio_oe[7]);
+			qspi_csb: assert (pin_uio_out[7]);
+			// 2.1.1: at most one CS_n is low. 2.1.3: SCK is 0 whenever both are high.
+			qspi_rule1: assert (cf || cr);
+			qspi_rule3: assert (!sck || !(cf && cr));
+		end
+		// Section 1: while rst_n is low both CS_n are 1, SCK is 0, uo_out is 0; nothing retires.
+		if (mon_en && reset_q) begin
+			qspi_reset_cs: assert (cf && cr);
+			qspi_reset_sck: assert (!sck);
+			qspi_reset_uo: assert (pin_uo_out == 8'h00);
+			qspi_reset_valid: assert (!rvfi_valid);
+		end
+		if (mon_pair) begin
+			// 2.1.2: a CS_n changes only while SCK is low at t-1 and t.
+			if (cf != pcf || cr != pcr) qspi_rule2: assert (!psck && !sck);
+			// 2.1.4: a line the core drives at a rising SCK edge was driven at t-1 too, with the
+			// same value (releasing a line at the edge is fine).
+			if (mon_rise) qspi_rule4: assert ((pin_uio_oe & SDALL &
+			                                   (~pin_puio_oe | (pin_uio_out ^ pin_puio_out))) == 8'h00);
+		end
+		if (mon_en) begin
+			// 2.1.6: no contention: during a chip's data-out phase the core drives none of its
+			// output lines (SD1 for a single read, SD0-SD3 for a quad read).
+			if (f_dout) qspi_rule6_flash: assert ((pin_uio_oe & (f_dquad ? SDALL : SD1)) == 8'h00);
+			if (r_dout) qspi_rule6_psram: assert ((pin_uio_oe & (r_dquad ? SDALL : SD1)) == 8'h00);
+			// 2.1.7: PSRAM CS_n low for at most tCEM; 2.3: CS_n high for tRST after 0x99.
+			qspi_tcem: assert (!r_bad_cem);
+			qspi_trst: assert (!r_bad_trst);
+			// 2.1.10, 2.2, 2.3, 2.4: only the listed commands for the chip's state, 0x66 then
+			// 0x99, no PSRAM access before its reset, nothing after a command that takes no
+			// fields.
+			qspi_cmd_flash: assert (!f_bad_cmd);
+			qspi_cmd_psram: assert (!r_bad_cmd);
+			qspi_extra: assert (!f_bad_extra && !r_bad_extra);
+			// 2.1.9: a write ends with its address complete and on a byte boundary.
+			qspi_wend: assert (!f_bad_wend && !r_bad_wend);
 		end
 	end
 
-	// This step's transaction end, classified.
-	wire e_prog = !reset && ev_end && !ev_end_region && !ev_end_mixed;
-	wire e_f = e_prog && !ev_end_write && ev_end_hdr && ev_end_addr == pc16 &&
-	           ev_end_nbits == 10'd32;
-	wire e_rd = e_prog && !ev_end_write && !e_f;   // a non-F program READ
-	wire e_wr = e_prog && ev_end_write;
-
-	// Window accumulators (cleared at each retirement; the values below include this
-	// step, so a transaction ending in the retirement step counts for it).
-	reg [15:0] epc;
-	reg [7:0] ms;
-	reg [1:0] nf;
-	reg rn, fn, mx;
-	reg [1:0] wc;
-	reg [7:0] wv;
-	wire [1:0] nf_now = (e_f && nf != 2'd3) ? nf + 2'd1 : nf;
-	wire rn_now = rn || (e_rd && c_rd);
-	wire fn_now = fn || (e_rd && c_full);
-	wire [2:0] wc_sum = {1'b0, wc} + {1'b0, (e_wr ? c_wr : 2'd0)};
-	wire [1:0] wc_now = wc_sum[2] ? 2'd3 : wc_sum[1:0];
-	wire mx_now = mx || (!reset && ev_end && ev_end_mixed);
-	always @(posedge clock) begin
-		if (reset) begin
-			epc <= 16'd0;
-		end else if (rvfi_valid) begin
-			epc <= rvfi_pc_wdata[15:0];
-		end
-		if (reset || rvfi_valid) begin
-			ms <= mem_next;
-			nf <= 2'd0;
-			rn <= 1'b0;
-			fn <= 1'b0;
-			wc <= 2'd0;
-			mx <= 1'b0;
-		end else begin
-			nf <= nf_now;
-			rn <= rn_now;
-			fn <= fn_now;
-			wc <= wc_now;
-			if (e_wr && c_wr != 2'd0) wv <= c_wv;
-			mx <= mx_now;
+	// Triggers (reach task): a flash read, a PSRAM read and a PSRAM write, each with data.
+	always @* begin
+		if (!reset) begin
+			`BONETTO_REACH(reach_qspi_flash_read, f_fin_rd)
+			`BONETTO_REACH(reach_qspi_psram_read, r_fin_rd)
+			`BONETTO_REACH(reach_qspi_psram_write, r_fin_wr)
 		end
 	end
-
-	assign a = addr;
-	assign pc16 = epc;
-	assign mstart = ms;
-	assign n_fetch = nf_now;
-	assign rd_nonf = rn_now;
-	assign full_nonf = fn_now;
-	assign wr_cnt = wc_now;
-	assign wr_val = (e_wr && c_wr != 2'd0) ? c_wv : wv;
-	assign mixed = mx_now;
 endmodule
 
-// Which bytes of the retiring instruction are byte X. A trapping retirement makes no
-// load or store (contract section 4: no effect), whatever it claims.
-module bonetto_bus_claims (
-	input [15:0] a,
-	input [31:0] rvfi_insn,
-	input [31:0] rvfi_pc_rdata,
-	input rvfi_trap,
-	input [31:0] rvfi_mem_addr,
-	input [3:0] rvfi_mem_rmask,
-	input [3:0] rvfi_mem_wmask,
-	input [31:0] rvfi_mem_rdata,
-	input [31:0] rvfi_mem_wdata,
-	output reg fetch_hit,
-	output reg [7:0] fetch_byte,
-	output reg load_hit,
-	output reg [7:0] load_byte,
-	output reg store_hit,
-	output reg [7:0] store_byte
-);
-	wire ram = !rvfi_mem_addr[31] && !rvfi_trap;
-	wire [15:0] pc16 = rvfi_pc_rdata[15:0];
-	wire [15:0] ma = rvfi_mem_addr[15:0];
-	wire [15:0] fa [0:3];
-	wire [15:0] da [0:3];
-	assign fa[0] = pc16;
-	assign fa[1] = pc16 + 16'd1;
-	assign fa[2] = pc16 + 16'd2;
-	assign fa[3] = pc16 + 16'd3;
-	assign da[0] = ma;
-	assign da[1] = ma + 16'd1;
-	assign da[2] = ma + 16'd2;
-	assign da[3] = ma + 16'd3;
+// Whether CPU byte address b (a byte of a retirement's access) is PSRAM byte a23.
+`define BON_PSRAM_BYTE(_b, _a23) (!_b[31] && _b[24] && _b[22:0] == _a23)
 
+// Contract 8: every PSRAM write outside the core region writes a byte of a retired store, at
+// its address, with its data. One symbolic PSRAM byte address wa outside the region and one
+// symbolic value wv (free constants, so every pair is covered). A write of wv at wa is
+// explained by a compared, non-trapping retirement that stores wv at wa (rvfi_mem_wmask lane k,
+// byte address rvfi_mem_addr + k). The write may land before its store retires (a core without
+// a write buffer writes during the store's own execution), but no later than the store's
+// retirement: every write since the previous retirement must be explained by the stores retired
+// so far, this retirement included (the cosim's rule, verif/cosim/harness.cpp
+// check_psram_writes). Writes after a store retires (write buffers) are explained by it.
+// Not covered here: that every store byte is written at all (coherence and the cosim's final
+// memory compare), and the order of two writes of different values (coherence).
+module bonetto_psram_write_check (
+	`BONETTO_CHECKER_PORTS
+);
+	`rvformal_rand_const_reg [22:0] wa;
+	`rvformal_rand_const_reg [7:0] wv;
+	always @* assume (wa[22:7] != 16'hffff);   // the core region is exempt
+
+	wire full = !reset && rvfi_valid && `BONETTO_FULL;
+	wire [31:0] b0 = rvfi_mem_addr, b1 = rvfi_mem_addr + 32'd1, b2 = rvfi_mem_addr + 32'd2,
+	            b3 = rvfi_mem_addr + 32'd3;
+	wire hit = (rvfi_mem_wmask[0] && `BON_PSRAM_BYTE(b0, wa) && rvfi_mem_wdata[7:0] == wv) ||
+	           (rvfi_mem_wmask[1] && `BON_PSRAM_BYTE(b1, wa) && rvfi_mem_wdata[15:8] == wv) ||
+	           (rvfi_mem_wmask[2] && `BON_PSRAM_BYTE(b2, wa) && rvfi_mem_wdata[23:16] == wv) ||
+	           (rvfi_mem_wmask[3] && `BON_PSRAM_BYTE(b3, wa) && rvfi_mem_wdata[31:24] == wv);
+	wire st_now = full && !rvfi_trap && hit;
+	wire wr_now = !reset && r_wb && r_wb_addr == wa && r_wb_data == wv;
+	reg st_seen;   // a retired store wrote wv at wa
+	reg pend;      // a write of wv at wa since the previous retirement
+	always @(posedge clock) begin
+		if (reset) begin
+			st_seen <= 1'b0;
+			pend <= 1'b0;
+		end else begin
+			if (st_now) st_seen <= 1'b1;
+			if (rvfi_valid) pend <= 1'b0;
+			else if (wr_now) pend <= 1'b1;
+		end
+	end
+	wire wrote = pend || wr_now;
+
+	always @* begin
+		if (full && check && wrote) psram_write_attr: assert (st_seen || st_now);
+		if (!reset) `BONETTO_REACH(reach_psram_write, full && wrote && (st_seen || st_now))
+	end
+endmodule
+
+// Contract 3, coherence: every load and fetch returns the value most recently stored to that
+// address by the program, or the loaded image if nothing was stored. One symbolic byte X: the
+// flash byte ax (cx = 0) or the PSRAM byte ax[22:0] (cx = 1, outside the core region).
+//   - pmem: the chip's byte at X, with a free initial value. The flash never changes (its 0x02
+//     is ignored, contract 2.2); a PSRAM write byte at X updates it. Every data-out edge at X
+//     drives pmem's bits (the bit or nibble the edge clocks). This, and the core region in the
+//     wrapper, are the only memory bytes that are not noise.
+//   - amem: the architectural byte at X: pmem's initial value (the loaded image, or the
+//     PSRAM's arbitrary content), then the bytes of compared, non-trapping retirements that
+//     store at X. A store to flash changes nothing (contract 3).
+//   - At each compared retirement, every fetched byte (rvfi_insn, pc_rdata + k) and every
+//     loaded byte (rvfi_mem_rdata lane k, rvfi_mem_addr + k) at X equals amem before this
+//     retirement. The fetch is checked at the UNSPECIFIED retirement too, unless the fetch
+//     itself is UNSPECIFIED: its instruction word decided the stop.
+// Caches, prefetch and write buffers are free in between: only what retires is compared.
+module bonetto_coherence_check (
+	`BONETTO_CHECKER_PORTS
+);
+	`rvformal_rand_const_reg cx;
+	`rvformal_rand_const_reg [23:0] ax;
+	always @* if (cx) assume (!ax[23] && ax[22:7] != 16'hffff);
+
+	reg [7:0] pmem;
+	reg [7:0] amem;
+	always @* if (reset) assume (amem == pmem);
+
+	// The environment drives X's bits at each data-out edge at X.
+	wire f_hit = !cx && f_rd && f_rd_addr == ax;
+	wire r_hit = cx && r_rd && r_rd_addr[22:0] == ax[22:0];
+	wire rquad = f_hit ? f_rd_quad : r_rd_quad;
+	wire [2:0] ridx = f_hit ? f_rd_idx : r_rd_idx;
+	always @* begin
+		if (!reset && (f_hit || r_hit)) begin
+			if (rquad) assume (mon_sd == (ridx[0] ? pmem[3:0] : pmem[7:4]));
+			else assume (mon_sd[1] == pmem[3'd7 - ridx]);
+		end
+	end
+
+	// CPU byte address b is X.
+	function is_x(input [31:0] b);
+		is_x = !b[31] && b[24] == cx && (cx ? b[22:0] == ax[22:0] : b[23:0] == ax);
+	endfunction
+
+	wire full = !reset && rvfi_valid && `BONETTO_FULL;
+	wire fvalid = !reset && rvfi_valid && !bon_stopped && !bon_fetch_unspec;
+	wire [31:0] pc = rvfi_pc_rdata, ma = rvfi_mem_addr;
+	reg fetch_hit, fetch_ok, load_hit, load_ok, store_hit;
+	reg [7:0] store_byte;
 	integer k;
 	always @* begin
 		fetch_hit = 1'b0;
-		fetch_byte = 8'h00;
+		fetch_ok = 1'b1;
 		load_hit = 1'b0;
-		load_byte = 8'h00;
+		load_ok = 1'b1;
 		store_hit = 1'b0;
 		store_byte = 8'h00;
 		for (k = 0; k < 4; k = k + 1) begin
-			if (fa[k] == a) begin
+			if (is_x(pc + k)) begin
 				fetch_hit = 1'b1;
-				fetch_byte = rvfi_insn[8*k +: 8];
+				if (rvfi_insn[8*k +: 8] != amem) fetch_ok = 1'b0;
 			end
-			if (ram && rvfi_mem_rmask[k] && da[k] == a) begin
+			if (!rvfi_trap && rvfi_mem_rmask[k] && is_x(ma + k)) begin
 				load_hit = 1'b1;
-				load_byte = rvfi_mem_rdata[8*k +: 8];
+				if (rvfi_mem_rdata[8*k +: 8] != amem) load_ok = 1'b0;
 			end
-			if (ram && rvfi_mem_wmask[k] && da[k] == a) begin
+			if (!rvfi_trap && rvfi_mem_wmask[k] && is_x(ma + k)) begin
 				store_hit = 1'b1;
 				store_byte = rvfi_mem_wdata[8*k +: 8];
 			end
 		end
 	end
-endmodule
 
-`define BONETTO_BUS_COMMON \
-	wire [15:0] a, pc16; \
-	wire [7:0] mstart, wr_val; \
-	wire [1:0] n_fetch, wr_cnt; \
-	wire rd_nonf, full_nonf, mixed; \
-	bonetto_bus_track track ( \
-		.clock(clock), .reset(reset), .rvfi_valid(rvfi_valid), .rvfi_pc_wdata(rvfi_pc_wdata), \
-		.ev_rd_bit(ev_rd_bit), .ev_rd_addr(ev_rd_addr), .ev_rd_idx(ev_rd_idx), .ev_rd_val(ev_rd_val), \
-		.ev_byte(ev_byte), .ev_byte_wr(ev_byte_wr), .ev_byte_addr(ev_byte_addr), \
-		.ev_byte_data(ev_byte_data), .ev_end(ev_end), .ev_end_hdr(ev_end_hdr), \
-		.ev_end_write(ev_end_write), .ev_end_addr(ev_end_addr), .ev_end_nbits(ev_end_nbits), \
-		.ev_end_region(ev_end_region), .ev_end_mixed(ev_end_mixed), \
-		.a(a), .pc16(pc16), .mstart(mstart), .n_fetch(n_fetch), .rd_nonf(rd_nonf), \
-		.full_nonf(full_nonf), .wr_cnt(wr_cnt), .wr_val(wr_val), .mixed(mixed) \
-	); \
-	wire fetch_hit, load_hit, store_hit; \
-	wire [7:0] fetch_byte, load_byte, store_byte; \
-	bonetto_bus_claims claims ( \
-		.a(a), .rvfi_insn(rvfi_insn), .rvfi_pc_rdata(rvfi_pc_rdata), .rvfi_trap(rvfi_trap), \
-		.rvfi_mem_addr(rvfi_mem_addr), .rvfi_mem_rmask(rvfi_mem_rmask), \
-		.rvfi_mem_wmask(rvfi_mem_wmask), .rvfi_mem_rdata(rvfi_mem_rdata), \
-		.rvfi_mem_wdata(rvfi_mem_wdata), .fetch_hit(fetch_hit), .fetch_byte(fetch_byte), \
-		.load_hit(load_hit), .load_byte(load_byte), .store_hit(store_hit), \
-		.store_byte(store_byte) \
-	); \
-	wire valid = !reset && rvfi_valid && `BONETTO_FULL;
-
-module bonetto_bus_imem_check (
-	`BONETTO_CHECKER_PORTS
-);
-	`BONETTO_BUS_COMMON
-	// The fetch is checked at the stop retirement too, unless the fetch itself touched
-	// the region: its instruction word decided the stop.
-	wire fvalid = !reset && rvfi_valid && !bon_stopped && !bon_fetch_touch;
-	always @* begin
-		if (fvalid && check) begin
-			// A fetch: a program READ of exactly the 4 instruction bytes, at the pc.
-			bus_imem_pc: assert (pc16 == rvfi_pc_rdata[15:0]);
-			bus_imem_fetch: assert (n_fetch != 2'd0);
-			if (fetch_hit) bus_imem_value: assert (fetch_byte == mstart);
+	reg stored;   // a compared store wrote X
+	always @(posedge clock) begin
+		if (reset) begin
+			stored <= 1'b0;
+		end else begin
+			if (cx && r_wb && r_wb_addr == ax[22:0]) pmem <= r_wb_data;
+			if (full && store_hit && cx) begin
+				amem <= store_byte;
+				stored <= 1'b1;
+			end
 		end
-		if (valid && check && fetch_hit && n_fetch[1]) begin
-			// Exactly one: a second fetch-shaped READ is only allowed as a load READ.
-			bus_imem_refetch: assert (load_hit);
-		end
-		if (!reset) `BONETTO_REACH(reach_bus_imem, valid && fetch_hit)
 	end
-endmodule
 
-module bonetto_bus_dmem_check (
-	`BONETTO_CHECKER_PORTS
-);
-	`BONETTO_BUS_COMMON
 	always @* begin
-		if (valid && check) begin
-			if (load_hit) begin
-				// Read in full by a READ that is not the fetch (a second F READ is a
-				// load READ).
-				bus_dmem_load_read: assert (full_nonf || (fetch_hit && n_fetch[1]));
-				bus_dmem_load_value: assert (load_byte == mstart);
-			end
-			if (store_hit) begin
-				bus_dmem_store_once: assert (wr_cnt == 2'd1);
-				bus_dmem_store_value: assert (wr_val == store_byte);
-			end
-			if (wr_cnt != 2'd0) bus_dmem_write_claimed: assert (store_hit);
-			if (rd_nonf) bus_dmem_read_claimed: assert (load_hit);
-			bus_region_mixed: assert (!mixed);
-		end
+		if (fvalid && check && fetch_hit) coherence_fetch: assert (fetch_ok);
+		if (full && check && load_hit) coherence_load: assert (load_ok);
 		if (!reset) begin
-			`BONETTO_REACH(reach_bus_dmem_load, valid && load_hit)
-			`BONETTO_REACH(reach_bus_dmem_store, valid && store_hit)
+			`BONETTO_REACH(reach_coherence_fetch, full && fetch_hit)
+			`BONETTO_REACH(reach_coherence_load, full && load_hit)
+			`BONETTO_REACH(reach_coherence_store_load, full && load_hit && stored)
 		end
 	end
 endmodule

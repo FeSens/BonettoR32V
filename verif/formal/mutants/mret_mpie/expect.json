@@ -1,0 +1,10 @@
+{
+  "class": "MRET leaves MPIE",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_read",
+  "description": "MRET does not set mstatus.MPIE.",
+  "expect": "fail",
+  "deep": false
+}

@@ -1,0 +1,10 @@
+{
+  "class": "a store to UART_DATA byte 1 starts a transmission",
+  "checks": [
+    "periph"
+  ],
+  "assertion": "periph_read",
+  "description": "TX starts on a write of either byte of UART_DATA (contract 5: byte 0 only); UART_CTRL.TX_BUSY then reads 1.",
+  "expect": "fail",
+  "deep": false
+}

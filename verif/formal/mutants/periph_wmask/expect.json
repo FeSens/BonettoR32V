@@ -1,0 +1,10 @@
+{
+  "class": "TIMER_CMP's high byte is not writable",
+  "checks": [
+    "periph"
+  ],
+  "assertion": "periph_read",
+  "description": "TIMER_CMP[15:8] only takes the reset value.",
+  "expect": "fail",
+  "deep": false
+}

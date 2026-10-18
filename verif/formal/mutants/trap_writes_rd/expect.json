@@ -1,11 +1,10 @@
 {
-  "class": "trap_writes_rd",
+  "class": "a trap reports rd",
   "checks": [
-    "insn_jal",
     "rvfi"
   ],
-  "description": "A JAL whose target has bit 1 set traps but still writes rd.",
+  "assertion": "conv_trap_rd_addr",
+  "description": "A trapping instruction reports its rd field and a write (contract 8: rd 0 on a trap).",
   "expect": "fail",
-  "deep": false,
-  "rtl": "verif/cosim/mutants/trap_writes_rd"
+  "deep": false
 }

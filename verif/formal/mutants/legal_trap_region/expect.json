@@ -1,7 +1,0 @@
-{
-  "class": "legal: a region READ on a trap",
-  "checks": "all",
-  "description": "Before a trapping instruction retires, the core READs 4 bytes at 0xFF80 (contract section 4: a trapping instruction may make core-region transactions). Expect PASS.",
-  "expect": "pass",
-  "deep": false
-}

@@ -1,10 +1,10 @@
 {
-  "class": "store_extra_byte",
+  "class": "SB writes two bytes",
   "checks": [
-    "bus_dmem"
+    "psram_write"
   ],
-  "description": "SB sends 2 data bytes: its own and the next one (rs2[15:8]), a byte outside the store.",
+  "assertion": "psram_write_attr",
+  "description": "A byte store writes the next byte too (rs2's second byte).",
   "expect": "fail",
-  "deep": false,
-  "rtl": "verif/cosim/mutants/store_extra_byte"
+  "deep": false
 }

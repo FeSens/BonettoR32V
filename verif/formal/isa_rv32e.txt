@@ -38,3 +38,11 @@ xori
 fence
 ecall
 ebreak
+csrrw
+csrrs
+csrrc
+csrrwi
+csrrsi
+csrrci
+mret
+wfi

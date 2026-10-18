@@ -4,20 +4,26 @@
 Reads third_party/riscv-formal/insns/isa_rv32i.txt (the 37 RV32I computational,
 memory and control instructions) and writes:
 
-  isa_rv32e.txt  the 40 instruction names: the 37 RV32I ones plus fence, ecall, ebreak.
+  isa_rv32e.txt  the 48 instruction names: the 37 RV32I ones plus fence, ecall, ebreak, the six
+                 Zicsr instructions, mret and wfi (contract v3 section 4).
   isa_rv32e.v    Verilog modules:
-    rvfi_insn_fence / rvfi_insn_ecall / rvfi_insn_ebreak
+    rvfi_insn_<new>
         New models (riscv-formal has none). Contract section 4: FENCE (every
         encoding with opcode MISC-MEM and funct3 000, FENCE.TSO and PAUSE
-        included) is a no-op; ECALL (0x00000073) and EBREAK (0x00100073) trap.
+        included) is a no-op; ECALL (0x00000073) and EBREAK (0x00100073) trap;
+        the CSR instructions on the listed CSR numbers (a write to the read-only
+        0xF11-0xF14 is UNSPECIFIED, so not modeled) read rs1 (register forms),
+        write rd and go to pc + 4; MRET (0x30200073) and WFI (0x10500073) use no
+        register and no memory. The CSR state (a CSR instruction's rd value,
+        MRET's target) is not visible to a model: the csr check compares it.
     rvfi_insn_e_<name>  (one per instruction)
-        The E filter: wraps the stock rv32i model from the submodule and gates
-        spec_valid off when any register field the instruction uses names
-        x16-x31. Those encodings are reserved in RV32E (contract section 4), so
-        the instruction checks demand nothing of them; the consistency checks
-        still apply.
+        The E filter: wraps the model (stock rv32i from the submodule, or new)
+        and gates spec_valid off when any register field the instruction uses
+        names x16-x31. Those encodings are reserved in RV32E (contract section
+        4), so the instruction checks demand nothing of them; the consistency
+        checks still apply.
     rvfi_isa_rv32e
-        All 40 E-filtered models muxed into one spec, in riscv-formal's
+        All 48 E-filtered models muxed into one spec, in riscv-formal's
         rvfi_isa_<isa> layout.
 
 Usage: python3 verif/formal/gen_isa_rv32e.py [--check]
@@ -30,7 +36,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 RVI_TXT = os.path.join(ROOT, "third_party", "riscv-formal", "insns", "isa_rv32i.txt")
 
-NEW_INSNS = ["fence", "ecall", "ebreak"]
+NEW_INSNS = ["fence", "ecall", "ebreak", "csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi",
+             "csrrci", "mret", "wfi"]
 
 PORTS = """\
   input                                 rvfi_valid,
@@ -113,10 +120,186 @@ NEW_MODELS = {
   assign spec_mem_wmask = 0;
   assign spec_mem_wdata = 0;
 """,
+    "csrrw": """\
+  // CSRRW (contract v3 section 4): funct3 001, a listed CSR number (mstatus, misa, mie,
+  // mtvec, mscratch, mepc, mcause, mtval, mip, mvendorid..mhartid); a write to the read-only
+  // 0xF11-0xF14 (always a write) is UNSPECIFIED. rd gets the old CSR value: spec_rd_wdata is not
+  // compared by the insn check (the csr check compares it with its CSR shadow).
+  wire [11:0] csr = rvfi_insn[31:20];
+  wire listed = csr == 12'h 300 || csr == 12'h 301 || csr == 12'h 304 || csr == 12'h 305 ||
+                csr == 12'h 340 || csr == 12'h 341 || csr == 12'h 342 || csr == 12'h 343 ||
+                csr == 12'h 344 || csr == 12'h f11 || csr == 12'h f12 || csr == 12'h f13 ||
+                csr == 12'h f14;
+  wire writes = 1;
+  assign spec_valid = rvfi_valid && rvfi_insn[6:0] == 7'b 1110011 && rvfi_insn[14:12] == 3'b 001 &&
+                      listed && !(writes && csr[11:10] == 2'b 11);
+  assign spec_trap = 0;
+  assign spec_rs1_addr = rvfi_insn[19:15];
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = rvfi_insn[11:7];
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "csrrs": """\
+  // CSRRS (contract v3 section 4): funct3 010, a listed CSR number (mstatus, misa, mie,
+  // mtvec, mscratch, mepc, mcause, mtval, mip, mvendorid..mhartid); a write to the read-only
+  // 0xF11-0xF14 (rs1 not x0) is UNSPECIFIED. rd gets the old CSR value: spec_rd_wdata is not
+  // compared by the insn check (the csr check compares it with its CSR shadow).
+  wire [11:0] csr = rvfi_insn[31:20];
+  wire listed = csr == 12'h 300 || csr == 12'h 301 || csr == 12'h 304 || csr == 12'h 305 ||
+                csr == 12'h 340 || csr == 12'h 341 || csr == 12'h 342 || csr == 12'h 343 ||
+                csr == 12'h 344 || csr == 12'h f11 || csr == 12'h f12 || csr == 12'h f13 ||
+                csr == 12'h f14;
+  wire writes = rvfi_insn[19:15] != 0;
+  assign spec_valid = rvfi_valid && rvfi_insn[6:0] == 7'b 1110011 && rvfi_insn[14:12] == 3'b 010 &&
+                      listed && !(writes && csr[11:10] == 2'b 11);
+  assign spec_trap = 0;
+  assign spec_rs1_addr = rvfi_insn[19:15];
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = rvfi_insn[11:7];
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "csrrc": """\
+  // CSRRC (contract v3 section 4): funct3 011, a listed CSR number (mstatus, misa, mie,
+  // mtvec, mscratch, mepc, mcause, mtval, mip, mvendorid..mhartid); a write to the read-only
+  // 0xF11-0xF14 (rs1 not x0) is UNSPECIFIED. rd gets the old CSR value: spec_rd_wdata is not
+  // compared by the insn check (the csr check compares it with its CSR shadow).
+  wire [11:0] csr = rvfi_insn[31:20];
+  wire listed = csr == 12'h 300 || csr == 12'h 301 || csr == 12'h 304 || csr == 12'h 305 ||
+                csr == 12'h 340 || csr == 12'h 341 || csr == 12'h 342 || csr == 12'h 343 ||
+                csr == 12'h 344 || csr == 12'h f11 || csr == 12'h f12 || csr == 12'h f13 ||
+                csr == 12'h f14;
+  wire writes = rvfi_insn[19:15] != 0;
+  assign spec_valid = rvfi_valid && rvfi_insn[6:0] == 7'b 1110011 && rvfi_insn[14:12] == 3'b 011 &&
+                      listed && !(writes && csr[11:10] == 2'b 11);
+  assign spec_trap = 0;
+  assign spec_rs1_addr = rvfi_insn[19:15];
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = rvfi_insn[11:7];
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "csrrwi": """\
+  // CSRRWI (contract v3 section 4): funct3 101, a listed CSR number (mstatus, misa, mie,
+  // mtvec, mscratch, mepc, mcause, mtval, mip, mvendorid..mhartid); a write to the read-only
+  // 0xF11-0xF14 (always a write) is UNSPECIFIED. rd gets the old CSR value: spec_rd_wdata is not
+  // compared by the insn check (the csr check compares it with its CSR shadow).
+  wire [11:0] csr = rvfi_insn[31:20];
+  wire listed = csr == 12'h 300 || csr == 12'h 301 || csr == 12'h 304 || csr == 12'h 305 ||
+                csr == 12'h 340 || csr == 12'h 341 || csr == 12'h 342 || csr == 12'h 343 ||
+                csr == 12'h 344 || csr == 12'h f11 || csr == 12'h f12 || csr == 12'h f13 ||
+                csr == 12'h f14;
+  wire writes = 1;
+  assign spec_valid = rvfi_valid && rvfi_insn[6:0] == 7'b 1110011 && rvfi_insn[14:12] == 3'b 101 &&
+                      listed && !(writes && csr[11:10] == 2'b 11);
+  assign spec_trap = 0;
+  assign spec_rs1_addr = 0;
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = rvfi_insn[11:7];
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "csrrsi": """\
+  // CSRRSI (contract v3 section 4): funct3 110, a listed CSR number (mstatus, misa, mie,
+  // mtvec, mscratch, mepc, mcause, mtval, mip, mvendorid..mhartid); a write to the read-only
+  // 0xF11-0xF14 (a nonzero zimm) is UNSPECIFIED. rd gets the old CSR value: spec_rd_wdata is not
+  // compared by the insn check (the csr check compares it with its CSR shadow).
+  wire [11:0] csr = rvfi_insn[31:20];
+  wire listed = csr == 12'h 300 || csr == 12'h 301 || csr == 12'h 304 || csr == 12'h 305 ||
+                csr == 12'h 340 || csr == 12'h 341 || csr == 12'h 342 || csr == 12'h 343 ||
+                csr == 12'h 344 || csr == 12'h f11 || csr == 12'h f12 || csr == 12'h f13 ||
+                csr == 12'h f14;
+  wire writes = rvfi_insn[19:15] != 0;
+  assign spec_valid = rvfi_valid && rvfi_insn[6:0] == 7'b 1110011 && rvfi_insn[14:12] == 3'b 110 &&
+                      listed && !(writes && csr[11:10] == 2'b 11);
+  assign spec_trap = 0;
+  assign spec_rs1_addr = 0;
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = rvfi_insn[11:7];
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "csrrci": """\
+  // CSRRCI (contract v3 section 4): funct3 111, a listed CSR number (mstatus, misa, mie,
+  // mtvec, mscratch, mepc, mcause, mtval, mip, mvendorid..mhartid); a write to the read-only
+  // 0xF11-0xF14 (a nonzero zimm) is UNSPECIFIED. rd gets the old CSR value: spec_rd_wdata is not
+  // compared by the insn check (the csr check compares it with its CSR shadow).
+  wire [11:0] csr = rvfi_insn[31:20];
+  wire listed = csr == 12'h 300 || csr == 12'h 301 || csr == 12'h 304 || csr == 12'h 305 ||
+                csr == 12'h 340 || csr == 12'h 341 || csr == 12'h 342 || csr == 12'h 343 ||
+                csr == 12'h 344 || csr == 12'h f11 || csr == 12'h f12 || csr == 12'h f13 ||
+                csr == 12'h f14;
+  wire writes = rvfi_insn[19:15] != 0;
+  assign spec_valid = rvfi_valid && rvfi_insn[6:0] == 7'b 1110011 && rvfi_insn[14:12] == 3'b 111 &&
+                      listed && !(writes && csr[11:10] == 2'b 11);
+  assign spec_trap = 0;
+  assign spec_rs1_addr = 0;
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = rvfi_insn[11:7];
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "mret": """\
+  // MRET (contract v3 section 4): exactly 0x30200073; pc = mepc, MIE = MPIE, MPIE = 1. No
+  // register or memory use. spec_pc_wdata is not compared by the insn check (the csr check
+  // compares pc_wdata with its mepc shadow).
+  assign spec_valid = rvfi_valid && rvfi_insn == 32'h 30200073;
+  assign spec_trap = 0;
+  assign spec_rs1_addr = 0;
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = 0;
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = 0;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
+    "wfi": """\
+  // WFI (contract v3 section 4): exactly 0x10500073; retires (it may stall before the next
+  // retirement, see liveness) and goes to pc + 4. No register or memory use.
+  assign spec_valid = rvfi_valid && rvfi_insn == 32'h 10500073;
+  assign spec_trap = 0;
+  assign spec_rs1_addr = 0;
+  assign spec_rs2_addr = 0;
+  assign spec_rd_addr = 0;
+  assign spec_rd_wdata = 0;
+  assign spec_pc_wdata = rvfi_pc_rdata + 4;
+  assign spec_mem_addr = 0;
+  assign spec_mem_rmask = 0;
+  assign spec_mem_wmask = 0;
+  assign spec_mem_wdata = 0;
+""",
 }
 
 HEADER = ("// DO NOT EDIT -- generated by verif/formal/gen_isa_rv32e.py from\n"
-          "// third_party/riscv-formal/insns/isa_rv32i.txt plus the fence, ecall and ebreak models.\n")
+          "// third_party/riscv-formal/insns/isa_rv32i.txt plus the fence, ecall, ebreak, Zicsr,\n"
+          "// mret and wfi models.\n")
 
 
 def rv32i_insns():
@@ -152,20 +335,13 @@ def gen_v():
         out.append(f"\nmodule rvfi_insn_{insn} (\n{PORTS}\n);\n{NEW_MODELS[insn]}endmodule\n")
     # E-filtered wrappers.
     for insn in all_insns():
-        filt = insn not in NEW_INSNS
         body = [f"\nmodule rvfi_insn_e_{insn} (\n{PORTS}\n);"]
-        if filt:
-            body.append("  wire raw_valid;")
-            body.append(f"  rvfi_insn_{insn} model (")
-            body.append(conn("spec_").replace(".spec_valid(spec_valid)", ".spec_valid(raw_valid)"))
-            body.append("  );")
-            body.append("  // E filter: a used register field naming x16-x31 makes the encoding reserved.")
-            body.append("  assign spec_valid = raw_valid && !spec_rs1_addr[4] && !spec_rs2_addr[4] && !spec_rd_addr[4];")
-        else:
-            body.append(f"  rvfi_insn_{insn} model (")
-            c = conn("spec_")
-            body.append(c)
-            body.append("  );")
+        body.append("  wire raw_valid;")
+        body.append(f"  rvfi_insn_{insn} model (")
+        body.append(conn("spec_").replace(".spec_valid(spec_valid)", ".spec_valid(raw_valid)"))
+        body.append("  );")
+        body.append("  // E filter: a used register field naming x16-x31 makes the encoding reserved.")
+        body.append("  assign spec_valid = raw_valid && !spec_rs1_addr[4] && !spec_rs2_addr[4] && !spec_rd_addr[4];")
         body.append("endmodule\n")
         out.append("\n".join(body))
     # Combined ISA module.

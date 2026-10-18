@@ -1,0 +1,10 @@
+{
+  "class": "EBREAK's mcause is 11",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_read",
+  "description": "The cause decode drops insn[20]: EBREAK records cause 11 (ECALL's).",
+  "expect": "fail",
+  "deep": false
+}

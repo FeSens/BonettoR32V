@@ -1,9 +1,0 @@
-{
-  "class": "a READ that straddles into the region",
-  "checks": [
-    "bus_dmem"
-  ],
-  "description": "Before a trapping instruction retires, the core READs 4 bytes at 0xFF7E: two program bytes and two region bytes in one transaction.",
-  "expect": "fail",
-  "deep": false
-}

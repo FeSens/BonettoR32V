@@ -1,10 +1,10 @@
 {
-  "class": "a decoder bug in SUB",
+  "class": "SUB adds",
   "checks": [
-    "insn_sub",
-    "insn_add"
+    "insn_sub"
   ],
-  "description": "SUB (funct3 000) is decoded as ADD.",
+  "assertion": "insn_rd_wdata",
+  "description": "The subtract decode needs funct3[0] = 1 too, so SUB adds.",
   "expect": "fail",
   "deep": false
 }

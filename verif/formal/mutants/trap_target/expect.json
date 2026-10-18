@@ -1,0 +1,10 @@
+{
+  "class": "a trap jumps through the wrong core-region word",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_trap_target",
+  "description": "A trap sequence's C reads core-region CSR word 0, not mtvec.",
+  "expect": "fail",
+  "deep": false
+}

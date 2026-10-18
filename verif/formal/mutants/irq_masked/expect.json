@@ -1,0 +1,10 @@
+{
+  "class": "the interrupt ignores mstatus.MIE",
+  "checks": [
+    "irq"
+  ],
+  "assertion": "csr_irq_enabled",
+  "description": "An interrupt is taken with MIE = 0.",
+  "expect": "fail",
+  "deep": false
+}

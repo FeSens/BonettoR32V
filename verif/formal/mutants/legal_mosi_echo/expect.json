@@ -1,8 +1,0 @@
-{
-  "class": "legal_mosi_echo",
-  "checks": "all",
-  "description": "Legal: no header gate on the shift-in, so after a 56-bit transaction's last bit (CS_n still low) MOSI carries MISO's header-phase noise; the contract constrains MOSI only at rising SCK edges.",
-  "expect": "pass",
-  "deep": false,
-  "rtl": "verif/cosim/mutants/legal_mosi_echo"
-}

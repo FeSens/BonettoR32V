@@ -1,12 +1,10 @@
 {
-  "class": "region_wrap",
+  "class": "core-region words at a 2-byte offset",
   "checks": [
-    "bus_dmem"
+    "psram_write"
   ],
-  "description": "hyp/002-rf-in-ram with register slots at 0xFFC2 + 4r: x15's 4-byte transactions run 0xFFFE..0x0001, out of the core region.",
+  "assertion": "psram_write_attr",
+  "description": "Core-region word addresses get bit 1 set: x15's word (0x7FFFFC) is written at 0x7FFFFE and wraps to PSRAM 0x000000-0x000001, outside the core region.",
   "expect": "fail",
-  "deep": false,
-  "rtl": "verif/cosim/mutants/region_wrap",
-  "timing": "legal_h002_rf",
-  "slow": true
+  "deep": false
 }

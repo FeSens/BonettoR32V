@@ -1,0 +1,10 @@
+{
+  "class": "flash CS_n low while rst_n is low",
+  "checks": [
+    "reset"
+  ],
+  "assertion": "qspi_reset_cs",
+  "description": "The flash CS_n is forced low while rst_n is low (contract 1: both CS_n high). Only the reset check sees it: with the one-edge reset of the other checks, rst_n is already high in step 1, the first step the pins are compared.",
+  "expect": "fail",
+  "deep": false
+}

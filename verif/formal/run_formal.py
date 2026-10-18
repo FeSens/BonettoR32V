@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""BonettoR32V formal gate: riscv-formal-style checks on the real TT top at its pins.
+"""BonettoR32V formal gate (contract v3): riscv-formal-style checks on the real TT top at its
+pins, on TT's QSPI Pmod.
 
   python3 verif/formal/run_formal.py [--deep] [--only REGEX] [--jobs N] [--timing JSON]
 
-Run it under the heavy-job lock:  lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py
+Run it on hwe-bench (BONETTO_FORMAL_HOST=hwe-bench, its own lock), or on the Mac under the
+heavy-job lock:  lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py
 
 Steps:
-  1. Stage src/*.v and src/*.sv (plus *.vh/*.svh includes) into a per-PID work dir
-     build/formal/work-<pid>/ (stale dirs of dead PIDs are reaped).
+  1. Stage src/*.v and src/*.sv (plus *.vh/*.svh includes), then the sky130 cell models
+     (verif/cells/*.v, contract section 1), into a per-PID work dir build/formal/work-<pid>/
+     (stale dirs of dead PIDs are reaped).
   2. Pre-pass (yosys): elaborate the RISCV_FORMAL build of tt_um_fesens_r32v (src/ is
      read with -DRISCV_FORMAL and no other define), check its structure (no latches,
      every flip-flop on the rising edge of clk, no formal-only cells), strip any
-     formal statements and initial values from the core, write core.il. The checkers are read separately, so the core's macros
-     and modules cannot reach them (a module name clash is a yosys error).
-  3. Depth (never set by an agent), from the timing measured on the candidate (the
-     cosim's --timing-json when available, else verif/formal/timing_tb.v run with
-     Icarus). Full depth D = max(depth_floor, D_min), D_min = reset_steps +
-     max(first_retire_cycle, max_cycles_per_insn) + max_cycles_per_insn + margin.
-     Short depth (checks marked depth=short) = reset_steps + first_retire_cycle +
-     max_cycles(class) + margin, with the slowest class of the instructions under check
-     (all classes for a non-instruction check). A base depth above depth_cap is a FAIL
-     (too slow for the formal policy); liveness's fixed +1,024 is not counted.
+     formal statements and initial values from the core, write core.il. The checkers are
+     read separately, so the core's macros and modules cannot reach them (a module name
+     clash is a yosys error). Then the pins equivalence (RVFI build without its rvfi ports
+     against the plain build).
+  3. Depth (never set by an agent), from the timing the cosim measures on the candidate
+     (run_cosim.py --timing-json, max over the built programs; or --timing JSON). Full depth
+     D = max(depth_floor, D_min), D_min = reset_steps + max(first_retire_cycle,
+     max_cycles_per_insn) + max_cycles_per_insn + margin. Short depth (depth=short) =
+     reset_steps + first_retire_cycle + max_cycles(class) + margin, with the slowest class of
+     the instructions under check (all classes for a non-instruction check). cpi=N (checks
+     that relate several instructions: a store then a load, a CSR write then a read, the
+     three instructions that enable an interrupt) = reset_steps + first_retire_cycle + N x
+     max_cycles_per_insn + margin. A base depth above depth_cap is a FAIL (too slow for the
+     formal policy); liveness's fixed +2,048 is not counted.
+     The signoff period T (src/config.json CLOCK_PERIOD, or --clk-ns) sets the Pmod timing
+     limits: tCEM = floor(8000 / T) cycles, tRST = ceil(50 / T) cycles (contract 2).
   4. Two SBY tasks per check in the config (checks.cfg, or checks-deep.cfg with
      --deep), on the same design and depth: the proof task (the check's assertions)
      and the reach task (only the reach_* statements, each as assert(!trigger), BMC
@@ -38,6 +47,7 @@ import configparser
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -51,6 +61,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 RVF = os.path.join(ROOT, "third_party", "riscv-formal")
+CELLS = os.path.join(ROOT, "verif", "cells")
 OSS_DEFAULT = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-suite/bin")
 TOP = "tt_um_fesens_r32v"
 
@@ -59,10 +70,14 @@ CHECKER_FILES = [
     "checks/rvfi_testbench.sv",
     "checks/bonetto_cons_checks.sv",
     "checks/bonetto_bus_checks.sv",
+    "checks/bonetto_csr_check.sv",
+    "checks/bonetto_io_checks.sv",
     "wrapper.sv",
     "isa_rv32e.v",
 ]
-NEW_INSNS = ("fence", "ecall", "ebreak")
+# Models riscv-formal has no file for (gen_isa_rv32e.py writes them into isa_rv32e.v).
+NEW_INSNS = ("fence", "ecall", "ebreak", "csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci",
+             "mret", "wfi")
 # Parallel SBY tasks: at most 8 on the Mac (heavy-lock rule); a remote host sets more.
 MAX_JOBS = int(os.environ.get("BONETTO_FORMAL_MAX_JOBS", "8"))
 
@@ -75,31 +90,37 @@ CHECKERS = {
     "unique": "bonetto_unique_check",
     "liveness": "bonetto_liveness_check",
     "ill": "bonetto_ill_check",
-    "bus_imem": "bonetto_bus_imem_check",
-    "bus_dmem": "bonetto_bus_dmem_check",
-    "silent": "bonetto_silent_check",
+    "qspi": "bonetto_qspi_check",
+    "psram_write": "bonetto_psram_write_check",
+    "coherence": "bonetto_coherence_check",
+    "csr": "bonetto_csr_check",
+    "irq": "bonetto_csr_check",
     "rvfi": "bonetto_rvfi_check",
-    "spi": "bonetto_spi_check",
     "gpio": "bonetto_gpio_check",
+    "periph": "bonetto_periph_check",
     "reset": "bonetto_reset_check",
     "cover": "bonetto_cover_check",
 }
 
-# Reach labels that must be reached for each check to count (non-vacuity).
+# Reach labels that must be reached for each check to count (non-vacuity). irq is the csr
+# checker at the depth that reaches an interrupt entry (cpi=4), with that one trigger.
 REACH = {
     "reg": ["reach_reg"],
-    "pc_fwd": ["reach_pc_fwd"],
+    "pc_fwd": ["reach_pc_fwd", "reach_pc_fwd_trap"],
     "pc_bwd": ["reach_pc_bwd"],
     "causal": ["reach_causal"],
     "unique": ["reach_unique"],
     "liveness": ["reach_liveness"],
     "ill": ["reach_ill_zero", "reach_ill_ones"],
-    "bus_imem": ["reach_bus_imem"],
-    "bus_dmem": ["reach_bus_dmem_load", "reach_bus_dmem_store"],
-    "silent": ["reach_silent"],
-    "rvfi": ["reach_rvfi"],
-    "spi": ["reach_spi_end_read", "reach_spi_end_write"],
-    "gpio": ["reach_gpio_load", "reach_gpio_store"],
+    "qspi": ["reach_qspi_flash_read", "reach_qspi_psram_read", "reach_qspi_psram_write"],
+    "psram_write": ["reach_psram_write"],
+    "coherence": ["reach_coherence_fetch", "reach_coherence_load", "reach_coherence_store_load"],
+    "csr": ["reach_csr_read", "reach_csr_write_read", "reach_csr_trap_read", "reach_csr_trap",
+            "reach_csr_mret"],
+    "irq": ["reach_csr_irq"],
+    "rvfi": ["reach_rvfi", "reach_rvfi_handler"],
+    "gpio": ["reach_gpio_out", "reach_gpio_altfn"],
+    "periph": ["reach_periph_rw", "reach_periph_pend", "reach_periph_gpio_in"],
     "cover": ["reach_cover_nontrap", "reach_cover_trap", "reach_cover_second"],
     "reset": ["reach_reset"],
 }
@@ -133,6 +154,10 @@ def insn_name(w):
     if op == 0x0f: return "fence"
     if w == 0x00000073: return "ecall"
     if w == 0x00100073: return "ebreak"
+    if w == 0x30200073: return "mret"
+    if w == 0x10500073: return "wfi"
+    if op == 0x73 and f3 in (1, 2, 3, 5, 6, 7):
+        return {1: "csrrw", 2: "csrrs", 3: "csrrc", 5: "csrrwi", 6: "csrrsi", 7: "csrrci"}[f3]
     return "?"
 
 
@@ -143,11 +168,14 @@ CLASS_GROUPS = [
     ["add", "sub", "sll", "slt", "sltu"], ["xor", "srl", "sra", "or", "and"],
     ["addi", "slti", "sltiu", "xori", "ori"], ["andi", "slli", "srli", "srai"],
     ["beq", "bne", "blt", "bge", "bltu", "bgeu"],
-    ["lui", "auipc", "jal", "jalr", "fence", "ecall", "ebreak"],
+    ["lui", "auipc", "jal", "jalr", "fence", "ecall", "ebreak", "mret", "wfi"],
     ["lb", "lh", "lw"], ["lbu", "lhu"], ["sb", "sh", "sw"],
+    ["csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci"],
 ]
 INSN_CLASS = {"lui": "lui", "auipc": "auipc", "jal": "jal", "jalr": "jalr", "fence": "fence",
-              "ecall": "system", "ebreak": "system"}
+              "ecall": "system", "ebreak": "system", "mret": "mret", "wfi": "wfi"}
+for _i in ("csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci"):
+    INSN_CLASS[_i] = "csr"
 for _i in ("beq", "bne", "blt", "bge", "bltu", "bgeu"):
     INSN_CLASS[_i] = "branch"
 for _i in ("lb", "lh", "lw", "lbu", "lhu"):
@@ -165,7 +193,9 @@ for _i in ("add", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and")
 # covers ECALL/EBREAK and the misaligned-target traps of jumps and branches).
 COSIM_CLASSES = {"lui": ["lui_auipc"], "auipc": ["lui_auipc"], "jal": ["jal", "trap"],
                  "jalr": ["jalr", "trap"], "fence": ["fence"], "ecall": ["trap"],
-                 "ebreak": ["trap"]}
+                 "ebreak": ["trap"], "mret": ["mret"], "wfi": ["wfi"]}
+for _i in ("csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci"):
+    COSIM_CLASSES[_i] = ["csr"]
 for _i in ("beq", "bne", "blt", "bge", "bltu", "bgeu"):
     COSIM_CLASSES[_i] = ["branch_taken", "branch_not_taken", "trap"]
 for _i in ("lb", "lh", "lw", "lbu", "lhu"):
@@ -181,34 +211,21 @@ for _i in ("sll", "srl", "sra", "slli", "srli", "srai"):
 
 
 def class_max_cycles(timing, insns):
-    """Slowest measured class among `insns`, from either per_class format (timing_tb.v:
-    {class: {"max_cycles": n}}; cosim: {class: n}). Any class not measured falls back to
+    """Slowest measured class among `insns`, from the cosim's per_class ({class: cycles}, its
+    own class names, COSIM_CLASSES). Any class not measured falls back to
     max_cycles_per_insn, so a missing measurement never shortens the depth."""
     pc = timing.get("per_class") or {}
     fallback = int(timing["max_cycles_per_insn"])
     vals = []
     for i in insns:
-        if pc and all(isinstance(v, dict) for v in pc.values()):
-            c = pc.get(INSN_CLASS.get(i, ""))
-            v = c.get("max_cycles") if c else None
-            vals.append(int(v) if v is not None else fallback)
-        else:
-            names = COSIM_CLASSES.get(i, [])
-            got = [pc[n] for n in names if isinstance(pc.get(n), int)]
-            vals.append(max(got) if names and len(got) == len(names) else fallback)
+        names = COSIM_CLASSES.get(i, [])
+        got = [pc[n] for n in names if isinstance(pc.get(n), int)]
+        vals.append(max(got) if names and len(got) == len(names) else fallback)
     return max(vals) if vals else fallback
 
 
 def is_reach_label(lbl):
     return lbl.startswith("reach_")
-
-
-# Instruction classes for the timing summary (by opcode).
-OPCLASS = {
-    0x37: "lui", 0x17: "auipc", 0x6f: "jal", 0x67: "jalr", 0x63: "branch",
-    0x03: "load", 0x23: "store", 0x13: "alu_imm", 0x33: "alu_reg",
-    0x0f: "fence", 0x73: "system",
-}
 
 
 def log(msg):
@@ -299,6 +316,17 @@ def stage(src_dir, work):
             shutil.copy(p, sdir)
     if not rtl:
         sys.exit(f"[formal] ERROR: no .v/.sv files in {src_dir}")
+    # The behavioral models of the whitelisted sky130 cells src/ may instantiate (contract
+    # section 1; verif/cells/<cell>.v, the files every RTL gate reads after src/*.v, sorted).
+    # Read after the design; unused ones are dropped by the top selection.
+    cdir = os.path.join(work, "cells")
+    os.makedirs(cdir, exist_ok=True)
+    cells = sorted(f for f in os.listdir(CELLS) if f.endswith(".v"))
+    if not cells:
+        sys.exit(f"[formal] ERROR: no cell models in {CELLS}")
+    for name in cells:
+        shutil.copy(os.path.join(CELLS, name), cdir)
+        rtl.append(os.path.join(cdir, name))
     return sdir, rtl
 
 
@@ -426,75 +454,6 @@ equiv_status -assert
 # Timing and depth
 # ---------------------------------------------------------------------------
 
-def timing_from_retires(retires):
-    """retires: list of (cycle, insn, trap). Returns the timing dict."""
-    if not retires:
-        return None
-    first = retires[0][0]
-    gaps = []
-    per_class = {}
-    prev = None
-    for cyc, insn, trap in retires:
-        cls = OPCLASS.get(insn & 0x7f, "other")
-        gap = cyc - prev if prev is not None else cyc
-        prev = cyc
-        gaps.append(gap)
-        c = per_class.setdefault(cls, {"count": 0, "max_cycles": 0, "first_retire_cycle": cyc})
-        c["count"] += 1
-        c["max_cycles"] = max(c["max_cycles"], gap)
-    return {"first_retire_cycle": first, "max_cycles_per_insn": max(gaps[1:] or gaps),
-            "per_class": per_class, "retired": len(retires)}
-
-
-def measure_timing(work, sdir, rtl, prog_hex):
-    """Fallback: run timing_tb.v (Icarus) on the candidate."""
-    tb = os.path.join(work, "timing_tb")
-    rc = run(["iverilog", "-g2012", "-DRISCV_FORMAL", "-o", tb,
-              os.path.join(HERE, "timing_tb.v")] + rtl, cwd=work,
-             log_path=os.path.join(work, "timing_build.log"))
-    if rc != 0:
-        return None, "iverilog build failed (see timing_build.log)"
-    out = os.path.join(work, "timing_run.log")
-    rc = run(["vvp", "-n", tb, f"+hex={prog_hex}", "+max_cycles=400000"], cwd=work, log_path=out,
-             timeout=600)
-    retires = []
-    halted = False
-    for line in open(out):
-        m = re.match(r"RETIRE (\d+) ([0-9a-fA-F]+) (\d)", line)
-        if m:
-            retires.append((int(m.group(1)), int(m.group(2), 16), int(m.group(3))))
-        if line.startswith("HALT"):
-            halted = True
-    t = timing_from_retires(retires)
-    if t is None:
-        return None, "no retirement in the timing run"
-    t["halted"] = halted
-    return t, "timing_tb.v (Icarus fallback)"
-
-
-def build_timing_prog(work):
-    """The program for the fallback timing run: selftest if built, else timing_prog.S."""
-    selftest = os.path.join(ROOT, "build", "programs", "selftest.hex")
-    if os.path.isfile(selftest):
-        return selftest, "build/programs/selftest.hex"
-    gcc = shutil.which("riscv32-unknown-elf-gcc")
-    objcopy = shutil.which("riscv32-unknown-elf-objcopy")
-    if not gcc or not objcopy:
-        return None, "no selftest.hex and no riscv32-unknown-elf-gcc"
-    elf = os.path.join(work, "timing_prog.elf")
-    binf = os.path.join(work, "timing_prog.bin")
-    if run([gcc, "-march=rv32e", "-mabi=ilp32e", "-nostdlib", "-Ttext=0", "-o", elf,
-            os.path.join(HERE, "timing_prog.S")]) != 0:
-        return None, "timing_prog.S failed to assemble"
-    run([objcopy, "-O", "binary", elf, binf])
-    data = open(binf, "rb").read()
-    data += bytes(65536 - len(data))
-    hexf = os.path.join(work, "timing_prog.hex")
-    with open(hexf, "w") as f:
-        f.write("".join(f"{b:02x}\n" for b in data))
-    return hexf, "verif/formal/timing_prog.S"
-
-
 # Cosim programs for the timing: every built program but CoreMark, whose instruction
 # classes the selftest and the random programs cover, and which is by far the slowest.
 TIMING_SKIP = ("coremark",)
@@ -513,7 +472,7 @@ def merge_timings(ts):
     return out
 
 
-def cosim_timing(work, sdir):
+def cosim_timing(work, sdir, clk_ns):
     """The candidate's timing from the cosim (rvfi mode, --timing-json), as the max over
     every program in build/programs except TIMING_SKIP. A failing run still reports its
     numbers up to the failure; runs without numbers are ignored. (None, []) if no run
@@ -531,7 +490,8 @@ def cosim_timing(work, sdir):
         out = os.path.join(work, f"cosim_timing_{prog}.json")
         # The cosim measures the staged candidate (--src), from reset release.
         cmd = [sys.executable, cosim, "--mode", "rvfi", "--prog",
-               os.path.join(pdir, prog + ".hex"), "--src", sdir, "--timing-json", out]
+               os.path.join(pdir, prog + ".hex"), "--src", sdir, "--timing-json", out,
+               "--clk-ns", f"{clk_ns:g}"]
         try:
             run(cmd, cwd=ROOT, timeout=3600,
                 log_path=os.path.join(work, f"cosim_timing_{prog}.log"))
@@ -554,23 +514,48 @@ def cosim_timing(work, sdir):
     return merge_timings([t for _, t in got]), [p for p, _ in got]
 
 
-def get_timing(args, work, sdir, rtl):
+def get_timing(args, work, sdir, clk_ns):
+    """The candidate's timing: --timing JSON, else the cosim's (build/programs must be built:
+    make -C verif/programs). The contract-v2 Icarus fallback (a 23LC512 model) is gone: the
+    cosim's QSPI Pmod models are the reference for v3 timing."""
     if args.timing:
         with open(args.timing) as f:
             return json.load(f), args.timing
-    t, progs = cosim_timing(work, sdir)
+    t, progs = cosim_timing(work, sdir, clk_ns)
     if t is not None:
         t["programs"] = progs
         return t, f"run_cosim.py --timing-json, max over {len(progs)} programs"
-    if os.path.isfile(os.path.join(ROOT, "verif", "cosim", "run_cosim.py")):
-        log("cosim timing unavailable; falling back to timing_tb.v")
-    prog, prog_src = build_timing_prog(work)
-    if prog is None:
-        return None, prog_src
-    t, src = measure_timing(work, sdir, rtl, prog)
-    if t is not None:
-        t["program"] = prog_src
-    return t, src
+    return None, ("no cosim timing (build the programs with make -C verif/programs, or pass "
+                  "--timing)")
+
+
+# The Pmod chips' maximum SCK rates (contract 2.2, 2.3), MHz: the slowest is the PSRAM's SPI
+# 0x03 Read at 33 MHz.
+MIN_CMD_MHZ = 33
+
+
+def clock_period_ns(args):
+    """The signoff period T: --clk-ns, else CLOCK_PERIOD in src/config.json (contract section
+    7; the checkout's file, which no candidate edits)."""
+    if args.clk_ns:
+        return float(args.clk_ns)
+    with open(os.path.join(ROOT, "src", "config.json")) as f:
+        return float(json.load(f)["CLOCK_PERIOD"])
+
+
+def pmod_limits(clk_ns):
+    """(tCEM, tRST) in cycles at period clk_ns (contract 2: '8 us' is floor(8000 / T) cycles,
+    tRST is 50 ns, so ceil(50 / T) cycles; the cosim's pmod.h computes the same). The SCK
+    rate limits (2.1.3) need no check at the cycle level as long as the fastest possible SCK,
+    one cycle high and one low, is within the slowest command's limit; otherwise the monitor
+    would have to count phases per command, which it does not, so the run is refused."""
+    tcem = int(math.floor(8000.0 / clk_ns + 1e-9))
+    trst = int(math.ceil(50.0 / clk_ns - 1e-9))
+    if 2 * clk_ns < 1000.0 / MIN_CMD_MHZ - 1e-9:
+        raise SystemExit(f"[formal] ERROR: at T = {clk_ns:g} ns a 2-cycle SCK period exceeds "
+                         f"the {MIN_CMD_MHZ} MHz limit of contract 2.3; the QSPI monitor does "
+                         "not model per-command SCK rates")
+    return tcem, trst
 
 
 def pick_depth(cfg, timing):
@@ -591,6 +576,24 @@ def short_depth(cfg, timing, insns=None):
     covered: two slow (memory) instructions in a row."""
     mx = class_max_cycles(timing, insns) if insns else int(timing["max_cycles_per_insn"])
     return cfg["reset_steps"] + int(timing["first_retire_cycle"]) + mx + cfg["depth_margin"]
+
+
+def cpi_depth(cfg, timing, n):
+    """Per-check option cpi=N: reset + first_retire + N x max_cycles_per_insn + margin, for the
+    checks whose triggers relate several instructions (coherence: a store, then a load of the
+    same byte; csr: a CSR write or a trap, then a read; irq: the IO store and the two CSR
+    writes that enable an interrupt, the entry, then the handler's first instruction)."""
+    return (cfg["reset_steps"] + int(timing["first_retire_cycle"]) +
+            n * int(timing["max_cycles_per_insn"]) + cfg["depth_margin"])
+
+
+def base_depth(cfg, timing, opts, depth, insns=None):
+    """A check's base depth from its config options (cpi=N, depth=short, else the full D)."""
+    if "cpi" in opts:
+        return cpi_depth(cfg, timing, int(opts["cpi"]))
+    if opts.get("depth") == "short":
+        return short_depth(cfg, timing, insns)
+    return depth
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +668,7 @@ def group_model(insns):
 
 
 def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, reset_free=False,
-              role="proof", reach=None):
+              role="proof", reach=None, extra_defines=()):
     """One SBY task. role "proof": the check's assertions (reach statements removed).
     role "reach": only the required reach_* statements (`reach`), each as
     assert(!trigger), so a failed one is a reached trigger (the check's own design and
@@ -701,6 +704,7 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
         defines.append("`define RISCV_FORMAL_INSN_MODEL bonetto_insn_group")
     if reset_free:
         defines.append("`define BONETTO_RESET_FREE")
+    defines += list(extra_defines)
     if role == "reach":
         defines.append("`define BONETTO_REACH_AS_ASSERT")
         keep = " ".join(f"c:*.{lbl}" for lbl in reach)
@@ -904,12 +908,14 @@ def kill_running(*_):
     os._exit(130)
 
 
-# Memory per SBY task (bitwuzla plus yosys-smtbmc), linear in the depth: measured about
-# 1.4 GB at depth 348 (the seed) and 6.1 GB at depth 1,623 (V2, hyp/002 b9a5211) for
-# bitwuzla, plus about 0.4 GB for smtbmc. A run uses at most budget / per-task jobs, so
-# it cannot push a shared host into swap.
+# Memory per SBY task (bitwuzla plus yosys-smtbmc), linear in the depth. Contract v3 on the
+# champion (346c4a3, hwe-bench, bitwuzla RSS): irq 13.7 GB at depth 1,448, csr 7.6 GB and
+# coherence 6.9 GB at 870, periph 3.5 GB and gpio 3.3 GB at 581, about 9.5 MB per step at
+# most, plus about 0.4 GB for smtbmc. (The v2 checks needed 3.7 MB per step: 1.4 GB at 348,
+# 6.1 GB at 1,623.) A run uses at most budget / per-task jobs, so it cannot push a shared
+# host into swap.
 GB_BASE = 0.4
-GB_PER_STEP = 0.0037
+GB_PER_STEP = 0.0095
 
 
 def mem_budget_gb():
@@ -934,9 +940,9 @@ def mem_budget_gb():
         return 16.0
 
 
-# Tasks that need several times the linear estimate: reset (free reset length) reached
-# 22 GB at depth 1,222 on hyp/002-rf-in-ram (fc07cc3), against 4.9 GB estimated.
-TASK_MEM_WEIGHT = {"reset": 5}
+# Tasks that need more than the linear estimate: reset (free reset length) reached 22 GB at
+# depth 1,222 on a v2 core (hyp/002-rf-in-ram fc07cc3), 6.2 GB at 581 on the v3 champion.
+TASK_MEM_WEIGHT = {"reset": 2}
 
 
 def task_mem_gb(name, depth):
@@ -974,9 +980,10 @@ def mem_jobs(depth, jobs, budget=None):
 
 
 # Relative cost of each task (measured on the seed, see docs/formal.md), for ordering.
-TASK_COST = {"liveness": 900, "bus_dmem": 500, "reg": 450, "insn_group": 300, "reset": 300,
-             "bus_imem": 180, "gpio": 100, "rvfi": 90, "pc_bwd": 80, "pc_fwd": 70,
-             "unique": 60, "causal": 60, "ill": 50, "silent": 50, "spi": 40, "cover": 20}
+TASK_COST = {"liveness": 900, "irq": 800, "coherence": 600, "csr": 550, "reg": 450,
+             "psram_write": 400, "insn_group": 300, "reset": 300, "periph": 120, "gpio": 100,
+             "rvfi": 90, "pc_bwd": 80, "pc_fwd": 70, "unique": 60, "causal": 60, "ill": 50,
+             "qspi": 40, "cover": 20}
 
 
 def task_cost(tname):
@@ -1274,20 +1281,10 @@ def _run_remote(args, host, tempfile):
     qd = shlex.quote(rdir)
     local_logs = os.path.join(ROOT, "build", "formal", f"remote-{run_id}")
     with tempfile.TemporaryDirectory(prefix="bonetto-formal-") as stg:
-        # Timing (cosim or the Icarus fallback) runs here, where the cosim lives.
-        timing = args.timing
-        if not timing:
-            timing = os.path.join(stg, "local_timing.json")
-            env = dict(os.environ, BONETTO_FORMAL_HOST="")
-            p = subprocess.run([sys.executable, os.path.abspath(__file__), "--host", "",
-                                "--src", args.src, "--timing-only", timing], env=env,
-                               capture_output=True, text=True)
-            sys.stdout.write(p.stdout)
-            if p.returncode != 0 or not os.path.isfile(timing):
-                log("remote: local pre-pass/timing failed")
-                sys.stdout.write(p.stderr)
-                return 1
-        # Stage exactly the inputs.
+        # Stage exactly the inputs: the candidate's src, verif/formal, the cell models, the
+        # riscv-formal macros and models, and either the timing JSON or what the cosim needs to
+        # measure it there (verif/cosim and the built programs): the cosim is Verilator, which
+        # runs on the remote host, never on the Mac (CLAUDE.md, Mac load).
         os.makedirs(os.path.join(stg, "src"))
         for name in os.listdir(args.src):
             sp = os.path.join(args.src, name)
@@ -1295,12 +1292,28 @@ def _run_remote(args, host, tempfile):
                 shutil.copy(sp, os.path.join(stg, "src", name))
         shutil.copytree(HERE, os.path.join(stg, "verif", "formal"),
                         ignore=shutil.ignore_patterns("mutants", "__pycache__", "*.pyc"))
+        shutil.copytree(CELLS, os.path.join(stg, "verif", "cells"))
         os.makedirs(os.path.join(stg, "third_party", "riscv-formal", "checks"))
         shutil.copy(os.path.join(RVF, "checks", "rvfi_macros.vh"),
                     os.path.join(stg, "third_party", "riscv-formal", "checks"))
         shutil.copytree(os.path.join(RVF, "insns"),
                         os.path.join(stg, "third_party", "riscv-formal", "insns"))
-        shutil.copy(timing, os.path.join(stg, "timing.json"))
+        timing_arg = []
+        if args.timing:
+            shutil.copy(args.timing, os.path.join(stg, "timing.json"))
+            timing_arg = ["--timing", "timing.json"]
+        else:
+            pdir = os.path.join(ROOT, "build", "programs")
+            if not os.path.isfile(os.path.join(pdir, "selftest.hex")):
+                log("remote: build/programs is not built (make -C verif/programs), and no --timing")
+                return 1
+            shutil.copytree(os.path.join(ROOT, "verif", "cosim"),
+                            os.path.join(stg, "verif", "cosim"),
+                            ignore=shutil.ignore_patterns("mutants", "__pycache__", "*.pyc"))
+            os.makedirs(os.path.join(stg, "build", "programs"))
+            for name in os.listdir(pdir):
+                if name.endswith((".hex", ".expect.json", ".stim")):
+                    shutil.copy(os.path.join(pdir, name), os.path.join(stg, "build", "programs"))
         cfg_arg = []
         if args.config:
             shutil.copy(args.config, os.path.join(stg, "config.cfg"))
@@ -1320,14 +1333,16 @@ def _run_remote(args, host, tempfile):
             fwd = ["--deep"] if args.deep else []
             fwd += ["--only", args.only] if args.only else []
             fwd += ["--keep-going"] if args.keep_going else []
+            fwd += ["--tasks", args.tasks] if args.tasks != "all" else []
             jobs = args.jobs or REMOTE_JOBS
             mem = os.environ.get("BONETTO_FORMAL_MEM_GB")   # a budget set here holds there
             mem_env = f"BONETTO_FORMAL_MEM_GB={shlex.quote(mem)} " if mem else ""
+            clk = clock_period_ns(args)
             inner = (f"flock ../formal.lock env BONETTO_OSS_CAD={shlex.quote(REMOTE_OSS)} "
                      f"{mem_env}BONETTO_FORMAL_MAX_JOBS={jobs} BONETTO_FORMAL_HOST= python3 "
-                     f"verif/formal/run_formal.py --host '' --src src --timing timing.json "
+                     f"verif/formal/run_formal.py --host '' --src src --clk-ns {clk:g} "
                      f"--out out/formal.json --jobs {jobs} --keep "
-                     + " ".join(shlex.quote(a) for a in cfg_arg + fwd))
+                     + " ".join(shlex.quote(a) for a in timing_arg + cfg_arg + fwd))
             body = f"echo $$ > remote.pid; {inner}; echo $? > done"
             log(f"remote: {host}:{rdir} (jobs={jobs}, detached)")
             launched = True
@@ -1435,10 +1450,16 @@ def main():
     ap.add_argument("--keep-going", action="store_true",
                     help="run every task even after a FAIL (default: stop at the first FAIL "
                     "or UNREACHED)")
+    ap.add_argument("--tasks", choices=("all", "proof", "reach"), default="all",
+                    help="run only the proof tasks (a mutant's counterexample) or only the reach "
+                    "tasks (non-vacuity); the checks whose other task did not run are SKIPPED, "
+                    "so the result is partial")
     ap.add_argument("--host", default=os.environ.get("BONETTO_FORMAL_HOST") or None,
                     help="run on this ssh host instead (default $BONETTO_FORMAL_HOST; unset = "
                     "locally). See run_remote().")
     ap.add_argument("--timing", help="timing JSON (cosim --timing-json format)")
+    ap.add_argument("--clk-ns", type=float, help="signoff clock period in ns (default: "
+                    "CLOCK_PERIOD in src/config.json)")
     ap.add_argument("--only", help="regex: run only matching checks (result is marked partial)")
     ap.add_argument("--keep", action="store_true", help="keep the work dir")
     ap.add_argument("--fetch-orphans", action="store_true",
@@ -1505,7 +1526,12 @@ def main():
         result["failures"]["equiv"] = {"why": msg}
         finish(1)
 
-    timing, tsrc = get_timing(args, work, sdir, rtl)
+    clk_ns = clock_period_ns(args)
+    tcem, trst = pmod_limits(clk_ns)
+    result["pmod"] = {"clk_ns": clk_ns, "tcem_cycles": tcem, "trst_cycles": trst}
+    log(f"signoff period T = {clk_ns:g} ns: tCEM = {tcem} cycles, tRST = {trst} cycles")
+    pmod_defines = [f"`define BONETTO_TCEM {tcem}", f"`define BONETTO_TRST {trst}"]
+    timing, tsrc = get_timing(args, work, sdir, clk_ns)
     if timing is None:
         result["error"] = f"no timing: {tsrc}"
         log(result["error"])
@@ -1524,8 +1550,8 @@ def main():
         f"max_cycles_per_insn={timing['max_cycles_per_insn']} -> D_min={d_min}, D={depth}")
     d_short = short_depth(cfg, timing)
     result["depth_policy"]["d_short"] = d_short
-    # The cap bounds the candidate-derived depth (liveness's fixed +1,024 is not counted).
-    deepest = max(d_short if o.get("depth") == "short" else depth for _, _, o in cfg["checks"])
+    # The cap bounds the candidate-derived depth (liveness's fixed +2,048 is not counted).
+    deepest = max(base_depth(cfg, timing, o, depth) for _, _, o in cfg["checks"])
     result["depth"] = deepest
     log(f"short depth (depth=short checks) = {d_short}; deepest base depth = {deepest}")
     if deepest > cfg["depth_cap"]:
@@ -1545,8 +1571,7 @@ def main():
         timeout = int(opts.get("timeout", cfg["timeout_s"]))
         ekey = opts.get("engine", kind if kind in cfg["engines"] else "bmc")
         eng = cfg["engines"][ekey]
-        short = opts.get("depth") == "short"
-        base = short_depth(cfg, timing) if short else depth
+        base = base_depth(cfg, timing, opts, depth)
         tdepth = base + int(opts.get("depth_add", 0))
         if kind == "insn":
             insns = [i for i in isa_insns() if not only or only.search(f"insn_{i}")]
@@ -1560,7 +1585,7 @@ def main():
             for g, members in enumerate(glist):
                 tname = f"insn_{members[0]}" if len(members) == 1 else f"insn_group{g}"
                 req = [(f"insn_{i}", insn_reach(i)) for i in members]
-                gdepth = short_depth(cfg, timing, members) if short else depth
+                gdepth = base_depth(cfg, timing, opts, depth, members)
                 items.append((tname, "bonetto_insn_check", members, req, gdepth))
         else:
             if only and not only.search(name):
@@ -1569,11 +1594,16 @@ def main():
         for tname, checker, model, req, ibase in items:
             tdepth = ibase + int(opts.get("depth_add", 0))
             rf = (tname == "reset")
-            p = write_sby(work, tname, checker, tdepth, eng, timeout, model=model, reset_free=rf)
+            p = write_sby(work, tname, checker, tdepth, eng, timeout, model=model, reset_free=rf,
+                          extra_defines=pmod_defines)
             r = write_sby(work, tname + "_reach", checker, tdepth, reach_eng, timeout,
                           model=model, reset_free=rf, role="reach",
-                          reach=[l for _, labels in req for l in labels])
-            jobs_todo += [(tname, p, timeout, tdepth), (tname + "_reach", r, timeout, tdepth)]
+                          reach=[l for _, labels in req for l in labels],
+                          extra_defines=pmod_defines)
+            if args.tasks != "reach":
+                jobs_todo.append((tname, p, timeout, tdepth))
+            if args.tasks != "proof":
+                jobs_todo.append((tname + "_reach", r, timeout, tdepth))
             units.append((tname, req))
             for cname, _ in req:
                 task_depths[cname] = tdepth
@@ -1602,6 +1632,12 @@ def main():
     for tname, req in units:
         unit_req[tname] = [l for _, labels in req for l in labels]
     results = {}
+    skipped_role = {"proof": "_reach", "reach": ""}.get(args.tasks)
+    if skipped_role is not None:
+        result["complete"] = False
+        for tname, _ in units:
+            results[tname + skipped_role] = (tname + skipped_role, "SKIPPED", 0.0,
+                                             {"failed": [], "traces": {}, "errors": []})
     first_fail = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
         futs = [ex.submit(run_task, n, p, to, d) for n, p, to, d in jobs_todo]

@@ -1,194 +1,261 @@
 # Formal verification at the pins
 
-`verif/formal` proves the contract (`docs/contract.md`, sections 2-4 and 6) on the real Tiny
-Tapeout top module, `tt_um_fesens_r32v`, at its pins. It is a fixed gate: hypothesis agents never
-edit it. It runs at the final sign-off and at every 10th merged improvement of the area loop
-(the user's policy), not per candidate.
+`verif/formal` proves the contract (`docs/contract.md` v3: sections 1-6 and 8) on the real Tiny
+Tapeout top module, `tt_um_fesens_r32v`, at its pins, on the TT QSPI Pmod. It is a fixed gate:
+hypothesis agents never edit it. It runs at the final signoff and at every 10th merged
+improvement of the performance loop (contract section 7), not per candidate.
 
 ```
 BONETTO_FORMAL_HOST=hwe-bench python3 verif/formal/run_formal.py [--deep]    # on hwe-bench (use this)
 BONETTO_FORMAL_HOST=hwe-bench python3 verif/formal/run_formal.py --fetch-orphans   # after a crash
-lockf -k /tmp/bonetto-heavy.lock python3 verif/formal/run_formal.py [--deep] # on the Mac (seed-sized only)
-pytest verif/formal/test_formal.py -v                                        # the gate's own tests
+python3 verif/formal/run_formal.py --tasks reach ...     # triggers only (fast iteration)
+python3 verif/formal/run_formal.py --tasks proof ...     # proofs only (mutants)
+pytest verif/formal/test_formal.py -v                    # the gate's own tests
 ```
 
 The runner writes `build/formal.json`:
-`{"pass", "checks": {name: "PASS|FAIL|UNREACHED|SKIPPED"}, "depth", "runtime_s", ...}`. It exits
-0 only when every check is `PASS`. `UNREACHED` (a check whose trigger the solver cannot reach
-within the depth) counts as a failure. By default the run stops at the first `FAIL` or
+`{"pass", "checks": {name: "PASS|FAIL|UNREACHED|SKIPPED"}, "depth", "runtime_s", "pmod", ...}`.
+It exits 0 only when every check is `PASS`. `UNREACHED` (a check whose trigger the solver cannot
+reach within the depth) counts as a failure. By default the run stops at the first `FAIL` or
 `UNREACHED` and marks the checks it did not finish `SKIPPED` (`first_failure` names the check);
-`--keep-going` runs everything.
+`--keep-going` runs everything. `--tasks proof` or `--tasks reach` runs one half of every check
+(the other half is `SKIPPED`, `complete` is false and the run never passes the gate).
 
 ## How it works
 
 1. **Staging.** Every top-level `src/*.v` and `src/*.sv`, `test_*.v` included (contract section
    1: every top-level file is design; subdirectories are not), is copied into
-   `build/formal/work-<pid>/`. Stale work dirs of dead processes are removed.
-2. **Pre-pass.** yosys elaborates the `RISCV_FORMAL` build, reading `src/` with that one define
-   and no other (contract section 6). It fails on latches, on flip-flops that are not on the
-   rising edge of `clk`, and on formal-only cells (`$anyconst`, `$initstate`, ...) in the core.
-   Formal multiclock is off, so anything but posedge-`clk` flip-flops would be modelled wrongly.
-   It removes the core's own assert/assume/cover statements and every initial value, so no check
-   can rely on power-up values (contract section 1). The core is written to `core.il` and read
-   separately from the checkers, so its macros cannot reach them.
+   `build/formal/work-<pid>/`, followed by the behavioral models of the whitelisted sky130 cells
+   (`verif/cells/*.v`, contract section 1; the champion instantiates `sky130_fd_sc_hd__sdfxtp_1`).
+   Stale work dirs of dead processes are removed.
+2. **Pre-pass.** yosys elaborates the `RISCV_FORMAL` build. It fails on latches, on flip-flops
+   that are not on the rising edge of `clk`, and on formal-only cells (`$anyconst`,
+   `$initstate`, ...) in the core. Formal multiclock is off, so anything but posedge-`clk`
+   flip-flops would be modelled wrongly. It removes the core's own assert/assume/cover
+   statements and every initial value, so no check can rely on power-up values (invariant 6).
+   The core is written to `core.il` and read separately from the checkers.
 3. **Pins equivalence** (`equiv`). The `RISCV_FORMAL` build with its `rvfi_*` ports removed must
    be equivalent to the plain build (yosys `equiv_make`, `equiv_simple -seq 5`, `equiv_induct`).
-   The checks run on the RVFI build; this is what makes them speak for the design that ships. It
-   overlaps with the equivalence gate (`make equiv`) on purpose, so the formal result stands on
-   its own.
-4. **Timing and depth.** See "Depth policy".
-5. **Tasks.** Each check runs as a proof task and a reach task (see "Non-vacuity"). The 40
-   instruction checks run in groups: one task checks several instructions through one muxed
+   The checks run on the RVFI build; this is what makes them speak for the design that ships.
+4. **Signoff period and Pmod limits.** `T` is `CLOCK_PERIOD` in `src/config.json` (the eval
+   cosim gate uses the same, contract 7), or `--clk-ns`. tCEM = floor(8000 / T) and tRST =
+   ceil(50 / T) cycles (the cosim's `pmod.h` computes the same); at T = 20 ns, 400 and 3. They
+   reach the checkers as `BONETTO_TCEM` and `BONETTO_TRST`, and `formal.json` records them
+   (`pmod`). The monitor counts edges, not SCK phase lengths: the slowest command limit (33 MHz,
+   PSRAM SPI `0x03`) holds for any waveform as long as a 2-cycle SCK period is within it, so the
+   runner refuses a T below 15.15 ns.
+5. **Timing and depth.** See "Depth policy".
+6. **Tasks.** Each check runs as a proof task and a reach task (see "Non-vacuity"). The 48
+   instruction checks run in class groups: one task checks several instructions through one muxed
    model (`bonetto_insn_group`, generated per task; the members' encodings are disjoint), with
-   one trigger per instruction. A group shares one unrolling of the core, which cuts the cost per
-   instruction (see "Engines tried"). A group counterexample is attributed to the instruction in the
+   one trigger per instruction. A group counterexample is attributed to the instruction in the
    trace; the other members are reported `FAIL` as not proven.
-6. **Scheduling.** At most 8 tasks in parallel on the Mac (`BONETTO_FORMAL_MAX_JOBS` raises the
-   cap on a bigger host). See "Fail fast, scheduling, remote runs". SIGTERM, SIGINT and SIGHUP
-   stop every SBY run.
+7. **Scheduling.** See "Fail fast, scheduling, remote runs". SIGTERM, SIGINT and SIGHUP stop
+   every SBY run.
 
 ### Environment (assumptions)
 
+`wrapper.sv`, module `rvfi_wrapper`:
+
 - `rst_n` is low for exactly the first rising edge (the contract's minimum), then high. The
   `reset` check instead holds it low for 1 to 8 edges.
-- `ui_in` is a free constant. Formal holds it constant (contract section 3).
-- `uio_in[7:3]` and `uio_in[1:0]` are free every cycle.
-- MISO (`uio_in[2]`) is free every cycle, except during a high SCK phase that began with a rising
-  edge clocking a READ data bit. There it holds the value it had on that rising edge (contract
-  rule 3). The SPI monitor records that value as the memory's bit. The bus checks then constrain
-  it to the memory contents. A core that samples MISO while SCK is low reads noise and fails the
-  bus checks (mutant `miso_low`).
-- `ena = 1`. All non-reset registers, the register file included, start at free values.
-- **The core region (0xFF80-0xFFFF) is a real 128-byte memory** in every task (`rmem` in
-  `wrapper.sv`), with free initial contents (contract section 3: arbitrary at reset, like on-die
-  registers). A READ data bit at a region byte is assumed equal to that byte's current bit, and a
-  complete WRITE byte to a region byte updates it. So a core that keeps x1..x15, the pc or
-  scratch in the region sees its own writes, and register consistency (`reg`, `causal`) covers
-  the core plus that memory. An uninitialized memory in SBY starts free (checked on a small
-  test design before relying on it). Program bytes (outside the region) are free noise, which
-  the bus checks constrain one symbolic byte at a time.
+- `ena = 1`. `ui_in` is a free constant (formal holds it constant).
+- `uio_in` is free every cycle: every line the core does not drive carries noise (contract
+  2.1.5).
+- **Memory outputs** (2.1.5): from a data-out rising edge until SCK falls, the lines the selected
+  chip drives (SD1 for a single read, SD0-SD3 for a quad read) hold the value they had at that
+  edge. Outside such a high phase they are noise. A core that samples while SCK is low reads
+  noise (mutant `sd_low`).
+- **Power-up modes** (2.4): one free constant per chip, flash standard or continuous read, PSRAM
+  SPI (not reset) or QPI, so every check covers all four combinations at once.
+- **The core region** (PSRAM `0x7F_FF80-0x7F_FFFF`, A[23] ignored) is a real 128-byte memory in
+  every task (`rmem`), with free initial contents (contract 3: arbitrary at reset). Each
+  data-out edge at a region byte drives that byte's bits; each completed write byte at a region
+  byte updates it. So a core that keeps x1..x15, the pc or CSRs there reads back what it wrote,
+  and the consistency checks (`reg`, `causal`, `csr`) cover the core plus that memory. Every other
+  memory byte is noise, which `coherence` constrains one symbolic byte at a time.
+- All flip-flops without reset start at free values.
 
-### The SPI monitor
+### The QSPI chip monitors
 
-`bonetto_spi_monitor` (in `wrapper.sv`) decodes the pins into transactions: the 8-bit command,
-the 16-bit address, and data bytes at `(A + k) mod 2^16`. It emits an event for every READ data
-bit (byte address, bit index, MISO value) and every complete data byte (READ or WRITE, address,
-value), plus command and end-of-transaction events.
+`bonetto_qspi_chip` (in `wrapper.sv`, one instance per chip) is a passive port of the command
+state machines of `verif/cosim/pmod.h` (`QspiFlash`, `Psram`), clocked by the rising SCK edges
+(2.1.4) while its CS_n is low. The chips sample `(uio_out & uio_oe) | (uio_in & ~uio_oe)`.
 
-When CS_n rises it classifies the transaction (contract section 6), from the address `A`, the
-number of data bits clocked (`ev_end_nbits`, saturating at 1,023) and which bytes got at least
-one data bit. A partly clocked last byte counts as addressed.
+- **Flash** (2.2): standard mode (8-bit single command) or continuous read (no command: the
+  transaction starts with `0xEB`'s quad address). At CS_n rise, a transaction that clocked both
+  mode nibbles enters or stays in continuous read iff M[5:4] = `10`, else it leaves it (whether
+  or not it completed).
+- **PSRAM** (2.3): SPI mode or QPI mode (2-edge quad command); `0x35` enters QPI, `0xF5` leaves
+  it, `0x66` then `0x99` (consecutive transactions with a complete command field) reset it to
+  SPI mode, initialized. A read or write before that reset is a violation. A transaction that
+  ends inside its command field is ignored by either chip.
+- Fields per the command tables: address 24 single or 6 quad edges, M (flash `0xEB`), dummy or
+  wait edges, data single or quad. Data bytes go to `(A + k) mod 2^24` (flash) or
+  `(A + k) mod 2^23` (PSRAM, A[23] ignored).
 
-- **region**: every addressed byte is in 0xFF80-0xFFFF. A READ with no data bit (a null READ)
-  is a region READ if `A` is in the region. Region transactions are exempt from the bus checks.
-- **mixed**: it addresses both region and program bytes (a region READ running past 0xFFFF into
-  0x0000, a program READ running into 0xFF80, or one bit past the region). Always a failure
-  (`bus_region_mixed`).
-- **program**: everything else, null READs at a program address included. A null READ addresses
-  no byte, so the bus checks never count it against an instruction: it is legal anywhere. A
-  header shorter than 24 bits still fails `spi_rule4_header`.
+Events and flags per cycle: `rd` (a data-out edge: address, quad, bit or nibble index), `wb` (a
+completed write byte: address, value), `dout` (the chip is in its data-out phase), `fin`,
+`fin_rd`, `fin_wr`, `bad_cmd` (unlisted command for the chip's state, `0x99` not right after
+`0x66`, `0x66` not followed by `0x99`, an access before the PSRAM reset), `bad_extra` (an edge
+after a command that takes no fields), `bad_wend` (a write ending inside its address or
+mid-byte), `bad_trst` (PSRAM CS_n falls less than tRST cycles after a `0x99` ended), `bad_cem`
+(PSRAM CS_n low for more than tCEM cycles).
 
-`test_formal.py::test_monitor_decodes_stub` checks the decoding and the classes against a
-hand-written waveform: stretched phases, a READ wrapping at 0xFFFF, a READ and a WRITE ending
-mid-byte, an incomplete header, MISO noise while SCK is low, a region READ, null READs in the
-region and in program memory, a READ clocking one bit past 0xFFFF (mixed), and a region WRITE.
+`test_formal.py::test_qspi_monitor_decodes_stub` checks both monitors against a hand-written
+waveform, from both power-up mode pairs: every command family, quad and single fields,
+stretched SCK phases, A[23] and the PSRAM burst wrap, the flash wrap, M = `0x20` and `0xFF`,
+reads ending mid-byte, a page program (ignored), and one of each violation (unlisted command on
+each chip, an edge after `0xFF` and after `0x66`, a write ending mid-byte and one ending in its
+address, tRST, tCEM). The expected events come from a Python reading of tables 2.2 and 2.3, not
+from the Verilog. Dropping one expected event (the tRST violation) makes the run fail.
 
-### The region stop
+### The UNSPECIFIED stop
 
-Contract section 3: a fetch or data access that touches a region byte is UNSPECIFIED, and the
-checkers stop comparing at the first retirement that makes one. Only liveness and the SPI
-waveform rules apply after it. `wrapper.sv` computes, at each retirement:
+Contracts 3 and 4: a program access to the core region, a fetch from IO, an access whose bytes
+span two areas (flash, PSRAM, IO) and a misaligned IO access are UNSPECIFIED, and the checkers
+stop comparing at the first retirement that makes one. Only the QSPI rules and (deep) liveness
+apply after it. `wrapper.sv` computes, at each retirement:
 
-- `bon_fetch_touch`: the fetch touches the region, `pc_rdata[15:0] >= 0xFF7D` (one of
-  `pc[15:0] + k`, k < 4, is a region byte);
-- the data access touches the region:
-  - for an RV32E instruction (`spec_insn`: one of the 40 instruction models' `spec_valid`, E
-    filter included, decoded by `rvfi_isa_rv32e` in the wrapper, or a fatal-trap word), from
-    the specification's address only, never from what the core claims (`rvfi_mem_*`), so a
-    core can neither dodge the stop nor trigger it by misreporting. For a load or store,
-    `addr = rs1_rdata + imm` (`rs1 = x0` reads 0), with `n` bytes; it touches the region iff
-    `addr[31] = 0` and `addr[15:0] >= 0xFF80 - (n - 1)`. That covers an access inside the
-    region, one that straddles 0xFF7F/0xFF80, one that wraps at 64 KB (touching
-    0xFFFD-0xFFFF), and one that crosses 0x7FFFFFFF into `addr[31] = 1` (its first bytes are
-    0xFFFD-0xFFFF of the RAM);
-  - for a reserved encoding (a used register field x16-x31, an undefined funct3, ...), which
-    has no spec access, from the access it claims (non-trapping `rvfi_mem_*`, same formula).
-    The hyp/002 cores execute such encodings as loads and stores and can touch the region
-    with them: at 5d23efc, without this rule, a reserved SH (rs1 = x17) on fc07cc3 wrote
-    0xFFC4, its x1 slot, and a later read of x1 failed `reg`; similar traces failed bus_dmem
-    and insn_group5 on fc07cc3 and reg and bus_dmem on b9a5211, all on legal cores. A core
-    cannot use it to end the checks, because formal, not the core, picks the instruction
-    stream;
-- `bon_region_ret`: either, at this retirement; `bon_stopped`: a region retirement has happened
-  before this step. `BONETTO_FULL` = neither.
+- `bon_fetch_unspec`: `pc[31] = 1`, or one of the 4 fetched bytes is a region byte, or they span
+  two areas;
+- the data access is UNSPECIFIED:
+  - for a specified instruction (`bon_spec`: one of the 48 instruction models' `spec_valid`,
+    E filter included, or a trap word), from the specification's address only (`rs1 + imm`,
+    `rs1 = x0` reads 0, `n` bytes), never from what the core claims (`rvfi_mem_*`), so a core
+    can neither dodge the stop nor trigger it by misreporting;
+  - for a reserved encoding, which has no spec access, from the access it claims (non-trapping
+    `rvfi_mem_*`). A core cannot use it to end the checks: formal, not the core, picks the
+    instruction stream;
+- `bon_unspec_ret`: either, at this retirement; `bon_stopped`: one has happened before.
+  `BONETTO_FULL` = neither.
 
-Everything that decides the stop is itself checked at the region retirement (unless the fetch
-touched the region): the instruction word (`bus_imem_pc`, `bus_imem_fetch`, `bus_imem_value`:
-the fetched bytes), `rs1_addr` (`insn_region_rs1_addr`), and the `rs1` value (`reg`). Also
-compared there: `insn_region_mem_addr`, and `insn_region_rmask` / `insn_region_wmask` unless the
-core trapped (contract section 3 lets a region-touching access trap and halt, and a trapping
-retirement reports `wmask = 0`), plus rvfi's first-pc and order rules, pc_fwd, pc_bwd and
-unique. Every other instruction, bus, gpio, causal, rvfi, ill and silent assertion is gated by
-`BONETTO_FULL`, and reg, pc_fwd, pc_bwd and unique by `!bon_stopped`. `spi` (minus
-`spi_cs_at_valid`, which is a retirement rule) and liveness never stop. The `insn_region_*`
-assertions apply to the group's own instructions (`spec_valid`), like the full checks.
+At the stop retirement only what decided the stop is compared: its pc and order (`pc_fwd`,
+`pc_bwd`, `unique`, the first-pc and order rules), its instruction word (`coherence`, unless the
+fetch is the UNSPECIFIED part), its rs1 read (`reg`) and, in the instruction checks, rs1_addr,
+mem_addr and the masks unless it trapped. (282f6d8, a v2 version, stopped on any claimed region
+access; the mutant `claim_region_stop` checks that a claim stops nothing.)
 
-The stop only removes traces from the comparison after a region-touching instruction. Formal
-picks the instruction stream, so every program that never touches the region (as every test
-program, contract section 3) is still checked in full: the touch is the trace's choice, and the
-core cannot fake one. (282f6d8 stopped on any claimed region access; the mutant
-`claim_region_stop`, an ADD with a wrong result that claims a read at 0xFF80, passed it.)
+### The bus checks
 
-### The bus checks (transaction identity)
+Contract 8 removed v2's per-instruction transaction attribution; in its place:
 
-`bus_imem` and `bus_dmem` follow one symbolic program byte `X` (a free constant outside the
-region, with a free initial value, updated by WRITE bytes at `X`; every READ data bit at `X` is
-assumed equal to its current bit). The window of an instruction is the SPI traffic between the
-previous retirement and its own. Transaction ends are classified by the monitor (above); region
-transactions are exempt. With `pc16` the expected fetch address (0 after reset, then the
-previous retirement's `pc_wdata[15:0]`) and the claimed bytes of the retiring instruction:
+**`qspi`** (`bonetto_qspi_check`, every cycle, never stops): `uio_oe[0,3,6,7] = 1` and
+`uio_out[7] = 1` (`qspi_oe_fixed`, `qspi_csb`); in reset both CS_n high, SCK 0, `uo_out` 0,
+nothing retires (`qspi_reset_*`); 2.1.1 at most one CS_n low (`qspi_rule1`); 2.1.2 a CS_n
+changes only with SCK low at t-1 and t (`qspi_rule2`); 2.1.3 SCK 0 while both CS_n are high
+(`qspi_rule3`); 2.1.4 every line the core drives at a rising edge was driven at t-1 with the
+same value (`qspi_rule4`); 2.1.6 no contention during a data-out phase (`qspi_rule6_flash`,
+`qspi_rule6_psram`); 2.1.7 tCEM (`qspi_tcem`); 2.3 tRST (`qspi_trst`); 2.1.10, 2.2, 2.3, 2.4
+command legality (`qspi_cmd_flash`, `qspi_cmd_psram`, `qspi_extra`); 2.1.9 writes end on a byte
+boundary (`qspi_wend`). CS_n high for at least one cycle between transactions (2.1.2) holds by
+construction in a cycle model (one cycle is at least tCPH = 18 ns at T >= 18 ns).
 
-- An **F READ** is a program READ with a full header, `A = pc16` and exactly 32 data bits. There
-  must be at least one (`bus_imem_fetch`), and `pc16 = pc_rdata[15:0]` (`bus_imem_pc`). A second
-  F READ is accepted only as a load READ of the same bytes (`bus_imem_refetch`: if there are two,
-  each fetch byte must be a load byte). So a re-fetch fails, and so does a fetch with one extra
-  bit or byte (it is not an F READ, and its bytes are not load bytes).
-- Every **other program READ** (a fetch split in two, a fetch running on, a load READ) may read
-  only the load's bytes: `ma + k` with `rmask[k]`, RAM, non-trapping (`bus_dmem_read_claimed`).
-  Each load byte must be read in full by a READ that is not the fetch, or by a second F READ
-  (`bus_dmem_load_read`). The fetch never counts toward a load, so a load of its own
-  instruction bytes needs its own READ (mutant `load_own_fetch`).
-- Every **program WRITE byte** must be a store byte (`bus_dmem_write_claimed`), each store byte
-  is written exactly once (`bus_dmem_store_once`; a store may be split over WRITEs), and with the
-  claimed value (`bus_dmem_store_value`).
-- Fetch and load bytes equal `X` at the start of the window (`bus_imem_value`,
-  `bus_dmem_load_value`).
-- No mixed transaction (`bus_region_mixed`).
+**`psram_write`** (`bonetto_psram_write_check`): every PSRAM write outside the core region writes
+a byte of a retired store, at its address, with its data. One symbolic PSRAM byte address `wa`
+outside the region and one symbolic value `wv` (free constants, so every pair is covered). A
+write of `wv` at `wa` must be explained by a compared, non-trapping retirement that stores `wv`
+at `wa` (lane k of `rvfi_mem_wmask`, byte address `mem_addr + k`). **Design decision:** the write
+may land before its store retires, as the champion's does (the store's M slot writes during the
+store's execution, and `rvfi_valid` comes at its tail), but no later than that retirement: every
+write since the previous retirement must be explained by the stores retired so far, this
+retirement included. This is the cosim's rule (`verif/cosim/harness.cpp` `check_psram_writes`).
+A write after its store retired (a write buffer) is explained too. A trapping retirement stores
+nothing, so a write before a trap fails.
+Not covered here: that every store byte reaches the PSRAM at all (`coherence` catches a store
+whose byte a later load does not see; the cosim's final memory compare catches the rest), and
+the order of two writes of different values to one byte (`coherence`).
 
-A trapping instruction claims no load and no store, whatever its fields say, so any program READ
-beyond its fetch and any program WRITE fail; its region transactions are allowed (contract
-section 4). Every assertion is checked at each `BONETTO_FULL` retirement for the window that
-retirement closes. Null READs address no byte, so they never trip a claim.
+**`coherence`** (`bonetto_coherence_check`): every load and fetch returns the value most recently
+stored to that address, or the loaded image (contract 3). One symbolic byte X: a flash byte
+(`cx = 0`) or a PSRAM byte outside the region (`cx = 1`).
+- `pmem`: the chip's byte at X, with a free initial value. The flash never changes; a PSRAM write
+  byte at X updates it. Every data-out edge at X drives `pmem`'s bits (the bit or nibble the
+  edge clocks).
+- `amem`: the architectural byte: `pmem`'s initial value (the loaded image, or the PSRAM's
+  arbitrary content), then the bytes of compared, non-trapping retirements that store at X. A
+  store to flash changes nothing.
+- At each compared retirement, every fetched byte (`rvfi_insn`, `pc_rdata + k`) and every loaded
+  byte (lane k of `rvfi_mem_rdata`) at X equals `amem` before this retirement
+  (`coherence_fetch`, `coherence_load`). The fetch is also checked at the stop retirement, unless
+  the fetch itself is UNSPECIFIED.
+
+Caches, prefetch and write buffers are free in between: only what retires is compared. Together
+with `insn_*` (rd from `mem_rdata`) this says each load's rd comes from memory, and with `reg`
+that the fetched word is what executes.
+
+### The CSR, trap and interrupt check
+
+Contract v3 has no `rvfi_csr_*` ports (the lead ruled against adding them), so riscv-formal's
+CSR checks cannot run. `bonetto_csr_check` keeps a shadow of the contract-4 CSR state built from
+the retirement stream alone and compares every observation with it:
+
+- **state**: mstatus.MIE, mstatus.MPIE, mie.MEIE, mtvec[31:2], mscratch, mepc[31:2],
+  mcause {31, 3:0}, each bit with a known flag. MIE, MPIE, MEIE are known 0 after reset; mtvec,
+  mscratch, mepc, mcause start unknown (arbitrary reset values).
+- **learning**: an unknown bit takes the first value observed (a CSR read's rd_wdata, a trap's
+  pc_wdata for mtvec, an MRET's pc_wdata for mepc, an interrupt entry's pc_rdata for mtvec);
+  every later observation must agree. So CSR state may start arbitrary but never changes by
+  itself.
+- **updates**: CSR instructions with the contract-4 masks (CSRRS/CSRRC with rs1 = x0 or zimm = 0
+  do not write); trap entry (mepc = pc, mcause = the cause, MPIE = MIE, MIE = 0); interrupt
+  entry (mepc = the previous retirement's pc_wdata, mcause = 0x8000_000B, MPIE = MIE, MIE = 0);
+  MRET (MIE = MPIE, MPIE = 1). An interrupt entry is a retirement with `rvfi_intr = 1` that does
+  not follow a trapping retirement (contract 8).
+- **havoc**: after a reserved encoding (`bon_spec = 0`, which includes CSR instructions on
+  unlisted numbers and writes to the read-only id CSRs) every shadow bit becomes unknown
+  (contract 4: any consistent effect).
+
+Assertions at each compared retirement: `csr_read` (a CSR instruction's rd_wdata is the old
+value: known shadow bits, MPP = 3, every other bit 0; misa, mtval, the id CSRs and mip read 0,
+except mip.MEIP), `csr_trap_target` (a trap's pc_wdata = mtvec), `csr_mret_target` (MRET's
+pc_wdata = mepc), `csr_irq_enabled` (an interrupt entry only with MIE = MEIE = 1),
+`csr_irq_target` (its pc_rdata = mtvec). The same checker runs twice: `csr` at cpi=2 (a CSR
+write or a trap, then a read) and `irq` at cpi=4 (an IO store and two CSR writes enable the
+interrupt, then the entry and the handler's first instruction), each with its own triggers.
+
+The instruction models of the CSR instructions, MRET and WFI (`gen_isa_rv32e.py`, `NEW_INSNS`)
+check everything else about them: register fields (rs1 for the register forms, 0 for the
+immediate forms), rd_addr, masks 0, pc_wdata = pc + 4 (MRET's pc_wdata is the csr check's), and
+that they do not trap. A CSR instruction on an unlisted number or writing an id CSR is
+reserved.
+
+### The IO checks
+
+**`gpio`** (contract 6): a uo pin whose ALTFN bit is 0 shows GPIO_OUT's bit. It takes a stored
+value no later than one cycle after the store retires (`gpio_uo_hold`: in the step after each
+compared retirement every GPIO-mode pin equals the architectural GPIO_OUT), and within an
+instruction's window it moves only to its new value, only if the instruction changes it, and
+only once (`gpio_uo_change`, `gpio_uo_once`; it may move early, inside the store's own window).
+Pins with ALTFN = 1 carry their peripheral and are not compared.
+
+**`periph`** (contract 5.1): a model of every slot, updated by compared IO stores and compared
+with every compared IO load where it knows the bit (`periph_read`): reset values, read/write
+masks, byte lanes (a store writes only the bytes it covers), read-only and unimplemented bits
+read 0, W1C and transfer starts on byte 0 only. GPIO_IN reads `ui_in`. Bits the hardware changes
+on its own are known only while their source is provably off (TIMER_CNT while the timer has
+been disabled, capture and edge flags while their select is off, TX_BUSY and SPI BUSY until the
+first byte-0 write). The UART receiver's bits are not compared. Bit-exact timer, PWM, UART and
+SPI waveforms are the cosim's (`verif/cosim/periph_models.h`).
 
 ### Forks of riscv-formal (in `verif/formal/checks/`, the submodule is untouched)
 
 | Fork | Why |
 |---|---|
-| `rvfi_testbench.sv` | 16-bit cycle counter (stock: 8 bits, saturating at 255); free `check` (unbounded style); pins and monitor events for the checkers; free reset length for the `reset` check. |
-| `bonetto_insn_check` | Checks a group of instructions (model `bonetto_insn_group`). Stock semantics plus: halt equals the spec's trap; a trapping retirement is compared only on trap, halt, `rd_addr = 0` and `wmask = 0`, plus the rs1/rs2 fields on a trapping branch or JALR (contract section 6); register fields of other retirements exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM; the region stop. |
-| `bonetto_reg_check` | Stock (reads return the last write) plus: a register not yet written reads the same value every time; the reads of a trapping branch or JALR are checked too; the region stop. |
-| `bonetto_pc_bwd_check` | Stock pc_bwd only fires when order N+1 retires before N, never true in order (unreachable). The fork checks the time-adjacent pair: order + 1 and pc chaining. |
-| `bonetto_unique_check` | Stock unique fails on any core with a free trig. The fork counts retirements per order. |
-| `bonetto_liveness_check` | Edge counter since edge 0 or the last retirement (contract section 4 count, see "Liveness"): a retirement by edge 1,024 unless halted. Stock fires check right after trig in unbounded mode. |
-| `bonetto_ill_check` | 0x00000000 and 0xFFFFFFFF. Stock only covers 0x00000000. |
-| `bonetto_bus_checks.sv` | Byte shadow at a 16-bit pin address outside the region, misaligned and wrap aware; GPIO is not RAM; transaction identity per instruction (one fetch READ, load READs, store WRITEs, see "The bus checks"). Stock shadows aligned words at 32-bit addresses and only on `mem_addr == addr`. |
-| new: `fence`, `ecall`, `ebreak` models, `silent`, `rvfi`, `spi`, `gpio`, `reset`, reach | See the property table. |
+| `rvfi_testbench.sv` | 16-bit cycle counter; free `check` (unbounded style); pins and monitor events for the checkers; free reset length for the `reset` check. |
+| `bonetto_insn_check` | Checks a group of instructions (model `bonetto_insn_group`). Stock semantics plus: trap equals the spec's trap; a trapping retirement is compared only on trap, `rd_addr = 0` and `wmask = 0`, plus the rs fields of a trapping branch or JALR (contract 8); register fields exact (unused fields report 0); exact memory masks; no PMA or ALIGNED_MEM; CSR rd_wdata and MRET pc_wdata left to the csr check; the UNSPECIFIED stop. |
+| `bonetto_reg_check` | Stock plus: a register not yet written reads the same value every time; the reads of a trapping branch or JALR are checked too; the stop. |
+| `bonetto_pc_fwd_check`, `bonetto_pc_bwd_check` | pc chaining between time-adjacent retirements, except into an interrupt entry (contract 8: the previous pc_wdata is the interrupted pc). Stock pc_bwd only fires when order N+1 retires before N. |
+| `bonetto_unique_check` | Counts retirements per order (stock fails on any core with a free trig). |
+| `bonetto_liveness_check` | Edge counter since edge 0 or the last retirement (see "Liveness"); 2,048 edges; the gap after a WFI is exempt. |
+| `bonetto_ill_check` | 0x00000000 and 0xFFFFFFFF trap with no write. Stock only covers 0x00000000. |
+| `bonetto_bus_checks.sv` | `qspi`, `psram_write`, `coherence` (above). Stock shadows aligned words at 32-bit addresses and knows nothing about the pins. |
+| new: `bonetto_csr_check.sv`, `bonetto_io_checks.sv`, the `fence`, `ecall`, `ebreak`, CSR, `mret`, `wfi` models, `rvfi`, `reset`, `cover` | See the property table. |
 
 `isa_rv32e.txt` and `isa_rv32e.v` are generated by `gen_isa_rv32e.py` from the submodule's
-`isa_rv32i.txt`. Each `rvfi_insn_e_<name>` wraps the stock RV32I model and drops `spec_valid`
-when a register field the instruction uses names x16-x31 (the E filter). Those encodings are
-reserved (UNSPECIFIED), so the instruction checks demand nothing of them. The consistency checks
-(reg, pc, causal, unique, rvfi, bus, gpio, silent, liveness) still apply to every retirement.
+`isa_rv32i.txt` plus the models above. Each `rvfi_insn_e_<name>` drops `spec_valid` when a
+register field the instruction uses names x16-x31 (the E filter). Those encodings are reserved,
+so the instruction checks demand nothing of them; the consistency checks still apply.
 
 ### Non-vacuity: a reach task per check
 
@@ -200,72 +267,46 @@ same assumptions, same depth):
 - the **proof task**: the check's assertions, with the reach statements removed;
 - the **reach task**: `BONETTO_REACH_AS_ASSERT` turns each `reach_*` into `assert(!trigger)` and
   every other assertion is removed. smtbmc runs with `--keep-going` in small windows, so a failed
-  `reach_*` assertion is a trigger reached within the depth, it is dropped (never assumed), and
-  the run stops as soon as every trigger has been reached.
+  `reach_*` assertion is a trigger reached within the depth, and the run stops as soon as every
+  trigger has been reached.
 
 A check is `PASS` only if its proof task passed and every required trigger was reached,
 `UNREACHED` if the proof passed but a required trigger was not reached, and `FAIL` otherwise
-(a counterexample, or a task that timed out or errored). `UNREACHED` fails the gate (and stops
-a fail-fast run).
+(a counterexample, or a task that timed out or errored). The progress line reads
+`insn_group2_reach REACHED 5/5 triggers` or `UNREACHED 3/5 ... missing: <labels>`. The two
+queries are kept apart on purpose: one solver call mixing easy satisfiable goals with a hard
+unsatisfiable one can stall (v1 seed: `bus_imem` 19.6 s as a proof, 61.1 s as a reach, more than
+10 minutes combined).
 
-Because the triggers are assertions, SBY reports a reach task as FAIL exactly when it reached
-them. The runner's progress line translates that: `insn_group2_reach REACHED 5/5 triggers`, or
-`UNREACHED 3/5 ... missing: <labels>`. (Before this line existed it printed the raw
-`insn_group2_reach FAIL ... failed: reach_insn_addi, ...`, which means the same as REACHED 5/5
-and was misread as a failure.) `formal.json` lists the reached triggers per check
-(`reached`).
-
-The two queries are kept apart on purpose. One solver call that mixes easy satisfiable goals (the
-triggers) with a hard unsatisfiable one (the proof) can stall: on the seed, `bus_imem` at D = 232
-took 19.6 s as a proof alone and 61.1 s as a reach alone (one window each), but more than 10
-minutes with both in one run (stopped). SBY's cover mode would solve step by step.
+The v3 triggers beyond the instruction ones: `qspi` a flash read, a PSRAM read and a PSRAM
+write, each with data; `psram_write` an explained write outside the region; `coherence` a fetch
+and a load of X, and a load of X after a store to X; `csr` a CSR read, a read after a CSR write,
+a read after a trap, a trap, an MRET; `irq` an interrupt entry; `rvfi` a second retirement and a
+handler's first instruction; `gpio` a GPIO_OUT change on a pin and an ALTFN change; `periph` a
+read of a written register, of IRQ_PEND, of GPIO_IN; `reset` a retirement after a reset of 3
+edges or more; `cover` a non-trapping and a trapping retirement and a second one.
 
 ## Properties and the contract clauses they encode
 
-Every assertion, by check. Each check also has the triggers listed under "reach", which must be
-reached (see "Non-vacuity").
-
 | Check | Assertions | Contract clause |
 |---|---|---|
-| structure (pre-pass) | no latches; every flip-flop `$dff`-family on the rising edge of `clk`; no formal-only cells in the core; initial values removed | 1: single clock domain, no latches, no negedge flip-flops, no reliance on power-up values |
-| equiv (pre-pass) | RVFI build with `rvfi_*` stripped is equivalent to the plain build | 6: RVFI logic drives no pin |
-| `insn_<name>` | `insn_trap`, `insn_halt` (trap and halt equal the spec's trap) | 4: fatal traps (ECALL, EBREAK, misaligned jump/branch target), trap = halt; nothing else traps |
-| | `insn_trap_rd_addr`, `insn_trap_wmask` (on a spec trap) | 4: no register write and no memory write; 6: only these are compared on a trapping retirement |
-| | `insn_trap_rs1_zero`, `insn_trap_rs2_zero`, `insn_trap_rs1_addr`, `insn_trap_rs2_addr` (trapping branch or JALR) | 6: there the trap depends on the operands, so the rs fields are truthful |
-| | `insn_region_rs1_addr`, `insn_region_mem_addr`, `insn_region_rmask`, `insn_region_wmask` (at the region retirement, unless the fetch touched the region; the masks only if it did not trap) | 3: the stop uses the spec's address, so what decides it and what reports the access must be right |
-| | `insn_rs1_zero`, `insn_rs2_zero`, `insn_rs1_addr`, `insn_rs2_addr` (non-trapping) | 6: register fields report the index read, unused fields 0 with rdata 0; 4: x0 reads 0 |
-| | `insn_rd_addr`, `insn_rd_wdata`, `insn_pc_wdata` (non-trapping) | 4: RV32E semantics (riscv-formal's rv32i model, E filter), FENCE a no-op; 6: a write to x0 reports rd 0, wdata 0 |
-| | `insn_rmask`, `insn_wmask`, `insn_mem_addr`, store data per lane | 6: exact first-byte address, LSB-aligned masks, lane k = byte at mem_addr + k; 3/4: misaligned accesses never trap |
-| | reach: `reach_insn_<name>`; also `reach_insn_<name>_trap` for JAL, JALR, branches, ECALL, EBREAK | non-vacuity |
-| reg | `reg_rs1`, `reg_rs2`, `reg_rs1_rs2` | 4: reads return the last value written (every encoding, trapping branches and JALR included); 1: registers start unknown but do not change by themselves; 3/6: on the die or in the region, one real memory |
-| pc_fwd | `pc_fwd` | 4: PCs chain (order N's pc_rdata = order N-1's pc_wdata) |
-| pc_bwd | `pc_bwd_order`, `pc_bwd_pc` | 6: one instruction per pulse, order counts retirements; 4: PCs chain |
-| causal | `causal` | 6: in-order retirement; 4: register reads return the last write |
-| unique | `unique_order` | 6: `rvfi_order` counts retirements (no repeats) |
-| rvfi | `conv_intr`, `conv_mode`, `conv_ixl` | 6: intr 0, mode 3, ixl 1 |
-| | `conv_rs1_x0`, `conv_rs2_x0`, `conv_rd_x0`, `conv_rmask` (non-trapping); `conv_wmask` | 6: register and memory field conventions |
-| | `conv_trap_halt`, `conv_trap_rd_addr`, `conv_trap_wmask` | 4: a trap halts, no register or memory write; stricter reading: nothing halts without trapping |
-| | `conv_first_order`, `conv_first_pc`, `conv_order_next` | 6: order from 0; 1: execution starts at pc = 0 |
-| ill | `ill_trap`, `ill_halt`, `ill_rd_addr`, `ill_wmask` for `0x00000000` and `0xFFFFFFFF` | 4: fatal traps |
-| silent | `silent_retire`, `silent_write`, `silent_uo` (after a halting retirement) | 4: never retires again, never starts another SPI WRITE (a region WRITE included); 3: uo_out changes only on an IO store |
-| liveness (deep only) | `liveness` (first retirement by edge 1,024, then at most 1,024 edges apart, unless halted; see "Liveness") | 4: latency cap |
-| bus_imem | `bus_imem_pc`, `bus_imem_fetch`, `bus_imem_value` (also at the region retirement unless its fetch touched the region), `bus_imem_refetch` | 6: exactly one fetch, a READ of exactly the 4 instruction bytes, before retirement, no caching; 3: fetch reads RAM at pc[15:0] (64 KB alias); 2: memory semantics |
-| bus_dmem | `bus_dmem_load_read`, `bus_dmem_load_value` (non-trapping) | 6: load completeness, the fetch never counts; 3: RAM bytes (addr[15:0] + k) mod 2^16, misaligned and wrapping |
-| | `bus_dmem_store_once`, `bus_dmem_store_value` | 3: store bytes; 2 rule 5: every byte sent is written; 6: each store byte exactly once, traffic finishes before retirement |
-| | `bus_dmem_write_claimed`, `bus_dmem_read_claimed` | 6: program transactions are the fetch, the load's READs and the store's WRITEs, nothing else (no program write on a trap); 3: an IO access never appears on the pins |
-| | `bus_region_mixed` | 6: a transaction is region, program or a null READ; a partial last byte counts as addressed |
-| gpio | IO load lanes (unnamed, one per byte lane) | 3: byte X with X[1:0] = 0 reads `ui_in`, other IO bytes read 0 (misaligned multi-byte IO unspecified) |
-| | `gpio_uo_hold`, `gpio_uo_once`, `gpio_uo_cause`, `gpio_uo_value` | 3: uo_out changes only from an IO store writing byte 0, at most once per instruction (it may move early, within the store's own window), holds the new value no later than one cycle after it retires; 1: 0 after reset. Not compared from a misaligned IO load or store on (unspecified, its own retirement included) |
-| spi | `spi_uio_oe`, `spi_uio_out_hi`, `spi_uio_out_2` | 1: uio_oe constant, unused outputs 0 |
-| | `spi_reset_cs`, `spi_reset_sck`, `spi_reset_uo`, `spi_reset_valid` | 1: reset state of the pins; nothing retires in reset |
-| | `spi_rule1_prev`, `spi_rule1_now`, `spi_rule2` | 2: rules 1 and 2 |
-| | `spi_rule4_cmd`, `spi_rule4_header`, `spi_rule5_write` | 2: rules 4 and 5 |
-| | `spi_cs_at_valid` (compared retirements) | 6: CS_n high at the retirement cycle |
-| reset | spi and rvfi checks with rst_n low for 1 to 8 edges | 1: rst_n low for at least one edge |
-| cover | reach only: a non-trapping retirement, a trapping one, a second retirement | riscv-formal's cover check |
-
-Rule 3 (MISO valid only while SCK is high) and rule 6 (no maximum phase length) are environment
-assumptions, not assertions: MISO is noise outside a held high phase, and phase lengths are free.
+| structure (pre-pass) | no latches; posedge `clk` flip-flops only; no formal-only cells; initial values removed | 1, invariants 6 and 7 |
+| equiv (pre-pass) | RVFI build with `rvfi_*` stripped equals the plain build | 8, invariant 4 |
+| `insn_<name>` (48) | `insn_trap`; on a trap `insn_trap_rd_addr`, `insn_trap_wmask` and, for a branch or JALR, the rs fields; otherwise `insn_rs*_addr`, `insn_rs*_zero`, `insn_rd_addr`, `insn_rd_wdata`, `insn_pc_wdata`, the masks, `insn_mem_addr`, store data per lane; `insn_unspec_*` at the stop | 4 (RV32E + Zicsr semantics, misaligned accesses never trap, FENCE a no-op, synchronous traps and nothing else), 8 (field conventions) |
+| reg | `reg_rs1`, `reg_rs2`, `reg_rs1_rs2` | 4: reads return the last value written; 3: registers on the die or in the region, one real memory |
+| pc_fwd, pc_bwd | `pc_fwd`, `pc_bwd_order`, `pc_bwd_pc` | 4, 8: pcs chain (trap target = next pc_rdata; interrupt entries exempt) |
+| causal, unique | `causal`, `unique_order` | 8: in-order retirement, order counts retirements |
+| rvfi | `conv_halt` (always 0), `conv_mode`, `conv_ixl`, `conv_intr_trap` (the handler's first instruction after a trap carries `rvfi_intr`), `conv_rs*_x0`, `conv_rd_x0`, `conv_rmask`, `conv_wmask`, `conv_trap_rd_addr`, `conv_trap_wmask`, `conv_first_order`, `conv_first_pc`, `conv_order_next` | 8; 1: execution starts at pc 0 |
+| ill | `ill_trap`, `ill_rd_addr`, `ill_wmask` for the two trap words | 4 |
+| qspi | see "The bus checks" | 1, 2.1-2.4 |
+| psram_write | `psram_write_attr` | 8 |
+| coherence | `coherence_fetch`, `coherence_load` | 3 |
+| csr, irq | `csr_read`, `csr_trap_target`, `csr_mret_target`, `csr_irq_enabled`, `csr_irq_target` | 4, 8 |
+| gpio | `gpio_uo_hold`, `gpio_uo_change`, `gpio_uo_once` | 6 |
+| periph | `periph_read` | 5.1 (and 5.3-5.7 where a register shows it) |
+| reset | the qspi and rvfi checks with rst_n low for 1 to 8 edges | 1 |
+| liveness (deep) | `liveness` | 4: latency cap, invariant 8 |
+| cover | reach only | riscv-formal's cover check |
 
 ## Depth policy
 
@@ -274,420 +315,215 @@ The runner computes every depth from the timing measured on the candidate; no ag
 `depth_policy` (`d_min`, `d`, `d_short`, the timing and its source).
 
 ```
-full depth   D    = max(depth_floor, reset_steps + max(first, max_cpi) + max_cpi + margin)
-short depth  d(c) = reset_steps + first + max_cycles(c) + margin
-liveness          = base depth + 1,024
-FAIL if a base depth > depth_cap   (liveness's fixed +1,024 is not counted)
+full depth   D       = max(depth_floor, reset_steps + max(first, max_cpi) + max_cpi + margin)
+short depth  d(c)    = reset_steps + first + max_cycles(c) + margin
+cpi=N        d_N     = reset_steps + first + N x max_cpi + margin
+liveness             = D + 2,048 (deep)
+FAIL if a base depth > depth_cap   (liveness's fixed +2,048 is not counted)
 ```
 
-`first` is the first retirement's cycle and `max_cpi` the slowest instruction measured.
-`max_cycles(c)` is the slowest measured instance of the classes under check. An instruction
-group uses its members' classes (`INSN_CLASS`, `COSIM_CLASSES` in `run_formal.py`). Any other
-check, or a class the timing does not measure, uses `max_cpi`. reset_steps = 1 and margin = 2 in
-both configs.
+`first` is the first retirement's cycle (the memory reset sequence included) and `max_cpi` the
+slowest instruction measured. `max_cycles(c)` is the slowest measured class among an
+instruction group's members (`COSIM_CLASSES` in `run_formal.py`; csr, mret and wfi have their
+own cosim classes); a class the timing does not measure uses `max_cpi`. reset_steps = 1 and
+margin = 2.
 
-The timing comes from the cosim when it runs: `run_cosim.py --mode rvfi --prog <p>.hex --src
-<dir> --timing-json <file>` for every built program in `build/programs/` except CoreMark (too
-long for a timing run), the selftest first, then the rest four at a time. The timing is the
-maximum over the programs, per class too (`merge_timings`); `depth_policy` lists the programs.
-On the v2 cores this matters: the slowest class differs between programs. Otherwise the runner
-measures it itself: `timing_tb.v` runs the candidate in Icarus against a behavioural 23LC512
-(noise on MISO while SCK is low) on the selftest, or on `timing_prog.S` when the selftest isn't
-built (per class `{class: {max_cycles, ...}}`). The cosim counts cycle c as the outputs right
-after edge c. BMC step s holds the state after edge s - 1, with step 0 the reset cycle. So cosim
-cycle c is BMC step c + 1, and margin covers it.
+The timing comes from the cosim: `run_cosim.py --mode rvfi --prog <p>.hex --src <dir>
+--timing-json <file> --clk-ns T` for every built program in `build/programs/` except CoreMark.
+The timing is the maximum over the programs, per class too (`merge_timings`); `depth_policy`
+lists the programs. With `--host`, the programs and the cosim are copied to the host and the
+timing runs there (Verilator stays off the Mac). The v2 Icarus fallback (`timing_tb.v`) is
+gone: there is no v3 Pmod model in Verilog outside the formal monitor.
 
-A short-depth trace therefore covers the first retirement, plus one more retirement of the
-class under check after the fastest first retirement. The full depth D also covers a retirement
-of the slowest class after the slowest first retirement (on the seed: a load after a load).
-Slower instances than the timing programs measure are left to cosim and the architecture tests.
-The seed has none (its shifter is a barrel shifter). hyp/002-rf-in-ram-pcram (b9a5211) has one:
-its commit message measures 993 cycles for a SW or JALR as the very first instruction after
-reset (its own directed tests), and no cosim program starts with one, so the measured first
-retirement is 729. A trace still reaches such a first retirement within the depth (994 < 1,623),
-but not a slow second retirement after it. Each check's reach task still demands that its
-triggers occur within the depth.
+The champion (346c4a3, cosim timing over 27 programs): first 289, max 289 (alu_imm and
+lui_auipc 289 include the first instruction after reset; csr 270; store and shift 236; trap and
+io_store 202; alu and load 160; branches 136; jalr and io_load 118; mret 84; jal 76; fence and
+wfi 52). So d_short = 581 (every fast check except below), cpi=2 = 870 (`coherence`, `csr`),
+cpi=4 = 1,448 (`irq`), D = 581, liveness 2,629.
 
-| | seed (`src/`) | bit-serial (hyp/001, 9a39f1d) |
-|---|---|---|
-| timing (`timing_tb.v`, `timing_prog.S`) | first 114, max 230 (loads and stores 230, all else 116) | first 319, max 736 (loads and stores 736, ALU 416, branches and JALR 320, LUI/AUIPC/JAL/FENCE 288, ECALL/EBREAK 256) |
-| D (deep) | 463 | 1,475 |
-| liveness (deep) | 1,487 | 2,499 |
-| d_short, non-instruction checks (fast) | 347 | 1,058 |
-| instruction groups (fast) | 233; loads, stores 347 | ALU 738; branches, U/J/system 642; loads, stores 1,058 |
-
-(The cosim measures the seed's first retirement at cycle 115, with the same 230 maximum. With
-the cosim the depths are one more.)
+A short-depth trace covers the first retirement plus one more retirement of the class under
+check. Slower instances than the timing programs measure (a shift by more bits than the
+programs shift) are left to cosim and the architecture tests. Each check's reach task demands
+that its triggers occur within the depth: for `irq` that is the IO store that enables the
+interrupt source, the two CSR writes (mie, mstatus), the entry and the handler's first
+instruction within 1,448 steps.
 
 ## Liveness
 
 Contract section 4 counts edges. Edge 0 is the last rising edge at which `rst_n` is sampled low.
-The first retirement must come at an edge <= 1,024, and each later one at most 1,024 edges after
-the previous. A halted core is exempt. A retirement "at edge e" means `rvfi_valid` is high after
-edge e, as the cosim harness counts it.
+The first retirement must come at an edge <= 2,048 (the memory reset sequence included), and
+each later one at most 2,048 edges after the previous. A retirement "at edge e" means
+`rvfi_valid` is high after edge e, as the cosim harness counts it.
 
-`bonetto_liveness_check` keeps `gap`. It is 0 in step 1 (right after edge 0) and counts up by one
-per step without a retirement. After a retirement in step r it is 1 in step r + 1. So in step s,
-gap = (s - 1) - (the edge of the last retirement, or 0). The assertion fires when gap reaches
-1,024 without `rvfi_valid` and the core has not halted. Two boundaries follow:
-
-- A first retirement at edge 1,024 (step 1,025) passes, and at edge 1,025 it fails.
-- A retirement 1,024 edges after the previous one passes, and 1,025 edges after it fails.
-
-The stall mutants pin both on the seed, one cycle apart:
-
-- `stall_first_1024` and `stall_first_1025` delay the first fetch by 795 and 796 cycles. The
-  latest first retirement (a 4-byte RAM access at edge 229) moves to edge 1,024 or 1,025.
-- `stall_later_1024` and `stall_later_1025` stall the fetch after the first retirement by 794
-  and 795 cycles. The longest gap (230 edges) becomes 1,024 or 1,025.
-
-The `_1024` mutants must PASS and the `_1025` ones must FAIL (`test_mutant_fails`).
+`bonetto_liveness_check` keeps `gap`: 0 in step 1 (right after edge 0), counting up by one per
+step without a retirement, 1 in the step after a retirement. The assertion fires when gap
+reaches 2,048 without `rvfi_valid`. So a first retirement at edge 2,048 (step 2,049) passes and
+one at edge 2,049 fails; the same for later gaps. **WFI:** the gap that starts at a WFI's
+retirement is exempt as a whole. The contract exempts the stall only while `mip.MEIP & mie.MEIE`
+is 0, but MEIP is internal (no port), so formal cannot tell; the cosim checks it (rule R31, the
+irq programs).
 
 This is a safety property, checked by BMC: every window that closes within the depth (D +
-1,024) is checked, and windows that close later are not. A core that stops retiring after the
-first few instructions fails, because its window closes within the depth. An unbounded proof
-(`abc pdr`) did not converge on the seed: frame 126 after about 16 minutes, stopped.
+2,048) is checked. The v2 boundary pairs (`stall_*`) are not re-derived: they need the
+champion's worst-case first-retirement latency over all instructions, which the timing programs
+do not measure (see "Mutants").
 
 ## Fast and deep
 
 | | fast (`checks.cfg`) | deep (`checks-deep.cfg`) |
 |---|---|---|
 | checks | every check except liveness | every check, liveness included |
-| depth | short depth, per class group | full depth D; liveness D + 1,024 |
-| instruction tasks | 9 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
-| task timeout | 40,000 s: 2 x the longest V2 task, reg at 19,669 s (see "Measured runtimes") | 40,000 s, never below fast (V2 at its full depth, 1,785, not measured) |
+| depth | short depth (per class group for the instructions); `coherence`, `csr` cpi=2; `irq` cpi=4 | full depth D; cpi checks keep cpi; liveness D + 2,048 |
+| instruction tasks | 10 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
+| task timeout | 44,000 s (2 x the longest task measured: reg, 21,934 s on hwe-bench, fc07cc3 reg-only run, host shared) | 44,000 s |
 | depth cap | 2,048 | 4,096 |
-| jobs | at most 8 on the Mac, `BONETTO_FORMAL_REMOTE_JOBS` (18) on a remote host, and never more than memory holds (below) | same |
+| jobs | at most 8 on the Mac, `BONETTO_FORMAL_REMOTE_JOBS` (18) on a remote host, and never more than memory holds | same |
 
-Project policy (the user's): formal runs at the final sign-off and at every 10th merged
-improvement, not per candidate.
+**Memory and jobs.** Each SBY task needs up to about 0.4 GB + 9.5 MB per step of its depth:
+bitwuzla's RSS on the champion (hwe-bench) was 13.7 GB for irq at depth 1,448, 7.6 GB for csr and
+6.9 GB for coherence at 870, 3.5 GB for periph and 3.3 GB for gpio at 581. (The v2 checks needed
+3.7 MB per step; with that estimate the first champion runs put hwe-bench down to 5 GB
+available.) The runner caps the job count at the memory budget divided by that need at the
+deepest task's depth (`mem_jobs`). The budget is `$BONETTO_FORMAL_MEM_GB` if set (forwarded to a
+remote run; set it to split a shared host), else 85 % of `MemAvailable` on Linux, else half the
+RAM on macOS. `reset` (free reset length) counts twice (22 GB at depth 1,222 on a v2 core, 6.2 GB
+at 581 on the champion). Each task also waits until its estimate fits next to the running ones
+(`MemGate`).
 
-**Memory and jobs.** Each SBY task (bitwuzla plus yosys-smtbmc) needs about
-0.4 GB + 3.7 MB per step of its depth: measured about 1.4 GB of bitwuzla at depth 348 (the
-seed) and 6.1 GB at depth 1,623 (V2). The runner caps the job count at the memory budget
-divided by that need at the deepest task's depth (`mem_jobs`; `formal.json` records `jobs`).
-The budget is `$BONETTO_FORMAL_MEM_GB` if set (forwarded to a remote run; set it to split a
-host between concurrent runs), else 85 % of `MemAvailable` on Linux (so other users' jobs on a
-shared host count), else half the RAM on macOS (the Mac is shared with other agents). On hwe-bench with about 55 GB available that is 18 jobs for the seed but 7 for V2; on
-the Mac 8 for the seed and 2 for V2. Before this cap, 10 V2 jobs pushed hwe-bench 11 GB into
-swap. Some tasks need several times the estimate: `reset` (free reset length) reached 22 GB at
-depth 1,222 on fc07cc3, against 4.9 GB estimated, so it counts five times (`TASK_MEM_WEIGHT`).
-On top of the job cap, each task waits until its estimate fits in the budget next to the
-running ones (`MemGate`; a task alone always runs).
+Fast does not cover:
 
-Stopping a run (fail-fast, a signal, a timeout, an exception) signals every process below each
-SBY run it started (`kill_tree`, by pid from the process tree, never by name). SBY puts each
-engine in its own process group and forwards SIGTERM to them; `kill_tree` also reaches them if
-SBY itself cannot. (The bitwuzla processes first blamed on a process-group kill on hwe-bench
-came from the launch bug under "Fail fast, scheduling, remote runs": no signal had been sent.)
-
-Fast keeps every instruction check and every bus, SPI, GPIO and RVFI-consistency check. It does
-not cover:
-
-1. **Liveness** (the 1,024-edge retirement cap, invariant 8). The lead ruled that fast needs no
-   liveness; deep checks it. Outside formal, cosim covers it two ways: its watchdog on the test
-   programs (which contain no reserved encodings and no region accesses), and its random-image
-   liveness fuzz (`run_cosim.py --fuzz-liveness`, in the eval cosim gate), which is what catches
-   a hang on a reserved encoding or an unspecified access per candidate. The fuzz is
-   probabilistic (random images), not a proof.
-2. **Retirements after step d_short.** That is the second retirement when the first one was
-   slow (on the seed, a load or store first, then a load or store), and every third or later
-   retirement. Deep adds the slow-then-slow pair. Neither config covers a third retirement of
-   the slowest class.
-
-**Ruling R9 (the lead's).** The fast depth policy is accepted as it stands. It is below the
-original brief's floor of 2 x max_cpi: an instruction group runs at reset + first + the slowest
-member class + margin, which on the seed is 234 for the ALU groups against 2 x 230 = 460, and
-every other check at reset + first + max_cpi + margin (348 on the seed). Deep keeps the full
-depth D, which is at least 2 x max_cpi + 3.
+1. **Liveness** (ruling R9, kept for v3: deep checks it; the cosim watchdog and liveness fuzz
+   cover it per candidate).
+2. **Retirements after the check's depth**: at d_short, a second retirement after a slow first
+   one, and every third retirement; the cpi checks reach 2 or 4 more instructions.
 
 Neither config is an unbounded proof (see "What is and is not proven").
 
-### Measured runtimes
+### Measured runtimes (contract v3, champion 346c4a3)
 
-Mac: Apple M5, 10 cores, 32 GB, shared with other agents' jobs. hwe-bench: Intel Core Ultra 7
-265 (8 P + 12 E cores, 62 GB), shared with another project's jobs at times. Times are wall
-clock for the whole runner, with `--keep-going` (a passing run is the same either way).
+@@RUNTIMES@@
 
-**Contract v2 checks (this version).** Every run below passed every check it ran (56 in fast),
-except fc07cc3's `reg`, which ran into the task timeout of the time (21,600 s).
+### Contract v2 measurements (history)
 
-| run | Mac, 8 jobs | hwe-bench |
-|---|---|---|
-| seed, fast | 486.5 s at 4c03d59, cosim timing included (reg 419 s, bus_dmem 358 s; load ~11 from other agents) | 208 s at 38551e4 with 18 jobs (the memory cap allowed 18: 1.7 GB per task, 53.7 GB budget), 251 s with staging and transfer; reg 206 s, bus_dmem 201 s |
-| V2 = hyp/002-rf-in-ram-pcram b9a5211, fast (depths 1,461 to 1,623) | not run (memory) | 32,538 s (9 h 2 min) at 7050096 with 4 jobs (the memory cap: 6.4 GB per task, 30 GB budget, the host shared), 56/56 PASS and every reach task REACHED; reg 19,669 s, reset 9,076 s, bus_dmem 7,796 s, bus_imem 6,773 s, the instruction groups 943 to 3,581 s, every other check 184 to 3,118 s. A first 7-job attempt was hung up after 2 h 20 min when the Mac crashed (see "Orphans") |
-| fc07cc3 (hyp/002-rf-in-ram), fast (depths up to 1,222) | not run (memory) | 36,823 s (10 h 14 min) at 7050096 with 3 jobs (4.9 GB per task, 15 GB budget, the host shared): 55/56 PASS, every reach task REACHED, and `reg` TIMEOUT at 21,602 s (a timeout is a FAIL); reset 11,487 s, bus_imem 7,636 s, bus_dmem 6,882 s, the instruction groups 378 to 1,517 s, every other check 240 to 1,731 s |
-
-The first V2 attempt (7 jobs, the host partly shared) finished these proofs before it was hung
-up, every one PASS: bus_dmem 6,495 s, the instruction groups 919 to 3,196 s, pc_bwd 2,859 s,
-rvfi 1,860 s, gpio 1,668 s, causal 713 s, ill 374 s; every instruction group's reach task
-reached all its triggers (267 to 1,407 s). reg was still running at about 8,260 s (it took
-19,669 s in the full run above). Memory: at
-depth 1,623 each bitwuzla holds about 6 GB, so 10 jobs pushed the host into swap (11 GB after
-38 minutes, that run was stopped); use at most about one job per 9 GB on V2-class cores.
-The task timeout (fast and deep) is 40,000 s: 2 x the longest V2 task, reg, 19,669 s in the
-7050096 run above (39,338 s, rounded up). fc07cc3's reg is slower: it timed out at 21,602 s in
-its full run. A reg-only run of it with a 24 h timeout (scratch config, 1 job) was started on
-hwe-bench and was still running at hand-off; its result is in
-`~/bonetto-formal/exp-rfreg/run-*/run.log` (the `reg` line), `done` and `out/formal.json`. If it
-needs more than 20,000 s, the timeout should become 2 x its time.
-
-**Contract v1 checks (commit 738a135, before the v2 port).** Every completed run below passed
-every check (56 in fast, 57 in deep: 40 instructions, 14 or 15 SBY checks, structure and
-equiv). Timing given, so no cosim. The fast runs used a trial config with the same checks and
-depths as `checks.cfg` (only the cap and timeout differed).
-
-| run | Mac, 8 jobs | hwe-bench, 18 jobs |
-|---|---|---|
-| seed, fast | 227 s | 190 s (191 s with 10 jobs, in the test suite) |
-| seed, deep (D = 463, liveness 1,487) | 1,072 s | 941 s |
-| bit-serial 9a39f1d, fast | 4,402 s (73 min) | 2,805 s (47 min) |
-| bit-serial 9a39f1d, deep | not run (memory, see below) | stopped after 16 min (memory, see below) |
-
-The slowest tasks (proof task seconds, Mac / hwe-bench):
-
-- Seed, fast: reg 177 / 162, bus_dmem 158 / 161. Every other task is under 80 s on the Mac.
-- Seed, deep: bus_dmem 981 / 829, liveness 859 / 658, reg 766 / 898.
-- Bit-serial, fast: bus_dmem 3,580 / 2,257, reg 2,387 / 2,779, the two ALU groups with the
-  shifts 2,630 and 2,492 / 1,590 and 1,378, reset 1,441 / 1,880, bus_imem 1,039 / 1,043.
-
-On the Mac the bit-serial fast run is bound by total work: 28,303 task-seconds over 8 jobs is
-3,538 s even with perfect packing. On hwe-bench it is bound by its longest task, reg at 2,779 s.
-Deep on a bit-serial core takes hours, and memory bounds its parallelism. An earlier run of
-every check at the full depth (1,475), 8 jobs on hwe-bench, still had every instruction group and
-bus_dmem running after 60 minutes, so it was stopped. The committed deep config with 10 jobs on
-hwe-bench was stopped after 16 minutes. Its 11 bitwuzla processes held 3.4 to 5.7 GB each and
-were still growing, and the host was down to 4 GB available of 62. Run deep on such a core with
-at most one job per 8 GB of RAM (`--jobs`). The Mac has 32 GB (memory per task was not measured
-there).
-
-Levers if a candidate is slower than 9a39f1d (none is in the gate today):
-
-- More jobs on a bigger host (`BONETTO_FORMAL_REMOTE_JOBS`).
-- Splitting `reg` and `bus_dmem` (the critical path on hwe-bench).
-- `abc bmc3` for the instruction groups. On the seed's 8 groups at D = 463 it took 332 s against
-  414 s for bitwuzla (Mac). The bit-serial core has constant x bits, which abc's AIGER flow
-  rejects ("Design contains 'x' or 'z' bits"), so it would need `setundef` first.
+The timeout comes from the v2 runs (hwe-bench): V2 (hyp/002-rf-in-ram-pcram b9a5211, depths
+1,461 to 1,623) took 32,538 s in fast with 4 jobs, its longest task `reg` 19,669 s; fc07cc3
+(hyp/002-rf-in-ram, depths up to 1,222) 36,823 s with `reg` TIMEOUT at 21,602 s under the then
+limit of 21,600 s. A reg-only re-run of fc07cc3 with a 24 h timeout PASSED in 21,933.8 s (host
+shared), above the 20,000 s threshold, so the timeout is 2 x that, rounded up: 44,000 s (the
+lead's L7 rule). The v2 seed's fast run took 208 s on hwe-bench with 18 jobs.
 
 ### Engines tried
 
-- **bitwuzla** (chosen) through smtbmc.
-  - Proofs use `step=all`: one solver call checks every step up to the depth. Windows of 64
-    steps for every proof took 520 s on the seed's fast config, against 302 s with one call
-    (hwe-bench, 8 jobs each, the two runs side by side).
-  - Liveness also uses one call. 64-step windows were tried at depth 1,487 (hwe-bench):
-    - they found `stall_first_1025`'s counterexample (step 1,026) in 56 s and proved
-      `stall_first_1024` in 323 s;
-    - but the seed's own proof was still running after 33 minutes, at 16 GB, against 658 s with
-      one call.
-
-    A single call has to find a trace of the full depth even when the violation is at step
-    1,026, so a liveness counterexample can take longer than a proof. At depth 1,487 on
-    hwe-bench, the counterexamples took 296 to 1,832 s and the proofs 87 to 309 s (658 s for
-    the seed's own) with the v1 checks, and 221 to 2,530 s against 113 and 353 s at 5d23efc
-    (see "Mutants").
+- **bitwuzla** (chosen) through smtbmc. Proofs use `step=all`: one solver call checks every step
+  up to the depth (64-step windows took 520 s against 302 s on the v1 seed). Liveness also uses
+  one call: 64-step windows found the v1 stall counterexamples faster but the seed's own proof
+  ran past 33 minutes at 16 GB, against 658 s with one call. A single call has to find a trace of
+  the full depth, so a counterexample can take as long as a proof.
 - **yices** stalls on the bus checks.
-- **abc bmc3**: see above.
-- **abc pdr**:
-  - it did not converge on liveness;
-  - with `--keep-going` SBY crashes converting its witness, so it is never used for a reach task.
+- **abc bmc3**: faster on the v1 seed's instruction groups (332 s against 414 s); rejects designs
+  with constant x bits without `setundef`.
+- **abc pdr**: did not converge on liveness; with `--keep-going` SBY crashes converting its
+  witness, so it is never used for a reach task.
 - **Combined proof and reach**, one solver call: stalls (see "Non-vacuity").
-- **Instruction groups**: one unrolling of the core for several instructions. On the seed at
-  D = 463 (Mac), the 8 groups took 2,525 proof task-seconds in all (414 s wall clock). In an
-  earlier run on a differently loaded Mac, single-instruction proofs at the same depth took 79 to
-  222 s each (the first 16 to finish, mean 153 s): about 6,100 task-seconds for 40. Class groups
-  at the short depth are the cheapest arrangement measured.
 
 ## Mutants
 
 Each mutant is a design with one bug, plus `expect.json`. `mutants/make_mutants.py` generates
-the seed-based ones (the seed with one change). The ones marked "cosim" in the table are shared
-with the cosim gate: their `expect.json` points at `verif/cosim/mutants/<name>` (`"rtl"`), so both
-gates test the same designs. That includes main's frozen copies of the two hyp/002 cores
-(`legal_h002_rf` = fc07cc3, `legal_h002_pcram` = b9a5211, each unchanged below a 3-line header)
-and three mutants of them.
+them from the champion: each mutant directory holds only the design files the change touches
+(`test_formal.py` lays them over a copy of `src/`), and every substitution must match exactly
+once, so a changed champion fails loudly in the generator. `tcem_stall` is shared with the
+cosim gate (`"rtl": "verif/cosim/mutants/tcem_stall"`, a stub with the contract ports).
 
-`test_mutant_fails` runs each one with `--only` its checks (`--deep` when a check is deep-only),
-on the seed's timing (cosim, max over 14 programs: first retirement at cycle 115, so fast depths
-234 and 348, deep D = 463), or on the timing of the design its `"timing"` names. A FAIL must be a
-counterexample: a failed assertion (or the pins equivalence), never a timeout or an error. The
-legal variants (`"expect": "pass"`, `"checks": "all"`) must pass the whole fast suite, and the
-`_1024` stall mutants must PASS their check. Mutants marked `"slow"` (the hyp/002 cores, hours
-each) run only with `BONETTO_FORMAL_SLOW=1`.
+`test_mutant_fails` runs each one with `--tasks proof --only` its checks (`--deep` for liveness)
+on the champion's timing. A FAIL must be a counterexample: a failed assertion (or the pins
+equivalence), never a timeout or an error.
 
-Results, all on hwe-bench (shared with other runs at the time). Every FAIL mutant on the seed's
-timing was re-run at 7b2aba3, the final checks (3 jobs), and so were the three hyp/002 region
-mutants (2 jobs, times are proof seconds); the six seed-based legal variants passed at 7b2aba3
-too (3 jobs); the liveness mutants ran at 5d23efc (2 jobs); the hyp/002 legal rows say where
-they ran. Which assertions fail first can differ between runs of the same mutant; the table gives
-the 7b2aba3 run and notes an earlier run's extra ones.
+The set re-derives the v2 mutants where their rule still exists (`miso_low` is `sd_low`,
+`mosi_rise` is `sd_rise`, `cs_sck_high`, `write_midbyte`, `store_extra_byte`, `region_wrap`,
+`zero_init`, `trap_writes_rd`, `reg_wrong_index`, `rvfi_rd`, `sub_decode`, `claim_region_stop`,
+`gpio_any_byte`, `uo_glitch`, `uo_late`, `norvfi_diff`, `hang_reserved`) and adds one per v3
+rule. Not re-derived: the v2 transaction-attribution mutants (`refetch`, `fetch_extra_byte`,
+`store_twice`, `load_own_fetch`, `cs_open_at_retire`, `load_skip_byte`, `load_half_swap`,
+`trap_program_write`, the region-mixing ones: repeated or extra accesses are legal in v3, and a
+wrong load value is `coherence`'s, covered by `sd_low` and `store_dropped`), the halt mutants
+(`no_halt`, `trap_continues`, `region_write_after_halt`: nothing halts in v3; `trap_target` and
+`rvfi_halt` replace them), the hyp/002 legal cores (v2 designs), `trap_fields_brj` (the trap
+field rules are `insn_*` and `conv_*` now) and the liveness boundary pairs (see "Liveness").
 
-| mutant | RTL | bug | checks | result: failed assertions |
-|---|---|---|---|---|
-| cs_sck_high | seed | CS_n rises with SCK still high | spi | FAIL: `spi_rule1_prev` |
-| mosi_rise | seed | MOSI changes while SCK is high | spi | FAIL: `spi_rule2`, `spi_rule4_cmd` |
-| cs_open_at_retire | cosim | CS_n still low in the retirement cycle | spi | FAIL: `spi_cs_at_valid` |
-| write_midbyte | seed | store WRITE one bit short | spi, bus_dmem | FAIL: `spi_rule5_write`; `bus_dmem_store_once`, `bus_dmem_store_value` |
-| miso_low | seed | samples MISO while SCK is low | bus_imem | FAIL: `bus_imem_value` |
-| refetch | seed | every instruction fetched twice | bus_imem | FAIL: `bus_imem_refetch` |
-| fetch_extra_byte | cosim | the fetch READ clocks a fifth byte | bus_imem, bus_dmem | FAIL: `bus_imem_fetch`; `bus_dmem_read_claimed` |
-| zero_init | cosim | pc not reset (relies on power-up 0) | rvfi, bus_imem | FAIL: `conv_first_pc`; `bus_imem_fetch`, `bus_imem_pc` |
-| load_half_swap | seed | LH/LHU bytes swapped | bus_dmem | FAIL: `bus_dmem_load_value` |
-| load_own_fetch | cosim | an LW at its own pc reuses the fetch, no READ | bus_dmem | FAIL: `bus_dmem_load_read` |
-| load_skip_byte | cosim | LW reads 3 bytes, takes the 4th from the shift register | bus_dmem | FAIL: `bus_dmem_load_read`, `bus_dmem_load_value` |
-| store_twice | cosim | every store WRITE sent twice | bus_dmem | FAIL: `bus_dmem_store_once` |
-| store_extra_byte | cosim | SB writes a second byte | bus_dmem | FAIL: `bus_dmem_write_claimed` |
-| trap_program_write | seed | a program WRITE (0x0100) before a trap retires | bus_dmem | FAIL: `bus_dmem_write_claimed` |
-| trap_region_wrap | seed | a READ at 0xFFFE before a trap: 0xFFFE-0x0001 | bus_dmem | FAIL: `bus_region_mixed` |
-| trap_region_straddle | seed | a READ at 0xFF7E before a trap: 0xFF7E-0xFF81 | bus_dmem | FAIL: `bus_region_mixed` |
-| region_wrap | cosim, hyp/002-rf | x15's slot at 0xFFFE: its transactions wrap to 0x0001 | bus_dmem | FAIL: `bus_region_mixed`, 598 s |
-| region_straddle | cosim, hyp/002-rf | the scratch slot at 0xFF7E straddles 0xFF7F/0xFF80 | bus_dmem | FAIL: `bus_region_mixed`, 943 s |
-| region_zero_init | cosim, hyp/002-pcram | no boot write: the pc comes from the region's reset contents | rvfi, bus_imem | FAIL: `conv_first_pc`, 462 s; `bus_imem_fetch`, `bus_imem_pc`, 866 s |
-| reg_wrong_index | seed | even rd writes one register up | reg | FAIL: `reg_rs1`, `reg_rs2` |
-| rvfi_rd | seed | RVFI XOR result bit 0 flipped | insn_xor | FAIL: `insn_rd_wdata` |
-| sub_decode | seed | SUB decoded as ADD (a two-member group) | insn_sub, insn_add | FAIL: `insn_rd_wdata` (insn_sub; insn_add not proven) |
-| trap_fields_brj | seed | junk rs fields on every trap | insn_jalr | FAIL: `insn_trap_rs1_addr`, `insn_trap_rs2_addr` |
-| claim_region_stop | seed | an OP with rs1 = rs2 flips result bit 0 and claims a 1-byte read at 0xFF80 | insn_add | FAIL: `insn_rmask`, 46 s (it PASSed the 282f6d8 checks, which also stopped on a claimed region access) |
-| trap_writes_rd | cosim | a trapping JAL writes rd | insn_jal, rvfi | FAIL: `insn_trap_rd_addr`; `conv_trap_rd_addr` |
-| trap_continues | seed | fetches again after a misaligned-target trap | silent | FAIL: `silent_retire` (and `silent_write` in another run) |
-| no_halt | cosim | EBREAK traps but the core keeps running | silent | FAIL: `silent_retire` |
-| region_write_after_halt | seed | a region WRITE (0xFF80) after the halt | silent | FAIL: `silent_write` |
-| gpio_any_byte | seed | any IO store sets uo_out | gpio | FAIL: `gpio_uo_hold` (`gpio_uo_cause`, `gpio_uo_value` too at 5d23efc) |
-| uo_glitch | cosim | uo_out shows the value, restores the old one, then sets it again | gpio | FAIL: `gpio_uo_once` |
-| uo_late | cosim | uo_out set two cycles after the store retires | gpio | FAIL: `gpio_uo_hold` |
-| norvfi_diff | seed | uo_out inverted in the plain build only | equiv | FAIL (pre-pass) |
-| hang_reserved | seed | custom-0 opcode hangs | liveness (deep) | FAIL: `liveness`, 221 s (the first instruction hangs, no retirement) |
-| stall_first_1024 | seed | first retirement at edge 1,024 | liveness (deep) | PASS, 113 s |
-| stall_first_1025 | seed | first retirement at edge 1,025 | liveness (deep) | FAIL: `liveness`, 519 s |
-| stall_later_1024 | seed | a gap of 1,024 edges | liveness (deep) | PASS, 353 s |
-| stall_later_1025 | seed | a gap of 1,025 edges | liveness (deep) | FAIL: `liveness`, 2,530 s |
-| legal_mosi_echo | cosim | MOSI carries noise after the last bit (CS_n still low) | all (fast) | PASS, 56 checks |
-| legal_split_store | cosim | SW as two 2-byte WRITEs | all (fast) | PASS, 56 checks |
-| legal_trap_fields_nb | seed | junk rs fields, rd_wdata and pc_wdata on non-branch traps | all (fast) | PASS, 56 checks |
-| legal_uo_early | seed | uo_out set on the edge into the retirement cycle | all (fast) | PASS, 56 checks |
-| legal_trap_region | seed | a region READ (0xFF80) before a trap | all (fast) | PASS, 56 checks |
-| legal_null_read | seed | a null READ (0x1234, header only) before a trap | all (fast) | PASS, 56 checks |
-| legal_h002_rf | cosim, fc07cc3 | registers in the region, pc on the die | all (fast) | 55/56 under the old 21,600 s task timeout: `reg` TIMEOUT at 21,602 s, every other check PASS and every reach task REACHED (7050096, run directly with `run_formal.py`). A reg-only run with a 24 h timeout was still running at hand-off (see "Measured runtimes") |
-| legal_h002_pcram | cosim, b9a5211 | registers and pc in the region | all (fast) | PASS, 56 checks, every reach task REACHED (7050096, the test's run made directly with `run_formal.py`; 32,538 s, see "Measured runtimes") |
-
-On the seed's timing, every fast-config FAIL above came within 227 s of proof time at 7b2aba3
-(the slowest: `load_half_swap`'s `bus_dmem`, 226.5 s, with the V2 and fc07cc3 runs sharing the
-host). The liveness counterexamples (deep, depth 1,487) are slower: 221 to 2,530 s on hwe-bench
-at 5d23efc, against 208 s for `stall_first_1025` on the Mac in an earlier run (see "Engines
-tried" on why a single-call liveness counterexample can take longer than a proof). A legal
-variant's whole fast run took 1,329 to 1,529 s at 7b2aba3 with 3 jobs (the V2 and fc07cc3 runs
-sharing the host; longest task 221 to 390 s), and 215 to 253 s with 10 jobs in an earlier run.
-The hyp/002 region mutants FAILed within 943 s of proof time at 7b2aba3 (2 jobs, host shared),
-against 317 s on the Mac (2 jobs) in an earlier run.
+@@MUTANTS@@
 
 ## Fail fast, scheduling, remote runs
 
 By default the runner stops at the first proof that does not pass, or the first reach task that
 finishes without every required trigger. It kills the running SBY tasks and marks the unfinished
-checks `SKIPPED`. `--keep-going` runs everything. Tasks start in this order:
+checks `SKIPPED`. `--keep-going` runs everything. Tasks start in this order: the proofs longest
+first (by `TASK_COST`: liveness, irq, coherence, csr, reg, psram_write, the instruction groups,
+reset, ...), interleaved with the reach tasks, which are cheap and catch a dead or stuck core
+early as `UNREACHED`.
 
-- the proofs longest first (by `TASK_COST`, measured: bus_dmem, reg, the instruction groups,
-  reset, ...), which are also the likeliest to fail;
-- interleaved with the reach tasks, which are cheap and catch a dead or stuck core early as
-  `UNREACHED`.
+`--host <ssh host>`, or `BONETTO_FORMAL_HOST` (unset by default), runs the gate on another
+machine. The verdict is the same on any host:
 
-A failing BMC proof stops at its counterexample, so a long proof that fails still fails early.
-
-`--host <ssh host>`, or the environment variable `BONETTO_FORMAL_HOST` (unset by default), runs
-the gate on another machine. The verdict is the same on any host:
-
-1. The pre-pass and the timing run locally, where the cosim lives.
-2. Exactly the inputs are copied (rsync) into a fresh
-   `~/bonetto-formal/run-<machine>-<checkout tag>-<pid>-<time>` (the tag is a hash of the
-   checkout's path: worktrees on one machine share its name and pid space):
-   the candidate's `src`, `verif/formal` (without the mutants), riscv-formal's `rvfi_macros.vh`
-   and instruction models, and the timing JSON.
-3. The remote run holds the host's own lock (`flock ~/bonetto-formal/formal.lock`), not the Mac's
-   heavy lock, with `BONETTO_FORMAL_REMOTE_JOBS` jobs (default 18). It uses the oss-cad-suite at
-   `BONETTO_FORMAL_REMOTE_OSS` (default `/opt/hwe-toolchain/oss-cad-suite/bin`).
-4. **The remote run is detached** from the ssh session (`setsid nohup`, its session leader's pid
+1. The pre-pass runs locally. Exactly the inputs are copied (rsync) into a fresh
+   `~/bonetto-formal/run-<machine>-<checkout tag>-<pid>-<time>`: the candidate's `src`,
+   `verif/formal` (without the mutants), `verif/cells`, riscv-formal's `rvfi_macros.vh` and
+   instruction models, and the timing JSON if given, else `verif/cosim` and the built programs
+   (`build/programs/*.hex`, `*.expect.json`, `*.stim`) so the timing runs there.
+2. The remote run holds the host's own lock (`flock <base>/formal.lock`) with
+   `BONETTO_FORMAL_REMOTE_JOBS` jobs (default 18), the oss-cad-suite at
+   `BONETTO_FORMAL_REMOTE_OSS`, and the signoff period passed as `--clk-ns`.
+   `BONETTO_FORMAL_REMOTE_DIR` changes the base dir (and so the lock): separate bases let
+   several runs share the host, each with its own `BONETTO_FORMAL_MEM_GB`.
+3. **The remote run is detached** from the ssh session (`setsid nohup`, its session leader's pid
    in `remote.pid`, its exit code in `done`, its log in `run.log`). The local runner follows the
-   log over ssh; a dropped connection only makes it follow again 30 s later. The launch
-   (`remote_launch_cmd`) backgrounds only the simple command (`cd <dir> || exit 1; setsid ... &`).
-   Up to 7b2aba3 it was `cd <dir> && setsid ... &`, which backgrounds a subshell that keeps the
-   ssh channel open and waits for the run: the launch ssh returned only when the run ended. The
-   run itself was detached all the same (it survived the Mac, and its result was fetched at the
-   end), but the log only showed at the end, and an interrupt during the run removed the run dir
-   without stopping the run (the runner had not yet marked it launched). On 2026-10-17 that left
-   a V2 and an fc07cc3 run computing in deleted dirs on hwe-bench, stopped by hand.
-5. `formal.json`, the task logs and any counterexample traces come back to
-   `build/formal/remote-<run id>/`, and the remote run dir is deleted. During a run, each task's
-   model files and each reach task's traces are deleted as soon as the task finishes.
+   log; a dropped connection only makes it follow again 30 s later.
+4. `formal.json`, the task logs and any counterexample traces come back to
+   `build/formal/remote-<run id>/`, and the remote run dir is deleted.
 
 SIGTERM, SIGINT or SIGHUP on the local runner stops the remote run and deletes its dir
-(`remote_stop_cmd`): SIGTERM to the run's own process group (its runner then stops every SBY
-task), waiting up to 60 s for it to end. The host is shared, so nothing else is ever signalled:
-not by name, not after the run wrote `done`, and only if the `remote.pid` process still works in
-the run dir (`/proc/<pid>/cwd`; a reused pid belongs to someone else). Any other exception in a
-runner stops every SBY task before it exits. `test_formal.py::test_remote_launch_and_stop` runs
-the launch and the stop on a Linux host (setsid and /proc; skipped on macOS): the launch returns
-at once, a `remote.pid` naming a process in another dir is left alone, and the run's own process
-group is stopped. It passed on hwe-bench, and a real run there streamed its log live, fetched its
-result, and on SIGTERM left no process in its dir.
+(`remote_stop_cmd`): SIGTERM to the run's own process group, only if the `remote.pid` process
+still works in the run dir (`/proc/<pid>/cwd`). The host is shared, so nothing else is ever
+signalled, never by name. `test_formal.py::test_remote_launch_and_stop` runs the launch and the
+stop on a Linux host.
 
-**Orphans.** A local runner that dies without cleaning up (the Mac crashes or runs out of
-memory, SIGKILL) leaves its remote run alive: it finishes on its own, holding the host's lock,
-and leaves `out/formal.json` and `done` in its dir. (Before the detached mode, such a run was
-hung up whenever sshd noticed the dead connection, possibly hours later, and its finished work
-was lost: that is what happened to the first 7-job V2 run below.) Recovery:
-
-- `run_formal.py --host <host> --fetch-orphans` fetches the result of every finished orphan of
-  this checkout (its run dirs whose local pid is gone) into
-  `build/formal/orphan-<run id>/formal.json` with its logs, deletes a finished orphan's dir only
-  once that fetch worked, deletes the dirs of dead orphans, and lists the orphans still running
-  (left alone);
-- every remote run does the same first (`reap_remote`), so orphans never pile up on the host's
-  shared disk;
-- each run also deletes the local work dirs and `build/formal/remote-*` logs of dead runs
-  (`reap_stale`).
-
-`test_formal.py::test_reap_remote_orphans` checks the classification (finished, dead, running,
-live runner, another checkout, another machine, a failed fetch); the SIGKILL, `--fetch-orphans` and SIGTERM paths were exercised on
-hwe-bench. `BONETTO_FORMAL_REMOTE_DIR` changes the remote base dir (and so the lock). With the
-host set, `test_formal.py` sends every formal run there and skips the local heavy lock.
+**Orphans.** A local runner that dies without cleaning up leaves its remote run alive: it
+finishes on its own and leaves `out/formal.json` and `done`. `run_formal.py --host <host>
+--fetch-orphans` fetches the result of every finished orphan of this checkout, deletes a
+finished orphan's dir once that fetch worked, deletes the dirs of dead orphans, and lists the
+running ones. Every remote run does the same first (`reap_remote`); each run also deletes the
+local work dirs and logs of dead runs (`reap_stale`). `test_reap_remote_orphans` checks the
+classification.
 
 ## What is and is not proven
 
 Proven, for the candidate as built with `-DRISCV_FORMAL`, under the environment above:
 
 - **Structure and RVFI isolation, for all time.** No latches, posedge `clk` only, no formal-only
-  cells. The pins equivalence (`equiv_simple` plus `equiv_induct`) is inductive.
-- **Every assertion of the property table, on every trace from reset up to the check's depth.**
-  That means:
-  - every free MISO bit, `uio_in` value and `ui_in` constant;
-  - free power-up values of every register, the register file included;
-  - free initial contents of the core region (a real memory);
-  - a free program memory image, through the bus checks' byte shadow.
-- **Non-vacuity of each check.** Its triggers occur within that same depth (the reach tasks).
-- **Liveness, in deep only.** Every 1,024-edge window that closes within D + 1,024.
+  cells. The pins equivalence is inductive.
+- **Every assertion of the property table, on every trace from reset up to the check's depth**:
+  every free `uio_in` value and `ui_in` constant, every memory power-up mode, free power-up
+  values of every flip-flop, free initial contents of the core region (a real memory), a free
+  flash image and PSRAM content (through the coherence check's symbolic byte).
+- **Non-vacuity of each check**: its triggers occur within that same depth (the reach tasks).
+- **Liveness, in deep only**: every 2,048-edge window that closes within D + 2,048.
 
 Not proven:
 
-- Anything beyond the depth. There is no induction, no k-induction and no unbounded proof of the
-  ISA, bus or liveness properties. A bug that needs three or more retirements of a slow class, or
-  internal state built up over many instructions, is cosim's and the architecture tests' to
-  find.
-- Instruction instances slower than the timing programs measured (for example, a
-  shift-amount-dependent shifter shifting further than the programs do, or b9a5211's
-  993-cycle first-instruction SW or JALR followed by a slow second retirement).
-- A reset after the start: `rst_n` goes low only at the beginning (the `reset` check varies its
-  length from 1 to 8 edges).
-- Encodings with register fields x16-x31 and other UNSPECIFIED behaviour: the E filter drops them
-  from the instruction checks; the consistency checks still apply.
-- What a trapping retirement claims on top of trap, halt, `rd_addr = 0` and `wmask = 0` (its
-  `rmask` and read data are not checked), and its rs fields unless it is a branch or JALR.
-- Anything at or after the first retirement whose fetch or data access touches the core region
-  (contract section 3), except `insn_region_mem_addr` and the reads before the touch at that
-  retirement, the SPI waveform rules and (deep) liveness. Region transactions themselves are
-  only checked for staying inside the region (no wrap, no mixing), for not starting after a
-  halt (a WRITE) and, through the region memory, for register consistency. Their number, order
-  and what they write are not compared.
-- The rs2 read of a load or store that touches the region in its data access (it may come after
-  the touch).
+- Anything beyond the depth: no induction, no unbounded proof of the ISA, bus, CSR or liveness
+  properties. A bug that needs more retirements than the check's depth holds is cosim's and the
+  architecture tests' to find.
+- Instruction instances slower than the timing programs measured.
+- A reset after the start (the `reset` check varies its length from 1 to 8 edges).
+- Encodings with register fields x16-x31 and other reserved encodings: the instruction checks
+  drop them; the consistency checks still apply, and the csr shadow forgets everything after
+  one.
+- The interrupt line: mip.MEIP is internal, so formal checks neither its value in `csr_read`,
+  nor that an enabled, pending interrupt is taken within one more instruction (contract 4), nor
+  the WFI stall condition. The cosim's irq programs and rule R31 do.
+- That every store byte reaches the PSRAM (the cosim's final memory compare), the UART
+  receiver's register bits, and bit-exact peripheral waveforms (the cosim).
+- Anything at or after the first UNSPECIFIED retirement, except what decided the stop, the QSPI
+  rules and (deep) liveness. Region transactions themselves are checked only through the QSPI
+  rules and, through the region memory, register consistency.
 - The plain build, other than through the pins equivalence. Gate-level behaviour, X propagation
   and timing belong to `make gl` and hardening.

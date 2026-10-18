@@ -1,10 +1,10 @@
 {
-  "class": "WRITE ends mid-byte",
+  "class": "a store ends mid-byte",
   "checks": [
-    "spi",
-    "bus_dmem"
+    "qspi"
   ],
-  "description": "Store transactions send one data bit fewer than the access size.",
+  "assertion": "qspi_wend",
+  "description": "A store's data phase ends one nibble early (contract 2.1.9).",
   "expect": "fail",
   "deep": false
 }

@@ -1,0 +1,10 @@
+{
+  "class": "the reset sequence skips the flash's continuous-read exit",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_rule6_flash",
+  "description": "Window w0 (8 edges with SD0-SD3 high) is gone: a flash that powers up in continuous read takes the 0xEB command as an address and M byte and drives data while the core still drives SD0-SD3 (contract 2.1.6, 2.4).",
+  "expect": "fail",
+  "deep": false
+}

@@ -1,7 +1,0 @@
-{
-  "class": "legal: uo_out changes in the retirement cycle",
-  "checks": "all",
-  "description": "An IO store sets uo_out on the edge that enters its retirement cycle (allowed: section 3 only bounds it by one cycle after the retirement), misaligned IO stores included (unspecified). The review's variant. Expect PASS.",
-  "expect": "pass",
-  "deep": false
-}

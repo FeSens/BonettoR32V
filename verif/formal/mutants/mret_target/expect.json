@@ -1,0 +1,10 @@
+{
+  "class": "MRET jumps to mtvec",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_mret_target",
+  "description": "MRET's C reads mtvec's word, not mepc's.",
+  "expect": "fail",
+  "deep": false
+}

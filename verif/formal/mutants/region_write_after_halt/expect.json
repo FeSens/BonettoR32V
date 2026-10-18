@@ -1,9 +1,0 @@
-{
-  "class": "a region WRITE after the halt",
-  "checks": [
-    "silent"
-  ],
-  "description": "After the halting retirement the core WRITEs one byte at 0xFF80 (contract section 4: never another SPI WRITE after the halt, core region included).",
-  "expect": "fail",
-  "deep": false
-}
