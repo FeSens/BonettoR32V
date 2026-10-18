@@ -250,22 +250,23 @@ module tt_um_fesens_r32v (
     wire active = ~gap & ~mk;
     wire wact   = wr & ~mk;                             // the slot drives data on the bus
     wire [3:0] nib   = {uio_in[5], uio_in[4], uio_in[2], uio_in[1]};   // {SD3, SD2, SD1, SD0}
-    // x11's nibble c (an x11 slot is fast, so its data nibble index n is c[2:0])
+    // x11's nibble c in an x11 slot, else 0 (an x11 slot is fast: its nibble index n is c[2:0])
     reg  [3:0] a1n;
     always @(*) begin
-        case (c[2:0])
-            3'd0:    a1n = a1r[3:0];
-            3'd1:    a1n = a1r[7:4];
-            3'd2:    a1n = a1r[11:8];
-            3'd3:    a1n = a1r[15:12];
-            3'd4:    a1n = a1r[19:16];
-            3'd5:    a1n = a1r[23:20];
-            3'd6:    a1n = a1r[27:24];
-            default: a1n = a1r[31:28];
+        case ({x11r, c[2:0]})
+            4'b1000: a1n = a1r[3:0];
+            4'b1001: a1n = a1r[7:4];
+            4'b1010: a1n = a1r[11:8];
+            4'b1011: a1n = a1r[15:12];
+            4'b1100: a1n = a1r[19:16];
+            4'b1101: a1n = a1r[23:20];
+            4'b1110: a1n = a1r[27:24];
+            4'b1111: a1n = a1r[31:28];
+            default: a1n = 4'd0;
         endcase
     end
     // 0 in a masked slot, x11's nibble in an x11 slot (x11r implies mk); 0 while booting (sl = F)
-    wire [3:0] nib_m = (nib & {4{active}}) | (a1n & {4{x11r}});
+    wire [3:0] nib_m = (nib & {4{active}}) | a1n;
 
     // strobes: stb = the clock where SCK is high (it falls at its edge)
     wire       stb   = sck;
