@@ -6,16 +6,18 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 ## Current champion
 
-**100** `f657a72aec8c` (setup/v3-swap): 0.0691 CoreMark iterations/s (clock 25 ns), 20,442.1 µm², 2,398 cells, formal skipped, tile fraction -, deep formal -. MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core region, Zicsr traps/interrupts, GPIO/timer/PWMx3/UART/SPI/IRQ peripherals; 1x2 routing settings (hold margins 0.03/0.02, routability...
+**102** `cd5d629bf5f5` (hyp/102-clk50): 0.0864 CoreMark iterations/s (clock 20 ns), 20,442.1 µm², 2,398 cells, formal skipped, tile fraction -, deep formal -. Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead move it up to the 50 MHz IO ceiling); physical, lead
 
 ## Champion history
 
 | # | id | date | sha | CoreMark/s | delta % | clock ns | area µm² | cells | delta µm² | formal | tile fraction | deep formal | status | idea |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 100 | 2026-10-18 | `f657a72aec` | 0.0691 | - | 25 | 20,442.1 | 2,398 | - | skipped | - | - | champion | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core region, Zicsr traps/in... |
+| 0 | 100 | 2026-10-18 | `f657a72aec` | 0.0691 | - | 25 | 20,442.1 | 2,398 | - | skipped | - | - | - | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core region, Zicsr traps/in... |
+| 1 | 102 | 2026-10-18 | `cd5d629bf5` | 0.0864 | +25.00% | 20 | 20,442.1 | 2,398 | +0.0 | skipped | - | - | champion | Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead move it up to the 50 MH... |
 
 ## Last 20 hypotheses
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 102 | 2026-10-18 | hyp/102-clk50 | merged | 0.0864 | +0.0173 | 20 | 20,442.1 | +0.0 | skipped | - | Signoff clock 50 MHz (CLOCK_PERIOD 20; contract 7 lets the lead mov... | Eval (hwe-bench, cosim Pmod models at 20 ns: tCEM 400 cycles, SCK 2... |
 | 100 | 2026-10-18 | setup/v3-swap | merged | 0.0691 | - | 25 | 20,442.1 | - | skipped | - | MCU v3 seed (contract v3): QSPI Pmod flash XIP + PSRAM data/core re... | Plan 2026-10-17-mcu-v3 Tasks 1-9. Harden 1x2 @25 ns (hwe-bench, hos... |
