@@ -4,7 +4,7 @@
  * quad mode (code runs from flash in continuous read, data in PSRAM in QPI mode), with a minimal
  * Zicsr, traps and one interrupt to mtvec, and the contract-5 peripherals.
  *
- * Modules: r32v_mem (reset sequence, the address register, header nibbles, pins), r32v_csr (CSR
+ * Modules: r32v_mem (reset sequence, the transaction chip, header nibbles, pins), r32v_csr (CSR
  * state and the trap/interrupt flags), r32v_periph (IO slots, the interrupt line). This file:
  * the slot engine, the nibble-serial datapath, the pc, decode and sequencing.
  *
