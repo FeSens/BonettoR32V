@@ -414,7 +414,7 @@ clock for the whole runner, with `--keep-going` (a passing run is the same eithe
 | run | Mac, 8 jobs | hwe-bench |
 |---|---|---|
 | seed, fast | 486.5 s at 4c03d59, cosim timing included (reg 419 s, bus_dmem 358 s; load ~11 from other agents) | 208 s at 38551e4 with 18 jobs (the memory cap allowed 18: 1.7 GB per task, 53.7 GB budget), 251 s with staging and transfer; reg 206 s, bus_dmem 201 s |
-| V2 = hyp/002-rf-in-ram-pcram b9a5211, fast (depths 1,461 to 1,623) | not run (memory) | first 7-job attempt hung up after 2 h 20 min when the Mac crashed (see "Orphans"); a detached 6-job rerun was still running at the time of writing |
+| V2 = hyp/002-rf-in-ram-pcram b9a5211, fast (depths 1,461 to 1,623) | not run (memory) | 32,538 s (9 h 2 min) at 7050096 with 4 jobs (the memory cap: 6.4 GB per task, 30 GB budget, the host shared), 56/56 PASS and every reach task REACHED; reg 19,669 s, reset 9,076 s, bus_dmem 7,796 s, bus_imem 6,773 s, the instruction groups 943 to 3,581 s, every other check 184 to 3,118 s. A first 7-job attempt was hung up after 2 h 20 min when the Mac crashed (see "Orphans") |
 | fc07cc3 (hyp/002-rf-in-ram), fast (depths up to 1,222) | not run (memory) | a detached 3-job run was still running at the time of writing |
 
 The first V2 attempt (7 jobs, the host partly shared) finished these proofs before it was hung
