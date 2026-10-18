@@ -260,17 +260,22 @@ def gate_cosim(ctx):
     if rc != 0 or not progs:
         raise GateFail(f"gate cosim: `make -C verif/programs list` failed or listed nothing "
                        f"(log {ctx.log_rel('cosim_list')})")
+    # The Pmod models check time-based limits (tCEM, SCK rate) at the signoff clock.
+    clk = clock_period_ns(ctx, "cosim")
     out = "build/cosim.json"
     ctx.clear(out)
     t0 = time.time()
     rc, lines = ctx.run([ctx.py, "verif/cosim/run_cosim.py", "--all", "--no-make", "--jobs",
-                         str(eval_jobs())], "cosim")
+                         str(eval_jobs()), "--clk-ns", f"{clk:g}"], "cosim")
     log = ctx.log_rel("cosim")
     j = ctx.fresh_json("cosim", out, t0)
     if j.get("error"):
         raise GateFail(f"cosim FAIL: {str(j['error'])[:240]} (log {log})")
     if j.get("contract") != "v3":
         raise GateFail(f"cosim FAIL: {out} has contract {j.get('contract')!r}, not 'v3' (log {log})")
+    if not _num(j.get("clk_ns")) or j["clk_ns"] != clk:
+        raise GateFail(f"cosim FAIL: the runner used clk_ns {j.get('clk_ns')!r}, not the signoff "
+                       f"CLOCK_PERIOD {clk:g} ns (log {log})")
     if j.get("programs") != progs:
         raise GateFail(f"cosim FAIL: the runner's programs {j.get('programs')!r} differ from "
                        f"`make -C verif/programs list` {progs!r} (log {log})")
