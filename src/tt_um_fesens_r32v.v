@@ -27,9 +27,9 @@
  * then emits ({ring[7:4], ring[3:0]} >> r) with zero or sign fill.
  *
  *   P   READ  x0 (the pc)                     -> ring, address register
- *   A   READ  rs1 -> ALU (+imm; AUIPC/JAL: ring + imm; CSR: rs1 or zimm; branches: rs1 - 0)
- *             -> ring, address register (loads/stores); an IO load captures the slot into the
- *             ring at A's tail
+ *   A   READ  rs1 -> ALU (+imm; AUIPC: ring + imm; CSR: rs1 or zimm; branches: rs1 - 0)
+ *             -> ring, address register (loads/stores); a branch on x0 only compares (the
+ *             ring keeps the pc); an IO load captures the slot into the ring at A's tail
  *   PX  READ  x0 -> ring + (taken ? imm : 4) (branch); READ scratch -> ring (JALR)
  *   B   READ  rs2 -> ALU with the ring (OP, branches); register shifts: rs2[4:0] -> mar
  *   BS  READ  rs2 -> ring (store data); an IO store writes the slot at BS's tail
@@ -38,11 +38,12 @@
  *   F   READ  pc -> instruction register
  *   M   READ/WRITE the load/store address (4 bytes / the store's bytes); a store to flash is
  *             masked
- *   WP  WRITE x0 <- ring;  WP4: x0 <- ring + 4;  W4: rd (JAL) or scratch (JALR) <- ring + 4
+ *   WP  WRITE x0 <- ring;  WP4: x0 <- ring + 4 (JAL, taken branch on x0: ring + imm);
+ *             W4: rd (JAL) or scratch (JALR) <- ring + 4
  *   W   WRITE rd <- ring (forward, load bytes extended, shifted, SLT)
  *   WS  WRITE scratch <- ring;  WC: the CSR <- ring
  * Sequences: ALU P F WP4 A [B] W; load P F WP4 A M W (IO: A W); store P F WP4 A BS M (IO: A BS);
- * branch P F A [B] PX WP (B only if rs2 != x0); JAL P F W4 A WP; JALR P F W4 A WP [PX W];
+ * branch P F A B PX WP, on x0 P F A WP4; JAL P F W4 WP4; JALR P F W4 A WP [PX W];
  * FENCE, WFI P F WP4; CSR P F WP4 A WS C W RS WC; MRET P F C WP. A synchronous trap (decode
  * after F, JALR after A, branch after A or B) runs [P] WC(mepc <- pc) C(mtvec) WP and retires; an
  * interrupt (at a retirement) runs P WC C WP and continues with the handler's P. Until the first
@@ -136,7 +137,7 @@ module tt_um_fesens_r32v (
     wire c_st    = c_mem & insn[5];
     wire c_ld    = c_mem & ~insn[5];
     wire c_u     = ~insn[6] & insn[4] & insn[2];
-    wire c_pcrel = (c_u & ~insn[5]) | c_jal;            // AUIPC, JAL: ring (pc) + imm
+    wire c_pcrel = c_u & ~insn[5];                      // AUIPC: ring (pc) + imm
     wire c_alu   = ~insn[6] & insn[4] & ~insn[2];
     wire c_op    = c_alu & insn[5];
     wire c_sh    = c_alu & (f3[1:0] == 2'b01);
@@ -190,7 +191,7 @@ module tt_um_fesens_r32v (
     // Slot control
     // ------------------------------------------------------------------------------------
     wire csr_sl = sC | sWC;
-    wire mask = (sA & (c_u | c_jal | (rs1_f == 4'd0) | (c_csr & f3[2]))) |
+    wire mask = (sA & (c_u | (rs1_f == 4'd0) | (c_csr & f3[2]))) |
                 ((sB | sBS) & rs2z) |
                 ((sW | sW4) & (rd_f == 4'd0)) |
                 (first & (sP | (sPX & c_br))) |
@@ -242,9 +243,10 @@ module tt_um_fesens_r32v (
     wire [3:0] four   = {1'b0, n0, 2'b00};
     wire       bimm_a = ~(c_op | c_br | c_sh);
     wire [3:0] a4     = (sB | (sA & c_pcrel) | winc) ? ring[3:0] : nib_m;
+    wire       wimm   = sWP4 & (c_jal | (c_br & taken));   // WP4 of JAL / taken x0 branch
     wire [3:0] b4     = sA ? (imm4 & {4{bimm_a}}) :
                         sB ? nib_m :
-                        winc ? four :
+                        winc ? (wimm ? imm4 : four) :
                         (sPX & c_br) ? (taken ? imm4 : four) : 4'd0;
     // A: SLTI/SLTIU, and branches compare rs1 with 0; B: SUB, SLT, SLTU and branches subtract
     wire       sub    = sA ? (c_slt | c_br) : (sB & (c_br | (~f3[2] & (f3[1] | insn[30]))));
@@ -328,10 +330,11 @@ module tt_um_fesens_r32v (
                     nsl = c_br ? SL_A : (c_jal | c_jalr) ? SL_W4 : p_mret ? SL_C : SL_WP4;
             end
             SL_WP4: begin
-                nret = c_fence | priv;                 // FENCE, WFI (MRET, ECALL, EBREAK never get here)
+                // FENCE, WFI (MRET, ECALL, EBREAK never get here), JAL, a branch on x0
+                nret = c_fence | priv | c_jal | c_br;
                 nsl  = SL_A;
             end
-            SL_W4: nsl = SL_A;
+            SL_W4: nsl = c_jal ? SL_WP4 : SL_A;
             SL_A: begin
                 if (c_jalr & ~cmp) begin
                     tgo = 1'b1;
@@ -345,7 +348,7 @@ module tt_um_fesens_r32v (
                         tgo = 1'b1;
                         nsl = SL_P;
                     end else
-                        nsl = SL_PX;
+                        nsl = SL_WP4;                   // the ring still holds the pc
                 end else if (c_op)
                     nsl = SL_B;
                 else if (c_st)
@@ -411,7 +414,7 @@ module tt_um_fesens_r32v (
     // ------------------------------------------------------------------------------------
     // Ring and instruction register (no reset: nothing reads them before they are written)
     // ------------------------------------------------------------------------------------
-    wire ring_in  = dstb & (fR | (sM & c_ld)) & ~shB;
+    wire ring_in  = dstb & (fR | (sM & c_ld)) & ~shB & ~(sA & c_br & rs2z);
     wire hrot     = stb & hdr & cn[5] & sW & c_sh & (cn[2:0] <= rotn);
     wire ring_rot = (dstb & wr) | hrot;
     always @(posedge clk) begin
