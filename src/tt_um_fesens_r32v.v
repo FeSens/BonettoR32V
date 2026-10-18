@@ -274,7 +274,7 @@ module tt_um_fesens_r32v (
     wire       bimm_a = ~(c_op | c_sh | (c_br & ~rs2z));
     // the pc operand: pcr, or the ring in a fetch after a taken branch on x0 (tk)
     wire       a_pc   = (sF & ~tk) | (sA & (c_pcrel | nb)) | sX | (sW4 & c_jal);
-    wire [3:0] a4     = a_pc ? pk4 : (sB | sW4 | sF) ? ring[3:0] : nib_m;
+    wire [3:0] a4     = a_pc ? pk4 : (sB | sW4 | (sF & tk)) ? ring[3:0] : nib_m;
     wire [3:0] b4     = sA ? (imm4 & {4{bimm_a}}) :
                         sB ? nib_m :
                         sF ? four :
@@ -373,10 +373,8 @@ module tt_um_fesens_r32v (
                     tgo = 1'b1;
                     nsl = SL_WC;
                 end else if (c_jalr) begin
-                    if (rd_f == 4'd0)
-                        nret = 1'b1;                    // nothing to link
-                    else
-                        nsl = SL_W4;
+                    nret = (rd_f == 4'd0);              // nothing to link
+                    nsl  = SL_W4;
                 end
                 else if (c_br) begin
                     if (~rs2z)
