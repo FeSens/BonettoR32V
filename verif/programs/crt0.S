@@ -1,4 +1,4 @@
-# Startup for the contract-v3 test programs (docs/contract-v3.md sections 3-4). Execution starts at
+# Startup for the contract-v3 test programs (docs/contract.md sections 3-4). Execution starts at
 # pc = 0 (flash) after reset.
 #
 #   1. x1..x15 start unknown on the core (contract 1), so clear them all: otherwise prologues

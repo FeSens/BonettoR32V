@@ -16,8 +16,8 @@
   "PL_TARGET_DENSITY_PCT": 60,
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
-  "//": "The value is in nanoseconds, so 20ns == 50MHz. BonettoR32V signs off at 50 ns (20 MHz).",
-  "CLOCK_PERIOD": 50,
+  "//": "The value is in nanoseconds, so 20ns == 50MHz. BonettoR32V: 25 ns, the 40 MHz signoff (contract section 7).",
+  "CLOCK_PERIOD": 25,
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,

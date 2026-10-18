@@ -3,50 +3,55 @@ project:
   title:        "BonettoR32V"
   author:       "Felipe Sens Bonetto"
   discord:      ""
-  description:  "Smallest-area RV32E RISC-V core with SPI RAM and GPIO"
+  description:  "RV32E microcontroller: code from the QSPI Pmod flash, data in its PSRAM; GPIO, timer, PWM, UART, SPI, interrupts"
   language:     "Verilog"
-  clock_hz:     20000000
+  clock_hz:     40000000
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  # Contract: the lead sets this to the smallest tile config the champion hardens in.
-  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  # Contract (docs/contract.md section 7): 1x2, the user's choice for the full peripheral set.
+  tiles: "1x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   top_module:  "tt_um_fesens_r32v"
 
-  # Source files must be in ./src; the lead regenerates this list from the champion's src/.
+  # Source files must be in ./src; the lead regenerates this list from the champion's src/*.v.
   source_files:
+    - "r32v_csr.v"
+    - "r32v_mem.v"
+    - "r32v_periph.v"
     - "tt_um_fesens_r32v.v"
 
+# Pin functions: docs/contract.md sections 1 and 5.2. A uo pin carries its peripheral function
+# when its ALTFN bit is 1, else GPIO_OUT; every ui pin is always readable through GPIO_IN.
 pinout:
   # Inputs
-  ui[0]: "GPIO_IN0"
-  ui[1]: "GPIO_IN1"
+  ui[0]: "GPIO_IN0 / timer capture"
+  ui[1]: "GPIO_IN1 / UART RX"
   ui[2]: "GPIO_IN2"
-  ui[3]: "GPIO_IN3"
+  ui[3]: "GPIO_IN3 / SPI MISO"
   ui[4]: "GPIO_IN4"
   ui[5]: "GPIO_IN5"
   ui[6]: "GPIO_IN6"
   ui[7]: "GPIO_IN7"
 
   # Outputs
-  uo[0]: "GPIO_OUT0"
-  uo[1]: "GPIO_OUT1"
-  uo[2]: "GPIO_OUT2"
-  uo[3]: "GPIO_OUT3"
-  uo[4]: "GPIO_OUT4"
-  uo[5]: "GPIO_OUT5"
-  uo[6]: "GPIO_OUT6"
-  uo[7]: "GPIO_OUT7"
+  uo[0]: "GPIO_OUT0 / UART TX"
+  uo[1]: "GPIO_OUT1 / PWM0 (IR gate: AND timer output)"
+  uo[2]: "GPIO_OUT2 / PWM1"
+  uo[3]: "GPIO_OUT3 / PWM2"
+  uo[4]: "GPIO_OUT4 / SPI CS_n"
+  uo[5]: "GPIO_OUT5 / SPI SCK"
+  uo[6]: "GPIO_OUT6 / SPI MOSI"
+  uo[7]: "GPIO_OUT7 / timer output"
 
-  # Bidirectional pins
-  uio[0]: "SPI_CS_N"
-  uio[1]: "SPI_MOSI"
-  uio[2]: "SPI_MISO"
-  uio[3]: "SPI_SCK"
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
-  uio[7]: ""
+  # Bidirectional pins: TT QSPI Pmod (W25Q128JV flash, APS6404L PSRAM)
+  uio[0]: "Pmod flash CS_n"
+  uio[1]: "Pmod SD0 (MOSI)"
+  uio[2]: "Pmod SD1 (MISO)"
+  uio[3]: "Pmod SCK"
+  uio[4]: "Pmod SD2"
+  uio[5]: "Pmod SD3"
+  uio[6]: "Pmod PSRAM A CS_n"
+  uio[7]: "Pmod PSRAM B CS_n (held high)"
 
 # Do not change!
 yaml_version: 6

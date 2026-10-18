@@ -328,7 +328,7 @@ class Search:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--project", default=str(REPO))
-    ap.add_argument("--tiles", help="tile size (default: info.yaml's, normally 1x1)")
+    ap.add_argument("--tiles", help="tile size (default: info.yaml's, 1x2 under contract v3)")
     ap.add_argument("--steps", type=int, default=6, help="bisection steps after the full tile")
     ap.add_argument("--lo", type=float, help="known-failing fraction (default: synth area/core)")
     ap.add_argument("--overlay", help="extra LibreLane keys for every trial (physical hypotheses)")

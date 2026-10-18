@@ -1,8 +1,8 @@
-// BonettoR32V reference ISS for contract v3 (docs/contract-v3.md sections 3, 4, 5 and 8): RV32E
+// BonettoR32V reference ISS for contract v3 (docs/contract.md sections 3, 4, 5 and 8): RV32E
 // plus the Zicsr subset, traps to mtvec, the external interrupt, the flash / PSRAM / IO memory
 // map and a register-level model of the peripherals. Header-only: the v3 cosim harness and
-// iss_main share one model. The RV32E decode and execute are copied from v2's iss.h, with traps
-// to mtvec instead of halts.
+// iss_main share one model. The RV32E decode and execute were copied from the contract v2 ISS
+// (iss.h, deleted at the integration swap), with traps to mtvec instead of halts.
 //
 // Memory map (contract 3), for an address a:
 //   - a[31] = 0, a[24] = 0: flash byte a[23:0] (16 MiB, read-only: stores change nothing);
@@ -816,8 +816,8 @@ inline bool load_flash_hex(const char* path, uint8_t* out, std::string* err) {
 
 }  // namespace v3
 
-// Global names for the v3 harness. A translation unit that also includes v2's iss.h (which has
-// its own Retire, iss_class and iss_disasm) defines ISS3_NAMESPACED and writes v3:: instead.
+// Global names for the cosim harness and progsim. A translation unit that wants only the v3::
+// names (iss_main) defines ISS3_NAMESPACED first.
 #ifndef ISS3_NAMESPACED
 using v3::IoHooks;
 using v3::IoRegs;

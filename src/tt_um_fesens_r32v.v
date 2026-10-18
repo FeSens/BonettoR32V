@@ -1,5 +1,5 @@
 /*
- * BonettoR32V MCU seed (contract v3, docs/contract-v3.md): the hypothesis-005 bit-serial RV32E
+ * BonettoR32V MCU seed (contract v3, docs/contract.md): the hypothesis-005 bit-serial RV32E
  * core with x1..x15, the pc, mtvec, mscratch and mepc in the PSRAM core region, on TT's QSPI Pmod
  * (code runs from flash, data in PSRAM), with a minimal Zicsr, traps and one interrupt to mtvec,
  * and the contract-5 peripherals.

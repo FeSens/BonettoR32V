@@ -1,5 +1,5 @@
 /*
- * BonettoR32V CSRs and trap/interrupt sequencing (docs/contract-v3.md section 4).
+ * BonettoR32V CSRs and trap/interrupt sequencing (docs/contract.md section 4).
  *
  * Where the CSRs live:
  * - mtvec, mscratch and mepc are words of the core region (PSRAM 0x7F_FF94, 0x7F_FF98,

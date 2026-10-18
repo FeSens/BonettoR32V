@@ -1,4 +1,4 @@
-/* BonettoR32V test programs, contract v3 (docs/contract-v3.md section 3): code runs from the QSPI
+/* BonettoR32V test programs, contract v3 (docs/contract.md section 3): code runs from the QSPI
  * Pmod's flash, data lives in its PSRAM. Execution starts at pc = 0 after reset.
  *
  * Flash (CPU 0x0000_0000, read-only; the image is loaded before reset):

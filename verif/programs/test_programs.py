@@ -1,11 +1,11 @@
-"""Checks of the contract-v3 test programs (docs/contract-v3.md) and their expect.json files.
+"""Checks of the contract-v3 test programs (docs/contract.md) and their expect.json files.
 
     python3 -m pytest verif/programs/test_programs.py -q      (or: make -C verif/programs check)
 
 It builds every program (`make -C verif/programs`), then checks:
   - every program the harness runs has <name>.{elf,hex,expect.json};
   - the hex files are sparse $readmemh flash images (`@addr` records, bytes only, inside 16 MiB);
-  - the deterministic programs ran to the self-loop on the standalone ISS (`iss_main --v3`) with
+  - the deterministic programs ran to the self-loop on the standalone ISS (`iss_main`) with
     GPIO_OUT = result_gpio = 0x5A (ruling R13), and their expect.json carries the ISS run;
   - the random streams cover what gen_random.py promises (alias bits, the bytes below the core
     region, flash loads and stores, IO slots and lanes, backward branches);
@@ -184,7 +184,7 @@ def test_irq_programs_have_no_stimulus(built):
 
 # ---- random streams: what gen_random.py promises ------------------------------------------------
 def iss_log(prog: str, max_retire: int = 20000):
-    p = subprocess.run([str(ISS), "--v3", str(OUT / f"{prog}.hex"), "--log", "--json", "--max",
+    p = subprocess.run([str(ISS), str(OUT / f"{prog}.hex"), "--log", "--json", "--max",
                         str(max_retire)], capture_output=True, text=True, timeout=120)
     lines = [json.loads(ln) for ln in p.stdout.splitlines() if ln.startswith("{")]
     return [x for x in lines if "i" in x], lines[-1]

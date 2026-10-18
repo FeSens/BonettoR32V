@@ -35,13 +35,16 @@ def defines(name: str, d: Path = PRIV) -> list:
 
 
 # ---- the option and test selection ---------------------------------------------------------------
-def test_v3_option_exists():
-    p = run_arch_cli("--phase", "prep")  # the v3-only option, without --v3
-    assert p.returncode == 2 and "--phase needs --v3" in p.stderr
+def test_options():
+    # contract v3 is the only flow since the swap (plan Task 9): --phase needs no --v3, and --v3
+    # is still accepted (a no-op) so old command lines keep working
     p = run_arch_cli("--help")
     assert p.returncode == 0 and "--v3" in p.stdout and "--phase" in p.stdout
-    p = run_arch_cli("--v3", "--phase", "nope")
-    assert p.returncode == 2 and "invalid choice" in p.stderr
+    assert "no-op" in p.stdout or "ignored" in p.stdout
+    for args in (["--phase", "nope"], ["--v3", "--phase", "nope"]):
+        p = run_arch_cli(*args)
+        assert p.returncode == 2 and "invalid choice" in p.stderr, args
+    assert run_arch.CFLAGS_V3.count("-DBONETTO_V3") == 0  # model_test.h has one model now
 
 
 @need_suite

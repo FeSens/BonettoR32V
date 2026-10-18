@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Felipe Sens Bonetto
 # SPDX-License-Identifier: Apache-2.0
-"""Tiny Tapeout test for the BonettoR32V MCU (contract v3, docs/contract-v3.md) on the TT QSPI Pmod.
+"""Tiny Tapeout test for the BonettoR32V MCU (contract v3, docs/contract.md) on the TT QSPI Pmod.
 
 The Pmod is the cosim's C++ model (verif/cosim/pmod.h, through pmod_ctypes.py): a W25Q128JV flash
 holding the program and an APS6404L PSRAM, with every contract 2.1-2.4 bus rule checked on every

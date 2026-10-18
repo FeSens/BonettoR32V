@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write <name>.expect.json for a contract-v3 test program (docs/contract-v3.md), the file the
+"""Write <name>.expect.json for a contract-v3 test program (docs/contract.md), the file the
 cosim harness reads (Task 3's field names), and check the program is valid.
 
 Usage: mkexpect.py --iss ISS_MAIN --hex PROG.hex --elf PROG.elf --out PROG.expect.json
@@ -23,7 +23,7 @@ Every expect.json has:
                 UART line, so the end makes no false start bit). Pins in GPIO mode at the end:
                 result_gpio & ~final_altfn.
 
-kind "iss" adds the `iss_main --v3 --check-init` summary: retired, end ("selfloop"), end_pc,
+kind "iss" adds the `iss_main --check-init` summary: retired, end ("selfloop"), end_pc,
 uo_trace (GPIO_OUT & ~ALTFN, one entry per change), gpio_out, altfn, traps, interrupts.
 The run must end in the self-loop with GPIO_OUT = 0x5A, never read a register or an arbitrary-reset
 CSR before writing it, never execute an unspecified instruction or touch the core region, and
@@ -154,7 +154,7 @@ def psram_windows(name: str, syms: dict, segs, crt0_data: bool) -> list:
 
 
 def run_iss(iss: str, hexfile: str, max_retire: int):
-    p = subprocess.run([iss, "--v3", hexfile, "--json", "--check-init", "--max", str(max_retire)],
+    p = subprocess.run([iss, hexfile, "--json", "--check-init", "--max", str(max_retire)],
                        capture_output=True, text=True, timeout=600)
     lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
     if not lines:

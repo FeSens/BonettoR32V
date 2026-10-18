@@ -1,4 +1,4 @@
-// Seed unit-test ISS for contract v3 (docs/contract-v3.md sections 3-5). Not a contract gate:
+// Seed unit-test ISS for contract v3 (docs/contract.md sections 3-5). Not a contract gate:
 // the gates' own Iss3 (verif/cosim/iss3.h, Task 2) replaces it. Header-only.
 //
 // - RV32E + Zicsr subset + MRET + WFI (no-op), machine mode only.

@@ -130,7 +130,7 @@ same skips, splits and exclusions: `run_arch.py --src verif/cosim/mutants/legal_
 
 ## Contract v3 (`--v3`)
 
-`python3 verif/arch-test/run_arch.py --v3` runs the same suite under `docs/contract-v3.md`: code
+`python3 verif/arch-test/run_arch.py --v3` runs the same suite under `docs/contract.md`: code
 in the QSPI Pmod's flash, data and the signature in its PSRAM, traps to `mtvec`. It writes
 `build/arch.json` and `build/arch/report.json` in the same formats (the report adds
 `"contract": "v3"`, the ISA string, the suite commit, the spike ISA form and GCC version prep

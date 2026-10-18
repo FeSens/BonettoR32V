@@ -1,4 +1,4 @@
-# BonettoR32V test programs, contract v3 (docs/contract-v3.md).
+# BonettoR32V test programs, contract v3 (docs/contract.md).
 #
 #   make -C verif/programs          build/programs/<name>.{elf,hex,expect.json} for every program
 #   make -C verif/programs NAME...  only those programs (e.g. `selftest coremark`)
@@ -11,7 +11,7 @@
 #
 # <name>.hex is a sparse 16 MiB flash image ($readmemh: `@addr` records, unset bytes erased).
 # <name>.expect.json (mkexpect.py) is what the cosim harness checks:
-#   - deterministic programs: the standalone ISS run (`iss_main --v3`), which must end in the
+#   - deterministic programs: the standalone ISS run (`iss_main`), which must end in the
 #     self-loop with GPIO_OUT = 0x5A;
 #   - peripheral programs (their outcome depends on peripheral timing, ruling R13): the declared
 #     stimulus and expectations (stim.h, stimuli in mkexpect.py), plus <name>.stim for progsim.
@@ -78,7 +78,7 @@ check: all $(PROGSIM)
 $(OUT) $(ROOT)/build/cosim:
 	mkdir -p $@
 
-$(ISS): $(COSIM)/iss_main.cpp $(COSIM)/iss.h $(COSIM)/iss3.h | $(ROOT)/build/cosim
+$(ISS): $(COSIM)/iss_main.cpp $(COSIM)/iss3.h | $(ROOT)/build/cosim
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ $<
 
 $(PROGSIM): progsim.cpp $(COSIM)/iss3.h | $(OUT)

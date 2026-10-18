@@ -1,14 +1,15 @@
-"""Tests for the contract v3 cosim harness (verif/cosim/harness.cpp, periph_models.h,
-run_cosim.py --v3). The contract v2 tests are in test_cosim_harness_v2.py until the swap.
+"""Tests for the cosim harness (contract v3: verif/cosim/harness.cpp, periph_models.h,
+run_cosim.py). The contract v2 harness and its tests were deleted at the integration swap (plan
+Task 9, ruling R26).
 
 1. The peripheral pin models (periph_models.h) through their unit-test binary test_periph:
    UART RX bit edges at round(k (DIV+1) (1 +- 1%)), UART TX exact bit times, the SPI echo device
    (mode 0, MISO held through 3 cycles after each rising edge), the PWM meter.
 2. The harness on hand-written stub designs. test_fixtures/playback replays a pin script and an
    RVFI script given as plusargs (one Verilator build per mode); the scripts come from tiny
-   hand-assembled programs run on the reference ISS (iss_main --v3 --log), so every retirement
+   hand-assembled programs run on the reference ISS (iss_main --log), so every retirement
    matches the ISS unless a test changes it on purpose.
-3. The tcem_stall mutant (ruling R12), run_cosim.py --v3 and its program list (ruling R18), the v3
+3. The tcem_stall mutant (ruling R12), run_cosim.py and its program list (ruling R18), the
    liveness fuzz.
 
 Every program here is hand-encoded (no RISC-V compiler needed), so the suite runs on hwe-bench.
@@ -78,8 +79,8 @@ def flash_hex(path: Path, segments: dict) -> Path:
 
 
 def iss_log(hexf: Path, *args):
-    """The ISS's retirements for a program (iss_main --v3 --log), interrupt entries left out."""
-    p = subprocess.run([str(TOOLS / "iss_main"), "--v3", str(hexf), "--log", "--json", "--max",
+    """The ISS's retirements for a program (iss_main --log), interrupt entries left out."""
+    p = subprocess.run([str(TOOLS / "iss_main"), str(hexf), "--log", "--json", "--max",
                         "1000", *args], capture_output=True, text=True)
     rows = [json.loads(ln) for ln in p.stdout.splitlines() if ln.startswith("{")]
     assert rows and rows[-1].get("summary") and rows[-1]["end"] == "selfloop", (p.stdout, p.stderr)
@@ -193,7 +194,7 @@ _n = [0]
 def stub(mode, hexf, tmp, pins=None, rets=None, cycles=None, expect=None, seed=1, extra=(),
          src=PLAYBACK):
     """Run the harness on the playback stub. Returns the JSON summary."""
-    exe = run_cosim.ensure_built(mode, src, v3=True)
+    exe = run_cosim.ensure_built(mode, src)
     _n[0] += 1
     cmd = [str(exe), str(hexf), "--seed", str(seed), *extra]
     if expect is not None:
@@ -218,7 +219,7 @@ def stub(mode, hexf, tmp, pins=None, rets=None, cycles=None, expect=None, seed=1
 
 def stub_setup_error(mode, hexf, tmp, expect):
     """A harness run that must stop as a setup error (exit 2, no JSON). Returns its stderr."""
-    exe = run_cosim.ensure_built(mode, PLAYBACK, v3=True)
+    exe = run_cosim.ensure_built(mode, PLAYBACK)
     _n[0] += 1
     ep = tmp / f"expect{_n[0]}.json"
     ep.write_text(json.dumps(expect))
@@ -925,57 +926,59 @@ def test_expect_max_cycles_budget(tools, tmp_path):
     assert "max_cycles" in stub_setup_error("pins", hexf, tmp_path, {**exp, "max_cycles": 0})
     # through run_cosim: <name>.expect.json beside the hex
     (tmp_path / "vbud.expect.json").write_text(json.dumps(exp))
-    s, _ = run_cosim.run_one("pins", hexf, 1, src=PLAYBACK, v3=True)
+    s, _ = run_cosim.run_one("pins", hexf, 1, src=PLAYBACK)
     assert not s["pass"] and "timeout after 15001 cycles (expect.json max_cycles)" in s["error"], (
         s["error"])
-    s, _ = run_cosim.run_one("pins", hexf, 1, max_cycles=12000, src=PLAYBACK, v3=True)
+    s, _ = run_cosim.run_one("pins", hexf, 1, max_cycles=12000, src=PLAYBACK)
     assert not s["pass"] and "timeout after 12001 cycles (--max-cycles)" in s["error"], s["error"]
 
 
 # ------------------------------------------------------------------------------------------------
-# 3. the tCEM mutant (R12), run_cosim.py --v3 (R18), the v3 fuzz
+# 3. the tCEM mutant (R12), run_cosim.py (R18), the fuzz
 @pytest.mark.parametrize("mode", ["rvfi", "pins"])
 def test_tcem_mutant_fails(tools, tmp_path, mode):
     """mutants/tcem_stall holds PSRAM CS_n low with SCK paused for 400 cycles during a read:
     past tCEM = 8 us = 320 cycles at 25 ns (contract 2.1.7)."""
     hexf = flash_hex(tmp_path / "loop.hex", {0: PROG_LOOP})
-    s, res = run_cosim.run_one(mode, hexf, 1, src=TCEM, v3=True)
+    s, res = run_cosim.run_one(mode, hexf, 1, src=TCEM)
     assert not s["pass"] and "tCEM" in s["error"], s["error"]
     assert list(s) == list(run_cosim.KEYS) and s["coremark_cycles_per_iter"] is None
 
 
-def test_run_cosim_v3_cli(tools, tmp_path):
-    """R18: --v3 runs the v3 harness and prints KEYS (coremark_cycles_per_iter included); the v3
-    gate is the plan's program list x both modes x seeds 1-4, plus the fuzz at seeds 1-5."""
+@pytest.mark.parametrize("v3_flag", [[], ["--v3"]], ids=["default", "v3-no-op"])
+def test_run_cosim_cli(tools, tmp_path, v3_flag):
+    """R18: the CLI runs the v3 harness and prints KEYS (coremark_cycles_per_iter included), with
+    or without the old --v3 flag (a no-op since the swap); the gate is the plan's program list x
+    both modes x seeds 1-4, plus the fuzz at seeds 1-5."""
     hexf = flash_hex(tmp_path / "loop.hex", {0: PROG_LOOP})
-    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), "--v3", "--mode", "pins",
+    p = subprocess.run([sys.executable, str(COSIM / "run_cosim.py"), *v3_flag, "--mode", "pins",
                         "--prog", str(hexf), "--src", str(TCEM)], capture_output=True, text=True)
     s = json.loads(p.stdout.strip().splitlines()[-1])
     assert p.returncode == 1 and list(s) == list(run_cosim.KEYS), (p.returncode, s)
     assert "tCEM" in s["error"] and s["coremark_cycles_per_iter"] is None
-    assert run_cosim.SEEDS_V3 == (1, 2, 3, 4) and run_cosim.FUZZ_SEEDS_V3 == (1, 2, 3, 4, 5)
-    assert run_cosim.LAT_CAP_V3 == 2048 and run_cosim.CLK_NS == 25.0
+    assert run_cosim.SEEDS == (1, 2, 3, 4) and run_cosim.FUZZ_SEEDS == (1, 2, 3, 4, 5)
+    assert run_cosim.LAT_CAP == 2048 and run_cosim.CLK_NS == 25.0
     plan = {"selftest", "csr", "irq_timer", "irq_stress", "wfi", "coherence", "uart_echo",
             "spi_loop", "pwm", "ir_loop", "gpio_edge", "mem_init_check", "coremark"}
     plan |= {f"trap_{t}" for t in ("ecall", "ebreak", "jal", "jalr", "branch", "zero", "ones")}
     plan |= {f"random_{n}" for n in range(1, 7)}
-    assert set(run_cosim.V3_PROGRAMS) == plan and len(run_cosim.V3_PROGRAMS) == len(plan)
-    # --all --v3 runs every program `make list` reports; the plan's 26 must be among them
+    assert set(run_cosim.PLAN_PROGRAMS) == plan and len(run_cosim.PLAN_PROGRAMS) == len(plan)
+    # --all runs every program `make list` reports; the plan's 26 must be among them
     listed = sorted(plan) + ["gpio_demo", "uart_echo_fast"]
-    assert run_cosim.missing_v3_programs(listed) == []
-    assert run_cosim.missing_v3_programs([p for p in listed if p != "wfi"]) == ["wfi"]
-    assert run_cosim.build_dir_for("rvfi", run_cosim.SRC, "", False, v3=True).name == "rvfi-v3"
+    assert run_cosim.missing_plan_programs(listed) == []
+    assert run_cosim.missing_plan_programs([p for p in listed if p != "wfi"]) == ["wfi"]
+    assert run_cosim.build_dir_for("rvfi", run_cosim.SRC, "", False).name == "rvfi"
 
 
-def test_fuzz_v3_checks_liveness(tools):
-    """The v3 liveness fuzz on random flash images: a stub that never retires fails the rvfi-mode
+def test_fuzz_checks_liveness(tools):
+    """The liveness fuzz on random flash images: a stub that never retires fails the rvfi-mode
     fuzz with the latency cap; pins mode checks only the pin rules (and the idle stub passes)."""
-    s = run_cosim.run_fuzz("rvfi", 1, runs=4, cap=10, src=PLAYBACK, v3=True)
-    assert list(s) == run_cosim.FUZZ_KEYS_V3
+    s = run_cosim.run_fuzz("rvfi", 1, runs=4, cap=10, src=PLAYBACK)
+    assert list(s) == run_cosim.FUZZ_KEYS
     assert not s["pass"] and s["liveness_checked"] is True, json.dumps(s)
     want = "latency cap: no retirement within 2048 cycles of reset release"
     assert want in s["error"], s["error"]
-    s = run_cosim.run_fuzz("pins", 1, runs=2, cap=10, src=PLAYBACK, v3=True)
+    s = run_cosim.run_fuzz("pins", 1, runs=2, cap=10, src=PLAYBACK)
     assert s["pass"] and s["liveness_checked"] is False and s["runs"] == 3, json.dumps(s)
-    s = run_cosim.run_fuzz("rvfi", 3, runs=2, cap=10, src=TCEM, v3=True)
+    s = run_cosim.run_fuzz("rvfi", 3, runs=2, cap=10, src=TCEM)
     assert not s["pass"] and "tCEM" in s["error"], json.dumps(s)

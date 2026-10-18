@@ -1,4 +1,4 @@
-# BonettoR32V selftest, contract v3 (docs/contract-v3.md sections 3-5).
+# BonettoR32V selftest, contract v3 (docs/contract.md sections 3-5).
 #
 # Executes every RV32E instruction (ECALL and EBREAK trap: see the trap_* programs), every branch
 # taken and not taken, x0 writes, JALR with bit 0 set, JAL offsets with J-imm bits 16-20 (to

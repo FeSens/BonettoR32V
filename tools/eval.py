@@ -3,11 +3,12 @@
 
 Gate order (docs/eval.md): cheapest first, so a bad candidate retires early.
   lint (~1 s), area (~10 s), cosim (minutes), arch (minutes), equiv, gl (minutes), and formal (the
-  longest) only with --formal (contract v3 section 7: formal runs at final signoff and on every
+  longest) only with --formal (contract section 7: formal runs at final signoff and on every
   tenth merged improvement). eval.json says "formal": "pass", "fail" or "skipped".
-The score is coremark_ips = f_clk / CoreMark cycles per iteration (contract v3 section 7): the
+The score is coremark_ips = f_clk / CoreMark cycles per iteration (contract section 7): the
 cosim gate reads the cycles from the CoreMark runs and f_clk from src/config.json CLOCK_PERIOD.
-The area gate includes the `fits` pre-filter: synth area above 11,500 um2 fails (harden confirms).
+The area gate includes the `fits` pre-filter for the 1x2 tile: synth area above FIT_AREA_UM2
+(provisional 24,000 um2) fails (a 1x2 harden confirms).
 With --min-ips X, a candidate whose coremark_ips is below X (or null) stops right after the cosim
 gate ("NO_GAIN", exit 3): it cannot win, so the rest of its gates are not worth running. A tie
 continues through every gate: the contract's tiebreak (smaller synth area) may still make it win.
@@ -27,6 +28,8 @@ Usage:
   eval.py -v              also stream runner output to the console (always on with --gate)
 
 Runner output goes to build/logs/<gate>*.log. Formal runs under `lockf -k /tmp/bonetto-heavy.lock`.
+The cosim and arch gates run their runner's parallel jobs: BONETTO_EVAL_JOBS (a positive integer),
+else the machine's cores minus 2, at most 16. That changes scheduling, never a verdict.
 """
 import argparse
 import datetime
@@ -50,17 +53,29 @@ TOOLCHAIN_BIN = os.path.expanduser("~/bonetto/riscv-autoarch/.toolchain/oss-cad-
 TOP = "tt_um_fesens_r32v"
 ORDER = ["lint", "area", "cosim", "arch", "equiv", "gl"]
 FORMAL_GATE = "formal"                  # appended to ORDER only with --formal
-FIT_AREA_UM2 = 11500.0                  # `fits` pre-filter for one 1x1 tile (harden confirms)
+# The `fits` pre-filter for one 1x2 tile (contract section 7). PROVISIONAL: the lead confirms the
+# threshold from a 1x2 harden of the seed (ledger: the user's 1x2 decision; the seed's synth area
+# is about 20,300 um2) and the harden in a champion round has the last word.
+FIT_AREA_UM2 = 24000.0
+FIT_TILES = "1x2"
 COREMARK_PROG = "coremark"              # the program whose runs carry the score
 # One heavy job at a time on the Mac. The path is overridable only so tests don't queue behind a
 # real formal run; it changes scheduling, never a verdict.
 HEAVY_LOCK = ["lockf", "-k", os.environ.get("BONETTO_HEAVY_LOCK", "/tmp/bonetto-heavy.lock")]
-LATENCY_CAP = 1024                       # contract section 4
+LATENCY_CAP = 2048                      # contract section 4
 COSIM_MODES = ("rvfi", "pins")
-COSIM_SEEDS = (1, 2, 3)
-FUZZ_SEEDS = (1, 2, 3, 4, 5)          # random-image liveness fuzz (reserved encodings etc.)
-FUZZ_MIN_RUNS = 2048 + 8              # run_cosim.py's default: 2,048 probe runs + 8 walks
-EXPECT_RETIRED_KEYS = ("retired", "retired_count", "instret", "insns", "instructions")
+COSIM_SEEDS = (1, 2, 3, 4)              # the four memory power-up modes (contract 2.4)
+FUZZ_SEEDS = (1, 2, 3, 4, 5)            # random-image liveness fuzz (reserved encodings etc.)
+FUZZ_MIN_RUNS = 2048 + 8                # run_cosim.py's default: 2,048 probe runs + 8 walks
+ARCH_TESTS = 53                         # ruling R34: rv32e_m/E (37) + rv32e_m/privilege (16)
+
+
+def eval_jobs():
+    """Parallel jobs for the cosim and arch runners (scheduling only, never a verdict)."""
+    v = os.environ.get("BONETTO_EVAL_JOBS", "")
+    if v.isdigit() and int(v) > 0:
+        return int(v)
+    return max(1, min(16, (os.cpu_count() or 2) - 2))
 
 
 class GateFail(Exception):
@@ -174,12 +189,12 @@ def positive_number(v):
 
 
 def coremark_ips(cycles_per_iter, clock_period_ns):
-    """CoreMark iterations per second: f_clk / cycles per iteration (contract v3 section 7)."""
+    """CoreMark iterations per second: f_clk / cycles per iteration (contract section 7)."""
     return 1e9 / clock_period_ns / cycles_per_iter
 
 
 def clock_period_ns(ctx, gate):
-    """CLOCK_PERIOD (ns) from src/config.json, the signoff clock (contract v3 section 7)."""
+    """CLOCK_PERIOD (ns) from src/config.json, the signoff clock (contract section 7)."""
     rel = "src/config.json"
     try:
         with open(ctx.path(rel)) as f:
@@ -224,87 +239,101 @@ def gate_lint(ctx):
     return f"verilator -Wall clean, plain and RISCV_FORMAL builds ({len(srcs)} files)", {}
 
 
-def expect_retired(path):
-    with open(path) as f:
-        exp = json.load(f)
-    for k in EXPECT_RETIRED_KEYS:
-        if isinstance(exp.get(k), int):
-            return exp[k]
-    raise GateFail(f"gate cosim: no retired-instruction count in {os.path.basename(path)} "
-                   f"(looked for {', '.join(EXPECT_RETIRED_KEYS)}; keys: {', '.join(exp)})")
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def gate_cosim(ctx):
-    """Every program in build/programs, modes rvfi and pins, seeds 1-3 (plan Task 3)."""
+    """make -C verif/programs, then one `run_cosim.py --all --no-make --jobs N` (contract v3;
+    writes build/cosim.json): every program `make -C verif/programs list` reports, modes rvfi and
+    pins, seeds 1-4 (the four memory power-up modes), plus the rvfi-mode liveness fuzz under seeds
+    1-5. The adapter re-checks the json itself: the program list, every (program, mode, seed) run
+    exactly once and passing, every fuzz seed, the 2,048-cycle cap and the CoreMark fields."""
     ctx.need("cosim", "verif/cosim/run_cosim.py", "verif/programs/Makefile")
     rc, lines = ctx.run(["make", "-C", "verif/programs"], "cosim_programs")
     if rc != 0:
         raise GateFail(f"gate cosim: program build failed: {first_problem(lines)} "
                        f"(log {ctx.log_rel('cosim_programs')})")
-    hexes = sorted(glob.glob(ctx.path("build", "programs", "*.hex")))
-    # Fail fast: the short directed programs first, CoreMark (the longest run) last.
-    first = {"selftest": 0, "gpio_demo": 1, "coremark": 3}
-    hexes.sort(key=lambda h: (first.get(os.path.basename(h)[:-4], 2), h))
-    if not hexes:
-        raise GateFail("gate cosim: no build/programs/*.hex after make -C verif/programs")
-    # Liveness on reserved encodings and unspecified accesses first (seconds, and the programs
-    # never contain them): every instruction must retire or trap within the latency cap.
-    for seed in FUZZ_SEEDS:
-        log = f"cosim_fuzz_{seed}"
-        rc, lines = ctx.run([ctx.py, "verif/cosim/run_cosim.py", "--fuzz-liveness",
-                             "--seed", str(seed)], log)
-        s = last_json_line(lines) or {}
-        runs_done = s.get("runs")
-        if rc != 0 or s.get("pass") is not True or s.get("liveness_checked") is not True \
-                or s.get("error") or not (isinstance(runs_done, int) and runs_done >= FUZZ_MIN_RUNS):
-            why = s.get("error") or (f"exit {rc}" if s else "no JSON summary line")
-            if s and s.get("liveness_checked") is not True and not s.get("error"):
-                why = "liveness was not checked"
-            elif s and not s.get("error") and s.get("pass") is True:
-                why = f"only {runs_done!r} fuzz runs (need >= {FUZZ_MIN_RUNS})"
-            raise GateFail(f"cosim FAIL on liveness fuzz --seed {seed}: {why} "
-                           f"(log {ctx.log_rel(log)})")
-    runs = []
-    for hexpath in hexes:
-        name = os.path.basename(hexpath)[:-4]
-        expect = hexpath[:-4] + ".expect.json"
-        if not os.path.isfile(expect):
-            raise GateFail(f"gate cosim: missing {os.path.relpath(expect, ctx.repo)}")
-        expect_retired(expect)              # the expect file must be well-formed
-        # No --max-cycles: the harness bounds each run by the latency cap times ITS OWN ISS
-        # retirement count for that mode and seed (programs branch on ui_in, so counts differ
-        # from the expect file's), and its watchdog bounds every gap.
-        for mode in COSIM_MODES:
-            for seed in COSIM_SEEDS:
-                log = f"cosim_{name}_{mode}_{seed}"
-                cmd = [ctx.py, "verif/cosim/run_cosim.py", "--mode", mode,
-                       "--prog", os.path.relpath(hexpath, ctx.repo), "--seed", str(seed)]
-                rc, lines = ctx.run(cmd, log)
-                s = last_json_line(lines) or {}
-                where = f"{name} --mode {mode} --seed {seed}"
-                if rc != 0 or s.get("pass") is not True or s.get("error"):
-                    why = s.get("error") or (f"exit {rc}" if s else "no JSON summary line")
-                    raise GateFail(f"cosim FAIL on {where}: {why} (log {ctx.log_rel(log)})")
-                gap = s.get("max_cycles_per_insn")
-                if isinstance(gap, (int, float)) and gap > LATENCY_CAP:
-                    raise GateFail(f"cosim FAIL on {where}: max_cycles_per_insn {gap} exceeds the "
-                                   f"latency cap {LATENCY_CAP} (contract section 4)")
-                cm = s.get("coremark_cycles_per_iter")
-                if cm is not None and not positive_number(cm):
-                    raise GateFail(f"cosim FAIL on {where}: bad coremark_cycles_per_iter {cm!r} "
-                                   f"(log {ctx.log_rel(log)})")
-                runs.append({"prog": name, "mode": mode, "seed": seed,
-                             "retired": s.get("retired"), "cycles": s.get("cycles"),
-                             "cpi": s.get("cpi"), "max_cycles_per_insn": gap,
-                             "coremark_cycles_per_iter": cm})
-    base = [r for r in runs if r["mode"] == "pins" and r["seed"] == COSIM_SEEDS[0]
+    rc, lines = ctx.run(["make", "-s", "-C", "verif/programs", "list"], "cosim_list")
+    progs = " ".join(ln for ln in lines if not ln.startswith(("$ ", "make"))).split()
+    if rc != 0 or not progs:
+        raise GateFail(f"gate cosim: `make -C verif/programs list` failed or listed nothing "
+                       f"(log {ctx.log_rel('cosim_list')})")
+    out = "build/cosim.json"
+    ctx.clear(out)
+    t0 = time.time()
+    rc, lines = ctx.run([ctx.py, "verif/cosim/run_cosim.py", "--all", "--no-make", "--jobs",
+                         str(eval_jobs())], "cosim")
+    log = ctx.log_rel("cosim")
+    j = ctx.fresh_json("cosim", out, t0)
+    if j.get("error"):
+        raise GateFail(f"cosim FAIL: {str(j['error'])[:240]} (log {log})")
+    if j.get("contract") != "v3":
+        raise GateFail(f"cosim FAIL: {out} has contract {j.get('contract')!r}, not 'v3' (log {log})")
+    if j.get("programs") != progs:
+        raise GateFail(f"cosim FAIL: the runner's programs {j.get('programs')!r} differ from "
+                       f"`make -C verif/programs list` {progs!r} (log {log})")
+    if j.get("seeds") != list(COSIM_SEEDS) or j.get("fuzz_seeds") != list(FUZZ_SEEDS):
+        raise GateFail(f"cosim FAIL: seeds {j.get('seeds')!r} and fuzz seeds "
+                       f"{j.get('fuzz_seeds')!r}, need {list(COSIM_SEEDS)} and {list(FUZZ_SEEDS)} "
+                       f"(log {log})")
+    runs = j.get("runs") if isinstance(j.get("runs"), list) else []
+    bad = [r for r in runs if r.get("pass") is not True or r.get("error")]
+    if bad:
+        r = bad[0]
+        raise GateFail(f"cosim FAIL on {r.get('prog')} --mode {r.get('mode')} --seed "
+                       f"{r.get('seed')}: {r.get('error') or 'pass is not true'} "
+                       f"({len(bad)} failing run(s); log {log})")
+    seen = [(r.get("prog"), r.get("mode"), r.get("seed")) for r in runs]
+    want = [(p, m, s) for p in progs for m in COSIM_MODES for s in COSIM_SEEDS]
+    if sorted(seen, key=repr) != sorted(want, key=repr):
+        lack = [k for k in want if k not in seen]
+        extra = sorted({k for k in seen if k not in want or seen.count(k) > 1}, key=repr)
+        raise GateFail(f"cosim FAIL: the runs are not every program x mode x seed exactly once "
+                       f"(missing {lack[:3]}, extra or repeated {extra[:3]}; log {log})")
+    for r in runs:
+        where = f"{r['prog']} --mode {r['mode']} --seed {r['seed']}"
+        gap = r.get("max_cycles_per_insn")
+        if _num(gap) and gap > LATENCY_CAP:
+            raise GateFail(f"cosim FAIL on {where}: max_cycles_per_insn {gap} exceeds the "
+                           f"latency cap {LATENCY_CAP} (contract section 4)")
+        cm = r.get("coremark_cycles_per_iter")
+        if cm is not None and not positive_number(cm):
+            raise GateFail(f"cosim FAIL on {where}: bad coremark_cycles_per_iter {cm!r} "
+                           f"(log {log})")
+    fuzz = j.get("fuzz") if isinstance(j.get("fuzz"), list) else []
+    if sorted((f.get("seed") for f in fuzz), key=repr) != list(FUZZ_SEEDS):
+        raise GateFail(f"cosim FAIL: liveness fuzz seeds "
+                       f"{sorted((f.get('seed') for f in fuzz), key=repr)}, need "
+                       f"{list(FUZZ_SEEDS)} once each (log {log})")
+    for f in sorted(fuzz, key=lambda f: f["seed"]):
+        runs_done, gap = f.get("runs"), f.get("max_cycles_per_insn")
+        why = None
+        if f.get("pass") is not True or f.get("error"):
+            why = f.get("error") or "pass is not true"
+        elif f.get("liveness_checked") is not True:
+            why = "liveness was not checked"
+        elif not (isinstance(runs_done, int) and runs_done >= FUZZ_MIN_RUNS):
+            why = f"only {runs_done!r} fuzz runs (need >= {FUZZ_MIN_RUNS})"
+        elif _num(gap) and gap > LATENCY_CAP:
+            why = f"max_cycles_per_insn {gap} exceeds the latency cap {LATENCY_CAP}"
+        if why:
+            raise GateFail(f"cosim FAIL on liveness fuzz --seed {f['seed']}: {why} (log {log})")
+    if rc != 0 or j.get("pass") is not True:
+        raise GateFail(f"cosim FAIL: run_cosim.py --all exit {rc}, pass {j.get('pass')!r} "
+                       f"(log {log})")
+    runs = [{k: r.get(k) for k in ("prog", "mode", "seed", "retired", "cycles", "cpi",
+                                   "max_cycles_per_insn", "coremark_cycles_per_iter")}
+            for r in runs]
+    # cpi: rvfi mode sees every retirement (pins mode can't), seed 1, every program.
+    base = [r for r in runs if r["mode"] == "rvfi" and r["seed"] == COSIM_SEEDS[0]
             and isinstance(r["retired"], int) and isinstance(r["cycles"], int)]
     retired = sum(r["retired"] for r in base)
     cpi = round(sum(r["cycles"] for r in base) / retired, 3) if retired else None
     ctx.notes["cpi"] = cpi
     # The score: the slowest CoreMark run that reports cycles per iteration (every mode and
-    # seed; they should agree). None when no run reports it (the runner or program predates
-    # the iteration marks); --min-ips then counts the candidate as no gain.
+    # seed; they should agree). None when no run reports it (R17, R21); --min-ips then counts the
+    # candidate as no gain.
     marks = [r["coremark_cycles_per_iter"] for r in runs
              if r["prog"] == COREMARK_PROG and r["coremark_cycles_per_iter"] is not None]
     cm_cycles = max(marks) if marks else None
@@ -312,12 +341,15 @@ def gate_cosim(ctx):
     ips = coremark_ips(cm_cycles, period) if cm_cycles is not None else None
     ctx.notes.update({"coremark_ips": ips, "coremark_cycles_per_iter": cm_cycles,
                       "clock_period_ns": period})
-    worst = max((r["max_cycles_per_insn"] or 0) for r in runs)
-    return (f"{len(runs)} runs pass ({len(hexes)} programs x {len(COSIM_MODES)} modes x "
+    worst = max(((r["max_cycles_per_insn"] or 0) for r in runs), default=0)
+    fuzz_worst = max(((f.get("max_cycles_per_insn") or 0) for f in fuzz), default=0)
+    return (f"{len(runs)} runs pass ({len(progs)} programs x {len(COSIM_MODES)} modes x "
             f"{len(COSIM_SEEDS)} seeds) + liveness fuzz x {len(FUZZ_SEEDS)}, cpi {cpi}, "
-            f"worst retirement gap {worst}, coremark_ips {ips} ({cm_cycles} cycles/iteration "
-            f"at {period} ns)",
-            {"runs": runs, "cpi": cpi, "coremark_ips": ips, "coremark_cycles_per_iter": cm_cycles,
+            f"worst retirement gap {worst} (fuzz {fuzz_worst}), coremark_ips {ips} "
+            f"({cm_cycles} cycles/iteration at {period} ns)",
+            {"runs": runs, "fuzz": [{k: f.get(k) for k in ("seed", "runs", "max_cycles_per_insn")}
+                                    for f in sorted(fuzz, key=lambda f: f["seed"])],
+             "cpi": cpi, "coremark_ips": ips, "coremark_cycles_per_iter": cm_cycles,
              "clock_period_ns": period})
 
 
@@ -369,12 +401,14 @@ def gate_formal_deep(ctx):
 
 
 def gate_arch(ctx):
-    """verif/arch-test/run_arch.py (writes build/arch.json)."""
+    """verif/arch-test/run_arch.py --jobs N, the one-host flow (--phase all: GCC, spike and
+    Verilator; writes build/arch.json): all 53 tests (ruling R34) under seeds 1-4."""
     ctx.need("arch", "verif/arch-test/run_arch.py")
     out = "build/arch.json"
     ctx.clear(out)
     t0 = time.time()
-    rc, lines = ctx.run([ctx.py, "verif/arch-test/run_arch.py"], "arch")
+    rc, lines = ctx.run([ctx.py, "verif/arch-test/run_arch.py", "--jobs", str(eval_jobs())],
+                        "arch")
     j = ctx.fresh_json("arch", out, t0)
     tests = j.get("tests") or {}
     failed = sorted(k for k, v in tests.items() if v is not True)
@@ -382,6 +416,9 @@ def gate_arch(ctx):
         why = ", ".join(failed[:10]) if failed else ("no tests reported" if not tests
                                                      else f"exit {rc}")
         raise GateFail(f"arch FAIL: {why} (log {ctx.log_rel('arch')})")
+    if len(tests) != ARCH_TESTS:
+        raise GateFail(f"arch FAIL: {len(tests)} tests ran, ruling R34 needs all {ARCH_TESTS} "
+                       f"(log {ctx.log_rel('arch')})")
     return f"{len(tests)} riscv-arch-test tests pass", {"tests": len(tests)}
 
 
@@ -404,7 +441,7 @@ def synth_area(ctx):
         raise GateFail(f"gate area: engine {j.get('engine')!r}, the score needs the librelane engine")
     latches = j.get("latches")
     if latches != 0:
-        raise GateFail(f"gate area: {latches!r} latches (contract v1 section 1: no latches)")
+        raise GateFail(f"gate area: {latches!r} latches (contract section 1: no latches)")
     netlist = j.get("netlist") or "build/synth/netlist.v"
     netlist = netlist if os.path.isabs(netlist) else ctx.path(netlist)
     if not os.path.isfile(netlist):
@@ -415,14 +452,14 @@ def synth_area(ctx):
 
 
 def gate_area(ctx):
-    """synth_area, then the `fits` pre-filter: synth area <= 11,500 um2 (one 1x1 tile; the
-    harden in a champion round confirms)."""
+    """synth_area, then the `fits` pre-filter: synth area <= FIT_AREA_UM2 (one 1x2 tile,
+    provisional; the harden in a champion round confirms)."""
     detail, data = synth_area(ctx)
     area = data["area_um2"]
     if area > FIT_AREA_UM2:
         raise GateFail(f"fits FAIL: synth area {area} um2 exceeds {FIT_AREA_UM2:,.0f} um2, the "
-                       f"1x1 pre-filter ({data['cells']} cells)")
-    return f"{detail}, fits (<= {FIT_AREA_UM2:,.0f} um2)", {**data, "fits": True}
+                       f"{FIT_TILES} pre-filter ({data['cells']} cells)")
+    return f"{detail}, fits {FIT_TILES} (<= {FIT_AREA_UM2:,.0f} um2)", {**data, "fits": True}
 
 
 def junit_counts(path):
@@ -438,7 +475,8 @@ def junit_counts(path):
 
 
 def gate_gl(ctx):
-    """make -C test GATES=yes on the area netlist with the sky130 cell models (plan Task 7)."""
+    """make -C test GATES=yes on the area netlist with the sky130 cell models: the TT test
+    (test/, contract v3: the QSPI Pmod model, gpio_demo in the four power-up modes, uart_hello)."""
     ctx.need("gl", "test/Makefile")
     if "netlist" not in ctx.notes:          # standalone `make gl`: synthesize (no fits check)
         try:
@@ -542,7 +580,7 @@ def main(argv=None):
     ap.add_argument("--out", help="eval json path (default build/eval.json)")
     ap.add_argument("--repo", default=REPO, help=argparse.SUPPRESS)
     ap.add_argument("--formal", action="store_true",
-                    help="also run the formal gate, last (contract v3 section 7 cadence)")
+                    help="also run the formal gate, last (contract section 7 cadence)")
     ap.add_argument("--min-ips", type=float, metavar="IPS",
                     help="retire the candidate after the cosim gate if coremark_ips < IPS "
                          "(a tie continues: the area tiebreak may win)")

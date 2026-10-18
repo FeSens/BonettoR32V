@@ -1,5 +1,5 @@
 /*
- * BonettoR32V MCU peripherals (docs/contract-v3.md section 5): GPIO with edge flags, a 16-bit
+ * BonettoR32V MCU peripherals (docs/contract.md section 5): GPIO with edge flags, a 16-bit
  * timer with compare, capture and an output, 3 PWM channels, a UART (8N1) and an SPI master
  * (mode 0), plus the interrupt line. One register file, one read mux.
  *

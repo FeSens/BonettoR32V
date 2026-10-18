@@ -1,4 +1,4 @@
-/* BonettoR32V platform definitions for the test programs (docs/contract-v3.md sections 3-5).
+/* BonettoR32V platform definitions for the test programs (docs/contract.md sections 3-5).
  * Usable from C and from assembly (.S files include it too: only #defines outside the C part).
  *
  * IO: 32-bit slots at 0x8000_0000 + 4n (slot = addr[6:2], other address bits ignored). A load

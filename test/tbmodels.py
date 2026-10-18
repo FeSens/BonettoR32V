@@ -6,7 +6,7 @@ test_tbmodels.py unit-tests them with plain pytest (python3 -m pytest test/test_
 - gpio_demo_shown / gpio_demo_memory: verif/programs/gpio_demo.c's GPIO_OUT writes, PSRAM stores
   and final result bytes while ui_in holds one value. test.py checks them against the ISS's
   expect.json (ui_in = 0) before using them.
-- changes: a GPIO-mode uo_out trace (mask first, then one entry per change), as iss_main --v3 lists
+- changes: a GPIO-mode uo_out trace (mask first, then one entry per change), as iss_main lists
   uo_trace.
 - UartRx: an 8N1 decoder for UART TX on uo[0] (contract 5.5), as verif/cosim/periph_models.h
   UartTerm::tx_step decodes it.

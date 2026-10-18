@@ -1,4 +1,4 @@
-// Seed unit-test model of TT's QSPI Pmod (docs/contract-v3.md section 2). Not a contract gate:
+// Seed unit-test model of TT's QSPI Pmod (docs/contract.md section 2). Not a contract gate:
 // the gates' PmodBus (verif/cosim/pmod.h, Task 1) replaces it. It covers what the seed uses:
 //   flash (W25Q128JV) on uio[0]: 0x03 read, 0x02 program (ignored), 0xFF mode reset, and the
 //     continuous-read exit (8 quad edges with M[5:4] != 10);

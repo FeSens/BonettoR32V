@@ -2,7 +2,7 @@
 `timescale 1ns / 1ps
 
 /*
- * Tiny Tapeout testbench for tt_um_fesens_r32v, contract v3 (docs/contract-v3.md).
+ * Tiny Tapeout testbench for tt_um_fesens_r32v, contract v3 (docs/contract.md).
  *
  * The TT QSPI Pmod (flash on uio[0], SD0/SD1 on uio[1:2], SCK on uio[3], SD2/SD3 on uio[4:5],
  * PSRAM A on uio[6], PSRAM B CS_n on uio[7]) is not a Verilog model: test.py runs the C++ chip

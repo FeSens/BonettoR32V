@@ -1,5 +1,5 @@
-// Pin-level cosim harness for tt_um_fesens_r32v under contract v3 (docs/contract-v3.md; see
-// docs/cosim.md). The contract v2 harness is harness_v2.cpp until the integration swap.
+// Pin-level cosim harness for tt_um_fesens_r32v under contract v3 (docs/contract.md; see
+// docs/cosim.md).
 //
 //   harness <prog.hex> [--seed S] [--expect PATH] [--clk-ns 25] [--max-cycles C] [--trace PATH]
 //           [--dump-psram PATH] [-v]
@@ -1791,10 +1791,11 @@ void Harness::summary(bool passed, double secs) {
 
 // ---- liveness fuzz (--fuzz-liveness K) ---------------------------------------------------------
 // Contract 4: every instruction retires within 2,048 cycles of the previous one (a WFI stall
-// excepted), reserved encodings, traps and unspecified accesses included. The fuzz keeps v2's
-// structure on random flash images (bytes 0-64 KB; the rest erased, 0xFF): K probe sub-runs, then
-// K/256 (at least 1) walk sub-runs, each from reset with its own power-up modes (all four cycle
-// through), flip-flop state and noise, and no reference: only liveness and the pin rules count.
+// excepted), reserved encodings, traps and unspecified accesses included. The fuzz keeps the
+// contract v2 fuzz's structure on random flash images (bytes 0-64 KB; the rest erased, 0xFF): K
+// probe sub-runs, then K/256 (at least 1) walk sub-runs, each from reset with its own power-up
+// modes (all four cycle through), flip-flop state and noise, and no reference: only liveness and
+// the pin rules count.
 //
 // Probe sub-run k (seed S): 0..8 valid, non-trapping, non-control RV32E instructions (random
 // registers x0..x15, so loads and stores reach flash, PSRAM, IO and the core region), then a

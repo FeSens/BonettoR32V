@@ -1,5 +1,5 @@
 /*
- * BonettoR32V memory controller for TT's QSPI Pmod (docs/contract-v3.md sections 2 and 3).
+ * BonettoR32V memory controller for TT's QSPI Pmod (docs/contract.md sections 2 and 3).
  *
  * - Reset sequence (contract 2.4), before the core starts: flash CS_n low for 8 SCK edges with
  *   SD0-SD3 high (leaves continuous read; in standard mode it is command 0xFF), then PSRAM

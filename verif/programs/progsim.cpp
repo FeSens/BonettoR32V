@@ -1,5 +1,5 @@
 // progsim: run a contract-v3 test program on the reference ISS (verif/cosim/iss3.h) with a timed
-// model of the peripherals (docs/contract-v3.md section 5) and of the harness's stimulus
+// model of the peripherals (docs/contract.md section 5) and of the harness's stimulus
 // (<name>.stim, written by mkexpect.py from stim.h). It checks the peripheral test programs
 // before the RTL harness exists and at core speeds the seed doesn't have. It is not a gate: the
 // cosim harness (Task 3) and the RTL decide.
