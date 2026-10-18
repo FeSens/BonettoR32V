@@ -211,10 +211,20 @@ def clock_period_ns(ctx, gate):
 # Gate adapters. Each returns (detail, data) on PASS and raises GateFail on FAIL.
 # ---------------------------------------------------------------------------------------------
 
+def cell_models(gate):
+    """The behavioral models of the whitelisted sky130 cells (verif/cells, contract section 1),
+    read after src/*.v by every gate that compiles RTL. A missing model fails the gate."""
+    models = src_check.cell_model_files()
+    for p in models:
+        if not os.path.isfile(p):
+            raise GateFail(f"gate {gate}: cell model missing ({os.path.relpath(p, REPO)})")
+    return models
+
+
 def gate_lint(ctx):
     """tools/src_check.py first (static rules, then the verilator/yosys/iverilog
-    differential preprocessor check), then verilator --lint-only -Wall over src/*.v (top tt_um_fesens_r32v),
-    plain and RISCV_FORMAL builds."""
+    differential preprocessor check), then verilator --lint-only -Wall over src/*.v and the cell
+    models (top tt_um_fesens_r32v), plain and RISCV_FORMAL builds."""
     problems = src_check.check(ctx.path("src"))
     if not problems:
         problems = src_check.check_differential(ctx.path("src"), ctx.env)
@@ -224,20 +234,22 @@ def gate_lint(ctx):
         raise GateFail(f"src hygiene (tools/src_check.py): {shown}")
     ctx.need_tool("lint", "verilator")
     srcs = ctx.src_files("lint")
+    models = cell_models("lint")
     # Paths go to Verilator as separate argv entries (no shell). They are absolute (so none can
     # read as an option) and must match SAFE_PATH, as a second line behind src_check.
-    for p in srcs:
+    for p in srcs + models:
         if not SAFE_PATH.match(p):
             raise GateFail(f"gate lint: unsafe path {p!r}")
     base = ["verilator", "--lint-only", "-Wall", "--top-module", TOP]
     builds = (("plain", []), ("RISCV_FORMAL", ["-DRISCV_FORMAL"]))
     for label, extra in builds:
         log = "lint_" + label.lower()
-        rc, lines = ctx.run(base + extra + srcs, log)
+        rc, lines = ctx.run(base + extra + srcs + models, log)
         if rc != 0:
             raise GateFail(f"verilator -Wall ({label} build) failed: {first_problem(lines)} "
                            f"(log {ctx.log_rel(log)})")
-    return f"verilator -Wall clean, plain and RISCV_FORMAL builds ({len(srcs)} files)", {}
+    return (f"verilator -Wall clean, plain and RISCV_FORMAL builds ({len(srcs)} files, "
+            f"{len(models)} cell models)"), {}
 
 
 def _num(v):

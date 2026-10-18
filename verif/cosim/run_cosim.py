@@ -111,6 +111,7 @@ def verilator_version() -> str:
 
 
 HARNESS_DEPS = ("harness.cpp", "pmod.h", "iss3.h", "periph_models.h", "build.sh")
+CELLS = ROOT / "verif" / "cells"    # the sky130 cell models build.sh reads after the design
 
 
 def build_key(mode: str, src: Path, vflags: str, trace: bool) -> str:
@@ -121,6 +122,9 @@ def build_key(mode: str, src: Path, vflags: str, trace: bool) -> str:
         h.update(p.read_bytes())
     for p in deps:
         h.update(p.name.encode() + b"\0")
+        h.update(p.read_bytes())
+    for p in sorted(CELLS.glob("*.v")):
+        h.update(b"cells/" + p.name.encode() + b"\0")
         h.update(p.read_bytes())
     return h.hexdigest()
 

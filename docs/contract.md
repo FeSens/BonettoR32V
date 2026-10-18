@@ -55,7 +55,8 @@ module tt_um_fesens_r32v (
   edges, internal tristates or combinational loops. Plain Verilog-2005 and the restricted
   preprocessor. No `initial` blocks or initializers. Module names `tt_um_fesens_r32v` or `r32v_*`.
   `tools/src_check.py` enforces the synthesizable subset. Every top-level `src/*.v` file is part of
-  the design.
+  the design. Instances of the sky130 standard cells listed in `CELL_WHITELIST` in
+  `tools/src_check.py` are allowed (named port connections only, no power pins or parameters).
 - **No power-up values.** Core state may start unknown, the register file included. The design
   must reach correct behavior from reset alone. Checkers randomize every flip-flop (cosim) or
   leave it as X (gate-level test).
