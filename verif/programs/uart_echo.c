@@ -11,6 +11,10 @@
  *   3. Overrun: it stops reading. UART_KEEP arrives (RX_FULL = 1), then UART_DROP arrives while
  *      RX_FULL = 1: it is dropped and RX_OVR = 1. Reading byte 0 of UART_DATA returns UART_KEEP and
  *      clears RX_FULL and RX_OVR. It echoes UART_KEEP.
+ *   4. Side effects only for the byte named (contract 5): reading byte 1 of UART_DATA during the
+ *      overrun keeps RX_FULL and RX_OVR; at the end, with the divider at its maximum (a frame
+ *      would keep TX_BUSY at 1 for about 82k cycles), writing byte 1 and the halfword at byte 2
+ *      sends nothing.
  * uart_tx_expect = UART_HELLO + UART_MSG + UART_KEEP.
  *
  * It ends with GPIO_OUT = 0x5A and ALTFN = ALT_UART_TX: uo0 stays the idle UART line (high), so
@@ -47,12 +51,21 @@ int main(void) {
   WAIT_UNTIL(UART_CTRL & UART_RX_OVR, 1u << 22, 0x18);
   CHECK(UART_CTRL & UART_RX_FULL, 0x19);
   CHECK(IRQ_PEND & IRQ_RX, 0x1a);
+  CHECK(*(volatile uint8_t *)(IO_BASE + OFS_UART_DATA + 1) == 0, 0x1f); /* byte 1: no side effect */
+  CHECK((UART_CTRL & (UART_RX_FULL | UART_RX_OVR)) == (UART_RX_FULL | UART_RX_OVR), 0x20);
   uint8_t k = IO_REG8(SLOT_UART_DATA);
   CHECK(k == UART_KEEP, 0x1b); /* the dropped UART_DROP didn't replace it */
   CHECK(!(UART_CTRL & (UART_RX_FULL | UART_RX_OVR)), 0x1c);
   CHECK(!(IRQ_PEND & IRQ_RX), 0x1d);
   send(k);
   WAIT_UNTIL(!(UART_CTRL & UART_TX_BUSY), 1u << 20, 0x1e); /* the last frame is out */
+
+  /* Writing bytes 1-3 of UART_DATA sends nothing (only byte 0 starts a frame). */
+  UART_CTRL = UART_DIV_MASK;
+  *(volatile uint8_t *)(IO_BASE + OFS_UART_DATA + 1) = 0x55;
+  CHECK(!(UART_CTRL & UART_TX_BUSY), 0x21);
+  *(volatile uint16_t *)(IO_BASE + OFS_UART_DATA + 2) = 0x5555;
+  CHECK(!(UART_CTRL & UART_TX_BUSY), 0x22);
 
   /* The end without crt0's _pass, which would hand uo0 back to GPIO (low). */
   GPIO_OUT = RESULT_PASS;
