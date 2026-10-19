@@ -153,12 +153,14 @@ The memory board is Tiny Tapeout's QSPI Pmod on the bidirectional (`uio`) header
   outputs; SD0-SD3 switch direction during read transactions.
 - **SCK** is the core clock divided by 2: 25 MHz at 50 MHz, below every limit of both chips
   (contract 2.2, 2.3).
-- **The flash's QE bit must be 1** (quad enable). First-party Pmods ship that way and TT's flasher
-  sets it (contract 1); a third-party board needs QE set first (section 6.9).
+- **The flash's QE bit must be 1** (quad enable). TT's store Pmods ship that way; TT's flasher
+  does not set it, so any other board needs QE set first (contract 1, section 6.9).
 - **The core never writes the flash.** It never sends write enable, erase or a status write. A
   store to a flash address does nothing.
-- **Any power-up state works.** The core puts both chips into a known mode at every reset
-  (section 3.2), whatever mode another design left them in.
+- **Any power-up state of contract 2.4 works.** The core puts both chips into a known mode at
+  every reset (section 3.2), whatever mode another design left them in, as long as the flash is
+  in standard SPI or EBh continuous read. After a design that left the flash in QPI mode, deep
+  power-down, dual continuous read or wrap mode, power-cycle the Pmod first (contract 1).
 - **PSRAM CS_n low time** (tCEM) is at most 8 µs per transaction for the APS6404L. The longest
   PSRAM transaction keeps CS_n low for 41 cycles (derived), 0.82 µs at 50 MHz.
 

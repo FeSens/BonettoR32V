@@ -30,6 +30,10 @@
 //                    r_wb_data
 //   r_bad_trst       PSRAM CS_n fell less than tRST after a 0x99 ended (contract 2.3)
 //   r_bad_cem        PSRAM CS_n has been low for more than tCEM cycles (contract 2.1.7)
+//   x_bad_cph        the chip's CS_n fell less than its minimum high time after it rose
+//                    (contract 2.1.2: BONETTO_TCPH_FLASH / BONETTO_TCPH_PSRAM cycles)
+//   f_bad_cont       the flash's CS_n rose after a first M nibble with M[5:4] = 10, before
+//                    the 4 dummy edges and one data byte (contract 2.2)
 //
 // UNSPECIFIED stop (contract 3 and 4, computed by rvfi_wrapper):
 //   bon_unspec_ret   this retirement's fetch or data access is UNSPECIFIED: it touches the core
@@ -99,6 +103,9 @@
   _d [7:0]  r_wb_data, \
   _d        r_bad_trst, \
   _d        r_bad_cem, \
+  _d        f_bad_cph, \
+  _d        r_bad_cph, \
+  _d        f_bad_cont, \
   _d        bon_unspec_ret, \
   _d        bon_fetch_unspec, \
   _d        bon_stopped, \
@@ -150,6 +157,9 @@
   (* keep *) wire [7:0]  r_wb_data; \
   (* keep *) wire        r_bad_trst; \
   (* keep *) wire        r_bad_cem; \
+  (* keep *) wire        f_bad_cph; \
+  (* keep *) wire        r_bad_cph; \
+  (* keep *) wire        f_bad_cont; \
   (* keep *) wire        bon_unspec_ret; \
   (* keep *) wire        bon_fetch_unspec; \
   (* keep *) wire        bon_stopped; \
@@ -168,7 +178,8 @@
   .r_bad_wend(r_bad_wend), .r_rd(r_rd), .r_rd_addr(r_rd_addr), .r_rd_quad(r_rd_quad), \
   .r_rd_idx(r_rd_idx), .r_fin(r_fin), .r_fin_rd(r_fin_rd), .r_fin_wr(r_fin_wr), \
   .r_wb(r_wb), .r_wb_addr(r_wb_addr), .r_wb_data(r_wb_data), .r_bad_trst(r_bad_trst), \
-  .r_bad_cem(r_bad_cem), .bon_unspec_ret(bon_unspec_ret), .bon_fetch_unspec(bon_fetch_unspec), \
+  .r_bad_cem(r_bad_cem), .f_bad_cph(f_bad_cph), .r_bad_cph(r_bad_cph), \
+  .f_bad_cont(f_bad_cont), .bon_unspec_ret(bon_unspec_ret), .bon_fetch_unspec(bon_fetch_unspec), \
   .bon_stopped(bon_stopped), .bon_brj(bon_brj), .bon_spec(bon_spec)
 
 // The uniform checker interface: clock, checker reset, the free check input

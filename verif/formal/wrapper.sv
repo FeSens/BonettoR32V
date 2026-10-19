@@ -129,7 +129,7 @@ module rvfi_wrapper (
 		.dout(f_dout), .dquad(f_dquad), .bad_cmd(f_bad_cmd), .bad_extra(f_bad_extra),
 		.bad_wend(f_bad_wend), .rd(f_rd), .rd_addr(f_rd_addr), .rd_quad(f_rd_quad),
 		.rd_idx(f_rd_idx), .wb(), .wb_addr(), .wb_data(), .fin(f_fin), .fin_rd(f_fin_rd),
-		.fin_wr(f_fin_wr), .bad_trst(), .bad_cem()
+		.fin_wr(f_fin_wr), .bad_trst(), .bad_cem(), .bad_cph(f_bad_cph), .bad_cont(f_bad_cont)
 	);
 	wire [23:0] r_wb_addr24;
 	bonetto_qspi_chip #(.PSRAM(1)) psram (
@@ -138,7 +138,8 @@ module rvfi_wrapper (
 		.dout(r_dout), .dquad(r_dquad), .bad_cmd(r_bad_cmd), .bad_extra(r_bad_extra),
 		.bad_wend(r_bad_wend), .rd(r_rd), .rd_addr(r_rd_addr), .rd_quad(r_rd_quad),
 		.rd_idx(r_rd_idx), .wb(r_wb), .wb_addr(r_wb_addr24), .wb_data(r_wb_data), .fin(r_fin),
-		.fin_rd(r_fin_rd), .fin_wr(r_fin_wr), .bad_trst(r_bad_trst), .bad_cem(r_bad_cem)
+		.fin_rd(r_fin_rd), .fin_wr(r_fin_wr), .bad_trst(r_bad_trst), .bad_cem(r_bad_cem),
+		.bad_cph(r_bad_cph), .bad_cont()
 	);
 	assign r_wb_addr = r_wb_addr24[22:0];
 
@@ -258,11 +259,16 @@ endmodule
 //   - Flash: standard mode (8-bit single command) or continuous read (no command: the
 //     transaction starts with 0xEB's quad address). At CS_n rise, a transaction that clocked
 //     both mode nibbles enters or stays in continuous read iff M[5:4] = 10, else leaves it.
+//     Contract 2.2: once the first M nibble has M[5:4] = 10, CS_n rises only after the 4 dummy
+//     edges and one data byte (bad_cont).
 //   - PSRAM: SPI mode (8-bit single command) or QPI mode (2-edge quad command); 0x35 enters
 //     QPI, 0xF5 leaves it, 0x66 then 0x99 (consecutive PSRAM transactions with a complete
 //     command field) resets it to SPI mode, initialized. Any read or write before that reset is
 //     a violation. tRST: CS_n high for at least TRST cycles after 0x99; tCEM: CS_n low for at
 //     most TCEM cycles (both from run_formal.py, at the signoff period).
+//   - Both chips: once CS_n rises, it stays high for at least TCPH steps (contract 2.1.2: PSRAM
+//     tCPH, flash tSHSL1, plus the pad allowance, at the signoff period; from run_formal.py).
+//     The first fall after reset is not measured (bad_cph).
 //   - A transaction that ends inside its command field is ignored.
 module bonetto_qspi_chip #(
 	parameter PSRAM = 0
@@ -290,7 +296,9 @@ module bonetto_qspi_chip #(
 	output fin_rd,
 	output fin_wr,
 	output bad_trst,
-	output bad_cem
+	output bad_cem,
+	output bad_cph,        // CS_n fell less than TCPH steps after it rose (contract 2.1.2)
+	output bad_cont        // flash: CS_n rose after M[5:4] = 10, before a data byte (2.2)
 );
 	`ifndef BONETTO_TCEM
 	`define BONETTO_TCEM 400
@@ -298,6 +306,13 @@ module bonetto_qspi_chip #(
 	`ifndef BONETTO_TRST
 	`define BONETTO_TRST 3
 	`endif
+	`ifndef BONETTO_TCPH_FLASH
+	`define BONETTO_TCPH_FLASH 1
+	`endif
+	`ifndef BONETTO_TCPH_PSRAM
+	`define BONETTO_TCPH_PSRAM 2
+	`endif
+	localparam [3:0] TCPH = PSRAM ? `BONETTO_TCPH_PSRAM : `BONETTO_TCPH_FLASH;
 
 	localparam P_CMD = 3'd0, P_ADDR = 3'd1, P_MODE = 3'd2, P_DUMMY = 3'd3, P_DATA = 3'd4,
 	           P_NONE = 3'd5;
@@ -312,6 +327,7 @@ module bonetto_qspi_chip #(
 	reg rpend;   // PSRAM: a 0x99 ended and no transaction has started since
 	reg [3:0] rcnt;   // steps since that 0x99 ended (saturating)
 	reg [9:0] lowcnt; // PSRAM: consecutive steps with CS_n low (saturating)
+	reg [3:0] hcnt;   // steps since CS_n rose (saturating at 15; 15 from reset: none yet)
 
 	// Transaction state.
 	reg pcs;
@@ -330,6 +346,9 @@ module bonetto_qspi_chip #(
 	reg [7:0] wsh;
 	reg dseen;         // a data edge has happened (data-out phase started)
 	reg wone;          // a write data byte has completed
+	reg bone;          // a data byte (read or write) has completed
+	reg ment;          // flash: the first M nibble had M[5:4] = 10 (enter or stay in
+	                   // continuous read)
 
 	wire sel = en && rise && !cs;
 	wire quadcmd = PSRAM && qpi;
@@ -417,6 +436,10 @@ module bonetto_qspi_chip #(
 	assign bad_trst = PSRAM && fall && rpend && rcnt < `BONETTO_TRST;
 	wire [9:0] low_now = pcs ? 10'd1 : lowcnt + 10'd1;
 	assign bad_cem = PSRAM && en && !cs && low_now > `BONETTO_TCEM;
+	// CS_n high time (2.1.2), either chip: hcnt is t1 - t0 at a fall at t1 after a rise at t0.
+	assign bad_cph = fall && hcnt < TCPH;
+	// Continuous-read entry (2.2): M[5:4] = 10, then CS_n rose before a whole data byte.
+	assign bad_cont = !PSRAM && fin && ment && !bone;
 
 	// Mode updates when CS_n rises after a complete command field.
 	wire f_cont_n = (fin && !PSRAM && mcnt == 2'd2) ? (mode[5:4] == 2'b10) : cont;
@@ -433,8 +456,11 @@ module bonetto_qspi_chip #(
 			rpend <= 1'b0;
 			rcnt <= 4'd0;
 			lowcnt <= 10'd0;
+			hcnt <= 4'hf;
 			pcs <= 1'b1;
 		end else begin
+			if (endt) hcnt <= 4'd1;
+			else if (hcnt != 4'hf) hcnt <= hcnt + 4'd1;
 			cont <= f_cont_n;
 			qpi <= p_qpi_n;
 			if (fin && PSRAM) begin
@@ -459,6 +485,8 @@ module bonetto_qspi_chip #(
 			didx <= 3'd0;
 			dseen <= 1'b0;
 			wone <= 1'b0;
+			bone <= 1'b0;
+			ment <= 1'b0;
 			if (!PSRAM && (reset ? mode0 : f_cont_n)) begin
 				ph <= P_ADDR;
 				cmd <= 8'heb;
@@ -491,6 +519,7 @@ module bonetto_qspi_chip #(
 				P_MODE: begin
 					mode <= {mode[3:0], nib};
 					mcnt <= mcnt + 2'd1;
+					if (mcnt == 2'd0) ment <= nib[1:0] == 2'b10;   // nib = M[7:4]
 					if (mcnt == 2'd1) ph <= (ld != 4'd0) ? P_DUMMY : P_DATA;
 				end
 				P_DUMMY: begin
@@ -506,6 +535,7 @@ module bonetto_qspi_chip #(
 					didx <= byte_last ? 3'd0 : didx + 3'd1;
 					if (byte_last) baddr <= binc;
 					if (byte_last && in_k) wone <= 1'b1;
+					if (byte_last) bone <= 1'b1;
 				end
 				default: ;
 			endcase

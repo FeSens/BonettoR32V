@@ -54,7 +54,9 @@ HERE = Path(__file__).resolve().parent
 BUILD = HERE.parent / "build" / "programs"
 LAT_CAP = 2048     # contract 4: cycles per instruction at most
 DRAIN = 2048       # contract 4: cycles after the program end before memory is compared
-CLK_NS = 25.0      # contract 7: T for the Pmod's rate and tCEM rules
+# contract 7: T for the Pmod's rate, tCEM, tRST and CS_n high time rules is the signoff period,
+# CLOCK_PERIOD in src/config.json (20 ns since hypothesis 102), as in the cosim gate
+CLK_NS = float(json.loads((HERE.parent / "src" / "config.json").read_text())["CLOCK_PERIOD"])
 SIM_PERIOD_US = 10  # the simulated period: long, so unit-delay netlists settle
 REGION_LO = 0x7FFF80  # contract 3: the core region, PSRAM 0x7F_FF80-0x7F_FFFF
 

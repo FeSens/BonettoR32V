@@ -37,7 +37,7 @@ module tt_um_fesens_r32v (
 | `uio[1]` | io | SD0 (MOSI in single-SPI commands) |
 | `uio[2]` | io | SD1 (MISO in single-SPI commands) |
 | `uio[3]` | out | SCK |
-| `uio[4]` | io | SD2 (flash WP_n while QE=0; QE is 1 here, section 2.4) |
+| `uio[4]` | io | SD2 (flash WP_n while QE=0; QE is 1 here, see the EEI assumptions below) |
 | `uio[5]` | io | SD3 (flash HOLD_n while QE=0) |
 | `uio[6]` | out | PSRAM A CS_n (APS6404L) |
 | `uio[7]` | out | PSRAM B CS_n: constant 1 |
@@ -62,8 +62,14 @@ module tt_um_fesens_r32v (
   leave it as X (gate-level test).
 - **EEI assumptions about the board:**
   - `rst_n` is released at least 150 µs after VDD is stable.
-  - The flash's QE bit is 1 (first-party Pmods ship that way, and TT's flasher sets it).
-  - The memories may be in any mode another design left them in (2.4).
+  - The flash's QE bit is 1. The Pmod's flash is the W25Q128JVSIM (the IM part: QE = 0 from the
+    factory, QPI capable). TT's store Pmods ship with QE = 1 (TT's QSPI guide: "enabled by default
+    on all first-party QSPI Pmods"). TT's flasher does not set QE. On another Pmod, run TT's QE
+    activation script once.
+  - When the design starts, the flash is in standard SPI mode or in EBh continuous read. A design
+    that leaves the flash in QPI mode, deep power-down, dual continuous read or wrap mode
+    requires a power cycle of the Pmod before this design runs.
+  - Within those, the memories may be in any mode another design left them in (2.4).
 
 ## 2. Memory interface (TT QSPI Pmod)
 
@@ -71,8 +77,19 @@ module tt_um_fesens_r32v (
 
 Let S = SCK, C_f / C_r = flash / PSRAM A CS_n, and SDk = the data lines.
 1. **At most one CS_n is low.** `C_f(t) = 0` and `C_r(t) = 0` never both hold.
-2. **CS_n changes only while SCK is low:** a change at edge t needs S(t-1) = S(t) = 0. Each
-   CS_n stays high for at least one cycle between transactions (tCPH ≥ 18 ns).
+2. **CS_n changes only while SCK is low:** a change at edge t needs S(t-1) = S(t) = 0.
+   **CS_n high time between two transactions of the same chip:** once a chip's CS_n rises at
+   edge t0, it falls again at an edge t1 ≥ t0 + N, with
+   - PSRAM: N = ceil((18 ns + 4 ns) / T), 2 cycles at T = 20 ns. 18 ns is tCPH, "CE# HIGH
+     between subsequent burst operations" (APS6404L datasheet, table 10).
+   - Flash: N = ceil((10 ns + 4 ns) / T), 1 cycle at T = 20 ns. 10 ns is tSHSL1, "/CS Active
+     High Time" between two array reads (W25Q128JV-DTR datasheet, section 9.6).
+   - 4 ns is the pad allowance. TT's GPIO pads delay a rising edge about 4 ns more than a
+     falling one (TT GPIO specification; TT3.5 scope measurements: round trip 20.4 ns rising,
+     16.3 ns falling), so a CS_n high pulse of N cycles reaches the chip about 4 ns shorter.
+   - The high time is measured on the chip's own CS_n: a transaction of the other chip in
+     between does not shorten the requirement. An ignored transaction (2.1.10) is a transaction
+     here. The first transaction of a run has no earlier one to measure from.
 3. **SCK is 0 whenever both CS_n are 1.** Its high and low phases each last at least one cycle.
    Per-command maximum rates are listed below; checkers convert them to cycles at period T.
 4. **Rising SCK edges.** A rising SCK edge is an edge t with S(t-1) = 0 and S(t) = 1 while a
@@ -116,6 +133,13 @@ Let S = SCK, C_f / C_r = flash / PSRAM A CS_n, and SDk = the data lines.
     ends, whether or not it was completed.
   - A transaction that clocks all four lines high for 8 edges therefore always leaves the flash
     in standard mode. In standard mode those 8 edges read as command `0xFF`, which is a no-op.
+    Leaving continuous read by raising CS_n right after M (M[5:4] ≠ `10`) stays legal.
+  - **Entering or staying in continuous read takes a completed read.** A transaction whose M
+    field sets M[5:4] = `10` (known at the first M edge, which carries M[7:4]) clocks its 4 dummy
+    edges and at least 2 data edges (one byte) before CS_n rises. Raising CS_n after M[5:4] =
+    `10` but before that is a protocol violation. The datasheet documents entering continuous
+    read only through a read (W25Q128JV-DTR datasheet, section 8.2.13), never through a
+    transaction aborted after M.
 - The memory drives the data lines only in the data phase. The core never sends a write enable
   (`0x06`), an erase or a status write. Flash contents never change during a run.
 

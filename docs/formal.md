@@ -39,9 +39,11 @@ reach within the depth) counts as a failure. By default the run stops at the fir
    The checks run on the RVFI build; this is what makes them speak for the design that ships.
 4. **Signoff period and Pmod limits.** `T` is `CLOCK_PERIOD` in `src/config.json` (the eval
    cosim gate uses the same, contract 7), or `--clk-ns`. tCEM = floor(8000 / T) and tRST =
-   ceil(50 / T) cycles (the cosim's `pmod.h` computes the same); at T = 20 ns, 400 and 3. They
-   reach the checkers as `BONETTO_TCEM` and `BONETTO_TRST`, and `formal.json` records them
-   (`pmod`). The monitor counts edges, not SCK phase lengths: the slowest command limit (33 MHz,
+   ceil(50 / T) cycles, and the CS_n high times of 2.1.2, ceil((10 + 4) / T) cycles for the
+   flash (tSHSL1 plus the pad allowance) and ceil((18 + 4) / T) for the PSRAM (tCPH plus the
+   pad allowance); the cosim's `pmod.h` computes the same. At T = 20 ns: 400, 3, 1 and 2. They
+   reach the checkers as `BONETTO_TCEM`, `BONETTO_TRST`, `BONETTO_TCPH_FLASH` and
+   `BONETTO_TCPH_PSRAM`, and `formal.json` records them (`pmod`). The monitor counts edges, not SCK phase lengths: the slowest command limit (33 MHz,
    PSRAM SPI `0x03`) holds for any waveform as long as a 2-cycle SCK period is within it, so the
    runner refuses a T below 15.15 ns.
 5. **Timing and depth.** See "Depth policy".
@@ -85,7 +87,14 @@ state machines of `verif/cosim/pmod.h` (`QspiFlash`, `Psram`), clocked by the ri
 - **Flash** (2.2): standard mode (8-bit single command) or continuous read (no command: the
   transaction starts with `0xEB`'s quad address). At CS_n rise, a transaction that clocked both
   mode nibbles enters or stays in continuous read iff M[5:4] = `10`, else it leaves it (whether
-  or not it completed).
+  or not it completed). Once the first M nibble (M[7:4]) has M[5:4] = `10`, CS_n may rise only
+  after the 4 dummy edges and one data byte (2 edges); earlier is `bad_cont`. Leaving right
+  after M (the `0xFF` exit) is legal.
+- **CS_n high time** (2.1.2, both chips): `hcnt` counts the steps since the chip's CS_n rose
+  (saturating at 15, and 15 from reset, so the first fall is not measured). A fall with
+  `hcnt` below `BONETTO_TCPH_FLASH` / `BONETTO_TCPH_PSRAM` is `bad_cph`. Each chip counts on
+  its own CS_n, so a transaction of the other chip in between changes nothing, and an ignored
+  transaction (ending inside its command field) counts.
 - **PSRAM** (2.3): SPI mode or QPI mode (2-edge quad command); `0x35` enters QPI, `0xF5` leaves
   it, `0x66` then `0x99` (consecutive transactions with a complete command field) reset it to
   SPI mode, initialized. A read or write before that reset is a violation. A transaction that
@@ -100,15 +109,19 @@ completed write byte: address, value), `dout` (the chip is in its data-out phase
 `0x66`, `0x66` not followed by `0x99`, an access before the PSRAM reset), `bad_extra` (an edge
 after a command that takes no fields), `bad_wend` (a write ending inside its address or
 mid-byte), `bad_trst` (PSRAM CS_n falls less than tRST cycles after a `0x99` ended), `bad_cem`
-(PSRAM CS_n low for more than tCEM cycles).
+(PSRAM CS_n low for more than tCEM cycles), `bad_cph` (CS_n falls less than its minimum high
+time after it rose), `bad_cont` (flash: CS_n rose after M[5:4] = `10` before one data byte).
 
 `test_formal.py::test_qspi_monitor_decodes_stub` checks both monitors against a hand-written
 waveform, from both power-up mode pairs: every command family, quad and single fields,
 stretched SCK phases, A[23] and the PSRAM burst wrap, the flash wrap, M = `0x20` and `0xFF`,
-reads ending mid-byte, a page program (ignored), and one of each violation (unlisted command on
-each chip, an edge after `0xFF` and after `0x66`, a write ending mid-byte and one ending in its
-address, tRST, tCEM). The expected events come from a Python reading of tables 2.2 and 2.3, not
-from the Verilog. Dropping one expected event (the tRST violation) makes the run fail.
+reads ending mid-byte, a page program (ignored), the `0xFF` exit right after M, and one of each
+violation (unlisted command on each chip, an edge after `0xFF` and after `0x66`, a write ending
+mid-byte and one ending in its address, tRST, tCEM, a 1-step CS_n high time on each chip, and
+M[5:4] = `10` followed by CS_n rising in the dummies, after the first M nibble and after one
+data edge). The stub uses a 2-step minimum on both chips, so the flash rule can fail too. The
+expected events come from a Python reading of 2.1.2 and tables 2.2 and 2.3, not from the
+Verilog. Dropping one expected event (the tRST violation) makes the run fail.
 
 ### The UNSPECIFIED stop
 
@@ -148,8 +161,20 @@ changes only with SCK low at t-1 and t (`qspi_rule2`); 2.1.3 SCK 0 while both CS
 same value (`qspi_rule4`); 2.1.6 no contention during a data-out phase (`qspi_rule6_flash`,
 `qspi_rule6_psram`); 2.1.7 tCEM (`qspi_tcem`); 2.3 tRST (`qspi_trst`); 2.1.10, 2.2, 2.3, 2.4
 command legality (`qspi_cmd_flash`, `qspi_cmd_psram`, `qspi_extra`); 2.1.9 writes end on a byte
-boundary (`qspi_wend`). CS_n high for at least one cycle between transactions (2.1.2) holds by
-construction in a cycle model (one cycle is at least tCPH = 18 ns at T >= 18 ns).
+boundary (`qspi_wend`); 2.1.2 the CS_n high time between two transactions of a chip
+(`qspi_cph_flash`, `qspi_cph_psram`: `BONETTO_TCPH_FLASH` and `BONETTO_TCPH_PSRAM` cycles, 1
+and 2 at T = 20 ns); 2.2 a flash transaction whose first M nibble has M[5:4] = `10` clocks its
+dummies and one data byte before CS_n rises (`qspi_cont`).
+
+The qspi triggers cover the new assertions without a trigger of their own: a PSRAM read needs
+the `0x66`, `0x99` reset first, so `reach_qspi_psram_read` implies a PSRAM CS_n fall after a
+rise, and the proof depth (at least reset + the first retirement + margin) covers the whole
+memory reset sequence, where a design enters continuous read if it uses it. A trigger for a
+continuous-read entry would make a design that never uses continuous read UNREACHED, so there
+is none. Measured on champion 112 (fa98a50, hwe-bench, 2026-10-19, `--only '^qspi$'`, the
+champion's timing): the qspi proof at depth 321 fails in 20 s with `qspi_cont` at step 163 (the
+boot's continuous-read entry ends CS_n inside the dummies) and `qspi_cph_psram` at step 291 (a
+1-cycle PSRAM CS_n high time).
 
 **`psram_write`** (`bonetto_psram_write_check`): every PSRAM write outside the core region writes
 a byte of a retired store, at its address, with its data. One symbolic PSRAM byte address `wa`

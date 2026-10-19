@@ -132,7 +132,20 @@ compared instead (a superset in rvfi mode and for deterministic programs).
 **Checks with their error texts.**
 
 Pins and bus rules:
-- Pmod chip models and bus rules every cycle (`pmod.h`, tCEM included): the model's message.
+- Pmod chip models and bus rules every cycle (`pmod.h`): the model's message, `Pmod protocol
+  violation at cycle N: ...`. Among them, at the run's `--clk-ns` T:
+  - tCEM (2.1.7) and tRST (2.3);
+  - the CS_n high time between two transactions of a chip (2.1.2): `CS_n high time: PSRAM CS_n
+    high for 1 cycle(s) between transactions, needs ceil((18 ns tCPH + 4 ns pad allowance) /
+    20 ns) = 2 cycles` (the flash: 10 ns tSHSL1). Each chip on its own CS_n; the first fall of
+    a run is not measured;
+  - the continuous-read entry (2.2): `flash continuous-read entry: CS_n rose after M[5:4] = 10
+    with 2 of 2 M edges, 0 of 4 dummy edges and 0 of 2 data edges; ...`, once the first M
+    nibble has M[5:4] = 10 and CS_n rises before the 4 dummy edges and one data byte.
+  - Measured on champion 112 (fa98a50, `make cosim` at 20 ns on hwe-bench, 2026-10-19): all
+    256 runs and the 5 fuzz seeds fail with the continuous-read entry message (the boot's entry
+    transaction, harness cycle 162). With that check disabled in a scratch copy, all
+    261 fail with the PSRAM CS_n high time (1 cycle, harness cycle 1,290 in selftest).
 - Reset values: `during reset`.
 - Outputs change only at rising edges: `outputs changed between rising clk edges`.
 - PSRAM writes outside the core region carry bytes of stores (retired ones in rvfi mode, the

@@ -53,6 +53,13 @@ module bonetto_qspi_check (
 			// 2.1.7: PSRAM CS_n low for at most tCEM; 2.3: CS_n high for tRST after 0x99.
 			qspi_tcem: assert (!r_bad_cem);
 			qspi_trst: assert (!r_bad_trst);
+			// 2.1.2: a chip's CS_n stays high for its minimum (PSRAM tCPH, flash tSHSL1, plus
+			// the pad allowance) between two of its transactions.
+			qspi_cph_flash: assert (!f_bad_cph);
+			qspi_cph_psram: assert (!r_bad_cph);
+			// 2.2: a flash transaction with M[5:4] = 10 clocks its dummies and one data byte
+			// before CS_n rises (continuous read is entered only through a completed read).
+			qspi_cont: assert (!f_bad_cont);
 			// 2.1.10, 2.2, 2.3, 2.4: only the listed commands for the chip's state, 0x66 then
 			// 0x99, no PSRAM access before its reset, nothing after a command that takes no
 			// fields.

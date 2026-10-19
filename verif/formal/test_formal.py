@@ -127,12 +127,14 @@ def test_config_split():
 
 
 def test_pmod_limits():
-    """tCEM = floor(8000 / T), tRST = ceil(50 / T) cycles (contract 2.1.7, 2.3); a period whose
-    2-cycle SCK would beat the slowest command's 33 MHz is refused (the monitor counts edges,
-    not SCK phases)."""
-    assert run_formal.pmod_limits(20.0) == (400, 3)
-    assert run_formal.pmod_limits(25.0) == (320, 2)
-    assert run_formal.pmod_limits(15.2) == (526, 4)
+    """tCEM = floor(8000 / T), tRST = ceil(50 / T) cycles (contract 2.1.7, 2.3), CS_n high
+    ceil((10 + 4) / T) cycles for the flash and ceil((18 + 4) / T) for the PSRAM (2.1.2: tSHSL1,
+    tCPH, the pad allowance); a period whose 2-cycle SCK would beat the slowest command's
+    33 MHz is refused (the monitor counts edges, not SCK phases)."""
+    assert run_formal.pmod_limits(20.0) == (400, 3, 1, 2)
+    assert run_formal.pmod_limits(25.0) == (320, 2, 1, 1)
+    assert run_formal.pmod_limits(15.2) == (526, 4, 1, 2)
+    assert run_formal.pmod_limits(22.0) == (363, 3, 1, 1)   # exactly 22 ns: no rounding up
     with pytest.raises(SystemExit):
         run_formal.pmod_limits(15.0)
 
@@ -510,8 +512,9 @@ QSPI_PSPI = {0x03: (24, 0, 0, "os"), 0x0B: (24, 0, 8, "os"), 0xEB: (6, 0, 6, "oq
 QSPI_PQPI = {0x0B: (6, 0, 4, "oq"), 0xEB: (6, 0, 6, "oq"), 0x02: (6, 0, 0, "iq"),
              0x38: (6, 0, 0, "iq"), 0xF5: None, 0x66: None, 0x99: None}
 QSPI_TCEM, QSPI_TRST = 40, 3     # small, so the stub stays short
+QSPI_TCPH_F, QSPI_TCPH_R = 2, 2   # CS_n high minimum (2.1.2); 2 so the flash one can fail
 QSPI_SIGS = ["dout", "rd", "wb", "fin", "fin_rd", "fin_wr", "bad_cmd", "bad_extra", "bad_wend",
-             "bad_trst", "bad_cem"]
+             "bad_trst", "bad_cem", "bad_cph", "bad_cont"]
 
 
 class _QspiChip:
@@ -523,6 +526,7 @@ class _QspiChip:
         self.qpi = psram and mode0
         self.init = self.rsten = False
         self.reset_end = None      # step a 0x99 ended at, until the next CS_n fall
+        self.rise = None           # step CS_n last rose (2.1.2); none before the first fall
         self.p = "r_" if psram else "f_"
 
     def put(self, ev, st, **kw):
@@ -531,11 +535,15 @@ class _QspiChip:
     def fall(self, ev, st):
         if self.psram and self.reset_end is not None and st - self.reset_end < QSPI_TRST:
             self.put(ev, st, bad_trst=1)
+        if self.rise is not None and st - self.rise < (QSPI_TCPH_R if self.psram else
+                                                        QSPI_TCPH_F):
+            self.put(ev, st, bad_cph=1)              # 2.1.2, ignored transactions included
         self.reset_end = None
 
     def txn(self, ev, edges, end):
         """edges: [(step, nibble)] at the rising edges of one CS_n-low window; end: the step
         CS_n is high again."""
+        self.rise = end
         if not self.psram and self.cont:
             cmd, rest, fields = 0xEB, edges, QSPI_FLASH[0xEB]
         else:
@@ -570,6 +578,10 @@ class _QspiChip:
             for _, nb in rest[alen:alen + mlen]:
                 mval, mseen = ((mval << 4) | nb) & 0xFF, mseen + 1
             data = rest[alen + mlen + dlen:]
+            # 2.2: a first M nibble (M[7:4]) with M[5:4] = 10 needs the dummies and one data
+            # byte (2 quad edges) before CS_n rises.
+            if mlen and len(rest) > alen and (rest[alen][1] & 3) == 2 and len(data) < 2:
+                self.put(ev, end, bad_cont=1)
             quad = kind in ("oq", "iq")
             per = 2 if quad else 8
             byte = 0
@@ -653,6 +665,7 @@ def _qspi_stub(fcont, pqpi):
     txn("r", [0xF, 0x5])                                        # QPI-form 0xF5
     idle(1)
     txn("r", single(0x66))
+    idle(1)                                                     # high for exactly QSPI_TCPH_R
     txn("r", single(0x99))
     idle(QSPI_TRST - 1)                                         # high for exactly tRST
     txn("r", single(0x35))                                      # QPI from here
@@ -686,12 +699,20 @@ def _qspi_stub(fcont, pqpi):
     txn("r", nibs(0x66, 2) + [0x0])                             # an edge after 0x66
     idle(1)
     txn("r", nibs(0x99, 2))                                     # reset (QPI form): SPI mode
-    txn("r", single(0x35))                                      # CS_n high 1 step: tRST
+    txn("r", single(0x35))                                      # CS_n high 1 step: tRST, tCPH
     idle(1)
     txn("r", [], low_only=QSPI_TCEM + 2)                        # CS_n low past tCEM
     idle(1)
-    txn("f", [0x1] * 3)                                         # ends in the command
-    idle(2)
+    # 2.2: M[5:4] = 10 needs the dummies and one data byte before CS_n rises.
+    txn("f", single(0xEB) + nibs(0x000200, 6) + nibs(0xA0, 2) + [0x0] * 3)   # ends in dummies
+    idle(1)
+    txn("f", nibs(0x000300, 6) + [0x2])                         # ends after M[7:4] = 0x2
+    idle(1)
+    txn("f", nibs(0x000400, 6) + nibs(0xA5, 2) + [0x0] * 4 + [0x7])   # one data edge
+    idle(1)
+    txn("f", nibs(0x000500, 6) + nibs(0xFF, 2))                 # exit right after M: legal
+    txn("f", [0x1] * 3)                                         # CS_n high 1 step: tSHSL;
+    idle(2)                                                     # ends in the command
     return steps, ev
 
 
@@ -744,18 +765,23 @@ def _qspi_tb(steps, ev, fcont, pqpi):
 def test_qspi_monitor_decodes_stub(tmp_path, fcont, pqpi):
     """Both chip monitors decode a stub waveform (every listed command family, quad and single
     fields, stretched SCK phases, A[23] and burst wrap, M = 0x20 and 0xFF, reads ending
-    mid-byte, and one of each violation: unlisted command, edge after a no-field command,
-    write ending mid-byte or in its address, tRST, tCEM) into exactly the expected events,
-    from both power-up modes."""
+    mid-byte, the FFh exit right after M, and one of each violation: unlisted command, edge
+    after a no-field command, write ending mid-byte or in its address, tRST, tCEM, CS_n high
+    too short on each chip, M[5:4] = 10 then CS_n rising in the dummies, after the first M
+    nibble and after one data edge) into exactly the expected events, from both power-up
+    modes."""
     run_formal.setup_path()
     steps, ev = _qspi_stub(fcont, pqpi)
     flags = {k for e in ev.values() for k, v in e.items() if v and k[2:].startswith("bad_")}
     assert flags == {"f_bad_cmd", "f_bad_extra", "r_bad_cmd", "r_bad_extra", "r_bad_wend",
-                     "r_bad_trst", "r_bad_cem"}
+                     "r_bad_trst", "r_bad_cem", "f_bad_cph", "r_bad_cph", "f_bad_cont"}
+    assert sum(1 for e in ev.values() if e.get("f_bad_cont")) == 3
     assert sum(1 for e in ev.values() if e.get("r_wb")) == 4       # 3 + 1 of the mid-byte write
     (tmp_path / "stub_tb.v").write_text(_qspi_tb(steps, ev, fcont, pqpi))
     (tmp_path / "defs.vh").write_text(f"`define BONETTO_TCEM {QSPI_TCEM}\n"
-                                      f"`define BONETTO_TRST {QSPI_TRST}\n")
+                                      f"`define BONETTO_TRST {QSPI_TRST}\n"
+                                      f"`define BONETTO_TCPH_FLASH {QSPI_TCPH_F}\n"
+                                      f"`define BONETTO_TCPH_PSRAM {QSPI_TCPH_R}\n")
     (tmp_path / "stub.sby").write_text(f"""[options]
 mode bmc
 depth {len(steps) + 2}

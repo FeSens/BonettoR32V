@@ -3,6 +3,10 @@
 // Each test drives a hand-built pin waveform through PmodBus::edge, one call per clk edge, with
 // SCK = clk/2 unless it says otherwise, and prints "PASS name" or "FAIL name: why". The exit code is
 // the number of failures. Run through verif/cosim/test_pmod.py.
+//
+// Drv::select() first waits until the chip's CS_n has been high for the model's minimum (contract
+// 2.1.2), so the other tests stay legal at any clock period; test_cs_high_time sets Drv::raw to
+// drive short high times on purpose.
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -63,6 +67,12 @@ std::string hex(const Bytes& b) {
 
 const PmodInit STD_UNINIT{FlashMode::Standard, PsramMode::SpiUninit};
 
+std::string fmt_dummies(int n) {  // the dummy count in a continuous-read entry message
+  char b[32];
+  std::snprintf(b, sizeof b, "%d of 4 dummy edges", n);
+  return b;
+}
+
 // Pin-level driver: holds the core's uio_out / uio_oe and feeds one PmodBus edge per step().
 struct Drv {
   std::unique_ptr<PmodBus> bus;
@@ -72,6 +82,8 @@ struct Drv {
   uint8_t in = 0;      // uio_in after the latest edge
   uint8_t in_low = 0;  // uio_in after the low edge of the latest clk()
   int half;            // clk cycles per SCK phase (1: SCK = clk/2)
+  bool raw = false;    // select() does not wait for the CS_n high time
+  uint64_t rise_f = 0, rise_r = 0;  // the edge where each CS_n last rose in deselect() (0: none)
 
   explicit Drv(PmodInit init = STD_UNINIT, double clk_ns = 25.0, int half_ = 1, uint32_t seed = 7)
       : bus(new PmodBus(seed, image().data(), init, clk_ns)), half(half_) {}
@@ -84,13 +96,19 @@ struct Drv {
   }
   const std::string& err() const { return bus->error(); }
 
-  void select(uint8_t cs) {  // CS_n falls with SCK low
+  void select(uint8_t cs) {  // CS_n falls with SCK low, once its high time is legal (2.1.2)
+    uint64_t rise = cs == CSF ? rise_f : rise_r;
+    uint64_t need = cs == CSF ? bus->cph_flash_cycles() : bus->cph_psram_cycles();
+    while (!raw && ok && rise && t + 1 - rise < need) step();
     out = (uint8_t)(out & ~cs & ~SCK);
     step();
   }
   void deselect() {  // CS_n rises (SCK already low)
+    uint8_t low = (uint8_t)(~out & (CSF | CSR));
     out |= CSF | CSR;
     step();
+    if (low & CSF) rise_f = t;
+    if (low & CSR) rise_r = t;
   }
   void idle(int n) {
     for (int i = 0; i < n; i++) step();
@@ -600,6 +618,191 @@ std::string test_tcem_limit() {
   return "";
 }
 
+std::string test_cs_high_time() {
+  // Rule 2.1.2: N = ceil((t_min + 4 ns) / T), t_min = 10 ns (flash tSHSL1), 18 ns (PSRAM tCPH).
+  const struct {
+    double ns;
+    uint64_t f, r;
+  } lim[] = {{20.0, 1, 2}, {25.0, 1, 1}, {10.0, 2, 3}, {15.2, 1, 2}, {11.0, 2, 2},
+             {7.0, 2, 4}, {5.5, 3, 4}};
+  for (const auto& l : lim) {
+    PmodBus b(1, image().data(), STD_UNINIT, l.ns);
+    REQUIRE(b.cph_flash_cycles() == l.f && b.cph_psram_cycles() == l.r,
+            "T = %g ns: CS_n high minimum flash %llu, PSRAM %llu cycles, want %llu, %llu", l.ns,
+            (unsigned long long)b.cph_flash_cycles(), (unsigned long long)b.cph_psram_cycles(),
+            (unsigned long long)l.f, (unsigned long long)l.r);
+  }
+  for (int extra = 0; extra <= 1; extra++) {  // PSRAM at 20 ns: 2 cycles high
+    Drv d(STD_UNINIT, 20.0);
+    d.raw = true;
+    d.select(CSR);  // the first fall of the run: nothing to measure from
+    d.send_single(0x66, 8);
+    d.end();
+    d.idle(1);  // CS_n high for 2 cycles
+    d.select(CSR);
+    d.send_single(0x99, 8);
+    d.end();
+    d.idle(2);  // tRST: 3 cycles at 20 ns
+    d.select(CSR);
+    d.send_single(0x03, 8);
+    d.send_single(0x000100, 24);
+    d.read_single(1);
+    d.end();
+    REQUIRE_OK(d);
+    d.idle(extra);
+    d.select(CSR);  // CS_n high for 1 + extra cycles
+    if (extra == 0) {
+      REQUIRE_ERR(d, "CS_n high time: PSRAM CS_n high for 1 cycle(s)");
+      REQUIRE_ERR(d, "= 2 cycles");
+    } else {
+      REQUIRE_OK(d);
+    }
+  }
+  {  // measured on the PSRAM's own CS_n: a flash window in between doesn't reset it
+    Drv d(STD_UNINIT, 20.0);
+    d.psram_reset_spi();
+    d.select(CSR);
+    d.send_single(0x03, 8);
+    d.send_single(0x000100, 24);
+    d.read_single(1);
+    d.out &= (uint8_t)~SCK;
+    d.step();
+    d.out = (uint8_t)((d.out | CSR) & ~CSF);  // PSRAM CS_n rises as the flash's falls
+    d.step();
+    REQUIRE_OK(d);
+    d.out = (uint8_t)((d.out | CSF) & ~CSR);  // a 1-cycle flash window, then the PSRAM again
+    d.step();
+    REQUIRE_ERR(d, "CS_n high time: PSRAM CS_n high for 1 cycle(s)");
+  }
+  {  // a PSRAM transaction ignored inside its command field still needs the high time
+    Drv d(STD_UNINIT, 20.0);
+    d.raw = true;
+    d.select(CSR);
+    d.send_quad(0xF5, 2);  // ignored partial command in SPI mode
+    d.end();
+    d.select(CSR);
+    REQUIRE_ERR(d, "CS_n high time: PSRAM");
+  }
+  for (int extra = 0; extra <= 1; extra++) {  // flash at 10 ns: 2 cycles high
+    Drv d(STD_UNINIT, 10.0, 3);  // SCK = clk/6: within every command's rate
+    d.raw = true;
+    Bytes got = d.flash_read03(0x000020, 1);
+    REQUIRE_OK(d);
+    REQUIRE_BYTES(got, img_at(0x20, 1), "flash 0x03 at 10 ns");
+    d.idle(extra);
+    d.select(CSF);
+    if (extra == 0) {
+      REQUIRE_ERR(d, "CS_n high time: flash CS_n high for 1 cycle(s)");
+      REQUIRE_ERR(d, "tSHSL1");
+    } else {
+      REQUIRE_OK(d);
+    }
+  }
+  {  // 1 cycle is legal for both chips at 25 ns, and for the flash at 20 ns
+    Drv d(STD_UNINIT, 25.0);
+    d.raw = true;
+    d.psram_reset_spi();
+    d.psram_write02(0x10, Bytes{0x5A});
+    Bytes got = d.psram_read03(0x10, 1);  // CS_n high 1 cycle after the write
+    REQUIRE_OK(d);
+    REQUIRE_BYTES(got, Bytes{0x5A}, "PSRAM back to back at 25 ns");
+    Drv f(STD_UNINIT, 20.0);
+    f.raw = true;
+    f.flash_read03(0x0, 1);
+    got = f.flash_read03(0x30, 1);
+    REQUIRE_OK(f);
+    REQUIRE_BYTES(got, img_at(0x30, 1), "flash back to back at 20 ns");
+  }
+  return "";
+}
+
+std::string test_flash_continuous_entry() {
+  // Rule 2.2: a transaction whose first M nibble has M[5:4] = 10 clocks its 4 dummy edges and one
+  // data byte (2 edges) before CS_n rises.
+  const char* const want = "flash continuous-read entry";
+  for (int dummies = 0; dummies <= 4; dummies++) {  // CS_n rises in the dummies, or right after
+    Drv d;
+    d.select(CSF);
+    d.send_single(0xEB, 8);
+    d.send_quad(0x001000, 6);
+    d.send_quad(0x20, 2);
+    d.dummy(dummies);
+    d.end();
+    REQUIRE(!d.ok && d.err().find(want) != std::string::npos &&
+                d.err().find(fmt_dummies(dummies)) != std::string::npos,
+            "%d dummies: expected a continuous-read entry violation, got: %s", dummies,
+            d.ok ? "(none)" : d.err().c_str());
+  }
+  {  // one data edge is not a byte
+    Drv d;
+    d.select(CSF);
+    d.send_single(0xEB, 8);
+    d.send_quad(0x001000, 6);
+    d.send_quad(0xA0, 2);
+    d.dummy(4);
+    d.clk(0, 0);
+    d.end();
+    REQUIRE_ERR(d, "1 of 2 data edges");
+  }
+  {  // CS_n rises right after the first M nibble, with M[5:4] = 10 (power-up continuous read)
+    Drv d(PmodInit{FlashMode::Continuous, PsramMode::SpiUninit});
+    d.select(CSF);
+    d.send_quad(0x000100, 6);
+    d.send_quad(0x2, 1);
+    d.end();
+    REQUIRE_ERR(d, "1 of 2 M edges");
+  }
+  {  // staying in continuous read follows the same rule
+    Drv d(PmodInit{FlashMode::Continuous, PsramMode::SpiUninit});
+    d.select(CSF);
+    d.send_quad(0x000100, 6);
+    d.send_quad(0xA5, 2);
+    d.dummy(2);
+    d.end();
+    REQUIRE_ERR(d, want);
+  }
+  {  // the entry read completed with one byte: legal, and the flash is in continuous read
+    Drv d;
+    d.select(CSF);
+    d.send_single(0xEB, 8);
+    d.send_quad(0x001000, 6);
+    d.send_quad(0x20, 2);
+    d.dummy(4);
+    Bytes got = d.read_quad(1);
+    d.end();
+    REQUIRE_OK(d);
+    REQUIRE_BYTES(got, img_at(0x001000, 1), "entry read, one byte");
+    d.select(CSF);  // no command
+    d.send_quad(0x002468, 6);
+    d.send_quad(0x20, 2);
+    d.dummy(4);
+    got = d.read_quad(2);
+    d.end();
+    REQUIRE_OK(d);
+    REQUIRE_BYTES(got, img_at(0x002468, 2), "continuous read after the entry");
+    // exit by aborting right after M = 0xFF (no dummies): legal, standard mode after it
+    d.select(CSF);
+    d.send_quad(0x000000, 6);
+    d.send_quad(0xFF, 2);
+    d.end();
+    REQUIRE_OK(d);
+    got = d.flash_read03(0x000123, 1);
+    REQUIRE_OK(d);
+    REQUIRE_BYTES(got, img_at(0x000123, 1), "0x03 after the FFh exit");
+  }
+  {  // M[5:4] != 10 may end anywhere: 0xEB with M = 0x00 ending in the dummies
+    Drv d;
+    d.select(CSF);
+    d.send_single(0xEB, 8);
+    d.send_quad(0x001000, 6);
+    d.send_quad(0x00, 2);
+    d.dummy(1);
+    d.end();
+    REQUIRE_OK(d);
+  }
+  return "";
+}
+
 std::string test_contention() {
   {  // core drives SD1 during a flash 0x03 data phase
     Drv d;
@@ -905,6 +1108,8 @@ int main() {
       {"test_reset_sequence_from_every_state", test_reset_sequence_from_every_state},
       {"test_trst", test_trst},
       {"test_tcem_limit", test_tcem_limit},
+      {"test_cs_high_time", test_cs_high_time},
+      {"test_flash_continuous_entry", test_flash_continuous_entry},
       {"test_contention", test_contention},
       {"test_waveform_rules", test_waveform_rules},
       {"test_partial_command_ignored", test_partial_command_ignored},

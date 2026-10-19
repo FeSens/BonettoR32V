@@ -29,6 +29,8 @@ CASES = {
     "test_reset_sequence_from_every_state",
     "test_trst",
     "test_tcem_limit",
+    "test_cs_high_time",
+    "test_flash_continuous_entry",
     "test_contention",
     "test_waveform_rules",
     "test_partial_command_ignored",

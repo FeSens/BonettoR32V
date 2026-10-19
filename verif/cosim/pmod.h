@@ -24,6 +24,14 @@
 //     address complete and its data on a byte boundary; a read may end at any edge.
 //   - The PSRAM needs 0x66 then 0x99 (consecutive PSRAM transactions; ignored partial transactions
 //     in between don't count) before any read or write, whatever its power-up mode.
+//   - CS_n high time (2.1.2): a chip's CS_n, once it rose at edge t0, falls again at an edge
+//     t1 >= t0 + N, N = ceil((t_min + 4 ns) / T) with t_min = 18 ns (PSRAM tCPH) or 10 ns (flash
+//     tSHSL1); 4 ns is TT's pad allowance (rising edges arrive later than falling ones). Measured
+//     on each chip's own CS_n, whatever the other chip does in between, ignored transactions
+//     included. The first fall of a run has no earlier rise to measure from (the bus is idle
+//     before the first edge).
+//   - Continuous-read entry (2.2): once the first M nibble of a flash 0xEB transaction has
+//     M[5:4] = 10, CS_n may rise only after the 4 dummy edges and 2 data edges (one byte).
 #pragma once
 
 #include <algorithm>
@@ -139,7 +147,7 @@ class QspiChip {
     e -= L.addr_edges;
     if (e < L.mode_edges) {
       x_.mode = (uint8_t)((x_.mode << 4) | nib);
-      x_.mode_seen++;
+      if (x_.mode_seen++ == 0) x_.m_enter = (nib & 3) == 2;  // M7-4 = nib, M[5:4] = nib[1:0]
       return true;
     }
     e -= L.mode_edges;
@@ -187,6 +195,7 @@ class QspiChip {
                         "end on a byte boundary)",
                         x_.cmd, x_.data_edges));
     }
+    if (!end_ok()) return false;
     x_.active = false;
     return finish(t);
   }
@@ -221,6 +230,7 @@ class QspiChip {
     uint32_t addr = 0;
     uint8_t mode = 0;
     uint32_t mode_seen = 0;
+    bool m_enter = false;  // the first M nibble had M[5:4] = 10 (contract 2.2)
     uint32_t data_edges = 0;
     uint8_t cur = 0;  // data byte being shifted out or in
     uint8_t out = 0;  // uio bits for the latest data-out clock
@@ -242,6 +252,7 @@ class QspiChip {
   virtual void start_txn() {}
   virtual bool cmd_quad() const = 0;
   virtual bool decode() = 0;  // sets x_.lay from x_.cmd, or fails
+  virtual bool end_ok() { return true; }  // checks at CS_n rise, before finish()
   virtual uint8_t read_byte(uint32_t k) const = 0;
   virtual void store(uint64_t t, uint32_t k, uint8_t v) = 0;
   virtual bool finish(uint64_t t) = 0;  // state changes when CS_n rises
@@ -287,6 +298,21 @@ class QspiFlash : public pmod_detail::QspiChip {
     }
     return fail(pmod_detail::fmt("illegal command 0x%02x for the flash (rule 2.1.10, table 2.2)",
                                  x_.cmd));
+  }
+  // Contract 2.2: a transaction whose first M nibble has M[5:4] = 10 (enter or stay in
+  // continuous read) clocks its 4 dummy edges and one data byte (2 quad edges) before CS_n rises.
+  // The datasheet documents entering continuous read only through a completed read.
+  bool end_ok() override {
+    if (!x_.m_enter || x_.data_edges >= 2) return true;
+    const pmod_detail::Layout& L = x_.lay;
+    uint32_t after = x_.edges - x_.field0;  // edges after the command field
+    uint32_t pre = (uint32_t)L.addr_edges + L.mode_edges;
+    uint32_t dummies = after > pre ? std::min(after - pre, (uint32_t)L.dummy_edges) : 0;
+    return fail(pmod_detail::fmt(
+        "flash continuous-read entry: CS_n rose after M[5:4] = 10 with %u of %u M edges, %u of %u "
+        "dummy edges and %u of 2 data edges; a transaction with M[5:4] = 10 must clock its dummy "
+        "edges and one data byte before CS_n rises (rule 2.2)",
+        x_.mode_seen, (unsigned)L.mode_edges, dummies, (unsigned)L.dummy_edges, x_.data_edges));
   }
   uint8_t read_byte(uint32_t k) const override { return mem_[(x_.addr + k) & (SIZE - 1)]; }
   void store(uint64_t, uint32_t, uint8_t) override {}  // Page Program without write enable
@@ -402,6 +428,8 @@ class PmodBus {
         clk_ns_(clk_ns),
         tcem_((uint64_t)std::floor(8000.0 / clk_ns + 1e-9)),
         trst_((uint64_t)std::ceil(50.0 / clk_ns - 1e-9)),
+        cph_flash_((uint64_t)std::ceil((FLASH_TSHSL_NS + PAD_NS) / clk_ns - 1e-9)),
+        cph_psram_((uint64_t)std::ceil((PSRAM_TCPH_NS + PAD_NS) / clk_ns - 1e-9)),
         rng_(noise_seed * 0x9E3779B97F4A7C15ull + 1) {
     in_ = noise();
   }
@@ -429,6 +457,9 @@ class PmodBus {
     }
 
     if (pcf_ && !cf) {
+      if (flash_rose_ && t - flash_rise_ < cph_flash_)
+        return fail(t, cph_msg("flash", t - flash_rise_, cph_flash_, FLASH_TSHSL_NS, "tSHSL1",
+                               "W25Q128JV-DTR 9.6"));
       flash_.begin(t);
       new_txn();
     }
@@ -438,6 +469,9 @@ class PmodBus {
                            "cycles (table 2.3)",
                            (unsigned long long)(t - psram_.reset_t()),
                            (unsigned long long)trst_));
+      if (psram_rose_ && t - psram_rise_ < cph_psram_)
+        return fail(t, cph_msg("PSRAM", t - psram_rise_, cph_psram_, PSRAM_TCPH_NS, "tCPH",
+                               "APS6404L table 10"));
       psram_.begin(t);
       psram_fall_ = t;
       new_txn();
@@ -476,8 +510,16 @@ class PmodBus {
                            (unsigned)(oe & chip->drive_mask())));
     }
 
-    if (!pcf_ && cf && !flash_.end(t)) return fail(t, flash_.why());
-    if (!pcr_ && cr && !psram_.end(t)) return fail(t, psram_.why());
+    if (!pcf_ && cf) {
+      flash_rose_ = true;
+      flash_rise_ = t;
+      if (!flash_.end(t)) return fail(t, flash_.why());
+    }
+    if (!pcr_ && cr) {
+      psram_rose_ = true;
+      psram_rise_ = t;
+      if (!psram_.end(t)) return fail(t, psram_.why());
+    }
 
     uint8_t in = lines;
     if (valid_ && chip) in = (uint8_t)((in & ~chip->drive_mask()) | chip->out_uio());
@@ -497,19 +539,31 @@ class PmodBus {
   bool psram_initialized() const { return psram_.initialized(); }
   uint64_t flash_reads() const { return flash_.reads(); }
   uint64_t psram_reads() const { return psram_.reads(); }
+  // Minimum CS_n high time between two transactions of a chip, in cycles (contract 2.1.2).
+  uint64_t cph_flash_cycles() const { return cph_flash_; }
+  uint64_t cph_psram_cycles() const { return cph_psram_; }
+
+  // Contract 2.1.2: the chips' minimum CS_n high times and TT's pad allowance (the pads delay a
+  // rising edge about 4 ns more than a falling one, so a high pulse arrives about 4 ns short).
+  static constexpr double PSRAM_TCPH_NS = 18.0;   // APS6404L table 10, tCPH
+  static constexpr double FLASH_TSHSL_NS = 10.0;  // W25Q128JV-DTR 9.6, tSHSL1 (read)
+  static constexpr double PAD_NS = 4.0;
 
  private:
   static constexpr uint64_t NONE = ~0ull;
   QspiFlash flash_;
   Psram psram_;
   double clk_ns_;
-  uint64_t tcem_, trst_;
+  uint64_t tcem_, trst_, cph_flash_, cph_psram_;
   uint64_t rng_;
   // pins after the previous edge; before the first edge the bus is idle (reset state, section 1)
   bool pcf_ = true, pcr_ = true, ps_ = false;
   uint8_t pout_ = pmod_detail::CSF | pmod_detail::CSR | pmod_detail::CSB;
   uint8_t poe_ = pmod_detail::OE_FIXED;
   uint64_t psram_fall_ = 0;
+  // the edge where each CS_n last rose (none yet: the first fall of a run is not measured)
+  bool flash_rose_ = false, psram_rose_ = false;
+  uint64_t flash_rise_ = 0, psram_rise_ = 0;
   // SCK phases of the current transaction
   bool seen_rise_ = false;
   uint64_t t_rise_ = 0, t_fall_ = 0, min_high_ = NONE, min_low_ = NONE;
@@ -526,6 +580,14 @@ class PmodBus {
   void new_txn() {
     seen_rise_ = false;
     min_high_ = min_low_ = NONE;
+  }
+  std::string cph_msg(const char* chip, uint64_t high, uint64_t need, double tmin,
+                      const char* param, const char* src) const {
+    return pmod_detail::fmt(
+        "CS_n high time: %s CS_n high for %llu cycle(s) between transactions, needs ceil((%g ns "
+        "%s + %g ns pad allowance) / %g ns) = %llu cycles (rule 2.1.2; %s)",
+        chip, (unsigned long long)high, tmin, param, PAD_NS, clk_ns_, (unsigned long long)need,
+        src);
   }
   bool fail(uint64_t t, const std::string& why) {
     err_ = pmod_detail::fmt("Pmod protocol violation at cycle %llu: ", (unsigned long long)t) + why;

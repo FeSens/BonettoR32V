@@ -31,7 +31,8 @@ Steps:
      depth above depth_cap is a FAIL (too slow for the formal policy); liveness's fixed
      +2,048 is not counted.
      The signoff period T (src/config.json CLOCK_PERIOD, or --clk-ns) sets the Pmod timing
-     limits: tCEM = floor(8000 / T) cycles, tRST = ceil(50 / T) cycles (contract 2).
+     limits: tCEM = floor(8000 / T) cycles, tRST = ceil(50 / T) cycles, and the CS_n high
+     times ceil((10 + 4) / T) (flash) and ceil((18 + 4) / T) (PSRAM) cycles (contract 2).
   4. Two SBY tasks per check in the config (checks.cfg, or checks-deep.cfg with
      --deep), on the same design and depth: the proof task (the check's assertions)
      and the reach task (only the reach_* statements, each as assert(!trigger), BMC
@@ -534,6 +535,12 @@ def get_timing(args, work, sdir, clk_ns):
 # The Pmod chips' maximum SCK rates (contract 2.2, 2.3), MHz: the slowest is the PSRAM's SPI
 # 0x03 Read at 33 MHz.
 MIN_CMD_MHZ = 33
+# Contract 2.1.2: minimum CS_n high times (PSRAM tCPH, APS6404L table 10; flash tSHSL1,
+# W25Q128JV-DTR 9.6) and TT's pad allowance (rising edges arrive about 4 ns later than falling
+# ones), ns. verif/cosim/pmod.h has the same numbers.
+PSRAM_TCPH_NS = 18.0
+FLASH_TSHSL_NS = 10.0
+PAD_NS = 4.0
 
 
 def clock_period_ns(args):
@@ -546,18 +553,23 @@ def clock_period_ns(args):
 
 
 def pmod_limits(clk_ns):
-    """(tCEM, tRST) in cycles at period clk_ns (contract 2: '8 us' is floor(8000 / T) cycles,
-    tRST is 50 ns, so ceil(50 / T) cycles; the cosim's pmod.h computes the same). The SCK
-    rate limits (2.1.3) need no check at the cycle level as long as the fastest possible SCK,
-    one cycle high and one low, is within the slowest command's limit; otherwise the monitor
-    would have to count phases per command, which it does not, so the run is refused."""
+    """(tCEM, tRST, CS_n high flash, CS_n high PSRAM) in cycles at period clk_ns (contract 2:
+    '8 us' is floor(8000 / T) cycles; tRST is 50 ns, so ceil(50 / T) cycles; 2.1.2's CS_n high
+    times are ceil((10 ns tSHSL1 + 4 ns) / T) for the flash and ceil((18 ns tCPH + 4 ns) / T)
+    for the PSRAM, 4 ns being TT's pad allowance; the cosim's pmod.h computes the same). The
+    SCK rate limits (2.1.3) need no check at the cycle level as long as the fastest possible
+    SCK, one cycle high and one low, is within the slowest command's limit; otherwise the
+    monitor would have to count phases per command, which it does not, so the run is
+    refused."""
     tcem = int(math.floor(8000.0 / clk_ns + 1e-9))
     trst = int(math.ceil(50.0 / clk_ns - 1e-9))
+    cph_f = int(math.ceil((FLASH_TSHSL_NS + PAD_NS) / clk_ns - 1e-9))
+    cph_r = int(math.ceil((PSRAM_TCPH_NS + PAD_NS) / clk_ns - 1e-9))
     if 2 * clk_ns < 1000.0 / MIN_CMD_MHZ - 1e-9:
         raise SystemExit(f"[formal] ERROR: at T = {clk_ns:g} ns a 2-cycle SCK period exceeds "
                          f"the {MIN_CMD_MHZ} MHz limit of contract 2.3; the QSPI monitor does "
                          "not model per-command SCK rates")
-    return tcem, trst
+    return tcem, trst, cph_f, cph_r
 
 
 def pick_depth(cfg, timing):
@@ -1585,10 +1597,13 @@ def main():
         finish(1)
 
     clk_ns = clock_period_ns(args)
-    tcem, trst = pmod_limits(clk_ns)
-    result["pmod"] = {"clk_ns": clk_ns, "tcem_cycles": tcem, "trst_cycles": trst}
-    log(f"signoff period T = {clk_ns:g} ns: tCEM = {tcem} cycles, tRST = {trst} cycles")
-    pmod_defines = [f"`define BONETTO_TCEM {tcem}", f"`define BONETTO_TRST {trst}"]
+    tcem, trst, cph_f, cph_r = pmod_limits(clk_ns)
+    result["pmod"] = {"clk_ns": clk_ns, "tcem_cycles": tcem, "trst_cycles": trst,
+                      "cph_flash_cycles": cph_f, "cph_psram_cycles": cph_r}
+    log(f"signoff period T = {clk_ns:g} ns: tCEM = {tcem} cycles, tRST = {trst} cycles, "
+        f"CS_n high flash >= {cph_f}, PSRAM >= {cph_r} cycles")
+    pmod_defines = [f"`define BONETTO_TCEM {tcem}", f"`define BONETTO_TRST {trst}",
+                    f"`define BONETTO_TCPH_FLASH {cph_f}", f"`define BONETTO_TCPH_PSRAM {cph_r}"]
     timing, tsrc = get_timing(args, work, sdir, clk_ns)
     if timing is None:
         result["error"] = f"no timing: {tsrc}"
