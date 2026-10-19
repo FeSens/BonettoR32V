@@ -136,6 +136,10 @@ and flashing the QSPI Pmod"), not yet tried on hardware:
   program) and `0x03` (read-back verify).
 - It writes the chosen `.bin` at its "Flash offset" field, 0 by default. Use 0 with
   `sdk/build/<name>/<name>.bin`: the core starts at flash address 0.
+- Power-cycle the board before flashing if BonettoR32V has run (it leaves the flash in continuous
+  read, which the flasher doesn't exit), and before running it after a design that may have left
+  the flash in QPI, deep power-down or wrap mode. Select the project after flashing.
+- Clock: 6.25 to 50 MHz (simulated at 50, 12 and 6.25 MHz); never stop it while the design runs.
 
 Unconfirmed: selecting this design afterwards (TT Commander, commander.tinytapeout.com) and
 clocking it at `F_CPU` from the demo board (TT's clock spec: the RP2040 makes 1 Hz to 66.5 MHz;
