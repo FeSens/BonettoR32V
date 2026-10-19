@@ -622,6 +622,19 @@ the first run named no culprit instruction).
 | norvfi_diff | equiv | FAIL (pins equivalence pre-pass) | - | - | 37 | |
 | tcem_stall | qspi | UNREACHED in qspi (missing reach_qspi_flash_read, reach_qspi_psram_write) | reach ran to the cap 613; proof not run (fail-fast) | - | 72 | |
 
+**The 7 escapes against cosim** (lead, 2026-10-19: main bea2777 plus each mutant's file,
+`make cosim` on hwe-bench with the programs built fresh; the unmodified design passes all 262
+runs). Six fail cosim: `write_midbyte` (the Pmod model, rule 2.1.9, in every program),
+`store_dropped` (lockstep loads, `coherence`, the final PSRAM compare), `trap_cause` (`trap_ebreak`:
+mcause reads 0xb, expected 3), `irq_target` (`irq_timer`, `irq_stress`, `wfi`), `irq_masked`
+(`csr`, `irq_timer`, `irq_stress`, `wfi`: an interrupt entry while MIE = 0) and `hang_reserved`
+(the liveness fuzz's 2,048-cycle cap). `uart_any_byte` passed: no program wrote byte 1 of
+UART_DATA. Since a5b20fb, `uart_echo` and `spi_loop` check contract 5's byte-lane rules (writing
+bytes 1-3 of UART_DATA or SPI_DATA starts nothing; reading byte 1 of UART_DATA keeps RX_FULL and
+RX_OVR). `uart_any_byte` and two one-off mutants of `r32v_periph.v` (an SPI transfer started by
+byte 1, RX_FULL cleared by a byte-1 read) fail cosim in those programs, and the champion passes
+`make eval`. So every one of the 46 mutants fails at least one gate.
+
 ### Champion 111, proofs at the short depth (history)
 
 Results (hwe-bench, `--tasks proof`, so each proof ran at its cap: the short depth 581 of
