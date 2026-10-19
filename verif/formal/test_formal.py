@@ -106,6 +106,24 @@ def test_depth_policy():
     assert run_formal.base_depth(cfg, t, {}, 999) == 999
 
 
+def test_config_split():
+    """Fast: every check at depth=short, coherence and csr with the triggers reachable there
+    (a subset of their own), no irq, no liveness, a task timeout that fits a 6-hour run. Deep:
+    every check, coherence and csr at cpi=2 and irq at cpi=4 with every trigger, liveness."""
+    fast = run_formal.load_config(os.path.join(HERE, "checks.cfg"))
+    deep = run_formal.load_config(os.path.join(HERE, "checks-deep.cfg"))
+    f = {n: o for n, _, o in fast["checks"]}
+    d = {n: o for n, _, o in deep["checks"]}
+    assert all(o.get("depth") == "short" and "cpi" not in o for o in f.values())
+    assert "irq" not in f and "liveness" not in f and fast["timeout_s"] <= 18000
+    for name in ("coherence", "csr"):
+        labels = f[name]["reach"].split(",")
+        assert labels and set(labels) < set(run_formal.REACH[name])
+        assert "reach" not in d[name] and d[name]["cpi"] == "2"
+    assert d["irq"]["cpi"] == "4" and "liveness" in d
+    assert set(f) <= set(d) and deep["timeout_s"] >= fast["timeout_s"]
+
+
 def test_pmod_limits():
     """tCEM = floor(8000 / T), tRST = ceil(50 / T) cycles (contract 2.1.7, 2.3); a period whose
     2-cycle SCK would beat the slowest command's 33 MHz is refused (the monitor counts edges,
@@ -774,10 +792,10 @@ def test_seed_passes(tmp_path, heavy_lock):
     rc, text = formal(["--out", str(out)])
     res = json.load(open(out))
     assert rc == 0 and res["pass"], f"{res.get('checks')}\n{res.get('failures')}\n{text[-3000:]}"
-    # The fast config: the short depth for most checks, cpi=2 for coherence and csr, cpi=4
-    # for irq (the deepest).
+    # The fast config: every check at the short depth (the instruction groups at their own
+    # class's); irq and liveness only in deep.
     pcd = res["per_check_depth"]
-    assert res["depth"] == max(pcd.values()) == pcd["irq"]
-    assert pcd["qspi"] == res["depth_policy"]["d_short"]
-    assert pcd["irq"] > pcd["csr"] == pcd["coherence"] > pcd["qspi"]
+    assert res["depth"] == max(pcd.values()) == res["depth_policy"]["d_short"]
+    assert pcd["qspi"] == pcd["coherence"] == pcd["csr"] == res["depth_policy"]["d_short"]
+    assert "irq" not in pcd and "liveness" not in pcd
     assert all(v == "PASS" for v in res["checks"].values())

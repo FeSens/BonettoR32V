@@ -6,5 +6,5 @@
   "assertion": "csr_read",
   "description": "MRET does not set mstatus.MPIE.",
   "expect": "fail",
-  "deep": false
+  "deep": true
 }

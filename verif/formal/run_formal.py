@@ -1590,7 +1590,15 @@ def main():
         else:
             if only and not only.search(name):
                 continue
-            items = [(name, CHECKERS[name], None, [(name, REACH[name])], base)]
+            labels = REACH[name]
+            if "reach" in opts:
+                # A config may require a subset of the check's triggers: the ones reachable at
+                # the depth it runs at (checks.cfg says which and why).
+                labels = opts["reach"].split(",")
+                bad = [l for l in labels if l not in REACH[name]]
+                if bad:
+                    raise SystemExit(f"[formal] ERROR: {name}: unknown reach labels {bad}")
+            items = [(name, CHECKERS[name], None, [(name, labels)], base)]
         for tname, checker, model, req, ibase in items:
             tdepth = ibase + int(opts.get("depth_add", 0))
             rf = (tname == "reset")

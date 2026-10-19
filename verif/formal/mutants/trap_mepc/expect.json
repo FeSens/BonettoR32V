@@ -6,5 +6,5 @@
   "assertion": "csr_read",
   "description": "A trap sequence's WC writes the ring, not the pc, to mepc.",
   "expect": "fail",
-  "deep": false
+  "deep": true
 }

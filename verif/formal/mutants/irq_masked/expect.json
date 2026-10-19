@@ -6,5 +6,5 @@
   "assertion": "csr_irq_enabled",
   "description": "An interrupt is taken with MIE = 0.",
   "expect": "fail",
-  "deep": false
+  "deep": true
 }

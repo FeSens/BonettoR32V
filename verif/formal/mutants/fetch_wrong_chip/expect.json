@@ -6,5 +6,5 @@
   "assertion": "coherence_fetch",
   "description": "A fetch from PSRAM reads the flash byte at the same low address.",
   "expect": "fail",
-  "deep": false
+  "deep": true
 }

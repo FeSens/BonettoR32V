@@ -210,9 +210,11 @@ Assertions at each compared retirement: `csr_read` (a CSR instruction's rd_wdata
 value: known shadow bits, MPP = 3, every other bit 0; misa, mtval, the id CSRs and mip read 0,
 except mip.MEIP), `csr_trap_target` (a trap's pc_wdata = mtvec), `csr_mret_target` (MRET's
 pc_wdata = mepc), `csr_irq_enabled` (an interrupt entry only with MIE = MEIE = 1),
-`csr_irq_target` (its pc_rdata = mtvec). The same checker runs twice: `csr` at cpi=2 (a CSR
-write or a trap, then a read) and `irq` at cpi=4 (an IO store and two CSR writes enable the
-interrupt, then the entry and the handler's first instruction), each with its own triggers.
+`csr_irq_target` (its pc_rdata = mtvec). The same checker runs twice: `csr` and `irq`, each
+with its own triggers. In deep, `csr` runs at cpi=2 (a CSR write or a trap, then a read) and
+`irq` at cpi=4 (an IO store and two CSR writes enable the interrupt, then the entry and the
+handler's first instruction). In fast, `csr` is bounded at the short depth and `irq` does not
+run (see "Fast and deep").
 
 The instruction models of the CSR instructions, MRET and WFI (`gen_isa_rv32e.py`, `NEW_INSNS`)
 check everything else about them: register fields (rs1 for the register forms, 0 for the
@@ -280,8 +282,8 @@ unsatisfiable one can stall (v1 seed: `bus_imem` 19.6 s as a proof, 61.1 s as a 
 
 The v3 triggers beyond the instruction ones: `qspi` a flash read, a PSRAM read and a PSRAM
 write, each with data; `psram_write` an explained write outside the region; `coherence` a fetch
-and a load of X, and a load of X after a store to X; `csr` a CSR read, a read after a CSR write,
-a read after a trap, a trap, an MRET; `irq` an interrupt entry; `rvfi` a second retirement and a
+and a load of X, and (deep) a load of X after a store to X; `csr` a CSR read, a trap, an MRET,
+and (deep) a read after a CSR write and a read after a trap; `irq` (deep) an interrupt entry; `rvfi` a second retirement and a
 handler's first instruction; `gpio` a GPIO_OUT change on a pin and an ALTFN change; `periph` a
 read of a written register, of IRQ_PEND, of GPIO_IN; `reset` a retirement after a reset of 3
 edges or more; `cover` a non-trapping and a trapping retirement and a second one.
@@ -335,18 +337,19 @@ lists the programs. With `--host`, the programs and the cosim are copied to the 
 timing runs there (Verilator stays off the Mac). The v2 Icarus fallback (`timing_tb.v`) is
 gone: there is no v3 Pmod model in Verilog outside the formal monitor.
 
-The champion (346c4a3, cosim timing over 27 programs): first 289, max 289 (alu_imm and
+Champion 111 (346c4a3, cosim timing over 27 programs): first 289, max 289 (alu_imm and
 lui_auipc 289 include the first instruction after reset; csr 270; store and shift 236; trap and
 io_store 202; alu and load 160; branches 136; jalr and io_load 118; mret 84; jal 76; fence and
-wfi 52). So d_short = 581 (every fast check except below), cpi=2 = 870 (`coherence`, `csr`),
-cpi=4 = 1,448 (`irq`), D = 581, liveness 2,629.
+wfi 52). So d_short = 581, cpi=2 = 870 (deep `coherence`, `csr`), cpi=4 = 1,448 (deep `irq`),
+D = 581, liveness 2,629. Champion 112 (6810e6f, 31 programs): first 305, max 305, so
+d_short = D = 613, cpi=2 = 918, cpi=4 = 1,528, liveness 2,661.
 
 A short-depth trace covers the first retirement plus one more retirement of the class under
 check. Slower instances than the timing programs measure (a shift by more bits than the
 programs shift) are left to cosim and the architecture tests. Each check's reach task demands
-that its triggers occur within the depth: for `irq` that is the IO store that enables the
-interrupt source, the two CSR writes (mie, mstatus), the entry and the handler's first
-instruction within 1,448 steps.
+that its required triggers occur within the depth: for deep `irq` that is the IO store that
+enables the interrupt source, the two CSR writes (mie, mstatus), the entry and the handler's
+first instruction within cpi=4.
 
 ## Liveness
 
@@ -372,12 +375,42 @@ do not measure (see "Mutants").
 
 | | fast (`checks.cfg`) | deep (`checks-deep.cfg`) |
 |---|---|---|
-| checks | every check except liveness | every check, liveness included |
-| depth | short depth (per class group for the instructions); `coherence`, `csr` cpi=2; `irq` cpi=4 | full depth D; cpi checks keep cpi; liveness D + 2,048 |
+| checks | every check except irq and liveness | every check, irq and liveness included |
+| depth | short depth for every check (per class group for the instructions) | full depth D; `coherence`, `csr` cpi=2, `irq` cpi=4; liveness D + 2,048 |
+| triggers | `coherence`, `csr`: the ones reachable at the short depth (`reach=`) | all |
 | instruction tasks | 10 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
-| task timeout | 44,000 s (2 x the longest task measured: reg, 21,934 s on hwe-bench, fc07cc3 reg-only run, host shared) | 44,000 s |
+| task timeout | 18,000 s (5 h: a run fits in about 6 hours, the lead's target) | 44,000 s (2 x reg, 21,934 s, fc07cc3 reg-only run); 172,800 s for `coherence`, `csr`, `irq` |
 | depth cap | 2,048 | 4,096 |
-| jobs | at most 8 on the Mac, `BONETTO_FORMAL_REMOTE_JOBS` (18) on a remote host, and never more than memory holds | same |
+| jobs | at most 12 (`jobs` in the config), and never more than memory holds | 8, same rule |
+
+**Why fast bounds coherence and csr and drops irq.** The first fast config ran `coherence` and
+`csr` at cpi=2 and `irq` at cpi=4. On champion 111 (hwe-bench, 3 jobs, host shared) the three
+proofs started first: `coherence` (870) and `irq` (1,448) hit TIMEOUT at 44,000 s (44,001.8 s
+and 44,002.0 s, peak RSS 12.6 GB and 27.2 GB, still growing about 1 GB per hour), and `csr`
+(870) was past 41,000 s at 15.3 GB when the run was stopped: 2 of 52 tasks finished in 12 hours.
+So fast now runs every check at the short depth, and only the deep config keeps the full depths.
+What that costs, check by check:
+- `coherence` (fast): every fetch and load of the first two retirements returns the loaded image
+  (the flash byte, or the PSRAM's arbitrary content). Not in fast: a store followed by a load or
+  fetch of the same byte (the symbolic byte's `amem` update), so a store that never reaches the
+  PSRAM is caught only by deep, by the cosim's coherence program and final memory compare, and
+  by `psram_write` when the write goes to the wrong place.
+- `csr` (fast): every CSR read by the first two retirements (reset values of MIE, MPIE and MEIE,
+  MPP = 3, the read-only and zero bits, mip, misa, mtval and the id CSRs reading 0, mtvec and
+  mepc bits 1:0) and the first trap and MRET. Not in fast: anything compared with a value learned
+  or written earlier: `csr_trap_target` and `csr_mret_target` (they need mtvec or mepc read or
+  written by an earlier instruction), a read after a write, mcause and mepc after a trap, MPIE
+  after MRET.
+- `irq` (deep only): an interrupt entry needs three instructions first (an IO store and two
+  CSR writes), about 1,100 steps on 111 by the class timings (an estimate, not measured). Not in fast: `csr_irq_enabled`, `csr_irq_target`, the interrupt's mepc and mcause.
+
+The deep config keeps all three at their full depth with a 172,800 s timeout each; on 111 they
+did not finish within 44,000 s, so a deep run is not known to finish on this core, and `irq`
+may outgrow a shared 62 GB host before then. The cosim (every program against the ISS, in
+lockstep, the irq and coherence programs) covers these properties on every candidate. A proposal
+that would bring them back into fast: observation-only `rvfi_csr_*` ports for the contract-4
+CSRs (the riscv-formal convention), so the CSR and interrupt checks compare each retirement's
+CSR values directly and need no earlier instruction (a contract change, the lead's ruling).
 
 **Memory and jobs.** Each SBY task needs up to about 0.4 GB + 9.5 MB per step of its depth:
 bitwuzla's RSS on the champion (hwe-bench) was 13.7 GB for irq at depth 1,448, 7.6 GB for csr and
@@ -395,11 +428,12 @@ Fast does not cover:
 1. **Liveness** (ruling R9, kept for v3: deep checks it; the cosim watchdog and liveness fuzz
    cover it per candidate).
 2. **Retirements after the check's depth**: at d_short, a second retirement after a slow first
-   one, and every third retirement; the cpi checks reach 2 or 4 more instructions.
+   one, and every third retirement.
+3. **irq, and the multi-instruction parts of coherence and csr** (above).
 
 Neither config is an unbounded proof (see "What is and is not proven").
 
-### Measured runtimes (contract v3, champion 346c4a3)
+### Measured runtimes (contract v3)
 
 @@RUNTIMES@@
 

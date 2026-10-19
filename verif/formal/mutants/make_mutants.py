@@ -365,6 +365,13 @@ MUTANTS = {
 }
 
 # Shared with the cosim (verif/cosim/mutants/<name>/): name: (checks, assertion, description)
+# Mutants whose counterexample needs two or more retirements after the first (a store then a
+# load, a write or trap then a read, a learned mtvec or mepc, an interrupt entry): the fast
+# config bounds coherence and csr at the short depth and has no irq (checks.cfg), so they run
+# in the deep config (cpi=2, cpi=4).
+DEEP = {"store_dropped", "fetch_wrong_chip", "trap_target", "mret_target", "mret_mpie",
+        "trap_cause", "trap_mepc", "irq_target", "irq_masked"}
+
 SHARED = {
     "tcem_stall": (["qspi"], "qspi_tcem",
                    "The cosim's tCEM stub: a PSRAM read that holds CS_n low with SCK paused for "
@@ -380,7 +387,9 @@ def main():
             shutil.rmtree(os.path.join(HERE, name))
     for name, spec in MUTANTS.items():
         summary, checks, assertion, desc, subs = spec[:5]
-        opts = spec[5] if len(spec) > 5 else {}
+        opts = dict(spec[5]) if len(spec) > 5 else {}
+        if name in DEEP:
+            opts["deep"] = True
         files = {}
         for fname, old, new in subs:
             if fname not in texts:

@@ -6,5 +6,5 @@
   "assertion": "csr_trap_target",
   "description": "A trap sequence's C reads core-region CSR word 0, not mtvec.",
   "expect": "fail",
-  "deep": false
+  "deep": true
 }
