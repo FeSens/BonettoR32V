@@ -319,10 +319,18 @@ The runner computes every depth from the timing measured on the candidate; no ag
 ```
 full depth   D       = max(depth_floor, reset_steps + max(first, max_cpi) + max_cpi + margin)
 short depth  d(c)    = reset_steps + first + max_cycles(c) + margin
+reach depth  r(c)    = min(d(c), max(reset_steps + first + margin, w(c) + 1 + margin))
 cpi=N        d_N     = reset_steps + first + N x max_cpi + margin
 liveness             = D + 2,048 (deep)
 FAIL if a base depth > depth_cap   (liveness's fixed +2,048 is not counted)
 ```
+
+`depth=reach` (the fast config): the check's reach task runs first, at d(c). w(c) is the last
+step of the solver window (29 steps, the reach engine's) in which the last of the check's
+required triggers was first reached; the proof then runs to r(c). A trigger not reached within
+d(c) is UNREACHED and the proof stays at d(c). `formal.json` records each proof's depth, its
+cap and the reach step in `reach_depths`. With `--tasks proof` (no reach task) a depth=reach
+proof runs at d(c).
 
 `first` is the first retirement's cycle (the memory reset sequence included) and `max_cpi` the
 slowest instruction measured. `max_cycles(c)` is the slowest measured class among an
@@ -376,7 +384,7 @@ do not measure (see "Mutants").
 | | fast (`checks.cfg`) | deep (`checks-deep.cfg`) |
 |---|---|---|
 | checks | every check except irq and liveness | every check, irq and liveness included |
-| depth | short depth for every check (per class group for the instructions) | full depth D; `coherence`, `csr` cpi=2, `irq` cpi=4; liveness D + 2,048 |
+| depth | reach depth r(c) for every check: its reach task at the short depth first, then the proof to the step where its triggers were reached | full depth D; `coherence`, `csr` cpi=2, `irq` cpi=4; liveness D + 2,048 |
 | triggers | `coherence`, `csr`: the ones reachable at the short depth (`reach=`) | all |
 | instruction tasks | 10 class groups (`CLASS_GROUPS`) | 8 round-robin groups |
 | task timeout | 18,000 s (5 h: a run fits in about 6 hours, the lead's target) | 44,000 s (2 x reg, 21,934 s, fc07cc3 reg-only run); 172,800 s for `coherence`, `csr`, `irq` |
@@ -404,7 +412,32 @@ What that costs, check by check:
 - `irq` (deep only): an interrupt entry needs three instructions first (an IO store and two
   CSR writes), about 1,100 steps on 111 by the class timings (an estimate, not measured). Not in fast: `csr_irq_enabled`, `csr_irq_target`, the interrupt's mepc and mcause.
 
-The deep config keeps all three at their full depth with a 172,800 s timeout each; on 111 they
+**Why fast runs each proof at its reach depth.** The short depth did not fit either. In the fast
+run on champion 112 (6810e6f, d_short = 613, hwe-bench, 9 jobs, host shared) the proofs of reg,
+psram_write, coherence, csr and instruction groups 1, 2 and 3 hit TIMEOUT at 18,000 s (one solver
+call each, bitwuzla RSS 3.8 to 5.6 GB). The cost grows much faster than the depth (same host,
+one solver call): psram_write took 192 s at depth 408 and 3,646 s at 484; csr 1,437 s at 466 and
+2,870 s at 484; reg 48 s at 321, and was still running past 6,500 s at 484. Smaller solver windows
+do not rescue it: with 29-step windows the steps up to 289 took 25 s, but each later window took
+about 2.7 times the one before (51 s, 149 s and 402 s for steps 290 to 376 of instruction group
+0; reg's window 348 to 376 was still running after 8 minutes). So each fast proof stops at its
+reach depth r(c), where every behavior it requires has occurred. What that bound proves, and what
+it leaves to deep:
+- Proven in fast, per check: every trace from reset (any power-up mode, any flip-flop power-up
+  values, any flash image and PSRAM content, free registers) through the memory reset sequence
+  and the first retirement, up to r(c). In practice that is the first instruction and the
+  pair-fetched second one. The floor reset + first + margin covers the first retirement in the
+  slowest power-up mode the cosim measured.
+- Not in fast: anything after r(c). That includes an instruction that only retires after a slow
+  first one (a load or a store first), a trigger that a slower power-up mode reaches later than
+  the fastest one, and the qspi rules over long windows: `qspi_tcem` can only fail in fast for a
+  CS# low period that starts before r(qspi) - 400, so on 112 (r(qspi) = 321) fast never checks
+  tCEM; deep (613) checks the CS# low periods that start before step 213, and the cosim's Pmod
+  model checks tCEM on every cycle of every program.
+- Deep keeps every check at the full depth D or above (613 on 112; coherence and csr at cpi=2,
+  irq at cpi=4).
+
+The deep config keeps coherence, csr and irq at their full depth with a 172,800 s timeout each; on 111 they
 did not finish within 44,000 s, so a deep run is not known to finish on this core, and `irq`
 may outgrow a shared 62 GB host before then. The cosim (every program against the ISS, in
 lockstep, the irq and coherence programs) covers these properties on every candidate. A proposal
@@ -427,15 +460,47 @@ Fast does not cover:
 
 1. **Liveness** (ruling R9, kept for v3: deep checks it; the cosim watchdog and liveness fuzz
    cover it per candidate).
-2. **Retirements after the check's depth**: at d_short, a second retirement after a slow first
-   one, and every third retirement.
+2. **Retirements after the check's reach depth** r(c): in practice everything after the first
+   instruction and its pair-fetched second one (above).
 3. **irq, and the multi-instruction parts of coherence and csr** (above).
 
 Neither config is an unbounded proof (see "What is and is not proven").
 
 ### Measured runtimes (contract v3)
 
-@@RUNTIMES@@
+**Champion 112, fast (the 10th-improvement check).** 6810e6f (pair fetch), hwe-bench (shared),
+12 jobs, memory budget 40 GB, timing measured in the run (31 programs: first 305, max 305, so
+d_short = 613): **PASS, 65 of 65 checks, 3,367.6 s** (the remote run's runtime; about 57 minutes on
+the wall clock, cosim timing included). Peak bitwuzla RSS 5.3 GB (csr's reach task at 613;
+sampled once a minute). Per task: the proof depth r(c) (cap d(c)), proof and reach seconds.
+
+| task | r(c) (cap) | proof s | reach s | task | r(c) (cap) | proof s | reach s |
+|---|---|---|---|---|---|---|---|
+| insn_group0 | 408 (560) | 2,184.6 | 676.0 | reset | 308 (613) | 166.9 | 190.4 |
+| csr | 466 (613) | 1,436.6 | 1,650.0 | gpio | 379 (613) | 152.0 | 361.6 |
+| insn_group4 | 379 (469) | 1,107.1 | 743.3 | insn_group8 | 379 (560) | 140.1 | 462.2 |
+| insn_group1 | 408 (560) | 873.9 | 841.8 | insn_group9 | 379 (578) | 131.5 | 554.0 |
+| periph | 408 (613) | 663.0 | 556.5 | ill | 379 (613) | 107.5 | 303.3 |
+| pc_fwd | 408 (613) | 612.4 | 464.6 | insn_group2 | 321 (613) | 78.1 | 303.3 |
+| rvfi | 408 (613) | 305.9 | 397.0 | insn_group3 | 321 (613) | 74.1 | 238.4 |
+| coherence | 350 (613) | 261.3 | 140.2 | insn_group6 | 321 (484) | 61.6 | 168.2 |
+| insn_group5 | 350 (613) | 202.3 | 693.2 | insn_group7 | 321 (484) | 53.8 | 129.8 |
+| psram_write | 408 (613) | 191.7 | 398.4 | reg | 321 (613) | 48.0 | 56.7 |
+| pc_bwd | 321 (613) | 44.2 | 68.7 | qspi | 321 (613) | 38.7 | 123.2 |
+| unique | 321 (613) | 37.4 | 68.7 | causal | 308 (613) | 36.3 | 47.9 |
+| cover | 350 (613) | 33.5 | 170.5 | | | | |
+
+**Champion 112 at the short depth (stopped).** The same champion with every proof at d_short
+(613, 9 jobs, budget 48 GB): reg, psram_write, coherence and csr TIMEOUT at 18,000 s (18,002.1,
+18,002.0, 18,001.6 and 18,001.3 s), instruction groups 1, 2 and 3 past 16,800 s; the run was
+stopped there with 37 of its 50 tasks not started.
+
+**Champion 111 (346c4a3), the first fast config** (coherence and csr at cpi=2, 870; irq at cpi=4,
+1,448; hwe-bench, 3 jobs): coherence and irq TIMEOUT at 44,000 s (44,001.8 s and 44,002.0 s, peak
+RSS 12.6 GB and 27.2 GB), csr past 41,000 s at 15.3 GB; 2 of 52 tasks finished in 12 hours, then
+the run was stopped.
+
+Deep has not been run on contract v3.
 
 ### Contract v2 measurements (history)
 
@@ -452,7 +517,9 @@ lead's L7 rule). The v2 seed's fast run took 208 s on hwe-bench with 18 jobs.
   up to the depth (64-step windows took 520 s against 302 s on the v1 seed). Liveness also uses
   one call: 64-step windows found the v1 stall counterexamples faster but the seed's own proof
   ran past 33 minutes at 16 GB, against 658 s with one call. A single call has to find a trace of
-  the full depth, so a counterexample can take as long as a proof.
+  the full depth, so a counterexample can take as long as a proof. On champion 112, 29-step
+  windows at depth 613 grew about 2.7 times per window after the first retirement (see "Why
+  fast runs each proof at its reach depth"), so `step=all` stays.
 - **yices** stalls on the bus checks.
 - **abc bmc3**: faster on the v1 seed's instruction groups (332 s against 414 s); rejects designs
   with constant x bits without `setundef`.
@@ -484,7 +551,64 @@ wrong load value is `coherence`'s, covered by `sd_low` and `store_dropped`), the
 `rvfi_halt` replace them), the hyp/002 legal cores (v2 designs), `trap_fields_brj` (the trap
 field rules are `insn_*` and `conv_*` now) and the liveness boundary pairs (see "Liveness").
 
-@@MUTANTS@@
+Results (hwe-bench, `--tasks proof`, so each proof ran at its cap: the short depth 581 of
+champion 111, 346c4a3, one solver call; generated on 111, then regenerated on 112, where the
+generator still matches every substitution, but not re-run there). 31 of the 46 mutants FAIL as
+expected, each with a counterexample in its own check. The 15 marked "not run" were not run in
+this port: the deep ones (a deep proof did not finish within 44,000 s on 111), and `sd_low`,
+`csr_mtvec_lowbits`, `csr_mpp`, `ill_zero` and `uart_any_byte` (stopped when the shared host ran
+low on memory, or not reached in the time available). The fast proofs now stop at their reach
+depth r(c), below 581: a mutant whose first wrong retirement comes after r(c) is caught by deep
+only.
+
+| mutant | files | bug | checks | result: failed assertions, proof time |
+|---|---|---|---|---|
+| oe_sck_reset | r32v_mem | SCK's output enable is off during the reset sequence | qspi | qspi FAIL: `qspi_oe_fixed`, 113.1 s |
+| reset_cs_low | r32v_mem | flash CS_n low while rst_n is low | reset | reset FAIL: `qspi_reset_cs`, 206.0 s |
+| cs_both | r32v_mem | both CS_n low | qspi | qspi FAIL: `qspi_rule1`, `qspi_cmd_psram`, 116.3 s |
+| cs_sck_high | tt_um_fesens_r32v | CS_n rises while SCK is high | qspi | qspi FAIL: `qspi_rule2`, 115.1 s |
+| sck_masked | r32v_mem | SCK toggles with both CS_n high | qspi | qspi FAIL: `qspi_rule3`, `qspi_rule4`, 651.9 s |
+| sd_rise | r32v_mem | SD0 changes at a rising SCK edge | qspi | qspi FAIL: `qspi_rule4`, `qspi_cmd_psram`, 111.8 s |
+| contention | r32v_mem | drives SD0-SD3 during a read's data phase | qspi | qspi FAIL: `qspi_rule6_flash`, `qspi_rule6_psram`, 113.1 s |
+| flash_no_exit | r32v_mem | the reset sequence skips the flash's continuous-read exit | qspi | qspi FAIL: `qspi_rule6_flash`, `qspi_cmd_flash`, 328.5 s |
+| flash_m_byte | r32v_mem | M = 0x30 in the flash header | qspi | qspi FAIL: `qspi_wend`, `qspi_cmd_flash`, 243.0 s |
+| psram_cmd | r32v_mem | PSRAM read command 0x0C | qspi | qspi FAIL: `qspi_cmd_psram`, 242.4 s |
+| psram_no_reset | r32v_mem | no PSRAM reset | qspi | qspi FAIL: `qspi_cmd_psram`, 277.1 s |
+| trst_short | r32v_mem | CS_n high for one cycle after 0x99 | qspi | qspi FAIL: `qspi_trst`, 115.7 s |
+| cmd_extra_edge | r32v_mem | a ninth edge after 0x66 | qspi | qspi FAIL: `qspi_extra`, 116.0 s |
+| write_midbyte | tt_um_fesens_r32v | a store ends mid-byte | qspi | qspi FAIL: `qspi_wend`, 1776.4 s |
+| store_extra_byte | tt_um_fesens_r32v | SB writes two bytes | psram_write | psram_write FAIL: `psram_write_attr`, 1540.6 s |
+| store_data_flip | tt_um_fesens_r32v | a store writes a wrong bit | psram_write | psram_write FAIL: `psram_write_attr`, 1579.0 s |
+| region_wrap | r32v_mem | core-region words at a 2-byte offset | psram_write | psram_write FAIL: `psram_write_attr`, 735.5 s |
+| sd_low | tt_um_fesens_r32v | samples SD0-SD3 while SCK is low | coherence | not run |
+| store_dropped | tt_um_fesens_r32v | stores issue nothing | coherence (deep) | not run |
+| fetch_wrong_chip | tt_um_fesens_r32v | fetches always read the flash | coherence (deep) | not run |
+| trap_target | r32v_csr | a trap jumps through the wrong core-region word | csr (deep) | not run |
+| mret_target | r32v_csr | MRET jumps to mtvec | csr (deep) | not run |
+| irq_target | r32v_csr | an interrupt jumps to mepc | irq (deep) | not run |
+| irq_masked | r32v_csr | the interrupt ignores mstatus.MIE | irq (deep) | not run |
+| csr_mtvec_lowbits | r32v_csr | mtvec and mepc bits 1:0 read back | csr | not run |
+| csr_mpp | r32v_csr | mstatus.MPP bit 12 reads 0 | csr | not run |
+| mret_mpie | r32v_csr | MRET leaves MPIE | csr (deep) | not run |
+| trap_cause | tt_um_fesens_r32v | EBREAK's mcause is 11 | csr (deep) | not run |
+| trap_mepc | tt_um_fesens_r32v | a trap writes the ring to mepc | csr (deep) | not run |
+| hang_reserved | tt_um_fesens_r32v | custom-0 encodings hang | liveness (deep) | not run |
+| gpio_any_byte | r32v_periph | a store to any byte of GPIO_OUT writes it | gpio, periph | gpio FAIL: `gpio_uo_hold`, 1772.0 s; periph SKIPPED |
+| uo_glitch | r32v_periph | uo_out[0] glitches at a GPIO_OUT store | gpio | gpio FAIL: `gpio_uo_change`, `gpio_uo_once`, 1100.0 s |
+| uo_late | r32v_periph | uo_out takes GPIO_OUT two clocks late | gpio | gpio FAIL: `gpio_uo_hold`, 2610.2 s |
+| periph_wmask | r32v_periph | TIMER_CMP's high byte is not writable | periph | periph FAIL: `periph_read`, 3311.6 s |
+| uart_any_byte | r32v_periph | a store to UART_DATA byte 1 starts a transmission | periph | not run |
+| rvfi_halt | tt_um_fesens_r32v | rvfi_halt at a trap | rvfi | rvfi FAIL: `conv_halt`, 1411.6 s |
+| intr_after_trap | tt_um_fesens_r32v | rvfi_intr only after an interrupt | rvfi | rvfi FAIL: `conv_intr_trap`, 1316.5 s |
+| trap_writes_rd | tt_um_fesens_r32v | a trap reports rd | rvfi | rvfi FAIL: `conv_trap_rd_addr`, 873.2 s |
+| zero_init | tt_um_fesens_r32v | the pc is not cleared | rvfi | rvfi FAIL: `conv_first_pc`, 476.3 s |
+| ill_zero | tt_um_fesens_r32v | the all-zeros word executes | ill | not run |
+| reg_wrong_index | tt_um_fesens_r32v | writes go to an odd register | reg | reg FAIL: `reg_rs1`, 452.0 s |
+| sub_decode | tt_um_fesens_r32v | SUB adds | insn_sub | insn_sub FAIL: `insn_rd_wdata`, 217.6 s |
+| rvfi_rd | tt_um_fesens_r32v | a wrong RVFI rd value | insn_xor | insn_xor FAIL: `insn_rd_wdata`, 204.3 s |
+| claim_region_stop | tt_um_fesens_r32v | claims a core-region address to stop the checks | insn_add | insn_add FAIL: `insn_rd_wdata`, 202.7 s |
+| norvfi_diff | r32v_periph | a behavior difference only without RVFI | equiv | FAIL (pins equivalence pre-pass) |
+| tcem_stall | cosim stub | tcem_stall | qspi | qspi FAIL: `qspi_tcem`, 36.5 s |
 
 ## Fail fast, scheduling, remote runs
 
@@ -493,7 +617,8 @@ finishes without every required trigger. It kills the running SBY tasks and mark
 checks `SKIPPED`. `--keep-going` runs everything. Tasks start in this order: the proofs longest
 first (by `TASK_COST`: liveness, irq, coherence, csr, reg, psram_write, the instruction groups,
 reset, ...), interleaved with the reach tasks, which are cheap and catch a dead or stuck core
-early as `UNREACHED`.
+early as `UNREACHED`. A depth=reach check's reach task goes first (slowest checks first), and its
+proof is queued as soon as that reach task finishes.
 
 `--host <ssh host>`, or `BONETTO_FORMAL_HOST` (unset by default), runs the gate on another
 machine. The verdict is the same on any host:

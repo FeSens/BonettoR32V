@@ -107,14 +107,16 @@ def test_depth_policy():
 
 
 def test_config_split():
-    """Fast: every check at depth=short, coherence and csr with the triggers reachable there
-    (a subset of their own), no irq, no liveness, a task timeout that fits a 6-hour run. Deep:
-    every check, coherence and csr at cpi=2 and irq at cpi=4 with every trigger, liveness."""
+    """Fast: every check at depth=reach (proof depth from its reach task, capped at the short
+    depth), coherence and csr with the triggers reachable there (a subset of their own), no
+    irq, no liveness, a task timeout that fits a 6-hour run. Deep: every check, coherence and
+    csr at cpi=2 and irq at cpi=4 with every trigger, liveness."""
     fast = run_formal.load_config(os.path.join(HERE, "checks.cfg"))
     deep = run_formal.load_config(os.path.join(HERE, "checks-deep.cfg"))
     f = {n: o for n, _, o in fast["checks"]}
     d = {n: o for n, _, o in deep["checks"]}
-    assert all(o.get("depth") == "short" and "cpi" not in o for o in f.values())
+    assert all(o.get("depth") == "reach" and "cpi" not in o for o in f.values())
+    assert all(o.get("depth") != "reach" for o in d.values())
     assert "irq" not in f and "liveness" not in f and fast["timeout_s"] <= 18000
     for name in ("coherence", "csr"):
         labels = f[name]["reach"].split(",")
@@ -264,6 +266,38 @@ def test_task_line():
     assert "UNREACHED 0/2" in t("insn_group0_reach", "PASS", 9.0, [], req)
     assert "TIMEOUT" in t("insn_group0_reach", "TIMEOUT", 9.0, [], req)
     assert "failed assertions: insn_rd_wdata" in t("insn_group0", "FAIL", 9.0, ["insn_rd_wdata"])
+
+
+def test_reach_depth(tmp_path):
+    """depth=reach: parse_task keeps the last step of the solver window where each label
+    first failed; the proof depth is one past the latest required one plus the margin, at
+    least reset + first retirement + margin, at most the cap; a missing trigger leaves the
+    cap."""
+    d = tmp_path / "x_reach"
+    d.mkdir()
+    (d / "status").write_text("FAIL\n")
+    (d / "logfile.txt").write_text(
+        "##   0:00:01  Checking assertions in steps 261 to 289..\n"
+        "##   0:00:02  Assert failed in rvfi_testbench: checker_inst.insn_spec.reach_insn_beq\n"
+        "##   0:00:02  Writing trace to VCD file: engine_0/trace0.vcd\n"
+        "##   0:00:03  Checking assertions in steps 377 to 405..\n"
+        "##   0:00:04  Assert failed in rvfi_testbench: checker_inst.insn_spec.reach_insn_bne\n"
+        "##   0:00:04  Assert failed in rvfi_testbench: checker_inst.insn_spec.reach_insn_beq "
+        "[failed before]\n")
+    st, det = run_formal.parse_task(str(tmp_path), "x_reach")
+    assert st == "FAIL" and det["steps"] == {"reach_insn_beq": 289, "reach_insn_bne": 405}
+    cfg = {"reset_steps": 1, "depth_margin": 2}
+    t = {"first_retire_cycle": 305}
+    res = ("x_reach", st, 9.0, det)
+    assert run_formal.reach_depth(cfg, t, 613, ["reach_insn_beq", "reach_insn_bne"], res)[0] \
+        == 405 + 1 + 2
+    assert run_formal.reach_depth(cfg, t, 613, ["reach_insn_beq"], res)[0] == 1 + 305 + 2
+    assert run_formal.reach_depth(cfg, t, 400, ["reach_insn_bne"], res)[0] == 400
+    assert run_formal.reach_depth(cfg, t, 613, ["reach_insn_blt"], res)[0] == 613
+    assert run_formal.reach_depth(cfg, t, 613, ["reach_insn_beq"],
+                                  ("x_reach", "TIMEOUT", 9.0, det))[0] == 613
+    assert run_formal.base_depth(cfg | {"depth_floor": 0}, t | {"max_cycles_per_insn": 305},
+                                 {"depth": "reach"}, 999) == 1 + 305 + 305 + 2
 
 
 def test_timing_merge():
@@ -792,10 +826,13 @@ def test_seed_passes(tmp_path, heavy_lock):
     rc, text = formal(["--out", str(out)])
     res = json.load(open(out))
     assert rc == 0 and res["pass"], f"{res.get('checks')}\n{res.get('failures')}\n{text[-3000:]}"
-    # The fast config: every check at the short depth (the instruction groups at their own
-    # class's); irq and liveness only in deep.
+    # The fast config: every proof at its reach depth, between reset + first retirement +
+    # margin and the short depth (the cap); irq and liveness only in deep.
     pcd = res["per_check_depth"]
-    assert res["depth"] == max(pcd.values()) == res["depth_policy"]["d_short"]
-    assert pcd["qspi"] == pcd["coherence"] == pcd["csr"] == res["depth_policy"]["d_short"]
+    t = res["depth_policy"]["timing"]
+    assert res["depth"] == res["depth_policy"]["d_short"]
+    assert all(1 + t["first_retire_cycle"] + 2 <= v <= res["depth"] for v in pcd.values())
+    assert set(res["reach_depths"]) and all(r["depth"] <= r["cap"]
+                                            for r in res["reach_depths"].values())
     assert "irq" not in pcd and "liveness" not in pcd
     assert all(v == "PASS" for v in res["checks"].values())

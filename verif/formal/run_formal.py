@@ -26,8 +26,10 @@ Steps:
      the instructions under check (all classes for a non-instruction check). cpi=N (checks
      that relate several instructions: a store then a load, a CSR write then a read, the
      three instructions that enable an interrupt) = reset_steps + first_retire_cycle + N x
-     max_cycles_per_insn + margin. A base depth above depth_cap is a FAIL (too slow for the
-     formal policy); liveness's fixed +2,048 is not counted.
+     max_cycles_per_insn + margin. depth=reach: the reach task runs at the short depth, and
+     the proof to the step where its required triggers were reached (reach_depth). A base
+     depth above depth_cap is a FAIL (too slow for the formal policy); liveness's fixed
+     +2,048 is not counted.
      The signoff period T (src/config.json CLOCK_PERIOD, or --clk-ns) sets the Pmod timing
      limits: tCEM = floor(8000 / T) cycles, tRST = ceil(50 / T) cycles (contract 2).
   4. Two SBY tasks per check in the config (checks.cfg, or checks-deep.cfg with
@@ -588,12 +590,36 @@ def cpi_depth(cfg, timing, n):
 
 
 def base_depth(cfg, timing, opts, depth, insns=None):
-    """A check's base depth from its config options (cpi=N, depth=short, else the full D)."""
+    """A check's base depth from its config options (cpi=N, depth=short, else the full D).
+    depth=reach: the short depth is the cap (the reach task's depth); the proof's own depth
+    comes from its reach task (reach_depth)."""
     if "cpi" in opts:
         return cpi_depth(cfg, timing, int(opts["cpi"]))
-    if opts.get("depth") == "short":
+    if opts.get("depth") in ("short", "reach"):
         return short_depth(cfg, timing, insns)
     return depth
+
+
+def reach_floor(cfg, timing):
+    """The shallowest depth=reach proof: reset + the measured first retirement (the slowest
+    power-up mode the cosim ran) + margin."""
+    return cfg["reset_steps"] + int(timing["first_retire_cycle"]) + cfg["depth_margin"]
+
+
+def reach_depth(cfg, timing, cap, required, rres):
+    """depth=reach: the proof depth of a check from its finished reach task: one past the last
+    step of the solver window where the last of its required triggers was first reached, plus
+    depth_margin, at least reach_floor, at most cap (the short depth). Returns (depth, why).
+    A reach task that did not reach every trigger leaves the proof at the cap (the check is
+    UNREACHED anyway)."""
+    _, st, _, det = rres
+    steps = det.get("steps", {})
+    miss = [l for l in required if l not in steps]
+    if st not in ("PASS", "FAIL") or miss:
+        return cap, f"reach task {st}, missing {miss}: proof at the cap"
+    last = max(steps[l] for l in required)
+    d = min(cap, max(reach_floor(cfg, timing), last + 1 + cfg["depth_margin"]))
+    return d, f"every trigger reached by step {last}"
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +771,9 @@ core.il {core_il}
 def parse_task(tdir, name):
     """Returns (sby status, detail). detail["failed"] lists every failed assertion label
     (last path component) in order; detail["traces"] maps a label to the VCD of the
-    trace where it first failed (smtbmc prints the failures, then writes the trace)."""
+    trace where it first failed (smtbmc prints the failures, then writes the trace);
+    detail["steps"] maps a label to the last step of the solver window it first failed in
+    (an upper bound on the step of its first failure)."""
     d = os.path.join(tdir, name)
     status_file = os.path.join(d, "status")
     logf = os.path.join(d, "logfile.txt")
@@ -754,14 +782,20 @@ def parse_task(tdir, name):
         txt = open(status_file).read().split()
         status = txt[0] if txt else "ERROR"
     text = open(logf, errors="replace").read() if os.path.isfile(logf) else ""
-    failed, traces, pending = [], {}, []
+    failed, traces, pending, steps, win = [], {}, [], {}, None
     for line in text.splitlines():
+        m = re.search(r"Checking assertions in steps? (\d+)(?: to (\d+))?", line)
+        if m:
+            win = int(m.group(2) or m.group(1))
+            continue
         m = re.search(r"Assert failed in \S+: (\S+)", line)
         if m and "[failed before]" not in line:
             lbl = m.group(1).split(".")[-1]
             if lbl not in failed:
                 failed.append(lbl)
                 pending.append(lbl)
+                if win is not None:
+                    steps[lbl] = win
             continue
         m = re.search(r"Writing trace to VCD file: (\S+)", line)
         if m:
@@ -769,7 +803,7 @@ def parse_task(tdir, name):
                 traces[lbl] = os.path.join(d, m.group(1))
             pending = []
     errors = [l for l in text.splitlines() if "ERROR" in l][:5]
-    return status, {"failed": failed, "traces": traces, "errors": errors}
+    return status, {"failed": failed, "traces": traces, "errors": errors, "steps": steps}
 
 
 def classify(proof_status, proof_detail, reach_status, reach_detail, required):
@@ -1565,6 +1599,9 @@ def main():
     only = re.compile(args.only) if args.only else None
     units = []      # (task name, [(check name, required reach labels)])
     jobs_todo = []  # (task name, sby path, timeout, depth)
+    first_todo = []  # the reach tasks of depth=reach checks: they go first
+    deferred = {}   # depth=reach proofs: task name -> (checker, model, reset_free, engine,
+                    # timeout, cap depth, required triggers)
     task_depths = {}
     reach_eng = cfg["engines"]["reach"]
     for name, kind, opts in cfg["checks"]:
@@ -1602,16 +1639,22 @@ def main():
         for tname, checker, model, req, ibase in items:
             tdepth = ibase + int(opts.get("depth_add", 0))
             rf = (tname == "reset")
-            p = write_sby(work, tname, checker, tdepth, eng, timeout, model=model, reset_free=rf,
-                          extra_defines=pmod_defines)
             r = write_sby(work, tname + "_reach", checker, tdepth, reach_eng, timeout,
                           model=model, reset_free=rf, role="reach",
                           reach=[l for _, labels in req for l in labels],
                           extra_defines=pmod_defines)
-            if args.tasks != "reach":
-                jobs_todo.append((tname, p, timeout, tdepth))
-            if args.tasks != "proof":
-                jobs_todo.append((tname + "_reach", r, timeout, tdepth))
+            # depth=reach: the proof waits for its reach task (its depth comes from it). With
+            # --tasks proof (no reach task) it runs at the cap.
+            if opts.get("depth") == "reach" and args.tasks == "all":
+                deferred[tname] = (checker, model, rf, eng, timeout, tdepth, req)
+                first_todo.append((tname + "_reach", r, timeout, tdepth))
+            else:
+                p = write_sby(work, tname, checker, tdepth, eng, timeout, model=model,
+                              reset_free=rf, extra_defines=pmod_defines)
+                if args.tasks != "reach":
+                    jobs_todo.append((tname, p, timeout, tdepth))
+                if args.tasks != "proof":
+                    jobs_todo.append((tname + "_reach", r, timeout, tdepth))
             units.append((tname, req))
             for cname, _ in req:
                 task_depths[cname] = tdepth
@@ -1625,11 +1668,18 @@ def main():
     reaches = [t for t in jobs_todo if t[0].endswith("_reach")]
     jobs_todo = [t for pair in zip(proofs, reaches) for t in pair] + \
         proofs[len(reaches):] + reaches[len(proofs):]
-    # Memory: at most as many threads as the budget holds at the shallowest task's depth; each
-    # task then waits until its own estimate (its depth, its weight) fits next to the running
-    # ones (MemGate). The deep tasks start first (TASK_COST), so they are not starved.
+    # The reach tasks of the depth=reach checks first (each one releases its proof), the
+    # slowest proofs first (TASK_COST).
+    first_todo.sort(key=lambda t: -task_cost(t[0][:-6]))
+    jobs_todo = first_todo + jobs_todo
+    # Memory: at most as many threads as the budget holds at the shallowest task's depth (a
+    # depth=reach proof counts at reach_floor); each task then waits until its own estimate
+    # (its depth, its weight) fits next to the running ones (MemGate). The deep tasks start
+    # first (TASK_COST), so they are not starved.
     max_tdepth = max(task_depths.values()) if task_depths else deepest
     min_tdepth = min(task_depths.values()) if task_depths else deepest
+    if deferred:
+        min_tdepth = min(min_tdepth, reach_floor(cfg, timing))
     jobs, per_gb, budget_gb = mem_jobs(min_tdepth, jobs)
     global MEM_GATE
     MEM_GATE = MemGate(budget_gb)
@@ -1653,30 +1703,51 @@ def main():
             results[tname + skipped_role] = (tname + skipped_role, "SKIPPED", 0.0,
                                              {"failed": [], "traces": {}, "errors": []})
     first_fail = None
+    reach_depths = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(run_task, n, p, to, d) for n, p, to, d in jobs_todo]
-        for fu in concurrent.futures.as_completed(futs):
-            res = fu.result()
-            results[res[0]] = res
-            if res[1] == "SKIPPED":
-                continue
-            failed = [l for l in res[3]["failed"]]
-            log(task_line(res[0], res[1], res[2], failed,
-                          unit_req.get(res[0][:-6]) if res[0].endswith("_reach") else None))
-            if args.keep_going or first_fail:
-                continue
-            # Fail fast: a proof that did not PASS, or a reach task that finished without
-            # every required trigger.
-            if res[0].endswith("_reach"):
-                missing = [l for l in unit_req[res[0][:-6]] if l not in failed]
-                bad = res[1] not in ("PASS", "FAIL") or missing
-            else:
-                bad = res[1] != "PASS"
-            if bad:
-                first_fail = res[0]
-                log(f"first failure: {res[0]}; stopping the remaining tasks (--keep-going runs all)")
-                stop_all()
+        pending = {ex.submit(run_task, n, p, to, d) for n, p, to, d in jobs_todo}
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for fu in done:
+                res = fu.result()
+                results[res[0]] = res
+                if res[1] == "SKIPPED":
+                    continue
+                failed = [l for l in res[3]["failed"]]
+                log(task_line(res[0], res[1], res[2], failed,
+                              unit_req.get(res[0][:-6]) if res[0].endswith("_reach") else None))
+                tname = res[0][:-6] if res[0].endswith("_reach") else None
+                if tname in deferred and not STOP.is_set():
+                    # depth=reach: the proof runs to the step where its triggers were reached.
+                    checker, model, rf, eng, timeout, cap, req = deferred.pop(tname)
+                    d, why = reach_depth(cfg, timing, cap, unit_req[tname], res)
+                    reach_depths[tname] = {"depth": d, "cap": cap, "why": why}
+                    for cname, _ in req:
+                        task_depths[cname] = d
+                    log(f"  {tname:<22} proof depth {d} (cap {cap}): {why}")
+                    p = write_sby(work, tname, checker, d, eng, timeout, model=model,
+                                  reset_free=rf, extra_defines=pmod_defines)
+                    pending.add(ex.submit(run_task, tname, p, timeout, d))
+                if args.keep_going or first_fail:
+                    continue
+                # Fail fast: a proof that did not PASS, or a reach task that finished without
+                # every required trigger.
+                if res[0].endswith("_reach"):
+                    missing = [l for l in unit_req[res[0][:-6]] if l not in failed]
+                    bad = res[1] not in ("PASS", "FAIL") or missing
+                else:
+                    bad = res[1] != "PASS"
+                if bad:
+                    first_fail = res[0]
+                    log(f"first failure: {res[0]}; stopping the remaining tasks "
+                        f"(--keep-going runs all)")
+                    stop_all()
+    # A depth=reach proof whose reach task never finished (stopped by fail-fast) was not run.
+    for tname in deferred:
+        results[tname] = (tname, "SKIPPED", 0.0, {"failed": [], "traces": {}, "errors": []})
     result["first_failure"] = first_fail
+    result["reach_depths"] = reach_depths
 
     checks, runtimes, failures, reached, skipped = aggregate(units, results)
     checks = dict(result["checks"], **checks)  # structure, equiv first
