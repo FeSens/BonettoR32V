@@ -53,7 +53,7 @@ the lead; don't route around it.
 | Command | What it does |
 |---|---|
 | `make lint` | src_check, then Verilator `-Wall` lint, plain and RISCV_FORMAL builds |
-| `make formal` | riscv-formal at the pins (fast config); its contract v3 port is plan Task 10, due by the 10th merged improvement |
+| `make formal` | riscv-formal at the pins (fast config): each proof runs from reset to the step where its check's triggers are reached (308-466 cycles on 112, about 50 minutes on hwe-bench with `BONETTO_FORMAL_HOST=hwe-bench`); docs/formal.md |
 | `make formal-deep` | the deep config (signoff) |
 | `make cosim` | Verilator cosim (contract v3): every program of `make -C verif/programs list` in rvfi and pins modes under seeds 1-4, plus the liveness fuzz (seeds 1-5); the 2,048-cycle cap; reports CoreMark cycles per iteration |
 | `make arch` | riscv-arch-test, all 53 RV32E and privilege tests under seeds 1-4, on one host with GCC, spike and Verilator (hwe-bench, `tools/hwe_run.sh --third-party`) |

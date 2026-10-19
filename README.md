@@ -19,7 +19,7 @@ Status: pre-silicon. Verified in simulation (RTL and gate level), and hardened c
 | Cycles per instruction | 99.1 over the 32 test programs (total cycles / total instructions) |
 | Area | 23,073.4 µm² synthesized, 2,336 cells, 495 flip-flops; utilization 0.803 in the 1x2 tile |
 | Memory | 16 MiB flash (code, execute in place), 8 MiB PSRAM (data) |
-| Gates | lint, area, cosim (256 runs + liveness fuzz), riscv-arch-test 53/53, equivalence, gate level 5/5; riscv-formal is being ported |
+| Gates | lint, area, cosim (256 runs + liveness fuzz), riscv-arch-test 53/53, equivalence, gate level 5/5; riscv-formal fast config 65/65 (bounded from reset; deep not run yet) |
 
 The clock, slack and utilization figures come from hardening 4c82e3a (the champion RTL)
 with the current `src/config.json`: DRC, LVS, antenna and TT precheck clean (manual section 9).
