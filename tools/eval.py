@@ -516,7 +516,6 @@ def gate_gl(ctx):
     stricter than Verilator, e.g. it refuses a net used before its declaration), then
     GATES=yes on the area netlist with the sky130 cell models."""
     ctx.need("gl", "test/Makefile")
-    rtl_passed = _tt_test(ctx, [], "gl_rtl", dict(ctx.env), "RTL, Icarus")
     if "netlist" not in ctx.notes:          # standalone `make gl`: synthesize (no fits check)
         try:
             synth_area(ctx)
@@ -526,6 +525,7 @@ def gate_gl(ctx):
     if os.path.getmtime(netlist) < ctx.notes["area_t0"] - 1:
         raise GateFail(f"gate gl: {os.path.relpath(netlist, ctx.repo)} is older than this run's "
                        f"area step (area.py did not rewrite it)")
+    rtl_passed = _tt_test(ctx, [], "gl_rtl", dict(ctx.env), "RTL, Icarus")
     shutil.copyfile(netlist, ctx.path("test", "gate_level_netlist.v"))
     env = dict(ctx.env)
     if not env.get("PDK_ROOT") and os.path.isdir(os.path.expanduser("~/.ciel/sky130A")):
