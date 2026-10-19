@@ -189,7 +189,6 @@ module tt_um_fesens_r32v (
     wire [3:0]  rs1_f = insn[18:15];
     wire [3:0]  rs2_f = insn[23:20];
     wire        _unused_insn = insn[1];
-    wire        spill = c_st | (c_op & c_sh);          // stores and register shifts spill the pc
 
     wire c_br    = insn[6] & ~insn[4] & ~insn[2];
     wire c_sys   = insn[6] &  insn[4] & ~insn[2];
@@ -205,6 +204,7 @@ module tt_um_fesens_r32v (
     wire c_op    = c_alu & insn[5];
     wire c_sh    = c_alu & (f3[1:0] == 2'b01);
     wire c_slt   = c_alu & (f3[2:1] == 2'b01);
+    wire spill   = c_st | (c_op & c_sh);              // stores and register shifts spill the pc
     wire sh_left = ~f3[2];
     wire [1:0] nm1 = {f3[1], f3[1] | f3[0]};            // access bytes - 1
     wire priv    = c_sys & (f3[1:0] == 2'b00);          // ECALL, EBREAK, MRET, WFI
