@@ -7,8 +7,9 @@
  *     w0       flash: 8 edges with SD0-SD3 high (leaves continuous read, or the no-op 0xFF);
  *     w1       PSRAM: 0xF5 in QPI form (2 edges; an ignored partial command in SPI mode);
  *     w2, w3   PSRAM: 0x66, 0x99 in SPI form (SPI mode, initialized);
- *     w4-w5    flash: 0xEB, 6 quad address edges, M = 0x20, then CS_n high inside the dummy
- *              field: the flash is in continuous read from here on;
+ *     w4-w5    flash: a read that enters continuous read: 0xEB, 6 quad address edges, M = 0x20,
+ *              4 dummy and 4 data edges (2 bytes, not sampled), SD0-SD3 released from the strobe
+ *              of the last M edge, as in every read: the flash is in continuous read from here on;
  *     w6       PSRAM: 0x35 in SPI form (QPI mode from here on).
  * - Program address: the core supplies the address register's odd nibbles `pa_odd` and bit 24
  *   `pa24` (the chip, 1 = PSRAM): the pc for a fetch, the load or store address for M. The
@@ -24,6 +25,10 @@
  *     0xFFFF80 | {1, regarea, rsel, 00} (A[23] is ignored).
  *   `sdoe` drives SD0-SD3 from each slot's start; a read releases them after its 8 header
  *   edges, for the dummy/wait edges and the data. PSRAM B's CS_n is constant 1.
+ * - PSRAM tCPH (18 ns, less the pads' up to 4 ns on a high pulse): `pw` is PSRAM A's CS_n low
+ *   at the last clock, so a gap right after a PSRAM transaction raises `hold` when the slot's
+ *   chip is the PSRAM, and the core holds the gap one more clock: 2 clocks with CS_n high between
+ *   two PSRAM transactions. The flash (10 ns) and a change of chip keep the single gap clock.
  *
  * Copyright 2026 Felipe Sens Bonetto
  * SPDX-License-Identifier: Apache-2.0
@@ -57,6 +62,7 @@ module r32v_mem (
     input  wire        dat_ld,     // load data nibble wd4 into sdo
     input  wire [3:0]  wd4,
     input  wire        oe_off,     // a read's header ends: release SD0-SD3
+    output wire        hold,       // at a gap: PSRAM transaction after a PSRAM transaction
     output wire [7:0]  uio_out,
     output wire [7:0]  uio_oe
 );
@@ -138,8 +144,8 @@ module r32v_mem (
     wire [3:0] ef   = b[4:1];                           // edge index in the flash-enter window
     wire       lo8  = ~p[4] | (p[3:0] == 4'd0);         // p <= 16: 8 edges, then SCK low
     wire       lo2  = ~p[4] & ~p[3] & (~p[2] | (p[1:0] == 2'd0));   // p <= 4: 2 edges
-    wire       lo16 = ~b[5] | (p == 5'd0);              // b[5:0] <= 32: 16 edges
-    wire       blo  = ~done & (fe ? lo16 : (w == 3'd1) ? lo2 : (w != 3'd7) & lo8);
+    wire       lo24 = ~b[5] | lo8;                      // b[5:0] <= 48: 24 edges
+    wire       blo  = ~done & (fe ? lo24 : (w == 3'd1) ? lo2 : (w != 3'd7) & lo8);
     wire       bsck = blo & p[0];
     wire       bcsf = ~(blo & fl);
     wire       bcsr = ~(blo & ~fl);
@@ -154,7 +160,8 @@ module r32v_mem (
             3'd1:    bsd = p[1] ? 4'h5 : 4'hF;          // QPI 0xF5
             3'd2:    bsd = {3'b111, c66};
             3'd3:    bsd = {3'b111, ~c66};
-            3'd4, 3'd5:                                 // 0xEB, address 0, M = 0x20
+            3'd4, 3'd5:                                 // 0xEB, address 0, M = 0x20 (w5:
+                                                        // released, dummy and data)
                      bsd = ef[3] ? {2'b00, ef[2:0] == 3'd6, 1'b0} : {3'b000, ceb};
             3'd6:    bsd = {3'b111, c35};
             default: bsd = 4'hF;
@@ -179,7 +186,15 @@ module r32v_mem (
     wire       csr = done ? ~(active & ~flash) : bcsr;
     wire       sk  = done ? (sck & active) : bsck;
     wire [3:0] sd  = done ? sdo : bsd;
-    wire       oe  = ~done | sdoe;
+    // w5: the flash-enter read's dummy and data edges (from the strobe of its last M edge, at
+    // b[5:0] = 31) and the rest of the window with both CS_n high
+    wire       oe  = done ? sdoe : (w != 3'd5);
+    // PSRAM tCPH: PSRAM A's CS_n was low at the last clock (no reset: csr is 1 from the first
+    // reset edge on, so pw is 0 one edge later; the core reads it only after the reset sequence)
+    reg        pw;
+    always @(posedge clk)
+        pw <= ~csr;
+    assign hold = pw & ~flash;
     assign uio_out = {1'b1, csr, sd[3], sd[2], sk, sd[1], sd[0], csf};
     assign uio_oe  = {2'b11, oe, oe, 1'b1, oe, oe, 1'b1};
 
