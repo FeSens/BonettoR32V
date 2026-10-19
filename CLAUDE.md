@@ -57,7 +57,7 @@ the lead; don't route around it.
 | `make formal-deep` | the deep config (signoff) |
 | `make cosim` | Verilator cosim (contract v3): every program of `make -C verif/programs list` in rvfi and pins modes under seeds 1-4, plus the liveness fuzz (seeds 1-5); the 2,048-cycle cap; reports CoreMark cycles per iteration |
 | `make arch` | riscv-arch-test, all 53 RV32E and privilege tests under seeds 1-4, on one host with GCC, spike and Verilator (hwe-bench, `tools/hwe_run.sh --third-party`) |
-| `make gl` | the TT test (test/, the QSPI Pmod model) on the synthesized netlist (`GATES=yes`) |
+| `make gl` | the TT test (test/, the QSPI Pmod model) on the RTL with Icarus (TT's test workflow), then on the synthesized netlist (`GATES=yes`) |
 | `make equiv` | the RVFI-stripped build equals the plain build |
 | `make area` | sky130 cell area, broken down (the tiebreak), and the `fits` pre-filter (1x2, 23,100 µm²: hyp 112's a85f6cb, 23,073, signs off at utilization 0.803) |
 | `make eval` | every gate plus the score, cheapest first, writing `build/eval.json`. `MIN_IPS=<champion coremark_ips>` (full precision, from `tools/ledger.py show --json`) stops a slower candidate right after cosim; a tie runs on, since area breaks it. Formal is skipped unless `FORMAL=1` |
