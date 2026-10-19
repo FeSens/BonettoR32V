@@ -551,6 +551,79 @@ wrong load value is `coherence`'s, covered by `sd_low` and `store_dropped`), the
 `rvfi_halt` replace them), the hyp/002 legal cores (v2 designs), `trap_fields_brj` (the trap
 field rules are `insn_*` and `conv_*` now) and the liveness boundary pairs (see "Liveness").
 
+### Fast config, depth=reach, 112
+
+Champion 112 (6810e6f; main 64c8cd7) with the fast config as merged, one `run_formal.py --host
+hwe-bench` run per mutant, fail-fast as in `make eval`, on the champion's timing (first 305,
+max 305), with `--only` the fast tasks that hold the mutant's expected checks: an instruction
+check runs as its whole class group (so at that group's reach depth), `irq` as fast `csr` (its
+checker holds the interrupt assertions), `liveness` as the whole fast config, `equiv` is the
+pre-pass. 8 lanes on hwe-bench (2 jobs, 7 GB budget each), then `hang_reserved` alone (12 jobs):
+1 h 37 min for the 45, then 55 min for `hang_reserved`, 2 h 33 min wall in all.
+
+**36 caught** by a counterexample in the expected check (35) or by the pins equivalence
+(`norvfi_diff`); **3 caught as UNREACHED**: the mutant breaks PSRAM or flash traffic, so qspi's
+reach task misses a trigger up to the cap and the gate fails without a counterexample (`sd_rise`,
+`psram_cmd`, and the cosim stub `tcem_stall`, which has no core); **7 escaped**; **no timeouts**.
+Of the 10 mutants tagged deep, fast catches 5 (`fetch_wrong_chip`, `trap_target`, `mret_target`,
+`mret_mpie`, `trap_mepc`). Every escape but `hang_reserved` is a bug its check sees, whose first
+visible effect comes after the check's reach depth; `hang_reserved` needs liveness (deep). "cex
+step" is the step where the failed assertion first fails in the replayed trace (`vcd_sim`, see
+"Fail fast, scheduling, remote runs"); "wall" is the mutant's whole run, reach task included.
+`sub_decode` was run a second time after the step-based group attribution went in (same verdict;
+the first run named no culprit instruction).
+
+| mutant | expected check | fast verdict: failed assertions | proof depth | cex step | wall s | why it escaped |
+|---|---|---|---|---|---|---|
+| oe_sck_reset | qspi | FAIL in qspi: `qspi_oe_fixed` | qspi 321 | 1 | 189 | |
+| reset_cs_low | reset | FAIL in reset: `qspi_reset_cs` | reset 308 | 1 | 287 | |
+| cs_both | qspi | FAIL in qspi: `qspi_rule1`, `qspi_cmd_psram` | qspi 321 | 215 | 181 | |
+| cs_sck_high | qspi | FAIL in qspi: `qspi_rule2` | qspi 321 | 255 | 184 | |
+| sck_masked | qspi | FAIL in qspi: `qspi_rule3`, `qspi_rule4` | qspi 321 | 257 | 194 | |
+| sd_rise | qspi | UNREACHED in qspi (missing reach_qspi_psram_read, reach_qspi_psram_write) | reach ran to the cap 613; proof not run (fail-fast) | - | 1166 | |
+| contention | qspi | FAIL in qspi: `qspi_rule6_flash`, `qspi_rule6_psram` | qspi 321 | 240 | 195 | |
+| flash_no_exit | qspi | FAIL in qspi: `qspi_rule6_flash`, `qspi_cmd_flash` | qspi 321 | 155 | 181 | |
+| flash_m_byte | qspi | FAIL in qspi: `qspi_cmd_flash` | qspi 321 | 306 | 189 | |
+| psram_cmd | qspi | UNREACHED in qspi (missing reach_qspi_psram_read) | reach ran to the cap 613; proof not run (fail-fast) | - | 1282 | |
+| psram_no_reset | qspi | FAIL in qspi: `qspi_cmd_psram` | qspi 321 | 270 | 193 | |
+| trst_short | qspi | FAIL in qspi: `qspi_trst` | qspi 321 | 116 | 191 | |
+| cmd_extra_edge | qspi | FAIL in qspi: `qspi_extra` | qspi 321 | 83 | 198 | |
+| write_midbyte | qspi | PASS (escaped) | qspi 321 | - | 193 | after the reach depth: qspi sees it (`qspi_wend`, at 581 on 111), but no store's write ends within 321 |
+| store_extra_byte | psram_write | FAIL in psram_write: `psram_write_attr` | psram_write 408 | 405 | 584 | |
+| store_data_flip | psram_write | FAIL in psram_write: `psram_write_attr` | psram_write 408 | 402 | 626 | |
+| region_wrap | psram_write | FAIL in psram_write: `psram_write_attr` | psram_write 408 | 355 | 569 | |
+| sd_low | coherence | FAIL in coherence: `coherence_fetch` | coherence 350 | 332 | 273 | |
+| store_dropped | coherence (deep) | PASS (escaped) | coherence 350 | - | 464 | after the reach depth: coherence sees it only when a load or fetch reads a byte after its store (store then load, cpi=2, deep): two memory instructions, beyond 350; psram_write cannot see a missing write |
+| fetch_wrong_chip | coherence (deep) | FAIL in coherence: `coherence_fetch` | coherence 350 | 347 | 440 | |
+| trap_target | csr (deep) | FAIL in csr: `csr_trap_target` | csr 466 | 352 | 2265 | |
+| mret_target | csr (deep) | FAIL in csr: `csr_mret_target` | csr 466 | 453 | 2759 | |
+| irq_target | irq (deep) | PASS (escaped) | csr 466 | - | 3582 | after the reach depth: csr's interrupt assertions need an interrupt entry, which needs an IO store and two CSR writes first, beyond 466 (irq, cpi=4, is deep only) |
+| irq_masked | irq (deep) | PASS (escaped) | csr 466 | - | 3225 | after the reach depth: as irq_target, no interrupt can be taken within 466 |
+| csr_mtvec_lowbits | csr | FAIL in csr: `csr_mret_target` | csr 466 | 461 | 1972 | |
+| csr_mpp | csr | FAIL in csr: `csr_read` | csr 466 | 417 | 2597 | |
+| mret_mpie | csr (deep) | FAIL in csr: `csr_read` | csr 466 | 456 | 3431 | |
+| trap_cause | csr (deep) | PASS (escaped) | csr 466 | - | 3589 | after the reach depth: the wrong mcause shows when the handler reads mcause after the EBREAK; csr's trap trigger is met only in steps 435 to 463 of 466, the read comes later |
+| trap_mepc | csr (deep) | FAIL in csr: `csr_mret_target` | csr 466 | 463 | 2773 | |
+| hang_reserved | liveness (deep) | PASS (escaped) | every fast task, 308 to 466 | - | 3315 | not visible to fast: a hang has no retirement, which only liveness (deep) flags; the whole fast config passes 65/65 |
+| gpio_any_byte | gpio, periph | FAIL in gpio: `gpio_uo_hold` | gpio 379, periph 408 | 369 | 1624 | |
+| uo_glitch | gpio | FAIL in gpio: `gpio_uo_change`, `gpio_uo_once` | gpio 379 | 368 | 531 | |
+| uo_late | gpio | FAIL in gpio: `gpio_uo_hold` | gpio 379 | 369 | 484 | |
+| periph_wmask | periph | FAIL in periph: `periph_read` | periph 408 | 389 | 1173 | |
+| uart_any_byte | periph | PASS (escaped) | periph 408 | - | 1252 | after the reach depth: periph sees it on a read of UART_CTRL after a byte-1 store (TX_BUSY 1); none fails within 408 |
+| rvfi_halt | rvfi | FAIL in rvfi: `conv_halt` | rvfi 408 | 352 | 472 | |
+| intr_after_trap | rvfi | FAIL in rvfi: `conv_intr_trap` | rvfi 408 | 394 | 593 | |
+| trap_writes_rd | rvfi | FAIL in rvfi: `conv_trap_rd_addr` | rvfi 408 | 371 | 494 | |
+| zero_init | rvfi | FAIL in rvfi: `conv_first_pc` | rvfi 408 | 283 | 456 | |
+| ill_zero | ill | FAIL in ill: `ill_trap` | ill 350 | 345 | 292 | |
+| reg_wrong_index | reg | FAIL in reg: `reg_rs1` | reg 321 | 303 | 132 | |
+| sub_decode | insn_sub | FAIL in insn_sub: `insn_rd_wdata` | insn_sub group 408 | 329 | 919 | |
+| rvfi_rd | insn_xor | FAIL in insn_xor: `insn_rd_wdata` | insn_xor group 408 | 407 | 1055 | |
+| claim_region_stop | insn_add | FAIL in insn_add: `insn_rd_wdata` | insn_add group 408 | 404 | 657 | |
+| norvfi_diff | equiv | FAIL (pins equivalence pre-pass) | - | - | 37 | |
+| tcem_stall | qspi | UNREACHED in qspi (missing reach_qspi_flash_read, reach_qspi_psram_write) | reach ran to the cap 613; proof not run (fail-fast) | - | 72 | |
+
+### Champion 111, proofs at the short depth (history)
+
 Results (hwe-bench, `--tasks proof`, so each proof ran at its cap: the short depth 581 of
 champion 111, 346c4a3, one solver call; generated on 111, then regenerated on 112, where the
 generator still matches every substitution, but not re-run there). 31 of the 46 mutants FAIL as
@@ -619,6 +692,12 @@ first (by `TASK_COST`: liveness, irq, coherence, csr, reg, psram_write, the inst
 reset, ...), interleaved with the reach tasks, which are cheap and catch a dead or stuck core
 early as `UNREACHED`. A depth=reach check's reach task goes first (slowest checks first), and its
 proof is queued as soon as that reach task finishes.
+
+**Counterexamples.** A proof's trace is replayed by yosys sim from the solver's witness (SBY's
+`vcd_sim on`; reach tasks keep smtbmc's own traces), because a `step=all` call does not say at
+which step an assertion failed. SBY's summary then names it, and `formal.json` records it as
+`cex_step` with the retirements up to it (`cex_retirements`, the last 8); in an instruction
+group, the retirement at that step names the culprit instruction.
 
 `--host <ssh host>`, or `BONETTO_FORMAL_HOST` (unset by default), runs the gate on another
 machine. The verdict is the same on any host:

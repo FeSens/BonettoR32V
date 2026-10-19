@@ -739,12 +739,15 @@ def write_sby(work, name, checker, depth, engine_spec, timeout, model=None, rese
         script_extra = "chformal -cover -remove\n"
     defines.append('`include "rvfi_macros.vh"')
     core_il = os.path.join(work, "core.il")
+    # A proof's counterexample trace comes from yosys sim on the solver's witness (vcd_sim),
+    # so SBY's summary names the step where each assertion failed (a step=all window does not).
+    sim = "vcd_sim on\n" if role == "proof" else ""
     text = f"""[options]
 mode {sby_mode}
 depth {depth}
 timeout {timeout}
 expect pass,fail
-
+{sim}
 [engines]
 {eng}
 
@@ -773,7 +776,8 @@ def parse_task(tdir, name):
     (last path component) in order; detail["traces"] maps a label to the VCD of the
     trace where it first failed (smtbmc prints the failures, then writes the trace);
     detail["steps"] maps a label to the last step of the solver window it first failed in
-    (an upper bound on the step of its first failure)."""
+    (an upper bound on the step of its first failure); detail["cex_steps"] maps a label to
+    the first step where it failed in its trace (SBY's summary, from the vcd_sim replay)."""
     d = os.path.join(tdir, name)
     status_file = os.path.join(d, "status")
     logf = os.path.join(d, "logfile.txt")
@@ -783,7 +787,19 @@ def parse_task(tdir, name):
         status = txt[0] if txt else "ERROR"
     text = open(logf, errors="replace").read() if os.path.isfile(logf) else ""
     failed, traces, pending, steps, win = [], {}, [], {}, None
+    cex_steps, summary_trace = {}, None
     for line in text.splitlines():
+        m = re.search(r"summary: counterexample trace: (\S+)", line)
+        if m:
+            summary_trace = os.path.join(tdir, m.group(1))
+            continue
+        m = re.search(r"summary:\s+failed assertion (\S+) at \S+ steps? (\d+)", line)
+        if m:
+            lbl = m.group(1).split(".")[-1]
+            cex_steps.setdefault(lbl, int(m.group(2)))
+            if summary_trace and lbl not in traces:
+                traces[lbl] = summary_trace
+            continue
         m = re.search(r"Checking assertions in steps? (\d+)(?: to (\d+))?", line)
         if m:
             win = int(m.group(2) or m.group(1))
@@ -803,7 +819,8 @@ def parse_task(tdir, name):
                 traces[lbl] = os.path.join(d, m.group(1))
             pending = []
     errors = [l for l in text.splitlines() if "ERROR" in l][:5]
-    return status, {"failed": failed, "traces": traces, "errors": errors, "steps": steps}
+    return status, {"failed": failed, "traces": traces, "errors": errors, "steps": steps,
+                    "cex_steps": cex_steps}
 
 
 def classify(proof_status, proof_detail, reach_status, reach_detail, required):
@@ -1159,8 +1176,15 @@ def combine(proof, reach, required):
     if verdict == "FAIL" and info.get("assertions"):
         trace = pdet["traces"].get(info["assertions"][0])
         info["trace"] = trace
+        if info["assertions"][0] in pdet.get("cex_steps", {}):
+            info["cex_step"] = pdet["cex_steps"][info["assertions"][0]]
         if trace:
-            info["cex_retirements"] = vcd_retirements(trace)
+            # The retirements up to the failing step, the last 8 (the last one is the failing
+            # retirement, which attributes a group's counterexample to its instruction).
+            rows = vcd_retirements(trace, limit=None)
+            if "cex_step" in info:
+                rows = [r for r in rows if r["step"] <= info["cex_step"]]
+            info["cex_retirements"] = rows[-8:]
     errs = pdet["errors"] + rdet["errors"]
     if errs and verdict == "FAIL":
         info["errors"] = errs[:5]

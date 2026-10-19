@@ -300,6 +300,32 @@ def test_reach_depth(tmp_path):
                                  {"depth": "reach"}, 999) == 1 + 305 + 305 + 2
 
 
+def test_cex_step(tmp_path):
+    """A failed proof's counterexample step and trace come from SBY's summary (vcd_sim replays
+    the witness; a step=all window does not say which step failed)."""
+    d = tmp_path / "reg"
+    d.mkdir()
+    (d / "status").write_text("FAIL\n")
+    (d / "logfile.txt").write_text(
+        "SBY  9:22:16 [reg] engine_0: ##   0:00:27  Checking assertions in steps 0 to 320..\n"
+        "SBY  9:22:16 [reg] engine_0: ##   0:00:27  Assert failed in rvfi_testbench: "
+        "checker_inst.reg_rs1\n"
+        "SBY  9:22:18 [reg] summary: counterexample trace: reg/engine_0/trace.vcd\n"
+        "SBY  9:22:18 [reg] summary:   failed assertion rvfi_testbench.checker_inst.reg_rs1 at "
+        "bonetto_cons_checks.sv:62.22-62.64 step 303\n"
+        "SBY  9:22:18 [reg] summary:   failed assertion rvfi_testbench.checker_inst.reg_rd at "
+        "bonetto_cons_checks.sv:70.1-70.9 steps 305, 306 and 2 further steps\n")
+    st, det = run_formal.parse_task(str(tmp_path), "reg")
+    assert st == "FAIL" and det["failed"] == ["reg_rs1"]
+    assert det["cex_steps"] == {"reg_rs1": 303, "reg_rd": 305}
+    assert det["traces"]["reg_rs1"] == str(tmp_path / "reg" / "engine_0" / "trace.vcd")
+    v, info = run_formal.combine(("reg", st, 30.0, det),
+                                 ("reg_reach", "FAIL", 9.0, {"failed": ["reach_reg"],
+                                                             "traces": {}, "errors": []}),
+                                 ["reach_reg"])
+    assert v == "FAIL" and info["cex_step"] == 303
+
+
 def test_timing_merge():
     """The timing is the max over the cosim programs, per class too."""
     a = {"first_retire_cycle": 115, "max_cycles_per_insn": 230,
@@ -339,6 +365,30 @@ def test_aggregate_group_failure(tmp_path):
     assert failures["insn_add"]["trace"] == vcd
     assert runtimes["insn_add"] == {"proof": 12.3, "reach": 4.5, "task": "insn_group0"}
     assert skipped == []
+
+
+def test_aggregate_group_failure_at_step(tmp_path):
+    """The trace runs to the depth past the failure: the culprit is the retirement at the
+    counterexample's step, not the trace's last one."""
+    vcd = tmp_path / "trace.vcd"
+    vcd.write_text("$scope module rvfi_testbench $end\n"
+                   "$var wire 1 ! rvfi_valid $end\n$var wire 32 \" rvfi_insn $end\n"
+                   "$upscope $end\n$enddefinitions $end\n"
+                   f"#0\n0!\nb0 \"\n#10\n1!\nb{0x40000033:032b} \"\n#20\n0!\n"
+                   f"#30\n1!\nb{0x00000033:032b} \"\n#40\n0!\n")
+    proof = ("insn_group0", "FAIL", 12.3,
+             {"failed": ["insn_rd_wdata"], "traces": {"insn_rd_wdata": str(vcd)}, "errors": [],
+              "cex_steps": {"insn_rd_wdata": 1}})
+    reach = ("insn_group0_reach", "FAIL", 4.5,
+             {"failed": ["reach_insn_add", "reach_insn_sub"], "traces": {}, "errors": []})
+    units = [("insn_group0", [("insn_add", ["reach_insn_add"]),
+                              ("insn_sub", ["reach_insn_sub"])])]
+    checks, _, failures, _, _ = run_formal.aggregate(
+        units, {"insn_group0": proof, "insn_group0_reach": reach})
+    assert failures["insn_sub"]["assertions"] == ["insn_rd_wdata"]
+    assert failures["insn_sub"]["cex_step"] == 1
+    assert [r["step"] for r in failures["insn_sub"]["cex_retirements"]] == [1]
+    assert "not proven" in failures["insn_add"]["why"]
 
 
 def test_aggregate_skipped():
@@ -438,6 +488,7 @@ def test_reach_and_proof_tasks_are_separate(tmp_path):
     pt, rt = open(p).read(), open(r).read()
     assert "chformal -cover -remove" in pt and "BONETTO_REACH_AS_ASSERT" not in pt
     assert "--keep-going" not in pt and "-t 0:100:100" in pt
+    assert "vcd_sim on" in pt and "vcd_sim" not in rt   # a proof's trace names its step
     assert "`define BONETTO_TCEM 400" in pt
     assert "BONETTO_REACH_AS_ASSERT" in rt
     assert "select -set keep c:*.reach_qspi_flash_read c:*.reach_qspi_psram_write" in rt
