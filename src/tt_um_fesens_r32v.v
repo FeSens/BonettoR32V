@@ -13,6 +13,9 @@
  *   read:  8 header edges (r32v_mem), 4 dummy/wait edges, 8 data edges: 42 clocks
  *   write: 8 header edges, 2/4/8 data edges: 22/26/34 clocks
  *   pair fetch: a read with 16 data edges: 58 clocks
+ * A PSRAM transaction right after another PSRAM transaction (r32v_mem's `hold`: PSRAM CS_n low
+ * at the clock before the gap) holds its gap one more clock, so PSRAM CS_n stays high for 2
+ * clocks between them (tCPH): 43, 23/27/35 clocks.
  * The counter c counts SCK edges: it starts at 52 (read) or 56 (write) and wraps to 0 at the
  * first data edge, so c is the data nibble index in the data phase (while booting, c is the low
  * 6 bits of the memory reset sequence's counter instead). A masked slot (x0, x11, or no
@@ -148,7 +151,9 @@ module tt_um_fesens_r32v (
                      SL_WP = 5'b10000, SL_W4 = 5'b10010, SL_W = 5'b10011, SL_WS = 5'b10100,
                      SL_WC = 5'b10101;
     // Engine phases
-    localparam [1:0] E_GAP  = 2'b00,     // CS_n high, SCK low (one clock; waits while booting)
+    localparam [1:0] E_GAP  = 2'b00,     // CS_n high, SCK low (one clock, two after a PSRAM
+                                         // transaction that precedes a PSRAM transaction;
+                                         // waits while booting)
                      E_HDR  = 2'b01,     // header and dummy edges
                      E_DATA = 2'b10,     // data edges
                      E_TAIL = 2'b11;     // SCK low, CS_n still low: the slot's events
@@ -184,7 +189,6 @@ module tt_um_fesens_r32v (
     wire [3:0]  rs1_f = insn[18:15];
     wire [3:0]  rs2_f = insn[23:20];
     wire        _unused_insn = insn[1];
-    wire        spill = c_st | (c_op & c_sh);          // stores and register shifts spill the pc
 
     wire c_br    = insn[6] & ~insn[4] & ~insn[2];
     wire c_sys   = insn[6] &  insn[4] & ~insn[2];
@@ -200,6 +204,7 @@ module tt_um_fesens_r32v (
     wire c_op    = c_alu & insn[5];
     wire c_sh    = c_alu & (f3[1:0] == 2'b01);
     wire c_slt   = c_alu & (f3[2:1] == 2'b01);
+    wire spill   = c_st | (c_op & c_sh);              // stores and register shifts spill the pc
     wire sh_left = ~f3[2];
     wire [1:0] nm1 = {f3[1], f3[1] | f3[0]};            // access bytes - 1
     wire priv    = c_sys & (f3[1:0] == 2'b00);          // ECALL, EBREAK, MRET, WFI
@@ -239,7 +244,7 @@ module tt_um_fesens_r32v (
     wire wr   = fW | (sM & c_st);                       // the slot writes
 
     // submodule wires
-    wire        tm, intr, irq, take, booting;
+    wire        tm, intr, irq, take, booting, hold;
     wire        csr_region, mask_lo2;
     wire [3:0]  rd_die;
     wire [1:0]  csr_idx;
@@ -535,7 +540,11 @@ module tt_um_fesens_r32v (
     // F and M rotate the ring and pcr by one nibble at each header nibble load (8 in all, so
     // both end where they started): the header's address nibbles then sit at odd positions
     // (r32v_mem). A read's dummy edges (cn[3] & cn[2]) load no address.
-    wire hdr_ld   = (gap & ~booting & ~mask) | (stb & hdr & cn[5]);
+    // A gap held for PSRAM tCPH (hold, an unmasked slot) loads its header nibble at its second
+    // clock; the first repeats only the gap's idempotent loads (mk, x11r, ps, c, cy, sdoe), so
+    // no rotation runs twice.
+    wire go       = ~booting & ~mask;                     // the slot starts a transaction
+    wire hdr_ld   = (gap & go & ~hold) | (stb & hdr & cn[5]);
     wire rot_hdr  = fM & hdr_ld & (gap | wr | ~(cn[3] & cn[2]));
     // F rotates the ring at its data strobes (16 in a pair fetch: twice around)
     wire ring_rot = (dstb & (wr | sF | (sP & ~n[2] & ~n[1]))) | hrot | rot_hdr;
@@ -659,7 +668,7 @@ module tt_um_fesens_r32v (
             // clock; SCK stays low on the pin)
             sck <= gap ? (~booting & mask) : ((ep[0] ^ ep[1]) & (~sck | mk) & ~dend);
             case (ep)
-                E_GAP:  if (~booting) ep <= (mask & ~fh) ? E_DATA : E_HDR;
+                E_GAP:  if (~booting & ~(go & hold)) ep <= (mask & ~fh) ? E_DATA : E_HDR;
                 E_HDR:  if (stb & (c == 6'd63)) ep <= E_DATA;
                 E_DATA: if (dend) ep <= E_TAIL;
                 default: begin
@@ -694,6 +703,7 @@ module tt_um_fesens_r32v (
         .h_wr(wr), .h_reg({regarea, rsel}),
         .dat_ld(dstb & wact), .wd4(wdo4),
         .oe_off(stb & hdr & ~wr & (cn[3:0] == 4'b1100)),
+        .hold(hold),
         .uio_out(uio_out), .uio_oe(uio_oe)
     );
 
