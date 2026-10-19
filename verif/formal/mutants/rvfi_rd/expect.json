@@ -1,0 +1,10 @@
+{
+  "class": "a wrong RVFI rd value",
+  "checks": [
+    "insn_xor"
+  ],
+  "assertion": "insn_rd_wdata",
+  "description": "RVFI reports XOR results with bit 0 flipped (the register gets the right value).",
+  "expect": "fail",
+  "deep": false
+}

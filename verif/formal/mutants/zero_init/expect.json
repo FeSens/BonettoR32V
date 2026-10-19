@@ -1,0 +1,10 @@
+{
+  "class": "the pc is not cleared",
+  "checks": [
+    "rvfi"
+  ],
+  "assertion": "conv_first_pc",
+  "description": "The reset sequence no longer shifts zeros into the pc register (no reset), so the first fetch is from its power-up value (contract 1, invariant 6).",
+  "expect": "fail",
+  "deep": false
+}

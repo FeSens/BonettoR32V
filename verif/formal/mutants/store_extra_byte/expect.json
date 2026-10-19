@@ -1,0 +1,10 @@
+{
+  "class": "SB writes two bytes",
+  "checks": [
+    "psram_write"
+  ],
+  "assertion": "psram_write_attr",
+  "description": "A byte store writes the next byte too (rs2's second byte).",
+  "expect": "fail",
+  "deep": false
+}

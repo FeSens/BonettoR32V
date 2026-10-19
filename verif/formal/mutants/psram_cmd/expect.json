@@ -1,0 +1,10 @@
+{
+  "class": "PSRAM read command 0x0C",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_cmd_psram",
+  "description": "A PSRAM read sends 0x0C, not 0x0B (contract 2.3).",
+  "expect": "fail",
+  "deep": false
+}

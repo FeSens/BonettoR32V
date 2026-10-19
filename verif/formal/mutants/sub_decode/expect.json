@@ -1,0 +1,10 @@
+{
+  "class": "SUB adds",
+  "checks": [
+    "insn_sub"
+  ],
+  "assertion": "insn_rd_wdata",
+  "description": "The subtract decode needs funct3[0] = 1 too, so SUB adds.",
+  "expect": "fail",
+  "deep": false
+}

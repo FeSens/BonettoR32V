@@ -1,0 +1,10 @@
+{
+  "class": "stores issue nothing",
+  "checks": [
+    "coherence"
+  ],
+  "assertion": "coherence_load",
+  "description": "Every store's M slot is masked (as a store to flash is): a later load of the byte returns the old value.",
+  "expect": "fail",
+  "deep": true
+}

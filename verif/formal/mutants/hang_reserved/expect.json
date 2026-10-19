@@ -1,0 +1,10 @@
+{
+  "class": "custom-0 encodings hang",
+  "checks": [
+    "liveness"
+  ],
+  "assertion": "liveness",
+  "description": "An instruction with opcode 0001011 fetches itself again forever (nothing retires).",
+  "expect": "fail",
+  "deep": true
+}

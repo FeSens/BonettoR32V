@@ -1,0 +1,10 @@
+{
+  "class": "a trap reports rd",
+  "checks": [
+    "rvfi"
+  ],
+  "assertion": "conv_trap_rd_addr",
+  "description": "A trapping instruction reports its rd field and a write (contract 8: rd 0 on a trap).",
+  "expect": "fail",
+  "deep": false
+}

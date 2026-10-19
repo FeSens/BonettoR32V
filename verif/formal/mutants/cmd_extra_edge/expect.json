@@ -1,0 +1,10 @@
+{
+  "class": "a ninth edge after 0x66",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_extra",
+  "description": "Window w2 clocks one more edge after 0x66, which takes no fields (contract 2.1.10).",
+  "expect": "fail",
+  "deep": false
+}

@@ -1,0 +1,11 @@
+{
+  "class": "tcem_stall",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_tcem",
+  "description": "The cosim's tCEM stub: a PSRAM read that holds CS_n low with SCK paused for 400 cycles (about 480 cycles low, tCEM = 400 cycles at 20 ns).",
+  "expect": "fail",
+  "deep": false,
+  "rtl": "verif/cosim/mutants/tcem_stall"
+}

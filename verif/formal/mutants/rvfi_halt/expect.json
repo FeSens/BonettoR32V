@@ -1,0 +1,10 @@
+{
+  "class": "rvfi_halt at a trap",
+  "checks": [
+    "rvfi"
+  ],
+  "assertion": "conv_halt",
+  "description": "rvfi_halt is 1 at every trap retirement (contract 8: always 0; nothing halts).",
+  "expect": "fail",
+  "deep": false
+}

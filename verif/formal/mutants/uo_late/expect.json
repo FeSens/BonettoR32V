@@ -1,0 +1,10 @@
+{
+  "class": "uo_out takes GPIO_OUT two clocks late",
+  "checks": [
+    "gpio"
+  ],
+  "assertion": "gpio_uo_hold",
+  "description": "GPIO_OUT reaches the pins through two more flip-flops (contract 6: no later than one cycle after the store retires).",
+  "expect": "fail",
+  "deep": false
+}

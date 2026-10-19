@@ -1,0 +1,10 @@
+{
+  "class": "an interrupt jumps to mepc",
+  "checks": [
+    "irq"
+  ],
+  "assertion": "csr_irq_target",
+  "description": "An interrupt sequence's C reads mepc's word, not mtvec's.",
+  "expect": "fail",
+  "deep": true
+}

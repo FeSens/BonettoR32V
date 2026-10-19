@@ -1,0 +1,10 @@
+{
+  "class": "drives SD0-SD3 during a read's data phase",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_rule6_psram",
+  "description": "SD0-SD3 are never released after a read's header (contract 2.1.6).",
+  "expect": "fail",
+  "deep": false
+}

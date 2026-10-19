@@ -1,0 +1,10 @@
+{
+  "class": "core-region words at a 2-byte offset",
+  "checks": [
+    "psram_write"
+  ],
+  "assertion": "psram_write_attr",
+  "description": "Core-region word addresses get bit 1 set: x15's word (0x7FFFFC) is written at 0x7FFFFE and wraps to PSRAM 0x000000-0x000001, outside the core region.",
+  "expect": "fail",
+  "deep": false
+}

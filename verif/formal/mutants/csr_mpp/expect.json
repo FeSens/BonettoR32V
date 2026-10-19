@@ -1,0 +1,10 @@
+{
+  "class": "mstatus.MPP bit 12 reads 0",
+  "checks": [
+    "csr"
+  ],
+  "assertion": "csr_read",
+  "description": "mstatus bit 12 (MPP = 3, read-only) reads 0.",
+  "expect": "fail",
+  "deep": false
+}

@@ -1,0 +1,10 @@
+{
+  "class": "SCK's output enable is off during the reset sequence",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_oe_fixed",
+  "description": "uio_oe[3] follows the reset sequence's done flag (contract 1: always 1).",
+  "expect": "fail",
+  "deep": false
+}

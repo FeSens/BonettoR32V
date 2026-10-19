@@ -1,0 +1,10 @@
+{
+  "class": "a store writes a wrong bit",
+  "checks": [
+    "psram_write"
+  ],
+  "assertion": "psram_write_attr",
+  "description": "Bit 0 of a store's data nibble 1 is flipped on the bus (RVFI reports rs2).",
+  "expect": "fail",
+  "deep": false
+}

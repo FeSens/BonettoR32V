@@ -1,0 +1,10 @@
+{
+  "class": "writes go to an odd register",
+  "checks": [
+    "reg"
+  ],
+  "assertion": "reg_rs1",
+  "description": "W and W4 address register rd | 1 (RVFI reports rd).",
+  "expect": "fail",
+  "deep": false
+}

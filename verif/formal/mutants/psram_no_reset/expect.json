@@ -1,0 +1,10 @@
+{
+  "class": "no PSRAM reset",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_cmd_psram",
+  "description": "Windows w2 and w3 (0x66, 0x99) keep the PSRAM CS_n high: the first access comes before the PSRAM's reset (contract 2.3, 2.4).",
+  "expect": "fail",
+  "deep": false
+}

@@ -1,0 +1,10 @@
+{
+  "class": "CS_n high for one cycle after 0x99",
+  "checks": [
+    "qspi"
+  ],
+  "assertion": "qspi_trst",
+  "description": "The PSRAM CS_n pulses low again two cycles after 0x99 ends (contract 2.3: high for tRST = 3 cycles at 20 ns).",
+  "expect": "fail",
+  "deep": false
+}

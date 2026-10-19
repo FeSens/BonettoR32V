@@ -1,0 +1,10 @@
+{
+  "class": "samples SD0-SD3 while SCK is low",
+  "checks": [
+    "coherence"
+  ],
+  "assertion": "coherence_fetch",
+  "description": "The data nibble goes through an extra flip-flop, so a strobe reads the value from the clock before the rising edge (noise). The v2 miso_low.",
+  "expect": "fail",
+  "deep": false
+}

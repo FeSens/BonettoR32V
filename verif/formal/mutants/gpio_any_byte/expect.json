@@ -1,0 +1,11 @@
+{
+  "class": "a store to any byte of GPIO_OUT writes it",
+  "checks": [
+    "gpio",
+    "periph"
+  ],
+  "assertion": "gpio_uo_hold",
+  "description": "Byte 0 write enables ignore the offset: SB to GPIO_OUT + 1 writes GPIO_OUT (and every other slot's byte 0).",
+  "expect": "fail",
+  "deep": false
+}

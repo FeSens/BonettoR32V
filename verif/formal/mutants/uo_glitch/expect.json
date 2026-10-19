@@ -1,0 +1,10 @@
+{
+  "class": "uo_out[0] glitches at a GPIO_OUT store",
+  "checks": [
+    "gpio"
+  ],
+  "assertion": "gpio_uo_hold",
+  "description": "uo_out[0] is inverted for the clock of the store's write enable.",
+  "expect": "fail",
+  "deep": false
+}

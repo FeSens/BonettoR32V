@@ -1,0 +1,10 @@
+{
+  "class": "claims a core-region address to stop the checks",
+  "checks": [
+    "insn_add"
+  ],
+  "assertion": "insn_rd_wdata",
+  "description": "ADD reports a wrong rd value and claims a core-region access (0x017FFF80): the UNSPECIFIED stop uses the spec's address for a specified instruction, so the claim stops nothing.",
+  "expect": "fail",
+  "deep": false
+}
