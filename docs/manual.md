@@ -1160,7 +1160,7 @@ project's Linux build host:
 | arch | riscv-arch-test 3.9.1: all 53 RV32E and privilege tests (traps included), under seeds 1-4 | 53/53 |
 | equiv | the RVFI-stripped build is formally equivalent to the plain build (yosys) | pass |
 | gl | TT's cocotb test on the synthesized netlist with every flip-flop starting at X: `gpio_demo` in the four memory power-up modes, `uart_hello` | 5/5 |
-| formal | riscv-formal at the pins, fast config: every check from reset to the step where its triggers are reached (308-466 cycles: the first instruction and the pair-fetched second one, any power-up state) | 65/65 on 6810e6f (same RTL) |
+| formal | riscv-formal at the pins, fast config: every check from reset to the step where its triggers are reached (308-466 cycles: the first instruction and the pair-fetched second one, any power-up state) | 65/65 on 6810e6f (same RTL); 39 of 46 planted bugs caught |
 
 **What the cosim checks** (docs/cosim.md): in rvfi mode the reference ISS runs in lockstep and
 every retired instruction is compared; in pins mode only the pins are judged. In both, the
@@ -1186,7 +1186,7 @@ the interrupt overhead of section 6.5.
 |----------|--------------------------------------------------|
 | Not proven in silicon | simulation and a clean hardening only; the IO round trip through TT's pads at 50 MHz is not modeled (section 2.3) |
 | Flashing unverified | the TT flasher flow, design selection and the 50 MHz demo board clock are taken from TT's sources and untested (section 6.9) |
-| Formal bounded | the fast config proves 308-466 cycles from reset; later bugs are cosim's and arch's to find. The deep config (signoff) has not run on contract v3 yet (docs/formal.md) |
+| Formal bounded | the fast config proves 308-466 cycles from reset; later bugs are cosim's and arch's to find. Of 46 planted bugs it catches 39; the 7 it misses show their first effect after that bound (6) or are hangs, which only the liveness check sees (1). The deep config (signoff) has not run on contract v3 yet (docs/formal.md) |
 | Slow | about 100 cycles per instruction (0.5 MIPS at 50 MHz); about 0.2 ms per 100 instructions in a handler |
 | No M extension | software multiply and divide; unknown encodings (a MUL included) execute silently as something else |
 | No counters | no `cycle`/`time`/`instret` CSRs; use the timer |
