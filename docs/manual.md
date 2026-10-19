@@ -144,7 +144,7 @@ The memory board is Tiny Tapeout's QSPI Pmod on the bidirectional (`uio`) header
 
 | Chip | Part | Size | CS_n | Used for | Mode used |
 |---|---------|---|----|-----------------|------------------------|
-| flash | Winbond W25Q128JV | 16 MiB | `uio[0]` | code, constants, the `.data` image | Fast Read Quad I/O (0xEB) in continuous read mode |
+| flash | Winbond W25Q128JVSIM | 16 MiB | `uio[0]` | code, constants, the `.data` image | Fast Read Quad I/O (0xEB) in continuous read mode |
 | PSRAM A | AP Memory APS6404L | 8 MiB | `uio[6]` | data, stack, the CPU's registers | QPI: 0x0B read (4 wait edges), 0x02 write |
 | PSRAM B | APS6404L | 8 MiB | `uio[7]` | unused (CS_n held high) | |
 
@@ -153,27 +153,38 @@ The memory board is Tiny Tapeout's QSPI Pmod on the bidirectional (`uio`) header
   outputs; SD0-SD3 switch direction during read transactions.
 - **SCK** is the core clock divided by 2: 25 MHz at 50 MHz, below every limit of both chips
   (contract 2.2, 2.3).
-- **The flash's QE bit must be 1** (quad enable). TT's store Pmods ship that way; TT's flasher
-  does not set it, so any other board needs QE set first (contract 1, section 6.9).
+- **The flash's QE bit must be 1** (quad enable). The Pmod's flash is the W25Q128JVSIM (the IM
+  part), whose factory default is QE = 0. Pmods from TT's store ship with QE = 1 because TT sets it
+  ("enabled by default on all first-party QSPI Pmods", TT's QSPI guide). TT's flasher does not set
+  it. Any other board needs QE set once with the MicroPython script in that guide (section 6.9);
+  with QE = 0 the core cannot fetch an instruction.
 - **The core never writes the flash.** It never sends write enable, erase or a status write. A
   store to a flash address does nothing.
-- **Any power-up state of contract 2.4 works.** The core puts both chips into a known mode at
-  every reset (section 3.2), whatever mode another design left them in, as long as the flash is
-  in standard SPI or EBh continuous read. After a design that left the flash in QPI mode, deep
-  power-down, dual continuous read or wrap mode, power-cycle the Pmod first (contract 1).
+- **Power-up states.** At every reset the core resets the PSRAM (from SPI or QPI mode) and takes
+  the flash out of continuous read (section 3.2). So it starts after a power-up, or after another
+  design that left the flash in standard SPI or in Fast Read Quad I/O continuous read. The flash
+  part also has modes the core does not undo: QPI, deep power-down, dual I/O continuous read and
+  wrapped bursts. If the design selected before BonettoR32V may have used one of them, power-cycle
+  the board (or replug the Pmod) first.
 - **PSRAM CS_n low time** (tCEM) is at most 8 µs per transaction for the APS6404L. The longest
-  PSRAM transaction keeps CS_n low for 41 cycles (derived), 0.82 µs at 50 MHz.
+  PSRAM transaction keeps CS_n low for 41 cycles, 0.82 µs at 50 MHz. It is why the clock has a
+  lower bound (section 2.3), and why the clock must never be stopped or single-stepped while the
+  design runs: a PSRAM held selected cannot refresh.
 
 ### 2.3 Clock
 
 - **Signoff: 50 MHz** (`clock_hz` in `info.yaml`, `CLOCK_PERIOD` 20 ns in `src/config.json`).
   STA closes at every corner with +1.85 ns of setup slack (section 9).
-- **Lower clocks** work in principle: every timing in the design is in cycles. The derived lower
-  bound is about 5.1 MHz, where a 41-cycle PSRAM transaction reaches the 8 µs tCEM limit. Only
-  the signoff clock is simulated. The SDK takes the clock as `F_CPU` and must be built for the
-  clock the board actually runs (section 6.2).
-- **IO risk at 50 MHz.** The core samples read data at the end of each 20 ns SCK-high phase. The
-  delay through TT's IO pads and mux to the Pmod and back is not modeled in simulation.
+- **Lower clocks: 6.25 to 50 MHz.** Every timing in the design is in cycles. The full cosim suite
+  (32 programs, both modes, four seeds, the liveness fuzz) passes at 12 MHz and at 6.25 MHz; at
+  5 MHz it fails the PSRAM's 8 µs tCEM, because a 41-cycle transaction then lasts 8.2 µs. The SDK
+  takes the clock as `F_CPU` and must be built for the clock the board actually runs (section 6.2).
+- **IO timing at 50 MHz (paper estimate, not proven).** The memory launches a read nibble on a
+  falling SCK edge and the core samples it 40 ns later, at the clock edge where it drives the next
+  falling edge. With TT's measured worst round trip through the pads and mux (20.4 ns on TT 3.5
+  silicon) and the chips' clock-to-output (6 ns flash, 5.5 ns PSRAM), setup margin is about
+  +11 ns; with a 35 % slower pad it is about +4 ns. Hold does not depend on the clock. TT publishes
+  no corner data for the TTSKY26d pads, so if reads fail at 50 MHz, lower the clock.
 
 ### 2.4 Reset
 
@@ -970,14 +981,19 @@ QSPI Pmod"). Nobody has flashed a BonettoR32V image this way yet.
 
 1. Plug the QSPI Pmod into the demo board's bidirectional (`uio`) header. TT's guide says
    first-party Pmods work with TT04 and later demo boards and ship with the flash's QE bit set;
-   third-party boards need QE set first with the MicroPython script in that guide.
+   third-party boards need QE set first with the MicroPython script in that guide (the flasher
+   itself never writes the status register). If BonettoR32V has run since the board powered up,
+   power-cycle the board first: the core leaves the flash in continuous read mode, and the flasher
+   does not send the command that leaves it.
 2. Open the web flasher (https://tinytapeout.github.io/tinytapeout-flasher/) in a Chromium-based
    browser (it uses WebSerial). It selects TT's chip ROM project, then the demo board's RP2040
    drives `uio[0]`-`uio[3]` as plain SPI at 10 MHz, using `0x9F` (JEDEC ID; expect `ef7018`),
    `0x20` (sector erase), `0x02` (page program) and `0x03` (read-back verify).
 3. Write `sdk/build/<name>/<name>.bin` at **flash offset 0** (the flasher's "Flash offset" field,
    0 by default). The core starts at flash address 0.
-4. **Unconfirmed:** selecting this design afterwards (TT Commander, commander.tinytapeout.com),
+4. Select the project after flashing (the flasher leaves the RP2040 driving `uio[0]`, `uio[1]`
+   and `uio[3]` until a project is selected or the board reboots).
+   **Unconfirmed:** selecting this design afterwards (TT Commander, commander.tinytapeout.com),
    clocking it at `F_CPU` from the demo board (TT's clock specification says the RP2040 makes
    1 Hz to 66.5 MHz; how close it comes to 50 MHz is not verified), and resetting it.
 5. If the board's clock is not 50 MHz, rebuild with `make -C sdk F_CPU=<Hz>` so the timebase,
@@ -1188,6 +1204,8 @@ the interrupt overhead of section 6.5.
 |----------|--------------------------------------------------|
 | Not proven in silicon | simulation and a clean hardening only; the IO round trip through TT's pads at 50 MHz is not modeled (section 2.3) |
 | Flashing unverified | the TT flasher flow, design selection and the 50 MHz demo board clock are taken from TT's sources and untested (section 6.9) |
+| Flash modes left by other designs | QPI, deep power-down, dual I/O continuous read and wrapped bursts are not undone at reset: power-cycle the board after a design that may use them (section 2.2) |
+| Clock range | 6.25 to 50 MHz (simulated at 50, 12 and 6.25 MHz); never stop the clock while the design runs (PSRAM refresh, section 2.2) |
 | Formal bounded | the fast config proves 308-466 cycles from reset; later bugs are cosim's and arch's to find. Of 46 planted bugs it catches 39; the 7 it misses show their first effect after that bound (6) or are hangs, which only the liveness check sees (1), and the simulation tests (cosim) catch all 7. The deep config (signoff) has not run on contract v3 yet (docs/formal.md) |
 | Slow | about 100 cycles per instruction (0.5 MIPS at 50 MHz); about 0.2 ms per 100 instructions in a handler |
 | No M extension | software multiply and divide; unknown encodings (a MUL included) execute silently as something else |

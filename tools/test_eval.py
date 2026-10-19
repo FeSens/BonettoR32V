@@ -603,9 +603,14 @@ WRITE_NETLIST = ("os.makedirs('build/synth', exist_ok=True); "
                  "open('build/synth/netlist.v', 'w').write('module tt_um_fesens_r32v(); endmodule')")
 
 
-def gl_makefile(xml):
-    return ("all:\n\t@test \"$(GATES)\" = yes\n\t@test -f gate_level_netlist.v\n"
-            f"\t@printf '%s' '{xml}' > results.xml\n")
+GL_PASS_XML = '<testsuites><testsuite><testcase name="gpio"/></testsuite></testsuites>'
+
+
+def gl_makefile(xml, rtl_xml=GL_PASS_XML):
+    # TT's test: `make` runs the RTL (Icarus), `make GATES=yes` the netlist.
+    return ("all:\nifeq ($(GATES),yes)\n\t@test -f gate_level_netlist.v\n"
+            f"\t@printf '%s' '{xml}' > results.xml\nelse\n"
+            f"\t@printf '%s' '{rtl_xml}' > results.xml\nendif\n")
 
 
 @pytest.mark.parametrize("xml,ok", [
@@ -621,6 +626,18 @@ def test_gl_adapter(repo, xml, ok):
     res = run_gate(repo, "gl")
     assert res["pass"] is ok, res["detail"]
     assert (repo / "test" / "gate_level_netlist.v").exists()
+
+
+def test_gl_fails_when_the_rtl_test_fails(repo):
+    # TT's RTL test (Icarus) runs first; a failure there fails the gate before the netlist run.
+    fake_runner(repo, "tools/area.py", "build/area.json", good_area(), 0, extra=WRITE_NETLIST)
+    put(repo, "test/Makefile", gl_makefile(
+        GL_PASS_XML,
+        rtl_xml='<testsuites><testsuite><testcase name="gpio"><failure/></testcase>'
+                '</testsuite></testsuites>'))
+    res = run_gate(repo, "gl")
+    assert res["pass"] is False and "RTL, Icarus" in res["detail"], res["detail"]
+    assert not (repo / "test" / "gate_level_netlist.v").exists()
 
 
 def test_gl_rejects_netlist_older_than_area_step(repo):

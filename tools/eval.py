@@ -493,9 +493,28 @@ def junit_counts(path):
     return total, bad, skipped
 
 
+def _tt_test(ctx, args, log, env, what):
+    """One run of TT's cocotb test (test/): `make -C test` plus args; returns the pass count."""
+    results = "test/results.xml"
+    ctx.clear(results)
+    t0 = time.time()
+    rc, lines = ctx.run(["make", "-C", "test"] + args, log, env)
+    rpath = ctx.path(results)
+    if not os.path.isfile(rpath) or os.path.getmtime(rpath) < t0 - 1:
+        raise GateFail(f"gl FAIL ({what}): no fresh {results} (exit {rc}; log {ctx.log_rel(log)})")
+    total, bad, skipped = junit_counts(rpath)
+    passed = total - bad - skipped
+    if rc != 0 or bad or passed < 1:
+        raise GateFail(f"gl FAIL ({what}): {bad} failed, {passed} passed, {skipped} skipped, "
+                       f"exit {rc} (log {ctx.log_rel(log)})")
+    return passed
+
+
 def gate_gl(ctx):
-    """make -C test GATES=yes on the area netlist with the sky130 cell models: the TT test
-    (test/, contract v3: the QSPI Pmod model, gpio_demo in the four power-up modes, uart_hello)."""
+    """TT's test (test/, contract v3: the QSPI Pmod model, gpio_demo in the four power-up modes,
+    uart_hello) twice, as TT's CI runs it: on the RTL with Icarus (TT's test workflow; Icarus is
+    stricter than Verilator, e.g. it refuses a net used before its declaration), then
+    GATES=yes on the area netlist with the sky130 cell models."""
     ctx.need("gl", "test/Makefile")
     if "netlist" not in ctx.notes:          # standalone `make gl`: synthesize (no fits check)
         try:
@@ -506,24 +525,15 @@ def gate_gl(ctx):
     if os.path.getmtime(netlist) < ctx.notes["area_t0"] - 1:
         raise GateFail(f"gate gl: {os.path.relpath(netlist, ctx.repo)} is older than this run's "
                        f"area step (area.py did not rewrite it)")
+    rtl_passed = _tt_test(ctx, [], "gl_rtl", dict(ctx.env), "RTL, Icarus")
     shutil.copyfile(netlist, ctx.path("test", "gate_level_netlist.v"))
     env = dict(ctx.env)
     if not env.get("PDK_ROOT") and os.path.isdir(os.path.expanduser("~/.ciel/sky130A")):
         env["PDK_ROOT"] = os.path.expanduser("~/.ciel")
     env.setdefault("PDK", "sky130A")
-    results = "test/results.xml"
-    ctx.clear(results)
-    t0 = time.time()
-    rc, lines = ctx.run(["make", "-C", "test", "GATES=yes", f"GL_NETLIST={netlist}"], "gl", env)
-    rpath = ctx.path(results)
-    if not os.path.isfile(rpath) or os.path.getmtime(rpath) < t0 - 1:
-        raise GateFail(f"gl FAIL: no fresh {results} (exit {rc}; log {ctx.log_rel('gl')})")
-    total, bad, skipped = junit_counts(rpath)
-    passed = total - bad - skipped
-    if rc != 0 or bad or passed < 1:
-        raise GateFail(f"gl FAIL: {bad} failed, {passed} passed, {skipped} skipped, exit {rc} "
-                       f"(log {ctx.log_rel('gl')})")
-    return f"gate-level: {passed} cocotb tests pass on {os.path.relpath(netlist, ctx.repo)}", {}
+    passed = _tt_test(ctx, ["GATES=yes", f"GL_NETLIST={netlist}"], "gl", env, "gate level")
+    return (f"TT test: {rtl_passed} cocotb tests pass on the RTL (Icarus), {passed} on "
+            f"{os.path.relpath(netlist, ctx.repo)}"), {}
 
 
 GATES = {
