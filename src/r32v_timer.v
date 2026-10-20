@@ -21,7 +21,7 @@ module r32v_timer (
     input  wire        w1,        // byte 1 store, or reset
     input  wire [7:0]  z0,        // byte 0 store data, 0 in reset
     input  wire [7:0]  z1,        // byte 1 store data, 0 in reset
-    input  wire [7:0]  d0,        // byte 0 store data
+    input  wire [1:0]  d0,        // byte 0 store data bits 1:0 (IRQ_PEND's W1C bits)
     input  wire        s_tcnt,    // slot TIMER_CNT
     input  wire        s_tcmp,    // slot TIMER_CMP
     input  wire        s_tctl,    // slot TIMER_CTRL

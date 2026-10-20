@@ -16,7 +16,7 @@ module r32v_pwm (
     input  wire        w0,        // byte 0 store, or reset
     input  wire        w1,        // byte 1 store, or reset
     input  wire [7:0]  z0,        // byte 0 store data, 0 in reset
-    input  wire [7:0]  z1,        // byte 1 store data, 0 in reset
+    input  wire [6:0]  z1,        // byte 1 store data bits 6:0, 0 in reset
     input  wire        s_pctl,    // slot PWM_CTRL
     input  wire        s_dut0,    // slots PWM_DUTY0-2
     input  wire        s_dut1,

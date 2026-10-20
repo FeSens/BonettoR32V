@@ -130,7 +130,7 @@ module r32v_periph (
     wire        p_cmp, p_cap, t_out;
     r32v_timer u_timer (
         .clk(clk), .rst_n(rst_n), .rst(rst), .be0(be0), .be1(be1), .w0(w0), .w1(w1),
-        .z0(z0), .z1(z1), .d0(d0),
+        .z0(z0), .z1(z1), .d0(d0[1:0]),
         .s_tcnt(s_tcnt), .s_tcmp(s_tcmp), .s_tctl(s_tctl), .s_pend(s_pend),
         .cap_in(s2[0]), .cap_chg(chg[0]),
         .tcnt(tcnt), .tcmp(tcmp), .tcap(tcap), .tctl(tctl),
@@ -141,7 +141,7 @@ module r32v_periph (
     wire [9:0]  duty0, duty1, duty2;
     wire [2:0]  pwm;
     r32v_pwm u_pwm (
-        .clk(clk), .rst(rst), .w0(w0), .w1(w1), .z0(z0), .z1(z1),
+        .clk(clk), .rst(rst), .w0(w0), .w1(w1), .z0(z0), .z1(z1[6:0]),
         .s_pctl(s_pctl), .s_dut0(s_dut0), .s_dut1(s_dut1), .s_dut2(s_dut2), .t_out(t_out),
         .pctl(pctl), .duty0(duty0), .duty1(duty1), .duty2(duty2), .pwm(pwm)
     );
@@ -150,7 +150,7 @@ module r32v_periph (
     wire [7:0]  rdat;
     wire        rfull, rovr, tx_busy, tx_pin;
     r32v_uart u_uart (
-        .clk(clk), .rst_n(rst_n), .rst(rst), .be0(be0), .w0(w0), .w1(w1), .z0(z0), .z1(z1),
+        .clk(clk), .rst_n(rst_n), .rst(rst), .be0(be0), .w0(w0), .w1(w1), .z0(z0), .z1(z1[4:0]),
         .rd0(rd0), .s_udat(s_udat), .s_uctl(s_uctl), .rx(s2[1]), .rx_chg(chg[1]),
         .div(div), .rdat(rdat), .rfull(rfull), .rovr(rovr), .tx_busy(tx_busy), .tx_pin(tx_pin)
     );
