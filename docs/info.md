@@ -7,7 +7,8 @@ its data, its stack and most of its registers in the Pmod's PSRAM.
 - **Core.** The registers x1-x10, x12-x15 and the CSRs `mtvec`, `mscratch` and `mepc` live in
   the top 128 bytes of the PSRAM; the pc and x11 live on the die. The datapath is 4 bits wide,
   matched to the quad SPI bus. Every instruction is a short series of quad transactions: a
-  42-cycle read per register operand, a 34-cycle write per result, a 10-cycle internal step for
+  42-cycle read per register operand, a 34-cycle write per result (one cycle more right after
+  another PSRAM transaction, for the chip's CS_n high time), a 10-cycle internal step for
   x0 or x11. SCK runs at half the core clock. A flash fetch of a non-branch instruction also
   reads the next word, so the next instruction skips its fetch.
 - **Memory map.** Flash (16 MiB, read-only) at `0x0000_0000`, where execution starts after
@@ -24,8 +25,8 @@ its data, its stack and most of its registers in the Pmod's PSRAM.
   IR remote codes with no CPU work. A UART (8N1, up to 3.125 Mbaud at 50 MHz) on `uo[0]`/`ui[1]`.
   An SPI master (mode 0, up to 12.5 MHz) on `uo[4]`-`uo[6]`/`ui[3]`. Each `uo` pin is GPIO or its
   peripheral function, chosen by the ALTFN register.
-- **Speed** (simulated on the RTL with models of the Pmod chips): CoreMark 0.6845
-  iterations/s at 50 MHz (73,047,400 cycles per iteration), about 100 cycles per instruction.
+- **Speed** (simulated on the RTL with models of the Pmod chips): CoreMark 0.6791
+  iterations/s at 50 MHz (73,622,855 cycles per iteration), about 100 cycles per instruction.
   Everything time-critical (UART, SPI, PWM, tones, IR timing) is done in hardware.
 
 The full reference manual, with every register bit, instruction timing and the Arduino-style

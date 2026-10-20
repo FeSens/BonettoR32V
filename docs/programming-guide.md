@@ -4,7 +4,7 @@ BonettoR32V is an RV32E + Zicsr microcontroller in a 1x2 Tiny Tapeout tile: code
 flash of TT's QSPI Pmod, data lives in its PSRAM, and it has GPIO, a 16-bit timer, three 10-bit
 PWM channels with an IR gate, a UART, an SPI master and one interrupt line. `docs/contract.md` is
 the authoritative interface (section numbers below are its own); `sdk/` gives an Arduino-style
-API. Code is fetched over serial flash, so an instruction averages about 100 cycles (99.1 over the
+API. Code is fetched over serial flash, so an instruction averages about 100 cycles (99.0 over the
 cosim programs, CoreMark included), about 2 µs at 50 MHz: budget interrupt work accordingly.
 
 ## 1. Memory map and boot (contract 3, 4)

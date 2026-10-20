@@ -6,7 +6,9 @@ most of its registers in the Pmod's PSRAM, and has the peripherals a hobby proje
 with edge interrupts, a 16-bit timer with compare, capture and an output, three 10-bit PWM
 channels with an IR carrier gate, a UART, an SPI master and one interrupt line.
 
-This manual describes the design at commit `4c82e3a` (the pair-fetch candidate, 2026-10-18). It is
+This manual describes the sign-off design (2026-10-20): the RTL of hypothesis 113 (`f0a62bf`, the
+pair-fetch champion with the PSRAM CS_n gap and flash boot fixes of docs/signoff.md) and the
+layout settings of `afdb678`. It is
 written for hardware hobbyists and Tiny Tapeout users who want to wire, program and evaluate the
 chip. `docs/contract.md` is the authoritative interface; where this manual and the contract
 differ, the contract wins. `docs/programming-guide.md` is a two-page summary, and `sdk/` holds an
@@ -41,7 +43,7 @@ the 50 MHz signoff clock. *Derived* numbers are computed from the RTL source and
 |-----|-------------------------------------------------------|
 | ISA | RV32E (16 registers, no multiply/divide) + Zicsr subset, MRET, WFI; machine mode only |
 | Clock | 50 MHz signoff (20 ns period) |
-| Speed (measured) | CoreMark 0.6845 iterations/s (73,047,400 cycles per iteration), 0.01369 CoreMark/MHz; 99.1 cycles per instruction over the 32 test programs (total cycles / total instructions), about 0.5 MIPS |
+| Speed (measured) | CoreMark 0.6791 iterations/s (73,622,855 cycles per iteration), 0.01358 CoreMark/MHz; 99.0 cycles per instruction over the 32 test programs (total cycles / total instructions), about 0.5 MIPS |
 | Code memory | W25Q128JV flash on the QSPI Pmod, 16 MiB, execute in place (quad continuous read) |
 | Data memory | APS6404L PSRAM A on the QSPI Pmod, 8 MiB (QPI mode); the top 128 bytes hold the CPU's registers |
 | On-die state | pc, x11, mstatus/mie/mcause bits, the instruction register and a one-word prefetch buffer |
@@ -51,7 +53,7 @@ the 50 MHz signoff clock. *Derived* numbers are computed from the RTL source and
 | UART | 8N1, bit time DIV+1 cycles, DIV 15..8191: 6,104 to 3,125,000 baud at 50 MHz |
 | SPI master | mode 0, MSB first, SCK = f_clk / 2^(D+1), D 1..7: 12.5 MHz to 195 kHz at 50 MHz |
 | Interrupts | one machine external interrupt from 5 sources (timer compare, capture, UART RX, UART TX idle, GPIO edges); synchronous traps to `mtvec` |
-| Silicon | sky130A, `sky130_fd_sc_hd`, Tiny Tapeout 1x2 tile; 23,073.4 µm² synthesized, 2,336 cells, 495 flip-flops |
+| Silicon | sky130A, `sky130_fd_sc_hd`, Tiny Tapeout 1x2 tile; 23,084.6 µm² synthesized, 2,339 cells, 496 flip-flops |
 | Software | xPack `riscv32-unknown-elf-gcc` 15.2.0, `-march=rv32e_zicsr -mabi=ilp32e`; Arduino-style SDK in `sdk/` |
 
 ### 1.2 Block diagram
@@ -174,7 +176,7 @@ The memory board is Tiny Tapeout's QSPI Pmod on the bidirectional (`uio`) header
 ### 2.3 Clock
 
 - **Signoff: 50 MHz** (`clock_hz` in `info.yaml`, `CLOCK_PERIOD` 20 ns in `src/config.json`).
-  STA closes at every corner with +1.85 ns of setup slack (section 9).
+  STA closes at every corner with +3.51 ns of setup slack (section 9).
 - **Lower clocks: 6.25 to 50 MHz.** Every timing in the design is in cycles. The full cosim suite
   (32 programs, both modes, four seeds, the liveness fuzz) passes at 12 MHz and at 6.25 MHz; at
   5 MHz it fails the PSRAM's 8 µs tCEM, because a 41-cycle transaction then lasts 8.2 µs. The SDK
@@ -232,7 +234,7 @@ from the last clock edge with `rst_n` low.
 | 33-37 | PSRAM | 0xF5 in QPI form (2 edges) | leaves QPI mode; in SPI mode it is an ignored partial command |
 | 65-81 | PSRAM | 0x66 (SPI) | reset enable |
 | 97-113 | PSRAM | 0x99 (SPI) | reset: SPI mode, initialized |
-| 129-161 | flash | 0xEB, address 0 (quad), mode byte 0x20, CS_n high before the dummy edges | the flash enters continuous read: from now on each read starts directly with the address |
+| 129-177 | flash | 0xEB, address 0 (quad), mode byte 0x20, 4 dummy and 4 data edges (2 bytes, not sampled; SD0-SD3 released after the mode byte) | the flash enters continuous read: from now on each read starts directly with the address |
 | 193-209 | PSRAM | 0x35 (SPI) | enters QPI mode |
 | 213 | | first fetch starts at flash address 0 | |
 | 305 | | first retirement (measured) | `li x1, 0`, the first instruction of both the SDK's and the test programs' crt0: a 58-cycle pair fetch and a 34-cycle register write |
@@ -353,8 +355,8 @@ All traps go to `mtvec` in direct mode. Nothing halts the core.
 - **Nesting.** There is one `mepc`: a trap inside a handler overwrites it. Save `mepc` before
   re-enabling interrupts or doing anything that can trap.
 - **Latency (derived).** The line is registered in the peripheral block, and a `ui` pin edge adds
-  the one-flop input synchronizer. The core then finishes the current instruction (at most 270
-  cycles, section 4.6), runs the 76-cycle entry sequence and fetches the handler's first
+  the one-flop input synchronizer. The core then finishes the current instruction (at most 277
+  cycles, section 4.6), runs the 77- or 78-cycle entry sequence and fetches the handler's first
   instruction.
 
 ### 4.4 The retirement bound
@@ -366,8 +368,8 @@ first within 2,048 cycles of reset, the memory reset sequence included. This cor
 | Gap | Cycles | Source |
 |------------------|---|----------------------------------------|
 | largest gap in the cosim runs (32 programs, 4 seeds) | 305 | measured: the first retirement after reset (section 3.2) |
-| first retirement, worst instruction at address 0 | 483 | derived: 213 + a 270-cycle CSR instruction (the liveness fuzz measured exactly 483 on the previous champion, entry 111) |
-| any later gap, worst case | 346 | derived: a 76-cycle interrupt entry, then a 270-cycle CSR instruction as the handler's first |
+| first retirement, worst instruction at address 0 | 488 | derived: 213 + a 275-cycle CSR instruction from flash (the liveness fuzz measures exactly 488) |
+| any later gap, worst case | 355 | derived: a 78-cycle interrupt entry, then a 277-cycle CSR instruction fetched from PSRAM as the handler's first |
 
 ### 4.5 How it works: the nibble-serial slot engine
 
@@ -380,13 +382,15 @@ same clock, so an operand is processed while it streams in and no register buffe
 **Slots.** An instruction is a short sequence of *slots*. Each slot is one quad transaction on
 the Pmod, or a short internal step when no memory access is needed. SCK runs at clk/2, so E SCK
 edges take 2E + 2 clocks: one gap clock with CS_n high, the edges, and one tail clock with SCK
-low.
+low. A PSRAM transaction that directly follows another PSRAM transaction holds its gap one more
+clock, so the PSRAM's CS_n stays high for 2 clocks (40 ns) between them: the chip needs 18 ns
+(tCPH), and TT's pads may take up to about 4 ns from a high pulse (contract 2.1.2).
 
-- **Read, 42 clocks:** 8 header edges (flash: 6 address nibbles and the mode byte 0x20 that keeps
+- **Read, 42 clocks (43 right after a PSRAM transaction):** 8 header edges (flash: 6 address nibbles and the mode byte 0x20 that keeps
   continuous read; PSRAM: command 0x0B and 6 address nibbles), 4 dummy or wait edges, 8 data
   edges. Data moves on 16 of the 42 clocks.
-- **Write, 22, 26 or 34 clocks:** 8 header edges (PSRAM command 0x02 and the address), then 2, 4
-  or 8 data edges for 1, 2 or 4 bytes.
+- **Write, 22, 26 or 34 clocks (23, 27 or 35 right after a PSRAM transaction):** 8 header edges
+  (PSRAM command 0x02 and the address), then 2, 4 or 8 data edges for 1, 2 or 4 bytes.
 - **Pair fetch, 58 clocks:** a flash read with 16 data edges, the instruction and the next word.
 - **Fast slot, 10 clocks:** an operand that is x0, x11 or nothing. CS_n stays high and the
   datapath steps through 8 nibbles internally.
@@ -399,7 +403,7 @@ low.
   another slot, so no slot exists just to update the pc.
 - **x11** (`a1r`, 32 flip-flops) is register a1, chosen for CoreMark: it is the operand of the
   software multiply routine (RV32E has no multiply). A read or write of x11 is a 10-clock fast
-  slot instead of a 42- or 34-clock transaction; it cut CoreMark's cycles by 11.1%.
+  slot instead of a 42-clock read or a 34-clock write; it cut CoreMark's cycles by 11.1%.
 - **Pair fetch.** A flash fetch of an instruction whose opcode bit 6 is 0 (anything except
   branches, jumps and system instructions, which rarely continue at pc + 4) clocks 8 more data
   edges, the word at pc + 4, into a 32-bit buffer. The next instruction then skips its fetch and
@@ -424,6 +428,10 @@ low.
 | WC | write a CSR; on trap entry, write `mepc` | 34, or 10 for die CSRs |
 | WS, RS | write, then read back the scratch word (CSR instructions) | 34, 42 |
 
+Every PSRAM transaction in this table takes one clock more when the slot before it was a PSRAM
+transaction too (the CS_n gap above); a flash transaction, a fast slot, X or a skipped fetch in
+between leaves it at the listed length.
+
 Section 4.6 lists the slot sequence of every instruction class. A synchronous trap runs the
 slots up to its detection, then WC (`mepc` = pc) and C (pc = `mtvec`); an interrupt runs WC C
 after a retirement, then the handler's F.
@@ -432,75 +440,79 @@ after a retirement, then the handler's F.
 
 1. F reads the word at the pc from flash (58 clocks, buffering the next word as well).
 2. A reads x12 from the core region; each nibble passes the ALU into the ring, and the pc
-   advances by 4 in the same strobes (42 clocks).
+   advances by 4 in the same strobes (42 clocks: the flash fetch before it needs no extra gap).
 3. B reads x13; each nibble is added to the ring's nibble with the carry kept in one flip-flop
-   (42 clocks).
-4. W writes the ring to x10's word in PSRAM (34 clocks) and the instruction retires.
+   (43 clocks: a PSRAM read right after a PSRAM read).
+4. W writes the ring to x10's word in PSRAM (35 clocks) and the instruction retires.
 
-Total 176 clocks, or 119 if the instruction before it was a pair fetch that buffered this one.
-`add a0, a1, a3` (x11 as an operand) takes 32 fewer.
+Total 178 clocks, or 121 if the instruction before it was a pair fetch that buffered this one.
+`add a0, a1, a3` (x11 as an operand) takes 33 fewer: A becomes a 10-clock fast slot, and B, no
+longer right after a PSRAM transaction, takes 42.
 
 ### 4.6 Instruction timing (derived)
 
-Derived from the slot sequences and slot lengths above; not measured per instruction. The cosim
-measures totals (section 8). Three measured gaps match the derivation exactly: the first
-retirement on 4c82e3a (305 = 213 + 58 + 34), the same on the previous champion without pair fetch
-(289 = 213 + 42 + 34, ledger entry 111), and that champion's liveness-fuzz worst case (483 =
-213 + a 270-cycle CSR instruction). Timing does not depend on data values, only on the
+Derived from the slot sequences and slot lengths above, including the extra clock of a PSRAM
+transaction right after another one. The cosim's per-class worst gaps on the sign-off RTL
+(`run_cosim.py --timing-json` on coremark, csr, irq_stress, three random programs and two trap
+programs) match the derivation exactly: ALU 178, ALU immediate 135, load 178, store and shift
+256, IO load 135, IO store 221, branch 137, JALR 119, CSR 275, misaligned JALR 121 and branch 164
+(both fetched in 1 cycle from the pair-fetch buffer); the first retirement is 305 = 213 + 58 + 34
+and the liveness fuzz's worst gap 488 = 213 + a 275-cycle CSR instruction. Timing does not depend on data values, only on the
 instruction, its registers, where it is fetched from and the address region of a load or store
 (one exception: a shift into x0 or x11 takes up to 8 more cycles depending on the shift amount).
 
 **Fetch (F):**
 
 - 42 cycles for branches, JAL, JALR and system instructions (opcode bit 6 = 1), and for any fetch
-  from PSRAM;
+  from PSRAM (43 when the slot before it was a PSRAM transaction);
 - 58 cycles for a flash fetch of any other instruction, which also buffers the next word;
 - 1 cycle for that buffered next word, unless an interrupt is taken first.
 
 **Cycles after the fetch.** "Typical" assumes every named register is x1-x10 or x12-x15 (in
-PSRAM). The low end of each range uses x0 or x11 operands.
+PSRAM) and code in flash. The low end of each range uses x0 or x11 operands. For code in PSRAM,
+add one cycle when the slot after the fetch is a PSRAM transaction.
 
 | Instructions | Slots after F | Typical | Range |
 |---------------------------|----------------------|-------|----|
 | LUI, LI (ADDI rd, x0, imm) | W | 34 | 10-34 |
 | AUIPC | A W (A has no register) | 44 | 20-44 |
-| ADDI, SLTI, SLTIU, XORI, ORI, ANDI, SLLI, SRLI, SRAI | A W | 76 | 20-76 |
-| ADD, SUB, SLT, SLTU, XOR, OR, AND | A B W | 118 | 30-118 |
-| SLL, SRL, SRA | WP A B W P | 194 | 106-194 |
-| LB, LH, LW, LBU, LHU from flash or PSRAM | A M W | 118 | 62-118 |
-| the same from IO | A W | 76 | 20-76 |
-| SB, SH, SW to PSRAM | WP A BS M P | 182, 186, 194 | 118-194 |
-| any store to flash (no effect) | WP A BS M P (M empty) | 170 | 106-170 |
-| any store to IO | WP A P BS | 160 | 96-160 |
-| BEQ, BNE, BLT, BGE, BLTU, BGEU with rs2 ≠ x0 | A B X | 94 | 30-94 |
+| ADDI, SLTI, SLTIU, XORI, ORI, ANDI, SLLI, SRLI, SRAI | A W | 77 | 20-77 |
+| ADD, SUB, SLT, SLTU, XOR, OR, AND | A B W | 120 | 30-120 |
+| SLL, SRL, SRA | WP A B W P | 198 | 106-198 |
+| LB, LH, LW, LBU, LHU from PSRAM / from flash | A M W | 120 / 118 | 62-120 |
+| the same from IO | A W | 77 | 20-77 |
+| SB, SH, SW to PSRAM | WP A BS M P | 186, 190, 198 | 119-198 |
+| any store to flash (no effect) | WP A BS M P (M empty) | 172 | 106-172 |
+| any store to IO | WP A P BS | 163 | 96-163 |
+| BEQ, BNE, BLT, BGE, BLTU, BGEU with rs2 ≠ x0 | A B X | 95 | 30-95 |
 | the same with rs2 = x0 (BEQZ, BNEZ, BLTZ, BGEZ, ...) | A (A X if not taken with target bit 1 set) | 42 | 10-52 |
 | JAL with rd ≠ x0 (CALL) / JAL x0 (J) | W4 | 34 / 10 | |
-| JALR with rd ≠ x0 / rd = x0 (RET, JR) | A W4 / A | 76 / 42 | 10-76 |
+| JALR with rd ≠ x0 / rd = x0 (RET, JR) | A W4 / A | 77 / 42 | 10-77 |
 | FENCE, WFI | X | 10 | |
-| CSR instructions | A WS C W RS WC | 172 or 228 | 116-228 |
+| CSR instructions | A WS C W RS WC | 174 or 233 | 116-233 |
 | MRET | C | 42 | |
-| ECALL, EBREAK, illegal word, misaligned JAL (trap) | WC C | 76 | |
-| misaligned JALR (trap) | A WC C | 118 | |
-| misaligned taken branch (trap) | A B WC C / A WC C (rs2 = x0) | 160 / 118 | |
-| interrupt entry (between instructions) | WC C | 76 | |
+| ECALL, EBREAK, illegal word, misaligned JAL (trap) | WC C | 77 | |
+| misaligned JALR (trap) | A WC C | 120 | |
+| misaligned taken branch (trap) | A B WC C / A WC C (rs2 = x0) | 163 / 120 | |
+| interrupt entry (between instructions) | WC C | 77, or 78 after a PSRAM slot | |
 
-CSR instructions take 172 cycles after the fetch on a die CSR (`mstatus`, `mie`, `mip`,
-`mcause`) with registers, 228 on `mtvec`, `mscratch` or `mepc` (which live in PSRAM), and 116 at
+CSR instructions take 174 cycles after the fetch on a die CSR (`mstatus`, `mie`, `mip`,
+`mcause`) with registers, 233 on `mtvec`, `mscratch` or `mepc` (which live in PSRAM), and 116 at
 least (a die CSR, an immediate, rd = x0).
 
-Examples, fetch included, code in flash: `beqz a5, L` 84; `bne a4, a5, L` 136; `ret` 84;
-`call f` 76; `lw a5, 0(a4)` 176, or 119 when the previous instruction buffered it;
+Examples, fetch included, code in flash: `beqz a5, L` 84; `bne a4, a5, L` 137; `ret` 84;
+`call f` 76; `lw a5, 0(a4)` from PSRAM 178, or 121 when the previous instruction buffered it;
 `csrsi mstatus, 8` 158.
 
 **Practical rules** that follow:
 
 - Keep hot values in x11 (a1) when writing assembly; the compiler already uses it for the second
   argument.
-- Branch against zero when you can: `bnez` costs 84 cycles against 136 for `bne` with two
+- Branch against zero when you can: `bnez` costs 84 cycles against 137 for `bne` with two
   registers.
 - Straight-line code from flash is cheaper than code from PSRAM (pair fetch only works in
   flash).
-- A store costs about 1.6 times a load (194 against 118 cycles after the fetch) because the pc
+- A store costs about 1.6 times a load (198 against 120 cycles after the fetch) because the pc
   is spilled and reloaded around it.
 
 ### 4.7 Unspecified behavior
@@ -838,18 +850,19 @@ wrote the edge to the wrong address; this manual's review found it, and it is fi
 
 ### 6.5 Interrupt costs (measured)
 
-Measured on the RTL in cosim at 50 MHz (`sdk/tests/progs/overhead`, `make -C sdk test`):
+Measured on the sign-off RTL (113) in cosim at 50 MHz (`sdk/tests/progs/overhead`, run by
+`make -C sdk test`, which writes `sdk/build/overhead.json`):
 
 | Activity | CPU time |
 |---------------------------|---------------------------------|
-| the timebase alone (one interrupt per 20 ms, 15,024 cycles each) | 1.51% |
-| a tone on UO7 at 1 kHz (an interrupt per half period) | 17.0% |
-| a tone on UO7 at 2 kHz (the maximum) | 32.7% |
+| the timebase alone (one interrupt per 20 ms, 13,939 cycles each) | 1.46% |
+| a tone on UO7 at 1 kHz (an interrupt per half period) | 16.0% |
+| a tone on UO7 at 2 kHz (the maximum) | 30.6% |
 | a tone on a PWM pin (UO1-UO3) | 0 (hardware) |
 | the IR carrier | 0 (hardware) |
 | an IR frame | one interrupt per mark or space edge (67 per NEC frame); not separately measured |
 
-Why: the hardware entry is 76 cycles, but a C interrupt handler saves and restores registers in
+Why: the hardware entry is 77 or 78 cycles, but a C interrupt handler saves and restores registers in
 PSRAM at about 100 cycles per instruction. The SDK therefore enters every trap in
 `sdk/core/trap.S`, which handles two hot cases in assembly without a stack: a received UART byte
 (read at the handler's sixth instruction, so a 17-byte back-to-back burst at 115,200 baud arrives
@@ -1096,11 +1109,11 @@ on both edges, `INT_CAPTURE` with `captureMicros()`), but the SDK has no decoder
 | Build | xPack GCC 15.2.0, `-O2 -march=rv32e_zicsr -mabi=ilp32e` (`verif/programs/coremark/`) |
 | Platform | the RTL in Verilator with the QSPI Pmod chip models: code in flash, data and stack in PSRAM |
 | Timing | cycles between GPIO_OUT marks 0xC0 and 0xC1 around the timed iterations; the slowest of all runs (2 modes x 4 seeds) counts |
-| Result (measured, 4c82e3a) | **73,047,400 cycles per iteration**: 0.6845 iterations/s at 50 MHz, 0.01369 CoreMark/MHz |
+| Result (measured, 113) | **73,622,855 cycles per iteration**: 0.6791 iterations/s at 50 MHz, 0.01358 CoreMark/MHz |
 | Validation | "Correct operation validated" in the program's PSRAM log |
 
 This is the project's score, not a reportable EEMBC result: the run rules ask for at least 10
-seconds of timed run and a published report, and one iteration takes 1.46 s here.
+seconds of timed run and a published report, and one iteration takes 1.47 s here.
 
 ### 8.2 Optimization history
 
@@ -1118,14 +1131,18 @@ The design is improved by a loop of hypotheses, each re-verified by every gate b
 | 107 | fewer slots: branches on x0 in F A, 10-clock fast slots, LI/LUI skip A | 50 MHz | 91,730,514 | 0.5451 | 21,804.7 |
 | 110 | core area diet at the same cycles (scan flops as enable flops) | 50 MHz | 91,730,514 | 0.5451 | 20,764.9 |
 | 111 | x11 on the die | 50 MHz | 81,557,200 | 0.6131 | 21,986.1 |
-| 112 (candidate `4c82e3a`) | pair fetch | 50 MHz | 73,047,400 | 0.6845 | 23,073.4 |
+| 112 (`4c82e3a`) | pair fetch | 50 MHz | 73,047,400 | 0.6845 | 23,073.4 |
+| 113 (`f0a62bf`, sign-off) | PSRAM CS_n high 2 clocks between PSRAM transactions (tCPH); flash boot enters continuous read with a completed read | 50 MHz | 73,622,855 | 0.6791 | 23,084.6 |
 
-From the seed: 7.9x fewer cycles per iteration and 9.9x the score (the clock gives the rest).
+113 is a correctness fix found by the sign-off datasheet audit (docs/pmod-audit.md), not an
+improvement: it costs 0.78% of the score. From the seed: 7.9x fewer cycles per iteration and 9.8x
+the score (the clock gives the rest).
 
 ### 8.3 What limits speed
 
 - **Registers in PSRAM.** Every register operand except x0 and x11 is a 42-clock read or a
-  34-clock write. `add a0, a2, a3` takes 176 cycles, 118 of them register transactions; with all
+  34-clock write (one more clock right after another PSRAM transaction). `add a0, a2, a3` takes
+  178 cycles, 120 of them register transactions; with all
   three registers on the die it would take 88. Putting x11 on the die cost 1,221 µm² for 12.5%
   more CoreMark/s (entry 111); the tile has room for few more.
 - **Transaction overhead.** A 42-clock read moves data on 16 clocks. The other 26 are the
@@ -1138,7 +1155,7 @@ From the seed: 7.9x fewer cycles per iteration and 9.9x the score (the clock giv
   5 to 6 instructions per bit of the multiplier (`andi`, `beqz`, `add`, `srli`, `slli`, `bnez`).
   The multiplier sits in x11 (a1), and three of those instructions use it: hence x11's place on
   the die.
-- **Area.** The 1x2 tile is nearly full (utilization 0.803 after placement, section 9). Every
+- **Area.** The 1x2 tile is nearly full (utilization 0.798 after placement, section 9). Every
   speed-up has to pay for its flip-flops.
 
 ## 9. Physical implementation
@@ -1148,14 +1165,17 @@ From the seed: 7.9x fewer cycles per iteration and 9.9x the score (the clock giv
 | Process, library | SkyWater sky130A, `sky130_fd_sc_hd` |
 | Flow | Tiny Tapeout's (tt-gds-action `ttsky26d`), LibreLane 3.0.14 Classic flow, run locally by `tools/harden_tt.sh` (docs/physical.md) |
 | Tile | 1x2: die 36,347 µm², core 34,255 µm² |
-| Synthesis (measured, 4c82e3a) | 23,073.4 µm², 2,336 cells, 495 flip-flops, no latches |
-| Placement utilization | 0.803 |
-| Timing at 20 ns (50 MHz) | setup slack +1.85 ns and hold slack +0.023 ns at every corner; 141 hold buffers |
-| Signoff checks | DRC, LVS, antenna and TT precheck clean |
-| Configuration | `src/config.json`: synthesis `AREA 2` with the smallest drive strengths allowed, hold margins 0.015/0.01 ns, design repair without slew/cap margins, timing-driven and routability-driven placement (overflow threshold 0.15), target density 60% |
+| Synthesis (measured, 113) | 23,084.6 µm², 2,339 cells, 496 flip-flops, no latches |
+| Placement utilization | 0.798 (5,570 instances after placement and repair, 129 of them hold buffers) |
+| Timing at 20 ns (50 MHz) | setup slack +3.51 ns and hold slack +0.022 ns at every one of the 9 corners, after the flow's 0.25 ns clock uncertainty and 5% derate |
+| Slew | 746 pins above TT's 0.75 ns target in the slowest corner (ss, 100 °C, 1.60 V), 16 above the library's 1.5 ns, worst 1.98 ns; none above 1.5 ns at the typical corner |
+| Signoff checks | DRC (Magic and TT's KLayout decks), LVS, antenna and TT precheck clean |
+| Configuration | `src/config.json`: synthesis `AREA 2` with the smallest drive strengths allowed, hold margins 0.015/0.01 ns, design repair without slew/cap margins, timing-driven and routability-driven placement (overflow threshold 0.13) with no initial placement, global-routing layer adjustments 0.99/0.1/0.1 on li1/met1/met2, target density 60% |
 
-- The hardening numbers are measured on 4c82e3a (merged to main as 5c66234) with the current
-  `src/config.json`; the sweep run on the a85f6cb netlist (the same RTL) gave identical figures.
+- The hardening numbers are measured on `afdb678` (the sign-off commit's RTL and `src/config.json`)
+  on 2026-10-20, and reproduce the sweep point the configuration came from exactly. Placement in
+  this nearly full tile is chaotic: 112's configuration did not route 113's netlist, so re-screen
+  the settings after any RTL change (docs/signoff.md, "Layout").
 - **Design style.** One rising-edge clock, synchronous reset, no latches, no tristates, plain
   Verilog-2005 (contract 1). Core state flip-flops (the ring, instruction register, pc, x11, the
   pair-fetch buffer, counters) are `sky130_fd_sc_hd__sdfxtp_1` scan flops used as enable flops
@@ -1167,18 +1187,19 @@ From the seed: 7.9x fewer cycles per iteration and 9.9x the score (the clock giv
 ## 10. Verification
 
 Every candidate passes every gate before it merges (`make eval`; docs/eval.md), except formal,
-which runs at every tenth merged improvement and at signoff. Results on 4c82e3a, measured on the
-project's Linux build host:
+which runs at every tenth merged improvement and at signoff. Results of `make eval FORMAL=1` on the
+sign-off design (d944aaf, the RTL of 113), measured on the project's Linux build host; the
+sign-off record with the soak, clock-range and layout checks is docs/signoff.md:
 
 | Gate | What it checks | Result |
 |---|------------------------------------------|----------------|
 | lint | `tools/src_check.py` (synthesizable subset, whitelisted cells only), Verilator `-Wall` on the plain and RVFI builds | pass |
-| area | TT's synthesis; no latches; 1x2 fit pre-filter (≤ 23,100 µm²) | pass, 23,073.4 µm² |
+| area | TT's synthesis; no latches; 1x2 fit pre-filter (≤ 23,100 µm²) | pass, 23,084.6 µm² |
 | cosim | 32 programs x 2 modes x 4 seeds = 256 runs, plus the liveness fuzz under 5 seeds (2,056 random-image sub-runs each) | 256/256, fuzz 5/5 |
 | arch | riscv-arch-test 3.9.1: all 53 RV32E and privilege tests (traps included), under seeds 1-4 | 53/53 |
 | equiv | the RVFI-stripped build is formally equivalent to the plain build (yosys) | pass |
-| gl | TT's cocotb test on the synthesized netlist with every flip-flop starting at X: `gpio_demo` in the four memory power-up modes, `uart_hello` | 5/5 |
-| formal | riscv-formal at the pins, fast config: every check from reset to the step where its triggers are reached (308-466 cycles: the first instruction and the pair-fetched second one, any power-up state) | 65/65 on 6810e6f (same RTL); 39 of 46 planted bugs caught |
+| gl | TT's cocotb test (`gpio_demo` in the four memory power-up modes, `uart_hello`) on the RTL under Icarus, as TT's test workflow runs it, then on the synthesized netlist with every flip-flop starting at X | 5/5 and 5/5 |
+| formal | riscv-formal at the pins, fast config: every check from reset to the step where its triggers are reached (308-466 cycles: the first instruction and the pair-fetched second one, any power-up state) | 65/65 (3,615 s); on 112, 39 of 46 planted bugs caught by formal and the other 7 by cosim |
 
 **What the cosim checks** (docs/cosim.md): in rvfi mode the reference ISS runs in lockstep and
 every retired instruction is compared; in pins mode only the pins are judged. In both, the
@@ -1190,9 +1211,9 @@ programs are selftest, csr, coherence, mem_init_check, gpio_demo, coremark, seve
 six random instruction streams, and the peripheral programs irq_timer, irq_stress, wfi,
 uart_echo, uart_echo_fast, spi_loop, pwm, pwm10, pwm10q, timer16, ir_loop, ir_gate and gpio_edge.
 
-**Measured totals on 4c82e3a:** CPI 99.1 (total cycles over total instructions of the rvfi runs,
-seed 1); worst retirement gap 305 cycles;
-CoreMark 73,047,400 cycles per iteration.
+**Measured totals on 113 (d944aaf):** CPI 99.0 (total cycles over total instructions of the rvfi
+runs, seed 1); worst retirement gap 305 cycles (liveness fuzz 488);
+CoreMark 73,622,855 cycles per iteration.
 
 **SDK tests** (`make -C sdk test`) run the examples on the RTL: blink and c_blink intervals, the
 fade's duties, serial echo and the 17-byte burst, the button count, tone periods, NEC frames, and

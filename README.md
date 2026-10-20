@@ -10,24 +10,27 @@ It comes with an Arduino-style SDK.
 
 Status: pre-silicon. Verified in simulation (RTL and gate level), and hardened clean in 1x2.
 
-## Headline numbers (commit 4c82e3a, measured)
+## Headline numbers (sign-off design, measured)
 
 | Item | Value |
 |---------|---------------------------------------------------|
-| Clock | 50 MHz signoff (setup slack +1.85 ns, hold slack +0.023 ns at every corner) |
-| CoreMark | 0.6845 iterations/s, 73,047,400 cycles per iteration (0.01369 CoreMark/MHz) |
-| Cycles per instruction | 99.1 over the 32 test programs (total cycles / total instructions) |
-| Area | 23,073.4 µm² synthesized, 2,336 cells, 495 flip-flops; utilization 0.803 in the 1x2 tile |
+| Clock | 50 MHz signoff (setup slack +3.51 ns, hold slack +0.022 ns at every corner) |
+| CoreMark | 0.6791 iterations/s, 73,622,855 cycles per iteration (0.01358 CoreMark/MHz) |
+| Cycles per instruction | 99.0 over the 32 test programs (total cycles / total instructions) |
+| Area | 23,084.6 µm² synthesized, 2,339 cells, 496 flip-flops; utilization 0.798 in the 1x2 tile |
 | Memory | 16 MiB flash (code, execute in place), 8 MiB PSRAM (data) |
-| Gates | lint, area, cosim (256 runs + liveness fuzz), riscv-arch-test 53/53, equivalence, gate level 5/5; riscv-formal fast config 65/65 (bounded from reset; deep not run yet) |
+| Gates | lint, area, cosim (256 runs + liveness fuzz), riscv-arch-test 53/53, equivalence, TT's test on the RTL and on the netlist 5/5; riscv-formal fast config 65/65 (bounded from reset; the deep config does not finish on this core); 2,850-run soak |
 
-The clock, slack and utilization figures come from hardening 4c82e3a (the champion RTL)
-with the current `src/config.json`: DRC, LVS, antenna and TT precheck clean (manual section 9).
+The design is hypothesis 113 (RTL `f0a62bf`) with the layout settings of `afdb678`. The clock,
+slack and utilization figures come from hardening that commit with TT's flow: DRC, LVS, antenna
+and TT precheck clean, and TT's test passes on the routed netlist (manual section 9).
+[docs/signoff.md](docs/signoff.md) is the tape-out sign-off record.
 
 ## Documentation
 
 | Document | What it covers |
 |---------------------|---------------------------------------|
+| [docs/signoff.md](docs/signoff.md) | the tape-out sign-off record: every check, the fixes it led to, the remaining risks |
 | [docs/manual.md](docs/manual.md) | the reference manual: pins, memory map, boot, the core and its timing, every peripheral register, programming, the IR remote walkthrough, performance, verification, limitations |
 | [docs/info.md](docs/info.md) | the Tiny Tapeout datasheet page |
 | [docs/programming-guide.md](docs/programming-guide.md) | a two-page programming summary |
