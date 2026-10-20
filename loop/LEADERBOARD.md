@@ -6,7 +6,7 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 
 ## Current champion
 
-**112** `4c82e3ad7b04` (hyp/112a-pair-fetch): 0.6845 CoreMark iterations/s (clock 20 ns), 23,073.4 µm², 2,336 cells, formal skipped, tile fraction -, deep formal -. Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 = 0) reads 8 more data edges, the word at pc + 4, into a 32-flop buffer; the next sequential instruction skips its fetch (1-clock ...
+**113** `a4f6c1c9d233` (hyp/113-pmod-timing): 0.6791 CoreMark iterations/s (clock 20 ns), 23,084.6 µm², 2,339 cells, formal skipped, tile fraction -, deep formal -. Sign-off Pmod timing fixes from the datasheet audit (docs/pmod-audit.md): PSRAM CS_n high 2 clocks between PSRAM transactions (APS6404L tCPH 18 ns plus pad distortion; contract 2.1.2), and the boot...
 
 ## Champion history
 
@@ -21,12 +21,14 @@ Score: `coremark_ips`, CoreMark iterations per second from `make eval` (f_clk / 
 | 6 | 107 | 2026-10-18 | `fa93772c9c` | 0.5451 | +4.33% | 20 | 21,804.7 | 2,241 | +67.6 | skipped | - | - | - | Cut no-transfer slots: branches on x0 run F A (A computes pc+imm into the ring via the ... |
 | 7 | 110 | 2026-10-18 | `f71a9ca961` | 0.5451 | +0.00% | 20 | 20,764.9 | 2,167 | -1,039.7 | skipped | - | - | - | Core area diet at identical cycles: 116 core enable flops (ring, ir, pcr, c, cy, cmp, m... |
 | 8 | 111 | 2026-10-18 | `19bd3a1770` | 0.6131 | +12.47% | 20 | 21,986.1 | 2,257 | +1,221.2 | skipped | - | - | - | Register x11 (a1) on the die, indexed (108 revived as 108c on the 110 core): a1r = 32 s... |
-| 9 | 112 | 2026-10-18 | `4c82e3ad7b` | 0.6845 | +11.65% | 20 | 23,073.4 | 2,336 | +1,087.3 | skipped | - | - | champion | Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 = 0) reads 8 more da... |
+| 9 | 112 | 2026-10-18 | `4c82e3ad7b` | 0.6845 | +11.65% | 20 | 23,073.4 | 2,336 | +1,087.3 | skipped | - | - | - | Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 = 0) reads 8 more da... |
+| 10 | 113 | 2026-10-20 | `a4f6c1c9d2` | 0.6791 | -0.78% | 20 | 23,084.6 | 2,339 | +11.3 | skipped | - | - | champion (forced) | Sign-off Pmod timing fixes from the datasheet audit (docs/pmod-audit.md): PSRAM CS_n hi... |
 
 ## Last 20 hypotheses
 
 | id | date | branch | verdict | CoreMark/s | delta CoreMark/s | clock ns | area µm² | delta µm² | formal | failed gates | idea | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 113 | 2026-10-20 | hyp/113-pmod-timing | merged (forced) | 0.6791 | -0.0053 | 20 | 23,084.6 | +11.3 | skipped | - | Sign-off Pmod timing fixes from the datasheet audit (docs/pmod-audi... | Contract-driven correctness fix, forced: -0.78% CoreMark vs 112 (73... |
 | 112 | 2026-10-18 | hyp/112a-pair-fetch | merged | 0.6845 | +0.0714 | 20 | 23,073.4 | +1,087.3 | skipped | - | Pair fetch: a flash fetch of a non-control-flow word (opcode bit 6 ... | Measured (hwe-bench): 81,557,200 -> 73,047,400 cycles/iter (model p... |
 | 109 | 2026-10-18 | hyp/109-periph-sdfxtp | failed | 0.6131 | +0.0000 | 20 | 21,819.7 | -166.4 | skipped | - | Peripheral flops as sky130 scan flops (sdfxtp): counters load throu... | Gates pass, CoreMark ties (81,557,200). Synth: 9724598 21,388.0 (-5... |
 | 1081 | 2026-10-18 | hyp/108b-a1-on-die | rejected | - | - | - | - | - | - | n/a | Register x11 on the die with a rotating a1r shift chain (sdfxtp) on... | Agent-measured: all gates pass, coremark_ips 0.61307 (+12.47%), are... |
