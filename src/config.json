@@ -49,8 +49,18 @@
 
   "//": "BonettoR32V (lead, 2026-10-18 sweep S9): routability-driven global placement checks",
   "//": "routability from 15% overflow (OpenROAD gpl -routability_check_overflow, default 30%); with",
-  "//": "the hold margins above it takes global-routing overflow to 0 and detailed routing to 0.",
-  "PL_ROUTABILITY_OVERFLOW_THRESHOLD": 0.15,
+  "//": "the hold margins above it took global-routing overflow to 0 and detailed routing to 0.",
+  "PL_ROUTABILITY_OVERFLOW_THRESHOLD": 0.13,
+
+  "//": "BonettoR32V (lead, 2026-10-20 sign-off sweep on hyp 113 d944aaf, 23,084.6 um2 synth): with",
+  "//": "0.15 and the default placement, 113 placed worse than 112 (global-routing overflow 1,239,",
+  "//": "detailed routing stuck near 9,000 violations); of about 100 screened overlays, threshold 0.13,",
+  "//": "no initial placement and these global-routing layer adjustments (li1 0.99, met1 0.1,",
+  "//": "met2 0.1) route to overflow 0 and 0 DRT violations at iteration 21, and sign off clean:",
+  "//": "DRC/LVS/antenna/precheck, setup +3.508 ns, hold +0.0216 ns at every corner, utilization",
+  "//": "0.798, 129 hold buffers. Placement is chaotic in the netlist: re-screen after RTL changes.",
+  "PL_SKIP_INITIAL_PLACEMENT": true,
+  "GRT_LAYER_ADJUSTMENTS": [0.99, 0.1, 0.1, 0, 0, 0],
 
   "//": "BonettoR32V (hypothesis 004, docs/synth-cells.md): synthesis cell set and ABC strategy.",
   "//": "EXTRA_EXCLUDED_CELLS - each '!' entry is a deny wildcard of LibreLane 3.0.14's cell filter",
