@@ -16,8 +16,13 @@ project:
   # Source files must be in ./src; the lead regenerates this list from the champion's src/*.v.
   source_files:
     - "r32v_csr.v"
+    - "r32v_gpio.v"
     - "r32v_mem.v"
     - "r32v_periph.v"
+    - "r32v_pwm.v"
+    - "r32v_spi.v"
+    - "r32v_timer.v"
+    - "r32v_uart.v"
     - "tt_um_fesens_r32v.v"
 
 # Pin functions: docs/contract.md sections 1 and 5.2. A uo pin carries its peripheral function

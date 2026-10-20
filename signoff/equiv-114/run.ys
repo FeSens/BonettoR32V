@@ -1,0 +1,39 @@
+read_verilog -mem2reg old/r32v_periph.v
+hierarchy -top r32v_periph
+proc
+flatten
+opt_clean
+rename r32v_periph gold
+write_rtlil gold.il
+design -reset
+read_verilog -mem2reg new/r32v_periph.v new/r32v_gpio.v new/r32v_timer.v new/r32v_pwm.v new/r32v_uart.v new/r32v_spi.v
+hierarchy -top r32v_periph
+proc
+flatten
+cd r32v_periph
+rename u_timer.tp tp
+rename u_timer.tq tq
+rename u_pwm.pq pq
+rename u_pwm.pcn pcn
+rename u_uart.tsr tsr
+rename u_uart.tbc tbc
+rename u_uart.ract ract
+rename u_uart.rcnt rcnt
+rename u_uart.rsr rsr
+rename u_spi.sdr sdr
+rename u_spi.sph sph
+rename u_spi.srp srp
+rename u_spi.sdc sdc
+cd ..
+opt_clean
+rename r32v_periph gate
+write_rtlil gate.il
+design -reset
+read_rtlil gold.il
+read_rtlil gate.il
+async2sync
+equiv_make gold gate equiv
+hierarchy -top equiv
+equiv_simple -seq 8
+equiv_induct -seq 8
+equiv_status -assert

@@ -1182,7 +1182,9 @@ the score (the clock gives the rest).
   (Q fed back through the scan input), which are smaller than the enable flops synthesis picks.
 - **Source files:** `src/tt_um_fesens_r32v.v` (top: decode, slot engine, datapath),
   `src/r32v_mem.v` (Pmod controller, reset sequence), `src/r32v_csr.v` (CSRs, trap and interrupt
-  entry), `src/r32v_periph.v` (peripherals).
+  entry), `src/r32v_periph.v` (the peripherals' bus decode, input synchronizers, pin mux,
+  interrupt line and read mux), and one file per peripheral: `src/r32v_gpio.v`, `src/r32v_timer.v`,
+  `src/r32v_pwm.v` (with the IR gate), `src/r32v_uart.v`, `src/r32v_spi.v`.
 
 ## 10. Verification
 

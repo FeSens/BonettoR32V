@@ -42,7 +42,7 @@ and TT precheck clean, and TT's test passes on the routed netlist (manual sectio
 
 | Path | Contents |
 |---------|---------------------------------------------------|
-| `src/` | the design: `tt_um_fesens_r32v.v` (core), `r32v_mem.v` (QSPI Pmod controller), `r32v_csr.v`, `r32v_periph.v` |
+| `src/` | the design: `tt_um_fesens_r32v.v` (core), `r32v_mem.v` (QSPI Pmod controller), `r32v_csr.v`, `r32v_periph.v` (bus, pin mux, interrupt line) with one file per peripheral: `r32v_gpio.v`, `r32v_timer.v`, `r32v_pwm.v`, `r32v_uart.v`, `r32v_spi.v` |
 | `sdk/` | the Arduino-style SDK (`core/`), examples (`examples/`: blink, fade, serial_echo, button, tone, ir_remote, c_blink), tests |
 | `verif/` | reference ISS, cosim harness with QSPI Pmod chip models, test programs (CoreMark included), riscv-arch-test flow |
 | `test/` | the Tiny Tapeout cocotb test (RTL and gate level) |

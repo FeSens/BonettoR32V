@@ -1,7 +1,10 @@
 /*
- * BonettoR32V MCU peripherals (docs/contract.md section 5): GPIO with edge flags, a 16-bit
- * timer with compare, capture and an output, 3 PWM channels, a UART (8N1) and an SPI master
- * (mode 0), plus the interrupt line. One register file, one read mux.
+ * BonettoR32V MCU peripherals (docs/contract.md section 5): GPIO with edge flags (r32v_gpio),
+ * a 16-bit timer with compare, capture and an output (r32v_timer), 3 PWM channels (r32v_pwm), a
+ * UART, 8N1 (r32v_uart) and an SPI master, mode 0 (r32v_spi), plus the interrupt line. Each
+ * peripheral is its own module with its own registers; this one holds the bus decode, the input
+ * synchronizers, the shared write data, ALTFN (the pin mux), IRQ_EN and the interrupt line, and
+ * the one read mux.
  *
  * Bus (from the core): a load or store of slot `slot` (address bits 6:2) at byte offset `off`
  * (bits 1:0) of size `size` (funct3[1:0]). `we` is a one-cycle store strobe with the store data
@@ -94,230 +97,72 @@ module r32v_periph (
     wire [7:0] chg = s2 ^ s3;                         // a synchronized edge on each pin
 
     // ------------------------------------------------------------------------------------
-    // Configuration registers (reset 0, SPI CS_n reset 1)
+    // Shared write data and the registers of this module (ALTFN, IRQ_EN; reset 0)
     // ------------------------------------------------------------------------------------
-    reg [7:0]  gpo, alt;
-    reg [15:0] tcmp;
-    reg [9:0]  tctl;
-    reg [14:0] pctl;
-    reg [9:0]  duty0, duty1, duty2;
-    reg [12:0] div;
-    reg        scs;
-    reg [2:0]  sd;
-    reg [4:0]  ien;
-    reg [7:0]  een, epol;
     // Plain enable flops: the reset is folded into the shared write data z0/z1 (0 while rst_n is
     // low) and into every write enable, so each bit maps to one enable flop with no logic of its own.
+    // Every peripheral module takes these signals and writes its own registers the same way.
     wire       rst = ~rst_n;
     wire [7:0] z0  = d0 & {8{rst_n}};
     wire [7:0] z1  = d1 & {8{rst_n}};
     wire       w0  = be0 | rst;
     wire       w1  = be1 | rst;
+    reg  [7:0] alt;
+    reg  [4:0] ien;
     always @(posedge clk) begin
-        if (w0 & (s_gpo | rst))  gpo <= z0;
-        if (w0 & (s_alt | rst))  alt <= z0;
-        if (w0 & (s_tcmp | rst)) tcmp[7:0]  <= z0;
-        if (w1 & (s_tcmp | rst)) tcmp[15:8] <= z1;
-        if (w0 & (s_tctl | rst)) tctl[7:0]  <= z0;
-        if (w1 & (s_tctl | rst)) tctl[9:8]  <= z1[1:0];
-        if (w0 & (s_pctl | rst)) pctl[7:0]  <= z0;
-        if (w1 & (s_pctl | rst)) pctl[14:8] <= z1[6:0];
-        if (w0 & (s_dut0 | rst)) duty0[7:0] <= z0;
-        if (w1 & (s_dut0 | rst)) duty0[9:8] <= z1[1:0];
-        if (w0 & (s_dut1 | rst)) duty1[7:0] <= z0;
-        if (w1 & (s_dut1 | rst)) duty1[9:8] <= z1[1:0];
-        if (w0 & (s_dut2 | rst)) duty2[7:0] <= z0;
-        if (w1 & (s_dut2 | rst)) duty2[9:8] <= z1[1:0];
-        if (w0 & (s_uctl | rst)) div[7:0]   <= z0;
-        if (w1 & (s_uctl | rst)) div[12:8]  <= z1[4:0];
-        if (w0 & (s_sctl | rst)) {sd, scs}  <= {z0[3:1], z0[0] | rst};
-        if (w0 & (s_ien | rst))  ien  <= z0[4:0];
-        if (w0 & (s_edge | rst)) een  <= z0;
-        if (w1 & (s_edge | rst)) epol <= z1;
+        if (w0 & (s_alt | rst)) alt <= z0;
+        if (w0 & (s_ien | rst)) ien <= z0[4:0];
     end
 
     // ------------------------------------------------------------------------------------
-    // GPIO edge flags (W1C; a new edge wins over the clear)
+    // Peripherals
     // ------------------------------------------------------------------------------------
-    reg [7:0] epend;
-    wire [7:0] eset = een & chg & (s2 ^ epol);
-    always @(posedge clk) begin
-        if (!rst_n)
-            epend <= 8'd0;
-        else
-            epend <= (epend & ~({8{be0 & s_epnd}} & d0)) | eset;
-    end
+    wire [7:0] gpo, een, epol, epend;
+    r32v_gpio u_gpio (
+        .clk(clk), .rst_n(rst_n), .rst(rst), .w0(w0), .w1(w1), .z0(z0), .z1(z1),
+        .be0(be0), .d0(d0), .s_gpo(s_gpo), .s_edge(s_edge), .s_epnd(s_epnd),
+        .s2(s2), .chg(chg),
+        .gpo(gpo), .een(een), .epol(epol), .epend(epend)
+    );
 
-    // ------------------------------------------------------------------------------------
-    // Timer: prescaler 2^P, counter, compare, capture on ui[0], output
-    // ------------------------------------------------------------------------------------
-    wire [3:0] tp_sel = tctl[3:0];
-    wire       t_en   = tctl[4];
-    wire       t_ar   = tctl[5];
-    wire [1:0] t_mode = tctl[7:6];
-    wire [1:0] t_cap  = tctl[9:8];
-    reg  [14:0] tp;
-    reg  [15:0] tcnt, tcap;
-    reg         tq, p_cmp, p_cap;
-    wire        wr_cnt = (be0 | be1) & s_tcnt;
-    // tp holds the complement of the prescaler count: tick when its low P bits are all zero
-    wire [15:0] tp_run = {~|tp[14:0], ~|tp[13:0], ~|tp[12:0], ~|tp[11:0], ~|tp[10:0], ~|tp[9:0],
-                          ~|tp[8:0], ~|tp[7:0], ~|tp[6:0], ~|tp[5:0], ~|tp[4:0], ~|tp[3:0],
-                          ~|tp[2:0], ~|tp[1:0], ~tp[0], 1'b1};
-    wire        tick   = t_en & tp_run[tp_sel];
-    wire        match  = (tcnt == tcmp);
-    wire        cap_ev = chg[0] & (s2[0] ? t_cap[0] : t_cap[1]);
-    wire [15:0] tcnt_i = tcnt + 16'd1;
-    // next count for the enable flops: the written bytes (0 in reset), else the tick's step
-    wire [15:0] t_nx   = wr_cnt ? {z1, z0} : (tcnt_i & {16{~((match & t_ar) | rst)}});
-    always @(posedge clk) begin
-        tp <= (wr_cnt | ~t_en) ? 15'h7fff : tp - 15'd1;   // inverted count
-        if (rst | (wr_cnt ? be0 : tick)) tcnt[7:0]  <= t_nx[7:0];
-        if (rst | (wr_cnt ? be1 : tick)) tcnt[15:8] <= t_nx[15:8];
-        if (!rst_n) begin
-            tcap  <= 16'd0;
-            p_cmp <= 1'b0;
-            p_cap <= 1'b0;
-        end else begin
-            // no reset: only toggle mode shows tq, and the write that selects it clears tq
-            if (be0 & s_tctl)
-                tq <= 1'b0;                                 // the mode is written: restart at 0
-            else if (tick & match & (t_mode == 2'b01))
-                tq <= ~tq;
-            if (cap_ev)
-                tcap <= tcnt;
-            p_cmp <= (p_cmp & ~(be0 & s_pend & d0[0])) | (tick & match);
-            p_cap <= (p_cap & ~(be0 & s_pend & d0[1])) | cap_ev;
-        end
-    end
-    wire t_out = (t_mode == 2'b01) ? tq : (t_mode == 2'b10) ? (tcnt < tcmp) : 1'b0;
+    wire [15:0] tcnt, tcmp, tcap;
+    wire [9:0]  tctl;
+    wire        p_cmp, p_cap, t_out;
+    r32v_timer u_timer (
+        .clk(clk), .rst_n(rst_n), .rst(rst), .be0(be0), .be1(be1), .w0(w0), .w1(w1),
+        .z0(z0), .z1(z1), .d0(d0),
+        .s_tcnt(s_tcnt), .s_tcmp(s_tcmp), .s_tctl(s_tctl), .s_pend(s_pend),
+        .cap_in(s2[0]), .cap_chg(chg[0]),
+        .tcnt(tcnt), .tcmp(tcmp), .tcap(tcap), .tctl(tctl),
+        .p_cmp(p_cmp), .p_cap(p_cap), .t_out(t_out)
+    );
 
-    // ------------------------------------------------------------------------------------
-    // PWM: prescaler 2^Q, counter 0..PER, three duty compares
-    // ------------------------------------------------------------------------------------
-    wire [9:0] per   = pctl[9:0];
-    wire [2:0] q_sel = pctl[12:10];
-    wire       p_en  = pctl[13];
-    wire       irg   = pctl[14];
-    reg  [6:0] pq;
-    reg  [9:0] pcn;                                    // ~pc (pq is inverted too)
-    // pc < x  <=>  pcn + x carries out of bit 9
-    wire       p_lp  = |(({1'b0, pcn} + {1'b0, per})   >> 10);
-    wire       p_l0  = |(({1'b0, pcn} + {1'b0, duty0}) >> 10);
-    wire       p_l1  = |(({1'b0, pcn} + {1'b0, duty1}) >> 10);
-    wire       p_l2  = |(({1'b0, pcn} + {1'b0, duty2}) >> 10);
-    wire [7:0] pq_run = {~|pq[6:0], ~|pq[5:0], ~|pq[4:0], ~|pq[3:0], ~|pq[2:0], ~|pq[1:0], ~pq[0], 1'b1};
-    wire       ptick  = pq_run[q_sel];
-    always @(posedge clk) begin
-        pq <= p_en ? pq - 7'd1 : 7'h7f;                  // inverted count
-        if (~p_en | ptick)
-            pcn <= (pcn - 10'd1) | {10{~(p_en & p_lp)}};
-    end
-    wire pwm0 = p_en & p_l0;
-    wire pwm1 = p_en & p_l1;
-    wire pwm2 = p_en & p_l2;
+    wire [14:0] pctl;
+    wire [9:0]  duty0, duty1, duty2;
+    wire [2:0]  pwm;
+    r32v_pwm u_pwm (
+        .clk(clk), .rst(rst), .w0(w0), .w1(w1), .z0(z0), .z1(z1),
+        .s_pctl(s_pctl), .s_dut0(s_dut0), .s_dut1(s_dut1), .s_dut2(s_dut2), .t_out(t_out),
+        .pctl(pctl), .duty0(duty0), .duty1(duty1), .duty2(duty2), .pwm(pwm)
+    );
 
-    // ------------------------------------------------------------------------------------
-    // UART transmitter: {stop, data, start} shifted out LSB first, DIV+1 cycles per bit
-    // ------------------------------------------------------------------------------------
-    reg  [9:0]  tsr;
-    reg  [12:0] tbc;
-    wire        tx_busy = |tsr;
-    wire        tx_go   = be0 & s_udat & ~tx_busy;
-    always @(posedge clk) begin
-        // the reset loads 0 (idle) through the start path. Only a busy tsr shifts: tbc has no
-        // reset and is unknown until the first start, and an idle tsr must not depend on it
-        // (gate-level X propagation otherwise turns the idle tsr, and TX_BUSY, into X)
-        if (tx_go | rst)
-            tsr <= {rst_n, z0, 1'b0};
-        else if (tx_busy & (tbc == 13'd0))
-            tsr <= {1'b0, tsr[9:1]};
-        if (tx_go | (tbc == 13'd0))
-            tbc <= div;
-        else
-            tbc <= tbc - 13'd1;
-    end
-    wire tx_pin = tsr[0] | ~tx_busy;
+    wire [12:0] div;
+    wire [7:0]  rdat;
+    wire        rfull, rovr, tx_busy, tx_pin;
+    r32v_uart u_uart (
+        .clk(clk), .rst_n(rst_n), .rst(rst), .be0(be0), .w0(w0), .w1(w1), .z0(z0), .z1(z1),
+        .rd0(rd0), .s_udat(s_udat), .s_uctl(s_uctl), .rx(s2[1]), .rx_chg(chg[1]),
+        .div(div), .rdat(rdat), .rfull(rfull), .rovr(rovr), .tx_busy(tx_busy), .tx_pin(tx_pin)
+    );
 
-    // ------------------------------------------------------------------------------------
-    // UART receiver: a falling edge starts a frame; samples at mid-bit (DIV/2, then DIV+1)
-    // ------------------------------------------------------------------------------------
-    reg         ract, rfull, rovr;
-    reg  [12:0] rcnt;
-    reg  [9:0]  rsr;
-    reg  [7:0]  rdat;
-    wire        r_start = ~ract & chg[1] & ~s2[1];
-    wire        r_smp   = ract & (rcnt == 13'd0);
-    wire        r_stop  = r_smp & rsr[0];
-    wire        r_clr   = rd0 & s_udat;
-    wire        full_k  = rfull & ~r_clr;                // reading byte 0 comes first
-    always @(posedge clk) begin
-        // rcnt reloads at zero whether or not a frame is active (idle, nothing samples it)
-        if (r_start)
-            rcnt <= {1'b0, div[12:1]};
-        else if (rcnt == 13'd0)
-            rcnt <= div;
-        else
-            rcnt <= rcnt - 13'd1;
-        // rsr: a start loads the marker into bit 9; each sample shifts in at the top, so after
-        // the start bit and 8 data bits the marker is in bit 0 and the byte in bits 9:2, and the
-        // next sample (the stop bit) ends the frame
-        if (r_start | r_smp)
-            rsr <= {r_start | s2[1], rsr[9:1] & {9{~r_start}}};
-        if (!rst_n) begin
-            ract  <= 1'b0;
-            rfull <= 1'b0;
-            rovr  <= 1'b0;
-            rdat  <= 8'd0;
-        end else begin
-            if (r_start)
-                ract <= 1'b1;
-            else if (r_stop)
-                ract <= 1'b0;
-            if (r_stop & ~full_k)
-                rdat <= rsr[9:2];
-            rfull <= full_k | r_stop;
-            rovr  <= (rovr & ~r_clr) | (r_stop & full_k);
-        end
-    end
-
-    // ------------------------------------------------------------------------------------
-    // SPI master, mode 0, MSB first: 2^D cycles low, 2^D high per bit.
-    // sph = {BUSY, half-period count}: a write loads 1_0000, each half period adds 1, and the
-    // sixteenth (the eighth falling edge) wraps it to 0, which clears BUSY. Bit 0 is SCK.
-    // sdr holds {bits still to send, bits received, the slot for the next MISO sample}: MOSI is
-    // its top bit (0 when idle), every falling SCK edge shifts it left, and the cycle after each
-    // rising edge writes the slot with MISO as synchronized at that rising edge (contract 5.6:
-    // the pin value at the rising edge). After the eighth falling edge sdr[8:1] is the received
-    // byte, which SPI_DATA reads. The sample and the falling edge meet only at D = 0
-    // (unspecified), where the sample goes straight to bit 1.
-    // ------------------------------------------------------------------------------------
-    reg  [8:0] sdr;
-    reg  [4:0] sph;
-    reg        srp;                                    // the cycle after a rising SCK edge
-    reg  [6:0] sdc;
-    wire       sbusy   = sph[4];
-    wire       ssck    = sph[0];
-    wire       s_go    = be0 & s_sdat & ~sbusy;
-    wire [7:0] sdc_run = {~|sdc[6:0], ~|sdc[5:0], ~|sdc[4:0], ~|sdc[3:0], ~|sdc[2:0], ~|sdc[1:0], ~sdc[0], 1'b1};
-    wire       s_half  = sbusy & sdc_run[sd];
-    always @(posedge clk) begin
-        sdc <= s_go ? 7'h7f : sdc - 7'd1;                // inverted count
-        // no reset on srp or sdr[0]: SPI_DATA reads sdr[8:1], and s_go clears sdr[0]
-        srp <= s_half & ~ssck;
-        if (s_go | rst)
-            sdr <= {z0, 1'b0};                           // the reset loads 0 the same way
-        else if (s_half & ssck)
-            sdr <= {sdr[7:1], srp ? s2[3] : sdr[0], 1'b0};
-        else if (srp)
-            sdr[0] <= s2[3];
-        if (!rst_n)
-            sph <= 5'd0;
-        else if (s_go)
-            sph <= 5'b10000;
-        else if (s_half)
-            sph <= sph + 5'd1;
-    end
+    wire       scs, sbusy, ssck, mosi;
+    wire [2:0] sd;
+    wire [7:0] srxd;
+    r32v_spi u_spi (
+        .clk(clk), .rst_n(rst_n), .rst(rst), .be0(be0), .w0(w0), .z0(z0),
+        .s_sdat(s_sdat), .s_sctl(s_sctl), .miso(s2[3]),
+        .scs(scs), .sd(sd), .sbusy(sbusy), .ssck(ssck), .mosi(mosi), .rxd(srxd)
+    );
 
     // ------------------------------------------------------------------------------------
     // Interrupt line (registered: MEIP is at most a cycle late)
@@ -333,7 +178,7 @@ module r32v_periph (
     // ------------------------------------------------------------------------------------
     // Pins
     // ------------------------------------------------------------------------------------
-    wire [7:0] fn = {t_out, sdr[8] & sbusy, ssck, scs, pwm2, pwm1, pwm0 & (t_out | ~irg), tx_pin};
+    wire [7:0] fn = {t_out, mosi, ssck, scs, pwm, tx_pin};
     assign uo_out = (alt & fn) | (~alt & gpo);
 
     // ------------------------------------------------------------------------------------
@@ -354,7 +199,7 @@ module r32v_periph (
             5'd10: rdata = {6'd0, duty2};
             5'd11: rdata = {8'd0, rdat};
             5'd12: rdata = {rovr, rfull, tx_busy, div};
-            5'd13: rdata = {8'd0, sdr[8:1]};
+            5'd13: rdata = {8'd0, srxd};
             5'd14: rdata = {11'd0, sbusy, sd, scs};
             5'd15: rdata = {11'd0, ien};
             5'd16: rdata = {11'd0, pend};
