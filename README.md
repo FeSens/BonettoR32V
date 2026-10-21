@@ -14,14 +14,14 @@ Status: pre-silicon. Verified in simulation (RTL and gate level), and hardened c
 
 | Item | Value |
 |---------|---------------------------------------------------|
-| Clock | 50 MHz signoff (setup slack +3.51 ns, hold slack +0.022 ns at every corner) |
+| Clock | 50 MHz signoff (setup slack +2.96 ns, hold slack +0.064 ns at every corner) |
 | CoreMark | 0.6791 iterations/s, 73,622,855 cycles per iteration (0.01358 CoreMark/MHz) |
 | Cycles per instruction | 99.0 over the 32 test programs (total cycles / total instructions) |
-| Area | 23,084.6 µm² synthesized, 2,339 cells, 496 flip-flops; utilization 0.798 in the 1x2 tile |
+| Area | 23,109.7 µm² synthesized, 2,336 cells, 496 flip-flops; utilization 0.813 in the 1x2 tile |
 | Memory | 16 MiB flash (code, execute in place), 8 MiB PSRAM (data) |
 | Gates | lint, area, cosim (256 runs + liveness fuzz), riscv-arch-test 53/53, equivalence, TT's test on the RTL and on the netlist 5/5; riscv-formal fast config 65/65 (bounded from reset; the deep config does not finish on this core); 2,850-run soak |
 
-The design is hypothesis 113 (RTL `f0a62bf`) with the layout settings of `afdb678`. The clock,
+The design is hypothesis 114 (RTL `ba04be4`) with the layout settings of `236c011`. The clock,
 slack and utilization figures come from hardening that commit with TT's flow: DRC, LVS, antenna
 and TT precheck clean, and TT's test passes on the routed netlist (manual section 9).
 [docs/signoff.md](docs/signoff.md) is the tape-out sign-off record.

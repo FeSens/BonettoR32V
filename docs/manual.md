@@ -6,9 +6,9 @@ most of its registers in the Pmod's PSRAM, and has the peripherals a hobby proje
 with edge interrupts, a 16-bit timer with compare, capture and an output, three 10-bit PWM
 channels with an IR carrier gate, a UART, an SPI master and one interrupt line.
 
-This manual describes the sign-off design (2026-10-20): the RTL of hypothesis 113 (`f0a62bf`, the
-pair-fetch champion with the PSRAM CS_n gap and flash boot fixes of docs/signoff.md) and the
-layout settings of `afdb678`. It is
+This manual describes the sign-off design (2026-10-21): hypothesis 114 (RTL `ba04be4`: the
+pair-fetch champion with the PSRAM CS_n gap and flash boot fixes of docs/signoff.md, one source
+file per peripheral) with the layout settings of `236c011`. It is
 written for hardware hobbyists and Tiny Tapeout users who want to wire, program and evaluate the
 chip. `docs/contract.md` is the authoritative interface; where this manual and the contract
 differ, the contract wins. `docs/programming-guide.md` is a two-page summary, and `sdk/` holds an
@@ -53,7 +53,7 @@ the 50 MHz signoff clock. *Derived* numbers are computed from the RTL source and
 | UART | 8N1, bit time DIV+1 cycles, DIV 15..8191: 6,104 to 3,125,000 baud at 50 MHz |
 | SPI master | mode 0, MSB first, SCK = f_clk / 2^(D+1), D 1..7: 12.5 MHz to 195 kHz at 50 MHz |
 | Interrupts | one machine external interrupt from 5 sources (timer compare, capture, UART RX, UART TX idle, GPIO edges); synchronous traps to `mtvec` |
-| Silicon | sky130A, `sky130_fd_sc_hd`, Tiny Tapeout 1x2 tile; 23,084.6 µm² synthesized, 2,339 cells, 496 flip-flops |
+| Silicon | sky130A, `sky130_fd_sc_hd`, Tiny Tapeout 1x2 tile; 23,109.7 µm² synthesized, 2,336 cells, 496 flip-flops |
 | Software | xPack `riscv32-unknown-elf-gcc` 15.2.0, `-march=rv32e_zicsr -mabi=ilp32e`; Arduino-style SDK in `sdk/` |
 
 ### 1.2 Block diagram
@@ -176,7 +176,7 @@ The memory board is Tiny Tapeout's QSPI Pmod on the bidirectional (`uio`) header
 ### 2.3 Clock
 
 - **Signoff: 50 MHz** (`clock_hz` in `info.yaml`, `CLOCK_PERIOD` 20 ns in `src/config.json`).
-  STA closes at every corner with +3.51 ns of setup slack (section 9).
+  STA closes at every corner with +2.96 ns of setup slack (section 9).
 - **Lower clocks: 6.25 to 50 MHz.** Every timing in the design is in cycles. The full cosim suite
   (32 programs, both modes, four seeds, the liveness fuzz) passes at 12 MHz and at 6.25 MHz; at
   5 MHz it fails the PSRAM's 8 µs tCEM, because a 41-cycle transaction then lasts 8.2 µs. The SDK
@@ -1132,10 +1132,12 @@ The design is improved by a loop of hypotheses, each re-verified by every gate b
 | 110 | core area diet at the same cycles (scan flops as enable flops) | 50 MHz | 91,730,514 | 0.5451 | 20,764.9 |
 | 111 | x11 on the die | 50 MHz | 81,557,200 | 0.6131 | 21,986.1 |
 | 112 (`4c82e3a`) | pair fetch | 50 MHz | 73,047,400 | 0.6845 | 23,073.4 |
-| 113 (`f0a62bf`, sign-off) | PSRAM CS_n high 2 clocks between PSRAM transactions (tCPH); flash boot enters continuous read with a completed read | 50 MHz | 73,622,855 | 0.6791 | 23,084.6 |
+| 113 (`f0a62bf`) | PSRAM CS_n high 2 clocks between PSRAM transactions (tCPH); flash boot enters continuous read with a completed read | 50 MHz | 73,622,855 | 0.6791 | 23,084.6 |
+| 114 (`ba04be4`, sign-off) | one source file per peripheral (proven equivalent logic) | 50 MHz | 73,622,855 | 0.6791 | 23,109.7 |
 
 113 is a correctness fix found by the sign-off datasheet audit (docs/pmod-audit.md), not an
-improvement: it costs 0.78% of the score. From the seed: 7.9x fewer cycles per iteration and 9.8x
+improvement: it costs 0.78% of the score. 114 only regroups the source; synthesis maps it 25 µm²
+larger. From the seed: 7.9x fewer cycles per iteration and 9.8x
 the score (the clock gives the rest).
 
 ### 8.3 What limits speed
@@ -1155,7 +1157,7 @@ the score (the clock gives the rest).
   5 to 6 instructions per bit of the multiplier (`andi`, `beqz`, `add`, `srli`, `slli`, `bnez`).
   The multiplier sits in x11 (a1), and three of those instructions use it: hence x11's place on
   the die.
-- **Area.** The 1x2 tile is nearly full (utilization 0.798 after placement, section 9). Every
+- **Area.** The 1x2 tile is nearly full (utilization 0.813 after placement, section 9). Every
   speed-up has to pay for its flip-flops.
 
 ## 9. Physical implementation
@@ -1165,17 +1167,18 @@ the score (the clock gives the rest).
 | Process, library | SkyWater sky130A, `sky130_fd_sc_hd` |
 | Flow | Tiny Tapeout's (tt-gds-action `ttsky26d`), LibreLane 3.0.14 Classic flow, run locally by `tools/harden_tt.sh` (docs/physical.md) |
 | Tile | 1x2: die 36,347 µm², core 34,255 µm² |
-| Synthesis (measured, 113) | 23,084.6 µm², 2,339 cells, 496 flip-flops, no latches |
-| Placement utilization | 0.798 (5,570 instances after placement and repair, 129 of them hold buffers) |
-| Timing at 20 ns (50 MHz) | setup slack +3.51 ns and hold slack +0.022 ns at every one of the 9 corners, after the flow's 0.25 ns clock uncertainty and 5% derate |
-| Slew | 746 pins above TT's 0.75 ns target in the slowest corner (ss, 100 °C, 1.60 V), 16 above the library's 1.5 ns, worst 1.98 ns; none above 1.5 ns at the typical corner |
+| Synthesis (measured, 114) | 23,109.7 µm², 2,336 cells, 496 flip-flops, no latches |
+| Area by block (synthesis with the hierarchy kept, 23,839 µm² in all) | core 9,196 µm² (`tt_um_fesens_r32v`); peripherals 13,048: timer 3,259, UART 2,798, PWM 2,565, GPIO 1,142, SPI 1,077, shared bus, pin mux, interrupt line and read mux 2,206; memory controller 1,013; CSRs 582 |
+| Placement utilization | 0.813 (5,444 instances after placement and repair, 183 of them hold buffers) |
+| Timing at 20 ns (50 MHz) | setup slack +2.96 ns and hold slack +0.064 ns at every one of the 9 corners, after the flow's 0.25 ns clock uncertainty and 5% derate |
+| Slew | 819 pins above TT's 0.75 ns target in the slowest corner (ss, 100 °C, 1.60 V), 24 above the library's 1.5 ns, worst 1.88 ns; none above 1.5 ns at the typical corner |
 | Signoff checks | DRC (Magic and TT's KLayout decks), LVS, antenna and TT precheck clean |
-| Configuration | `src/config.json`: synthesis `AREA 2` with the smallest drive strengths allowed, hold margins 0.015/0.01 ns, design repair without slew/cap margins, timing-driven and routability-driven placement (overflow threshold 0.13) with no initial placement, global-routing layer adjustments 0.99/0.1/0.1 on li1/met1/met2, target density 60% |
+| Configuration | `src/config.json`: synthesis `AREA 2` with the smallest drive strengths allowed, hold margins 0.05/0.01 ns, design repair without slew/cap margins, timing-driven and routability-driven placement (overflow threshold 0.14), global-routing layer adjustments 0.99/0.1/0.1 on li1/met1/met2, target density 60% |
 
-- The hardening numbers are measured on `afdb678` (the sign-off commit's RTL and `src/config.json`)
-  on 2026-10-20, and reproduce the sweep point the configuration came from exactly. Placement in
-  this nearly full tile is chaotic: 112's configuration did not route 113's netlist, so re-screen
-  the settings after any RTL change (docs/signoff.md, "Layout").
+- The hardening numbers are measured on `236c011` (the sign-off commit's RTL and `src/config.json`)
+  on 2026-10-21, and reproduce the sweep point the configuration came from exactly. Placement in
+  this nearly full tile is chaotic: 112's configuration did not route 113's netlist, nor 113's
+  114's, so re-screen the settings after any RTL change (docs/signoff.md, "Layout").
 - **Design style.** One rising-edge clock, synchronous reset, no latches, no tristates, plain
   Verilog-2005 (contract 1). Core state flip-flops (the ring, instruction register, pc, x11, the
   pair-fetch buffer, counters) are `sky130_fd_sc_hd__sdfxtp_1` scan flops used as enable flops
@@ -1189,19 +1192,19 @@ the score (the clock gives the rest).
 ## 10. Verification
 
 Every candidate passes every gate before it merges (`make eval`; docs/eval.md), except formal,
-which runs at every tenth merged improvement and at signoff. Results of `make eval FORMAL=1` on the
-sign-off design (d944aaf, the RTL of 113), measured on the project's Linux build host; the
+which runs at every tenth merged improvement and at signoff. Results of `make eval` on the sign-off
+commit (236c011) and formal on its RTL (ba04be4), measured on the project's Linux build host; the
 sign-off record with the soak, clock-range and layout checks is docs/signoff.md:
 
 | Gate | What it checks | Result |
 |---|------------------------------------------|----------------|
 | lint | `tools/src_check.py` (synthesizable subset, whitelisted cells only), Verilator `-Wall` on the plain and RVFI builds | pass |
-| area | TT's synthesis; no latches; 1x2 fit pre-filter (≤ 23,100 µm²) | pass, 23,084.6 µm² |
+| area | TT's synthesis; no latches; 1x2 fit pre-filter (≤ 23,110 µm²) | pass, 23,109.7 µm² |
 | cosim | 32 programs x 2 modes x 4 seeds = 256 runs, plus the liveness fuzz under 5 seeds (2,056 random-image sub-runs each) | 256/256, fuzz 5/5 |
 | arch | riscv-arch-test 3.9.1: all 53 RV32E and privilege tests (traps included), under seeds 1-4 | 53/53 |
 | equiv | the RVFI-stripped build is formally equivalent to the plain build (yosys) | pass |
 | gl | TT's cocotb test (`gpio_demo` in the four memory power-up modes, `uart_hello`) on the RTL under Icarus, as TT's test workflow runs it, then on the synthesized netlist with every flip-flop starting at X | 5/5 and 5/5 |
-| formal | riscv-formal at the pins, fast config: every check from reset to the step where its triggers are reached (308-466 cycles: the first instruction and the pair-fetched second one, any power-up state) | 65/65 (3,615 s); on 112, 39 of 46 planted bugs caught by formal and the other 7 by cosim |
+| formal | riscv-formal at the pins, fast config: every check from reset to the step where its triggers are reached (308-466 cycles: the first instruction and the pair-fetched second one, any power-up state) | 65/65 (5,940 s); on 112, 39 of 46 planted bugs caught by formal and the other 7 by cosim |
 
 **What the cosim checks** (docs/cosim.md): in rvfi mode the reference ISS runs in lockstep and
 every retired instruction is compared; in pins mode only the pins are judged. In both, the
@@ -1213,7 +1216,7 @@ programs are selftest, csr, coherence, mem_init_check, gpio_demo, coremark, seve
 six random instruction streams, and the peripheral programs irq_timer, irq_stress, wfi,
 uart_echo, uart_echo_fast, spi_loop, pwm, pwm10, pwm10q, timer16, ir_loop, ir_gate and gpio_edge.
 
-**Measured totals on 113 (d944aaf):** CPI 99.0 (total cycles over total instructions of the rvfi
+**Measured totals on 114 (236c011; the same as 113):** CPI 99.0 (total cycles over total instructions of the rvfi
 runs, seed 1); worst retirement gap 305 cycles (liveness fuzz 488);
 CoreMark 73,622,855 cycles per iteration.
 
