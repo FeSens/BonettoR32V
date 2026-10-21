@@ -8,8 +8,8 @@ Gate order (docs/eval.md): cheapest first, so a bad candidate retires early.
 The score is coremark_ips = f_clk / CoreMark cycles per iteration (contract section 7): the
 cosim gate reads the cycles from the CoreMark runs and f_clk from src/config.json CLOCK_PERIOD.
 The area gate includes the `fits` pre-filter for the 1x2 tile: synth area above FIT_AREA_UM2
-(23,100 um2) fails (a 1x2 harden confirms). 2026-10-18: hyp 112 a85f6cb, 23,073.4 um2 synth,
-hardens clean in 1x2 at utilization 0.803 with the src/config.json of that date (sweep x6).
+(23,110 um2) fails (a 1x2 harden confirms). 2026-10-21: hyp 114 ba04be4, 23,109.664 um2 synth,
+hardens clean in 1x2 at utilization 0.813 with the src/config.json of that date (sweep c05).
 With --min-ips X, a candidate whose coremark_ips is below X (or null) stops right after the cosim
 gate ("NO_GAIN", exit 3): it cannot win, so the rest of its gates are not worth running. A tie
 continues through every gate: the contract's tiebreak (smaller synth area) may still make it win.
@@ -58,7 +58,9 @@ FORMAL_GATE = "formal"                  # appended to ORDER only with --formal
 # signs off in 1x2 at utilization 0.728 with src/config.json's routing settings (2026-10-18 sweep);
 # nothing larger has been shown to route yet, so the pre-filter allows ~7.5% growth. The harden in a
 # champion round has the last word; the lead raises this once a tile-fit search shows more room.
-FIT_AREA_UM2 = 23100.0
+# Raised to 23,100 on hyp 112 (a85f6cb, 23,073.4, clean at utilization 0.803) and to 23,110 on hyp
+# 114 (ba04be4, 23,109.664, clean at utilization 0.813 with the 2026-10-21 settings, sweep c05).
+FIT_AREA_UM2 = 23110.0
 FIT_TILES = "1x2"
 COREMARK_PROG = "coremark"              # the program whose runs carry the score
 # One heavy job at a time on the Mac. The path is overridable only so tests don't queue behind a

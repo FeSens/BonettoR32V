@@ -57,7 +57,7 @@ so. A missing runner is a FAIL with `gate <name>: runner missing (<path>)`. Runn
 | # | Gate | Runner (as called) | PASS requires |
 |---|---|---|---|
 | 1 | lint | `tools/src_check.py` rules (below), then `verilator --lint-only -Wall --top-module tt_um_fesens_r32v src/*.v` followed by the cell models (`verif/cells/*.v`, see Cell instances), then again with the RVFI defines | src hygiene clean; Verilator exit 0 for both builds |
-| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract section 1), the `netlist` file exists (a cell instance counts at its liberty area, see Cell instances); then **`fits`**: `area_um2 <= FIT_AREA_UM2`, a fast 1x2 pre-filter, **23,100 µm²** (hyp 112's a85f6cb, 23,073.4 µm², signs off in 1x2 at utilization 0.803 with the 2026-10-18 config, sweep x6; the champion round's `make harden` has the last word) |
+| 2 | area | `tools/area.py --top tt_um_fesens_r32v --src src/` | exit 0, `area_um2 > 0`, `cells > 0`, `engine == "librelane"`, `latches == 0` (contract section 1), the `netlist` file exists (a cell instance counts at its liberty area, see Cell instances); then **`fits`**: `area_um2 <= FIT_AREA_UM2`, a fast 1x2 pre-filter, **23,110 µm²** (hyp 114's ba04be4, 23,109.7 µm², signs off in 1x2 at utilization 0.813 with the 2026-10-21 config, sweep c05; before it 23,100 on hyp 112's a85f6cb; the champion round's `make harden` has the last word) |
 | 3 | cosim | `make -C verif/programs`; `make -s -C verif/programs list`; then one `run_cosim.py --all --no-make --jobs N --clk-ns <CLOCK_PERIOD>` (contract v3, writes `build/cosim.json`; the Pmod models check tCEM and the SCK rate at the signoff clock): every listed program in modes rvfi and pins under seeds 1-4 (the four memory power-up modes), plus the rvfi-mode liveness fuzz under seeds 1-5. No `--max-cycles`: each run's budget is expect.json `max_cycles` or the harness default (R35), and the harness watchdog bounds every gap | a fresh `build/cosim.json` with no `error`, `contract: "v3"`, `clk_ns` equal to `CLOCK_PERIOD`, `programs` equal to `make list`, `seeds` [1, 2, 3, 4] and `fuzz_seeds` [1..5]; every (program, mode, seed) run exactly once, each `pass: true` with no `error`, `max_cycles_per_insn <= 2048`, and `coremark_cycles_per_iter` null or a positive number; each fuzz seed once, `pass` and `liveness_checked` true, `runs` >= 2,056, its gap `<= 2048`; then exit 0 and `pass: true` |
 | 4 | arch | `verif/arch-test/run_arch.py --jobs N` (`--phase all`: GCC, spike and Verilator on one host; seeds 1-4) | exit 0, `pass: true`, every test `true`, and exactly 53 tests (ruling R34) |
 | 5 | equiv | `tools/equiv.py --src src --top tt_um_fesens_r32v --out build/equiv.json --work build/equiv` (both builds read the cell models after `src/*.v`) | exit 0 and `pass: true` |
@@ -310,7 +310,7 @@ Fixtures in `tools/test_fixtures/src_check/`:
   "pass": true,
   "gates": {
     "lint":   {"pass": true, "detail": "<one line>", "runtime_s": 1.2},
-    "area":   {"pass": true, "detail": "..., fits 1x2 (<= 23,100 um2)", "runtime_s": 20.0},
+    "area":   {"pass": true, "detail": "..., fits 1x2 (<= 23,110 um2)", "runtime_s": 20.0},
     "cosim":  {"pass": true, "detail": "...", "runtime_s": 300.0},
     "arch":   {"pass": true, "detail": "...", "runtime_s": 60.0},
     "equiv":  {"pass": true, "detail": "...", "runtime_s": 2.0},
