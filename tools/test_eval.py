@@ -567,11 +567,11 @@ def test_area_adapter(repo, change, ok, msg):
 
 
 def test_fits_is_the_1x2_threshold():
-    # contract section 7: 1x2 tile; hyp 112 a85f6cb (23,073.4 um2) signs off in 1x2 (sweep x6)
-    assert (ev.FIT_AREA_UM2, ev.FIT_TILES) == (23100.0, "1x2")
+    # contract section 7: 1x2 tile; hyp 114 ba04be4 (23,109.664 um2) signs off in 1x2 (sweep c05)
+    assert (ev.FIT_AREA_UM2, ev.FIT_TILES) == (23110.0, "1x2")
 
 
-@pytest.mark.parametrize("area,ok", [(23101, False), (23100.01, False), (23100, True),
+@pytest.mark.parametrize("area,ok", [(23111, False), (23110.01, False), (23110, True),
                                      (20288.0, True), (4780.0, True)])
 def test_fits_prefilter(repo, area, ok):
     put(repo, "build/synth/netlist.v", "module tt_um_fesens_r32v(); endmodule\n")
@@ -579,9 +579,9 @@ def test_fits_prefilter(repo, area, ok):
     res = run_gate(repo, "area")
     assert res["pass"] is ok, res["detail"]
     if ok:
-        assert "fits 1x2 (<= 23,100 um2)" in res["detail"] and res["data"]["fits"] is True
+        assert "fits 1x2 (<= 23,110 um2)" in res["detail"] and res["data"]["fits"] is True
     else:
-        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 23,100 um2, "
+        assert res["detail"].startswith(f"fits FAIL: synth area {area} um2 exceeds 23,110 um2, "
                                         f"the 1x2 pre-filter")
 
 
