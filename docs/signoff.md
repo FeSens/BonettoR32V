@@ -36,6 +36,7 @@ and 2026-10-21 unless it is labelled otherwise.
 | Memory chips vs datasheets | docs/pmod-audit.md: pin map, every command, timing, power-up, the read-timing budget | 3 mismatches and 4 unverified points; each fixed, documented or kept with a reason (below) |
 | Layout (236c011; LibreLane 3.0.14, TT's tt-gds-action ttsky26d flow and precheck, hwe-bench) | DRC (Magic, route, TT's KLayout FEOL/BEOL/offgrid decks), LVS, antenna, power grid, setup and hold at 9 corners, TT precheck (15 checks) | all clean; setup +2.961 ns, hold +0.0639 ns (see "Layout") |
 | Post-layout netlist (236c011) | TT's test on the placed-and-routed netlist with power pins (`tt_submission/tt_um_fesens_r32v.v`, 5,444 cells), Icarus | 5/5 |
+| TT's GitHub workflows on main (0c9302c, the same design files as 236c011; run 39531768690) | test (TT's RTL test), docs (the datasheet), gds: TT's hardening (35 min), precheck, gate-level test on TT's routed netlist, 3D viewer (https://fesens.github.io/BonettoR32V/) | all pass; TT's routed netlist, LEF, OASIS and `stats/metrics.csv` are byte-identical to the local harden, and the GDS is identical except its timestamps |
 
 ## Fixes made during sign-off
 
@@ -107,13 +108,13 @@ and stays in git history (commit d5e742d).
 | Formal is bounded | the fast config proves 308-466 cycles from reset; the deep config does not finish on this core (proofs at 613 cycles timed out at 5 h) | cosim, the soak, arch-test and the mutant results cover later behavior |
 | Slew in the slow corner | in ss at 100 °C and 1.60 V, 24 pins exceed the library's 1.5 ns table (worst 1.88 ns; 113's layout had 16, worst 1.98 ns; 112's 9, worst 2.41 ns), driven by small cells; their delays are extrapolated | setup still has +3.0 ns there; lower the clock if needed |
 | Hold margin | +0.064 ns at the fast corner, on top of the flow's 0.25 ns clock uncertainty and 5 % derate; a hold failure cannot be fixed by a slower clock | the 0.25 ns uncertainty (LibreLane's default, kept) is the guard band; the placement repair margin is 0.05 ns (TT's default 0.1) and the routing one 0.01 ns (TT's 0.05), because TT's defaults added about 320 hold buffers on the v3 seed and left it unroutable; TT's gds workflow re-runs STA |
-| Layout settings are fragile | placement is chaotic in this tile, and every clean 114 point shares one placement: TT's own gds run on main must reproduce the local result | the local flow is TT's action at the same tag, and two hardens of the same tree reproduced each other exactly; compare TT's summary with the table above |
+| Layout settings are fragile | placement is chaotic in this tile: any RTL or setting change needs a new sweep | resolved for this design: TT's own gds run on main reproduced the local layout byte for byte (above); re-run the sweep before changing anything |
 | Flash left in an unsupported mode by another design | the boot only undoes standard SPI and EBh continuous read | power-cycle the board first (manual, programming guide) |
 | Flashing flow | taken from TT's sources, not tried | documented step by step (manual 6.9) |
 
-## What the user does to submit
+## Submission
 
-1. Enable the repository's GitHub workflows (gds, test, docs) and run gds on main: TT's own
-   hardening, precheck and gate-level test must pass there.
-2. Buy 2 tiles (1x2) for TTSKY26d at app.tinytapeout.com and submit the repository before
-   2026-11-30.
+1. Done (2026-10-21, with the user's OK): the gds, test and docs workflows and GitHub Pages are
+   enabled, and every workflow passes on main (above).
+2. The user: buy 2 tiles (1x2) for TTSKY26d at app.tinytapeout.com and submit the repository
+   (its latest main commit with a passing gds run) before 2026-11-30.

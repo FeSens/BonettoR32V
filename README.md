@@ -8,7 +8,9 @@ in its PSRAM. Peripherals: GPIO with edge interrupts, a 16-bit timer (compare, c
 three 10-bit PWM channels with an IR carrier gate, a UART, an SPI master and one interrupt line.
 It comes with an Arduino-style SDK.
 
-Status: pre-silicon. Verified in simulation (RTL and gate level), and hardened clean in 1x2.
+Status: pre-silicon, signed off for TTSKY26d (docs/signoff.md). Verified in simulation (RTL and gate
+level) and by formal proofs, hardened clean in 1x2, and TT's gds, precheck, gate-level test and docs
+workflows pass on main.
 
 ## Headline numbers (sign-off design, measured)
 
